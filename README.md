@@ -6,7 +6,17 @@ Greviewer lets you select a single commit or a contiguous range from the commit 
 
 ## Status
 
-Pre-implementation. The repository currently holds the architectural decisions, feature specs, and reference research that will guide construction. See `docs/adr/` for the foundational decisions.
+Early scaffolding. The repository currently builds a runnable but non-functional shell: a window opens with a placeholder ("No repository open") and exits cleanly when closed. No product behavior from `docs/specs/review/workflow.md` is wired up yet.
+
+## Running
+
+Requires a recent stable Rust toolchain.
+
+```
+cargo run
+```
+
+A 1280×800 window titled "Greviewer" opens with the placeholder root view. Closing the window exits the process.
 
 ## Documentation
 
