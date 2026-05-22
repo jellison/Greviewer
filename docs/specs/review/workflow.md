@@ -1,6 +1,6 @@
 # Review Workflow
 
-This contract defines the review experience: opening a Git repository, navigating its commit graph, selecting commits to review, browsing the rollup change set, and inspecting individual file diffs. Comments, reviewed-state, and unreviewed-only filtering are explicitly deferred and tracked under "Non-goals" at the end of this document.
+This contract defines the review experience: opening a Git repository, navigating its commit graph, selecting commits to review, browsing the rollup change set, and inspecting individual file diffs.
 
 ## Opening a repository
 
@@ -143,12 +143,3 @@ For files that exist on only one side of the selection — added or deleted file
 - Binary files render an explanatory placeholder rather than attempting a textual diff.
 - Very large files load progressively rather than blocking the UI.
 
-## Non-goals for v1
-
-The following user-facing capabilities are explicitly deferred to a later version. They are listed here so reviewers know what this contract does not yet promise.
-
-- **Comments on files or lines.** Adding, persisting, viewing, or exporting per-file or per-line comments.
-- **Marking files or hunks as reviewed.** Persisting per-file or per-hunk review state.
-- **Filtering the change set to un-reviewed items.** Hiding already-reviewed entries from the file tree.
-
-The persistence model that underpins these features will be designed when those features are picked up. v1 makes no commitment to any specific persistence shape.
