@@ -9,16 +9,19 @@ use git2::{IndexAddOption, Repository, Signature};
 use std::{fs, path::Path};
 use tempfile::TempDir;
 
+#[allow(dead_code)]
 pub struct CommitSpec {
     pub message: String,
     pub changes: Vec<FileChange>,
 }
 
+#[allow(dead_code)]
 pub struct FileChange {
     pub path: String,
     pub content: String,
 }
 
+#[allow(dead_code)]
 pub fn build_repo(commits: &[CommitSpec]) -> TempDir {
     let dir = tempfile::tempdir().expect("create tempdir");
     let repo = Repository::init(dir.path()).expect("init repo");
