@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Greviewer verification command.
+# Per ADR-0002: this is the single source of truth for "is this branch ready."
+# Per ADR-0003: `cargo test` exercises all four test levels (unit / integration / view / smoke).
+
+set -euo pipefail
+
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test

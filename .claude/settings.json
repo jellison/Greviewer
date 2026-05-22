@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(git clean)",
+      "Bash(git clean *)",
+      "Bash(git stash --all)",
+      "Bash(git stash --all *)",
+      "Bash(git stash -u)",
+      "Bash(git stash -u *)",
+      "Bash(git stash --include-untracked)",
+      "Bash(git stash --include-untracked *)",
+      "Bash(git checkout --orphan *)"
+    ]
+  }
+}
