@@ -1,8 +1,17 @@
 //! Top-level application entity and root view.
 
+pub mod menu;
+pub mod path_picker;
+
+pub use menu::{
+    bind_app_keys, build_app_menus, open_repository_key_binding, MenuSnapshot,
+    GREVIEWER_MENU_LABEL, OPEN_REPOSITORY_KEYSTROKE, OPEN_REPOSITORY_MENU_LABEL,
+};
+pub use path_picker::{repository_prompt_options, GpuiPathPicker, PathPicker, PathPickerOutcome};
+
 use gpui::{
-    actions, div, px, rgb, AppContext, Context, Entity, EventEmitter, IntoElement, ParentElement,
-    PathPromptOptions, Render, Styled, Window,
+    actions, div, px, rgb, AppContext, Context, Entity, EventEmitter, FocusHandle,
+    InteractiveElement, IntoElement, ParentElement, Render, Styled, Window,
 };
 use gpui_component::notification::{Notification, NotificationList};
 use std::path::PathBuf;
@@ -14,6 +23,8 @@ actions!(app, [OpenRepository]);
 pub struct App {
     pub mode: Mode,
     notifications: Entity<NotificationList>,
+    path_picker: Box<dyn PathPicker>,
+    focus_handle: FocusHandle,
 }
 
 pub enum Mode {
@@ -32,11 +43,27 @@ impl EventEmitter<OpenFailed> for App {}
 
 impl App {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_picker(window, cx, Box::new(GpuiPathPicker))
+    }
+
+    pub fn new_with_picker(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        path_picker: Box<dyn PathPicker>,
+    ) -> Self {
         let notifications = cx.new(|cx| NotificationList::new(window, cx));
+        let focus_handle = cx.focus_handle();
+
+        window.focus(&focus_handle);
+        cx.on_next_frame(window, |app, window, _cx| {
+            window.focus(&app.focus_handle);
+        });
 
         Self {
             mode: Mode::NoRepo,
             notifications,
+            path_picker,
+            focus_handle,
         }
     }
 
@@ -44,39 +71,39 @@ impl App {
     /// path off to `open_repository_at`. Cancellations are silent; picker
     /// errors surface through the notification list.
     pub fn prompt_and_open_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: None,
-        });
+        let task = self
+            .path_picker
+            .pick_path(repository_prompt_options(), window, cx);
 
         cx.spawn_in(window, async move |this, cx| {
-            let result = receiver.await;
-            this.update_in(cx, |app, window, cx| match result {
-                Ok(Ok(Some(mut paths))) if !paths.is_empty() => {
-                    let path = paths.remove(0);
-                    app.open_repository_at(path, window, cx);
-                }
-                Ok(Ok(_)) => {
-                    // User cancelled the picker or chose nothing.
-                }
-                Ok(Err(err)) => {
-                    let message = format!("Couldn't open the picker: {err}.");
-                    app.notifications.update(cx, |list, cx| {
-                        list.push(Notification::error(message.clone()), window, cx);
-                    });
-                    cx.emit(OpenFailed(message));
-                    cx.notify();
-                }
-                Err(_recv_err) => {
-                    // The picker channel was dropped before resolving; treat
-                    // as a cancellation.
-                }
+            let outcome = task.await;
+            this.update_in(cx, |app, window, cx| {
+                app.handle_path_picker_outcome(outcome, window, cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    fn handle_path_picker_outcome(
+        &mut self,
+        outcome: PathPickerOutcome,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match outcome {
+            PathPickerOutcome::Picked(path) => self.open_repository_at(path, window, cx),
+            PathPickerOutcome::Cancelled => {}
+            PathPickerOutcome::Failed(message) => self.push_open_failed(message, window, cx),
+        }
+    }
+
+    fn push_open_failed(&mut self, message: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.notifications.update(cx, |list, cx| {
+            list.push(Notification::error(message.clone()), window, cx);
+        });
+        cx.emit(OpenFailed(message));
+        cx.notify();
     }
 
     pub fn open_repository_at(
@@ -92,11 +119,7 @@ impl App {
             }
             Err(err) => {
                 let message = err.to_string();
-                self.notifications.update(cx, |list, cx| {
-                    list.push(Notification::error(message.clone()), window, cx);
-                });
-                cx.emit(OpenFailed(message));
-                cx.notify();
+                self.push_open_failed(message, window, cx);
             }
         }
     }
@@ -108,7 +131,7 @@ impl App {
 }
 
 impl Render for App {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = div()
             .flex()
             .flex_col()
@@ -159,6 +182,10 @@ impl Render for App {
             .relative()
             .w_full()
             .h_full()
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|app, _: &OpenRepository, window, cx| {
+                app.prompt_and_open_repository(window, cx);
+            }))
             .child(body)
             .child(self.notifications.clone())
     }

@@ -4,10 +4,11 @@
 //! placeholder state. Grows with each feature slice that adds to the golden path
 //! of `docs/specs/review/workflow.md`.
 
-mod common;
+pub mod common;
 
+use common::QueuedPathPicker;
 use gpui::TestAppContext;
-use greviewer::app::{App, Mode};
+use greviewer::app::{bind_app_keys, App, Mode, PathPickerOutcome, OPEN_REPOSITORY_KEYSTROKE};
 
 #[gpui::test]
 async fn boots_to_the_placeholder(cx: &mut TestAppContext) {
@@ -17,26 +18,22 @@ async fn boots_to_the_placeholder(cx: &mut TestAppContext) {
 
     let _window = cx.add_window(App::new);
     // The contract: the boot path constructs the App entity without panicking.
-    // When the open-repository affordance lands, this test grows to dispatch
-    // the open action and assert the graph-mode transition.
+    // Repository-opening behavior is covered by the dispatch smoke test below.
 }
 
 #[gpui::test]
 async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_component::init(cx);
+        bind_app_keys(cx);
     });
 
     let dir = common::load_fixture("two-commits");
-    let path = dir.path().to_path_buf();
+    let picker = QueuedPathPicker::new([PathPickerOutcome::Picked(dir.path().to_path_buf())]);
+    let window = cx.add_window(|window, cx| App::new_with_picker(window, cx, Box::new(picker)));
 
-    let window = cx.add_window(App::new);
-
-    window
-        .update(cx, |app, window, cx| {
-            app.open_repository_at(path, window, cx);
-        })
-        .expect("update window");
+    cx.simulate_keystrokes(*window, OPEN_REPOSITORY_KEYSTROKE);
+    cx.run_until_parked();
 
     window
         .read_with(cx, |app, _cx| match &app.mode {

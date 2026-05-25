@@ -1,6 +1,6 @@
 //! Exercises the synthetic-repo builder helper from `tests/common`.
 
-mod common;
+pub mod common;
 
 use common::{build_repo, CommitSpec, FileChange};
 

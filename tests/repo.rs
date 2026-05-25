@@ -1,6 +1,6 @@
 //! Integration test for the production-side repository layer.
 
-mod common;
+pub mod common;
 
 use greviewer::repo::{open_at, OpenError};
 

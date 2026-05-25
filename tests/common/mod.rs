@@ -6,7 +6,9 @@
 //! builder over checked-in fixtures because it is self-documenting.
 
 use git2::{IndexAddOption, Repository, Signature};
-use std::{fs, path::Path};
+use gpui::{Context, PathPromptOptions, Task, Window};
+use greviewer::app::{App, PathPicker, PathPickerOutcome};
+use std::{cell::RefCell, collections::VecDeque, fs, path::Path, rc::Rc};
 use tempfile::TempDir;
 
 #[allow(dead_code)]
@@ -97,5 +99,50 @@ fn copy_dir_recursive(from: &Path, to: &Path) {
         } else {
             fs::copy(entry.path(), &dest).expect("copy file");
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct QueuedPathPicker {
+    state: Rc<RefCell<QueuedPathPickerState>>,
+}
+
+struct QueuedPathPickerState {
+    requests: Vec<PathPromptOptions>,
+    outcomes: VecDeque<PathPickerOutcome>,
+}
+
+impl QueuedPathPicker {
+    pub fn new(outcomes: impl IntoIterator<Item = PathPickerOutcome>) -> Self {
+        Self {
+            state: Rc::new(RefCell::new(QueuedPathPickerState {
+                requests: Vec::new(),
+                outcomes: outcomes.into_iter().collect(),
+            })),
+        }
+    }
+
+    pub fn requests(&self) -> Vec<PathPromptOptions> {
+        self.state.borrow().requests.clone()
+    }
+}
+
+impl PathPicker for QueuedPathPicker {
+    fn pick_path(
+        &self,
+        options: PathPromptOptions,
+        window: &mut Window,
+        cx: &mut Context<App>,
+    ) -> Task<PathPickerOutcome> {
+        let outcome = {
+            let mut state = self.state.borrow_mut();
+            state.requests.push(options);
+            state
+                .outcomes
+                .pop_front()
+                .expect("queued path picker outcome")
+        };
+
+        cx.spawn_in(window, async move |_, _| outcome)
     }
 }
