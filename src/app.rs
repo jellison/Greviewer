@@ -37,6 +37,7 @@ pub struct App {
 struct FileDiffScroll {
     old: ScrollHandle,
     new: ScrollHandle,
+    side_by_side: ScrollHandle,
 }
 
 impl FileDiffScroll {
@@ -44,6 +45,7 @@ impl FileDiffScroll {
         Self {
             old: ScrollHandle::new(),
             new: ScrollHandle::new(),
+            side_by_side: ScrollHandle::new(),
         }
     }
 
@@ -58,6 +60,7 @@ impl FileDiffScroll {
         let origin = point(px(0.), px(0.));
         self.old.set_offset(origin);
         self.new.set_offset(origin);
+        self.side_by_side.set_offset(origin);
     }
 }
 
@@ -240,13 +243,18 @@ impl App {
     }
 
     #[cfg(test)]
+    fn file_diff_old_scroll_offset(&self) -> gpui::Point<gpui::Pixels> {
+        self.file_diff_scroll.side_by_side.offset()
+    }
+
+    #[cfg(test)]
     fn file_diff_new_scroll_offset(&self) -> gpui::Point<gpui::Pixels> {
-        self.file_diff_scroll.new.offset()
+        self.file_diff_scroll.side_by_side.offset()
     }
 
     #[cfg(test)]
     fn file_diff_new_scroll_max_offset(&self) -> gpui::Size<gpui::Pixels> {
-        self.file_diff_scroll.new.max_offset()
+        self.file_diff_scroll.side_by_side.max_offset()
     }
 
     fn render_no_repo(&self) -> gpui::Div {
@@ -783,13 +791,13 @@ fn render_file_diff_content(content: repo::FileDiffContent, scroll: &FileDiffScr
                     "Before",
                     "file-diff-side-old",
                     old_cells,
-                    &scroll.old,
+                    &scroll.side_by_side,
                 ))
                 .child(render_file_diff_side(
                     "After",
                     "file-diff-side-new",
                     new_cells,
-                    &scroll.new,
+                    &scroll.side_by_side,
                 ))
                 .into_any_element()
         }
@@ -1825,6 +1833,124 @@ mod tests {
         assert!(
             after.y < before.y,
             "wheel scroll should move the diff content upward"
+        );
+    }
+
+    #[gpui::test]
+    async fn scrolling_new_side_of_side_by_side_diff_scrolls_old_side(cx: &mut TestAppContext) {
+        use gpui::{point, px, size, ScrollDelta, ScrollWheelEvent};
+
+        let (dir, oid_hex) = init_repo_with_long_diff();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.select_changed_file("long.txt".to_string(), cx);
+            })
+            .expect("open long diff");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(320.)));
+
+        let scroll_bounds = visual
+            .debug_bounds("file-diff-side-new-scroll")
+            .expect("new file diff scroll debug bounds");
+        let old_before = window
+            .read_with(cx, |app, _cx| app.file_diff_old_scroll_offset())
+            .expect("read old diff scroll offset before wheel");
+        let new_before = window
+            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .expect("read new diff scroll offset before wheel");
+
+        visual.simulate_event(ScrollWheelEvent {
+            position: scroll_bounds.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-240.))),
+            ..Default::default()
+        });
+
+        let old_after = window
+            .read_with(cx, |app, _cx| app.file_diff_old_scroll_offset())
+            .expect("read old diff scroll offset after wheel");
+        let new_after = window
+            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .expect("read new diff scroll offset after wheel");
+
+        assert!(
+            new_after.y < new_before.y,
+            "wheel scroll should move the new side upward"
+        );
+        assert_ne!(
+            old_after.y, old_before.y,
+            "old side should move when the new side scrolls"
+        );
+        assert_eq!(
+            old_after.y, new_after.y,
+            "old side should stay aligned with new side"
+        );
+    }
+
+    #[gpui::test]
+    async fn scrolling_old_side_of_side_by_side_diff_scrolls_new_side(cx: &mut TestAppContext) {
+        use gpui::{point, px, size, ScrollDelta, ScrollWheelEvent};
+
+        let (dir, oid_hex) = init_repo_with_long_diff();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.select_changed_file("long.txt".to_string(), cx);
+            })
+            .expect("open long diff");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(320.)));
+
+        let scroll_bounds = visual
+            .debug_bounds("file-diff-side-old-scroll")
+            .expect("old file diff scroll debug bounds");
+        let old_before = window
+            .read_with(cx, |app, _cx| app.file_diff_old_scroll_offset())
+            .expect("read old diff scroll offset before wheel");
+        let new_before = window
+            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .expect("read new diff scroll offset before wheel");
+
+        visual.simulate_event(ScrollWheelEvent {
+            position: scroll_bounds.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-240.))),
+            ..Default::default()
+        });
+
+        let old_after = window
+            .read_with(cx, |app, _cx| app.file_diff_old_scroll_offset())
+            .expect("read old diff scroll offset after wheel");
+        let new_after = window
+            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .expect("read new diff scroll offset after wheel");
+
+        assert!(
+            old_after.y < old_before.y,
+            "wheel scroll should move the old side upward"
+        );
+        assert_ne!(
+            new_after.y, new_before.y,
+            "new side should move when the old side scrolls"
+        );
+        assert_eq!(
+            old_after.y, new_after.y,
+            "new side should stay aligned with old side"
         );
     }
 
