@@ -7,6 +7,7 @@
 use std::{
     fmt, io,
     path::{Path, PathBuf},
+    str,
 };
 
 pub const INITIAL_COMMIT_LIMIT: usize = 200;
@@ -56,6 +57,27 @@ pub enum ChangeKind {
     Modified,
     Deleted,
     Renamed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiff {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub kind: ChangeKind,
+    pub content: FileDiffContent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileDiffContent {
+    Single { side: DiffSide, text: String },
+    SideBySide { old_text: String, new_text: String },
+    Binary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffSide {
+    Old,
+    New,
 }
 
 #[derive(Debug)]
@@ -178,11 +200,123 @@ pub fn changeset_for_single_commit(path: &Path, sha: &str) -> Result<ChangeSet, 
     })
 }
 
+pub fn file_diff_for_changed_file(
+    path: &Path,
+    sha: &str,
+    file: &ChangedFile,
+) -> Result<FileDiff, ChangeSetError> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|err| ChangeSetError::Open(OpenError::Io(err)))?;
+    let repo = git2::Repository::open(&canonical)
+        .map_err(classify_open_error)
+        .map_err(ChangeSetError::Open)?;
+    let oid = git2::Oid::from_str(sha).map_err(ChangeSetError::Git)?;
+    let commit = repo.find_commit(oid).map_err(ChangeSetError::Git)?;
+    let commit_tree = commit.tree().map_err(ChangeSetError::Git)?;
+    let base_tree = first_parent_tree(&commit)?;
+
+    let content = match file.kind {
+        ChangeKind::Added => {
+            let text = read_text_blob(&repo, &commit_tree, &file.path)?;
+            single_file_content(DiffSide::New, text)
+        }
+        ChangeKind::Deleted => {
+            let base_tree = required_base_tree(base_tree.as_ref())?;
+            let old_path = file.old_path.as_deref().unwrap_or(&file.path);
+            let text = read_text_blob(&repo, base_tree, old_path)?;
+            single_file_content(DiffSide::Old, text)
+        }
+        ChangeKind::Modified => {
+            let base_tree = required_base_tree(base_tree.as_ref())?;
+            let old_text = read_text_blob(&repo, base_tree, &file.path)?;
+            let new_text = read_text_blob(&repo, &commit_tree, &file.path)?;
+            side_by_side_file_content(old_text, new_text)
+        }
+        ChangeKind::Renamed => {
+            let base_tree = required_base_tree(base_tree.as_ref())?;
+            let old_path = file.old_path.as_deref().ok_or_else(|| {
+                ChangeSetError::Git(git2::Error::from_str("Missing rename source path"))
+            })?;
+            let old_text = read_text_blob(&repo, base_tree, old_path)?;
+            let new_text = read_text_blob(&repo, &commit_tree, &file.path)?;
+            side_by_side_file_content(old_text, new_text)
+        }
+    };
+
+    Ok(FileDiff {
+        path: file.path.clone(),
+        old_path: file.old_path.clone(),
+        kind: file.kind,
+        content,
+    })
+}
+
 fn classify_open_error(err: git2::Error) -> OpenError {
     use git2::ErrorCode;
     match err.code() {
         ErrorCode::NotFound => OpenError::NotARepository,
         _ => OpenError::Git(err),
+    }
+}
+
+fn first_parent_tree<'repo>(
+    commit: &git2::Commit<'repo>,
+) -> Result<Option<git2::Tree<'repo>>, ChangeSetError> {
+    if commit.parent_count() == 0 {
+        return Ok(None);
+    }
+
+    commit
+        .parent(0)
+        .and_then(|parent| parent.tree())
+        .map(Some)
+        .map_err(ChangeSetError::Git)
+}
+
+fn required_base_tree<'a>(
+    base_tree: Option<&'a git2::Tree<'a>>,
+) -> Result<&'a git2::Tree<'a>, ChangeSetError> {
+    base_tree.ok_or_else(|| ChangeSetError::Git(git2::Error::from_str("Missing base commit tree")))
+}
+
+fn read_text_blob(
+    repo: &git2::Repository,
+    tree: &git2::Tree<'_>,
+    path: &str,
+) -> Result<Option<String>, ChangeSetError> {
+    let entry = tree
+        .get_path(Path::new(path))
+        .map_err(ChangeSetError::Git)?;
+    let object = entry.to_object(repo).map_err(ChangeSetError::Git)?;
+    let blob = object.as_blob().ok_or_else(|| {
+        ChangeSetError::Git(git2::Error::from_str("Tree entry is not a file blob"))
+    })?;
+    let bytes = blob.content();
+
+    if bytes.contains(&0) {
+        return Ok(None);
+    }
+
+    str::from_utf8(bytes)
+        .map(|text| Some(text.to_string()))
+        .or(Ok(None))
+}
+
+fn single_file_content(side: DiffSide, text: Option<String>) -> FileDiffContent {
+    match text {
+        Some(text) => FileDiffContent::Single { side, text },
+        None => FileDiffContent::Binary,
+    }
+}
+
+fn side_by_side_file_content(
+    old_text: Option<String>,
+    new_text: Option<String>,
+) -> FileDiffContent {
+    match (old_text, new_text) {
+        (Some(old_text), Some(new_text)) => FileDiffContent::SideBySide { old_text, new_text },
+        _ => FileDiffContent::Binary,
     }
 }
 
@@ -459,6 +593,29 @@ mod tests {
     }
 
     #[test]
+    fn file_diff_for_added_file_returns_new_text() {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let file = ChangedFile {
+            path: "hello.txt".to_string(),
+            old_path: None,
+            kind: ChangeKind::Added,
+        };
+
+        let diff = file_diff_for_changed_file(dir.path(), &oid_hex, &file).expect("file diff");
+
+        assert_eq!(diff.path, "hello.txt");
+        assert_eq!(diff.old_path, None);
+        assert_eq!(diff.kind, ChangeKind::Added);
+        assert_eq!(
+            diff.content,
+            FileDiffContent::Single {
+                side: DiffSide::New,
+                text: "hello\n".to_string(),
+            },
+        );
+    }
+
+    #[test]
     fn changeset_for_commit_lists_deleted_files() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let repo = Repository::init(dir.path()).expect("init repo");
@@ -486,6 +643,69 @@ mod tests {
                 old_path: None,
                 kind: ChangeKind::Deleted,
             }],
+        );
+    }
+
+    #[test]
+    fn file_diff_for_deleted_file_returns_old_text() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("obsolete.txt"), "obsolete\n").expect("write file");
+        let root_oid = git2::Oid::from_str(&commit_workdir(&repo, "Add obsolete.txt", &[]))
+            .expect("parse root oid");
+
+        fs::remove_file(dir.path().join("obsolete.txt")).expect("delete file");
+        let mut index = repo.index().expect("open index");
+        index
+            .remove_path(Path::new("obsolete.txt"))
+            .expect("stage deletion");
+        index.write().expect("write index");
+        drop(index);
+
+        let delete_oid = commit_workdir(&repo, "Delete obsolete.txt", &[root_oid]);
+        let file = ChangedFile {
+            path: "obsolete.txt".to_string(),
+            old_path: None,
+            kind: ChangeKind::Deleted,
+        };
+
+        let diff = file_diff_for_changed_file(dir.path(), &delete_oid, &file).expect("file diff");
+
+        assert_eq!(
+            diff.content,
+            FileDiffContent::Single {
+                side: DiffSide::Old,
+                text: "obsolete\n".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn file_diff_for_modified_file_returns_old_and_new_text() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("hello.txt"), "before\n").expect("write file");
+        let root_oid = git2::Oid::from_str(&commit_workdir(&repo, "Add hello.txt", &[]))
+            .expect("parse root oid");
+
+        fs::write(dir.path().join("hello.txt"), "after\n").expect("update file");
+        let update_oid = commit_workdir(&repo, "Update hello.txt", &[root_oid]);
+        let file = ChangedFile {
+            path: "hello.txt".to_string(),
+            old_path: None,
+            kind: ChangeKind::Modified,
+        };
+
+        let diff = file_diff_for_changed_file(dir.path(), &update_oid, &file).expect("file diff");
+
+        assert_eq!(
+            diff.content,
+            FileDiffContent::SideBySide {
+                old_text: "before\n".to_string(),
+                new_text: "after\n".to_string(),
+            },
         );
     }
 
@@ -521,6 +741,65 @@ mod tests {
                 kind: ChangeKind::Renamed,
             }],
         );
+    }
+
+    #[test]
+    fn file_diff_for_renamed_file_uses_old_and_new_paths() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("old.txt"), "before rename\n").expect("write old file");
+        let root_oid = git2::Oid::from_str(&commit_workdir(&repo, "Add old.txt", &[]))
+            .expect("parse root oid");
+
+        fs::rename(dir.path().join("old.txt"), dir.path().join("new.txt")).expect("rename file");
+        fs::write(dir.path().join("new.txt"), "after rename\n").expect("update new file");
+        let mut index = repo.index().expect("open index");
+        index
+            .remove_path(Path::new("old.txt"))
+            .expect("stage old path removal");
+        index
+            .add_path(Path::new("new.txt"))
+            .expect("stage new path");
+        index.write().expect("write index");
+        drop(index);
+
+        let rename_oid = commit_workdir(&repo, "Rename old.txt", &[root_oid]);
+        let file = ChangedFile {
+            path: "new.txt".to_string(),
+            old_path: Some("old.txt".to_string()),
+            kind: ChangeKind::Renamed,
+        };
+
+        let diff = file_diff_for_changed_file(dir.path(), &rename_oid, &file).expect("file diff");
+
+        assert_eq!(diff.path, "new.txt");
+        assert_eq!(diff.old_path.as_deref(), Some("old.txt"));
+        assert_eq!(
+            diff.content,
+            FileDiffContent::SideBySide {
+                old_text: "before rename\n".to_string(),
+                new_text: "after rename\n".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn file_diff_for_non_utf8_file_returns_binary_placeholder() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("binary.dat"), b"\xff\xfe\0data").expect("write binary file");
+        let oid_hex = commit_workdir(&repo, "Add binary.dat", &[]);
+        let file = ChangedFile {
+            path: "binary.dat".to_string(),
+            old_path: None,
+            kind: ChangeKind::Added,
+        };
+
+        let diff = file_diff_for_changed_file(dir.path(), &oid_hex, &file).expect("file diff");
+
+        assert_eq!(diff.content, FileDiffContent::Binary);
     }
 
     #[test]

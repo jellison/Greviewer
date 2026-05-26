@@ -2,7 +2,10 @@
 
 pub mod common;
 
-use greviewer::repo::{changeset_for_single_commit, open_at, ChangeKind, OpenError};
+use greviewer::repo::{
+    changeset_for_single_commit, file_diff_for_changed_file, open_at, ChangeKind, FileDiffContent,
+    OpenError,
+};
 
 #[test]
 fn open_at_reads_the_two_commits_fixture() {
@@ -41,6 +44,26 @@ fn changeset_for_fixture_head_lists_modified_hello_file() {
     assert_eq!(changeset.files[0].path, "hello.txt");
     assert_eq!(changeset.files[0].old_path, None);
     assert_eq!(changeset.files[0].kind, ChangeKind::Modified);
+}
+
+#[test]
+fn file_diff_for_fixture_head_reads_modified_hello_content() {
+    let dir = common::load_fixture("two-commits");
+    let snapshot = open_at(dir.path()).expect("open succeeds");
+    let changeset =
+        changeset_for_single_commit(dir.path(), &snapshot.commits[0].sha).expect("changeset");
+
+    let diff =
+        file_diff_for_changed_file(dir.path(), &snapshot.commits[0].sha, &changeset.files[0])
+            .expect("file diff");
+
+    assert_eq!(
+        diff.content,
+        FileDiffContent::SideBySide {
+            old_text: "hello\n".to_string(),
+            new_text: "hello world\n".to_string(),
+        },
+    );
 }
 
 #[test]

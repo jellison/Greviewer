@@ -442,7 +442,7 @@ impl App {
                                 .collect::<Vec<_>>(),
                         ),
                 )
-                .child(self.render_file_detail(selected_file))
+                .child(self.render_file_detail(repo, sha, selected_file))
                 .into_any_element()
         };
 
@@ -545,11 +545,20 @@ impl App {
             )
     }
 
-    fn render_file_detail(&self, selected_file: Option<&repo::ChangedFile>) -> AnyElement {
+    fn render_file_detail(
+        &self,
+        repo: &repo::OpenRepository,
+        sha: &str,
+        selected_file: Option<&repo::ChangedFile>,
+    ) -> AnyElement {
         match selected_file {
             Some(file) => {
                 let title = file.path.clone();
                 let kind = change_kind_label(file.kind);
+                let content = match repo::file_diff_for_changed_file(&repo.path, sha, file) {
+                    Ok(diff) => render_file_diff_content(diff.content),
+                    Err(err) => render_file_diff_error(err.to_string()),
+                };
 
                 div()
                     .flex()
@@ -595,19 +604,7 @@ impl App {
                                 .child(format!("Renamed from {old_path}")),
                         )
                     })
-                    .child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .items_center()
-                            .justify_center()
-                            .border_1()
-                            .border_color(rgb(0x2a2a2a))
-                            .bg(rgb(0x141414))
-                            .text_color(rgb(0x999999))
-                            .text_size(px(14.))
-                            .child("File diff will appear here in the next slice."),
-                    )
+                    .child(content)
                     .into_any_element()
             }
             None => div()
@@ -702,6 +699,152 @@ impl App {
                     ),
             )
     }
+}
+
+fn render_file_diff_content(content: repo::FileDiffContent) -> AnyElement {
+    match content {
+        repo::FileDiffContent::Single { side, text } => {
+            let label = match side {
+                repo::DiffSide::Old => "Before",
+                repo::DiffSide::New => "After",
+            };
+            let selector = match side {
+                repo::DiffSide::Old => "file-diff-side-old",
+                repo::DiffSide::New => "file-diff-side-new",
+            };
+
+            render_file_diff_side(label, selector, text).into_any_element()
+        }
+        repo::FileDiffContent::SideBySide { old_text, new_text } => div()
+            .flex()
+            .flex_1()
+            .gap_3()
+            .child(render_file_diff_side(
+                "Before",
+                "file-diff-side-old",
+                old_text,
+            ))
+            .child(render_file_diff_side(
+                "After",
+                "file-diff-side-new",
+                new_text,
+            ))
+            .into_any_element(),
+        repo::FileDiffContent::Binary => div()
+            .flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .border_1()
+            .border_color(rgb(0x2a2a2a))
+            .bg(rgb(0x141414))
+            .id("file-diff-binary")
+            .debug_selector(|| "file-diff-binary".to_string())
+            .text_color(rgb(0x999999))
+            .text_size(px(14.))
+            .child("No textual diff is available for this file.")
+            .into_any_element(),
+    }
+}
+
+fn render_file_diff_error(message: String) -> AnyElement {
+    div()
+        .flex()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .border_1()
+        .border_color(rgb(0x2a2a2a))
+        .bg(rgb(0x141414))
+        .id("file-diff-error")
+        .debug_selector(|| "file-diff-error".to_string())
+        .text_color(rgb(0xfca5a5))
+        .text_size(px(14.))
+        .child(message)
+        .into_any_element()
+}
+
+fn render_file_diff_side(
+    label: &'static str,
+    selector: &'static str,
+    text: String,
+) -> impl IntoElement {
+    let lines = diff_lines(&text);
+    let scroll_selector = match selector {
+        "file-diff-side-old" => "file-diff-side-old-scroll",
+        "file-diff-side-new" => "file-diff-side-new-scroll",
+        _ => "file-diff-side-scroll",
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .h_full()
+        .border_1()
+        .border_color(rgb(0x2a2a2a))
+        .bg(rgb(0x141414))
+        .id(selector)
+        .debug_selector(move || selector.to_string())
+        .child(
+            div()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(rgb(0x2a2a2a))
+                .text_color(rgb(0x999999))
+                .text_size(px(12.))
+                .font_family("monospace")
+                .child(label),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .id(scroll_selector)
+                .overflow_y_scroll()
+                .children(
+                    lines
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, line)| render_file_diff_line(index + 1, line))
+                        .collect::<Vec<_>>(),
+                ),
+        )
+}
+
+fn render_file_diff_line(line_number: usize, line: String) -> gpui::Div {
+    div()
+        .flex()
+        .items_start()
+        .min_h(px(18.))
+        .child(
+            div()
+                .w(px(48.))
+                .px_2()
+                .text_color(rgb(0x666666))
+                .text_size(px(12.))
+                .font_family("monospace")
+                .child(line_number.to_string()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .px_2()
+                .text_color(rgb(0xe6e6e6))
+                .text_size(px(12.))
+                .font_family("monospace")
+                .child(line),
+        )
+}
+
+fn diff_lines(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    text.lines().map(str::to_string).collect()
 }
 
 fn change_kind_label(kind: repo::ChangeKind) -> &'static str {
@@ -799,6 +942,42 @@ mod tests {
         drop(repo);
 
         (dir, oid.to_string())
+    }
+
+    fn init_repo_with_two_commits() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("hello.txt"), "hello\n").expect("write file");
+        let root_oid = commit_all(&repo, "Add hello.txt", &[]);
+
+        fs::write(dir.path().join("hello.txt"), "hello world\n").expect("update file");
+        let update_oid = commit_all(&repo, "Update hello.txt", &[root_oid]);
+
+        drop(repo);
+
+        (dir, update_oid.to_string())
+    }
+
+    fn commit_all(repo: &Repository, message: &str, parents: &[git2::Oid]) -> git2::Oid {
+        let mut index = repo.index().expect("open index");
+        index
+            .add_all(["*"], IndexAddOption::DEFAULT, None)
+            .expect("stage files");
+        index.write().expect("write index");
+        let tree_oid = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+
+        let sig =
+            Signature::now("Greviewer Tests", "tests@greviewer.invalid").expect("create signature");
+        let parent_commits = parents
+            .iter()
+            .map(|oid| repo.find_commit(*oid).expect("find parent commit"))
+            .collect::<Vec<_>>();
+        let parent_refs = parent_commits.iter().collect::<Vec<_>>();
+
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)
+            .expect("create commit")
     }
 
     #[gpui::test]
@@ -1211,6 +1390,40 @@ mod tests {
                 );
             })
             .expect("read selected changed file");
+    }
+
+    #[gpui::test]
+    async fn clicking_changed_file_renders_text_diff_content(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_two_commits();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+            })
+            .expect("open repo and select commit");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let open_bounds = visual
+            .debug_bounds("open-changeset")
+            .expect("open changeset debug bounds");
+        visual.simulate_click(open_bounds.center(), Modifiers::none());
+
+        let row_bounds = visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+
+        visual
+            .debug_bounds("file-diff-side-old")
+            .expect("old file diff side debug bounds");
+        visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new file diff side debug bounds");
     }
 
     #[gpui::test]
