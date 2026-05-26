@@ -9,8 +9,9 @@ pub use menu::{
 };
 pub use path_picker::{repository_prompt_options, GpuiPathPicker, PathPicker, PathPickerOutcome};
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, div, px, rgb, AppContext, Context, Entity, EventEmitter, FocusHandle,
+    actions, div, px, rgb, AnyElement, AppContext, Context, Entity, EventEmitter, FocusHandle,
     InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled,
     Window,
 };
@@ -19,11 +20,12 @@ use std::path::PathBuf;
 
 use crate::repo;
 
-actions!(app, [OpenRepository]);
+actions!(app, [OpenRepository, OpenChangeset, CloseChangeset]);
 
 pub struct App {
     pub mode: Mode,
     pub selection: Selection,
+    pub review_screen: ReviewScreen,
     notifications: Entity<NotificationList>,
     path_picker: Box<dyn PathPicker>,
     focus_handle: FocusHandle,
@@ -38,6 +40,12 @@ pub enum Mode {
 pub enum Selection {
     None,
     Single { sha: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewScreen {
+    Graph,
+    Changeset { sha: String },
 }
 
 /// Emitted whenever `open_repository_at` fails. Carries the user-facing
@@ -70,6 +78,7 @@ impl App {
         Self {
             mode: Mode::NoRepo,
             selection: Selection::None,
+            review_screen: ReviewScreen::Graph,
             notifications,
             path_picker,
             focus_handle,
@@ -125,6 +134,7 @@ impl App {
             Ok(repo) => {
                 self.mode = Mode::RepoOpen { repo };
                 self.selection = Selection::None;
+                self.review_screen = ReviewScreen::Graph;
                 cx.notify();
             }
             Err(err) => {
@@ -139,6 +149,18 @@ impl App {
             Selection::Single { sha: selected_sha } if selected_sha == &sha => Selection::None,
             _ => Selection::Single { sha },
         };
+        cx.notify();
+    }
+
+    fn open_changeset(&mut self, cx: &mut Context<Self>) {
+        if let Selection::Single { sha } = &self.selection {
+            self.review_screen = ReviewScreen::Changeset { sha: sha.clone() };
+            cx.notify();
+        }
+    }
+
+    fn close_changeset(&mut self, cx: &mut Context<Self>) {
+        self.review_screen = ReviewScreen::Graph;
         cx.notify();
     }
 
@@ -174,8 +196,13 @@ impl App {
             )
     }
 
-    fn render_repo_open(&self, repo: &repo::OpenRepository, cx: &mut Context<Self>) -> gpui::Div {
-        self.render_graph_screen(repo, cx)
+    fn render_repo_open(&self, repo: &repo::OpenRepository, cx: &mut Context<Self>) -> AnyElement {
+        match &self.review_screen {
+            ReviewScreen::Graph => self.render_graph_screen(repo, cx).into_any_element(),
+            ReviewScreen::Changeset { sha } => self
+                .render_changeset_screen(repo, sha, cx)
+                .into_any_element(),
+        }
     }
 
     fn render_graph_screen(
@@ -188,6 +215,8 @@ impl App {
             Some(head) => format!("{} · {}", head.short_sha, head.summary),
             None => "No commits yet.".to_string(),
         };
+        let can_open_changeset = matches!(self.selection, Selection::Single { .. });
+
         let title_row = div()
             .flex()
             .items_center()
@@ -199,7 +228,26 @@ impl App {
                     .text_size(px(16.))
                     .font_family("monospace")
                     .child(path_text),
-            );
+            )
+            .when(can_open_changeset, |row| {
+                row.child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .border_1()
+                        .border_color(rgb(0x3b82f6))
+                        .bg(rgb(0x1d283a))
+                        .text_color(rgb(0xdbeafe))
+                        .text_size(px(12.))
+                        .cursor_pointer()
+                        .id("open-changeset")
+                        .debug_selector(|| "open-changeset".to_string())
+                        .on_click(cx.listener(|app, _event, _window, cx| {
+                            app.open_changeset(cx);
+                        }))
+                        .child("Open changeset"),
+                )
+            });
 
         let header = div()
             .flex()
@@ -259,6 +307,80 @@ impl App {
             .bg(rgb(0x171717))
             .child(header)
             .child(history)
+    }
+
+    fn render_changeset_screen(
+        &self,
+        repo: &repo::OpenRepository,
+        sha: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let path_text = repo.path.display().to_string();
+        let short_sha: String = sha.chars().take(7).collect();
+
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .w_full()
+            .px_4()
+            .py_3()
+            .border_b_1()
+            .border_color(rgb(0x2a2a2a))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_color(rgb(0xe6e6e6))
+                            .text_size(px(16.))
+                            .font_family("monospace")
+                            .child(path_text),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(0x999999))
+                            .text_size(px(13.))
+                            .child(format!("Changeset for {short_sha}")),
+                    ),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .border_1()
+                    .border_color(rgb(0x4a4a4a))
+                    .bg(rgb(0x242424))
+                    .text_color(rgb(0xe6e6e6))
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .id("close-changeset")
+                    .debug_selector(|| "close-changeset".to_string())
+                    .on_click(cx.listener(|app, _event, _window, cx| {
+                        app.close_changeset(cx);
+                    }))
+                    .child("Close"),
+            );
+
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .h_full()
+            .bg(rgb(0x171717))
+            .child(header)
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(0x999999))
+                    .text_size(px(14.))
+                    .child("Changed files will appear here in the next slice."),
+            )
     }
 
     fn render_commit_row(
@@ -344,7 +466,7 @@ impl Render for App {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match &self.mode {
             Mode::NoRepo => self.render_no_repo().into_any_element(),
-            Mode::RepoOpen { repo } => self.render_repo_open(repo, cx).into_any_element(),
+            Mode::RepoOpen { repo } => self.render_repo_open(repo, cx),
         };
 
         div()
@@ -355,6 +477,12 @@ impl Render for App {
             .on_action(cx.listener(|app, _: &OpenRepository, window, cx| {
                 app.prompt_and_open_repository(window, cx);
             }))
+            .on_action(cx.listener(|app, _: &OpenChangeset, _window, cx| {
+                app.open_changeset(cx);
+            }))
+            .on_action(cx.listener(|app, _: &CloseChangeset, _window, cx| {
+                app.close_changeset(cx);
+            }))
             .child(body)
             .child(self.notifications.clone())
     }
@@ -362,7 +490,7 @@ impl Render for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, Mode, OpenFailed, Selection};
+    use super::{App, CloseChangeset, Mode, OpenChangeset, OpenFailed, ReviewScreen, Selection};
     use git2::{IndexAddOption, Repository, Signature};
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use std::fs;
@@ -404,8 +532,25 @@ mod tests {
 
     #[gpui::test]
     async fn opening_a_real_repo_advances_to_repo_open_mode(cx: &mut TestAppContext) {
-        let (dir, _) = init_repo_with_one_commit();
+        let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().to_path_buf();
+
+        let repo = Repository::init(&path).expect("init repo");
+        fs::write(path.join("hello.txt"), "hello\n").expect("write file");
+        let mut index = repo.index().expect("open index");
+        index
+            .add_all(["*"], IndexAddOption::DEFAULT, None)
+            .expect("stage files");
+        index.write().expect("write index");
+        let tree_oid = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let sig =
+            Signature::now("Greviewer Tests", "tests@greviewer.invalid").expect("create signature");
+        repo.commit(Some("HEAD"), &sig, &sig, "Add hello.txt", &tree, &[])
+            .expect("create commit");
+        drop(tree);
+        drop(index);
+        drop(repo);
 
         let window = cx.add_window(App::new);
 
@@ -452,6 +597,140 @@ mod tests {
                 assert_eq!(app.selection, Selection::None);
             })
             .expect("update window");
+    }
+
+    #[gpui::test]
+    async fn opening_changeset_requires_a_selection(cx: &mut TestAppContext) {
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.open_changeset(cx);
+                assert_eq!(app.review_screen, ReviewScreen::Graph);
+
+                app.select_single_commit("selected-sha".to_string(), cx);
+                app.open_changeset(cx);
+                assert_eq!(
+                    app.review_screen,
+                    ReviewScreen::Changeset {
+                        sha: "selected-sha".to_string(),
+                    },
+                );
+            })
+            .expect("update window");
+    }
+
+    #[gpui::test]
+    async fn closing_changeset_returns_to_graph_and_preserves_selection(cx: &mut TestAppContext) {
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.select_single_commit("selected-sha".to_string(), cx);
+                app.open_changeset(cx);
+                app.close_changeset(cx);
+
+                assert_eq!(app.review_screen, ReviewScreen::Graph);
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: "selected-sha".to_string(),
+                    },
+                );
+            })
+            .expect("update window");
+    }
+
+    #[gpui::test]
+    async fn dispatching_open_and_close_changeset_actions_updates_review_screen(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.select_single_commit("selected-sha".to_string(), cx);
+            })
+            .expect("select commit");
+
+        cx.dispatch_action(*window, OpenChangeset);
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.review_screen,
+                    ReviewScreen::Changeset {
+                        sha: "selected-sha".to_string(),
+                    },
+                );
+            })
+            .expect("read open changeset state");
+
+        cx.dispatch_action(*window, CloseChangeset);
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(app.review_screen, ReviewScreen::Graph);
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: "selected-sha".to_string(),
+                    },
+                );
+            })
+            .expect("read closed changeset state");
+    }
+
+    #[gpui::test]
+    async fn clicking_changeset_affordances_enters_and_exits_review_mode(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex.clone(), cx);
+            })
+            .expect("open repo and select commit");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let open_bounds = visual
+            .debug_bounds("open-changeset")
+            .expect("open changeset debug bounds");
+
+        visual.simulate_click(open_bounds.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.review_screen,
+                    ReviewScreen::Changeset {
+                        sha: oid_hex.clone(),
+                    },
+                );
+            })
+            .expect("read opened review state");
+
+        let close_bounds = visual
+            .debug_bounds("close-changeset")
+            .expect("close changeset debug bounds");
+
+        visual.simulate_click(close_bounds.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(app.review_screen, ReviewScreen::Graph);
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: oid_hex.clone(),
+                    },
+                );
+            })
+            .expect("read closed review state");
     }
 
     #[gpui::test]
