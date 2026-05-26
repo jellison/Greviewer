@@ -11,7 +11,8 @@ pub use path_picker::{repository_prompt_options, GpuiPathPicker, PathPicker, Pat
 
 use gpui::{
     actions, div, px, rgb, AppContext, Context, Entity, EventEmitter, FocusHandle,
-    InteractiveElement, IntoElement, ParentElement, Render, Styled, Window,
+    InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled,
+    Window,
 };
 use gpui_component::notification::{Notification, NotificationList};
 use std::path::PathBuf;
@@ -128,54 +129,165 @@ impl App {
     pub(crate) fn notification_count(&self, cx: &gpui::App) -> usize {
         self.notifications.read(cx).notifications().len()
     }
-}
 
-impl Render for App {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = div()
+    fn render_no_repo(&self) -> gpui::Div {
+        div()
             .flex()
             .flex_col()
             .w_full()
             .h_full()
             .items_center()
             .justify_center()
-            .gap_2();
+            .gap_2()
+            .child(
+                div()
+                    .text_color(rgb(0xe6e6e6))
+                    .text_size(px(20.))
+                    .child("No repository open"),
+            )
+            .child(
+                div()
+                    .text_color(rgb(0x999999))
+                    .text_size(px(14.))
+                    .child("Open a repository to start a review."),
+            )
+    }
 
+    fn render_repo_open(&self, repo: &repo::OpenRepository, _cx: &mut Context<Self>) -> gpui::Div {
+        self.render_graph_screen(repo)
+    }
+
+    fn render_graph_screen(&self, repo: &repo::OpenRepository) -> gpui::Div {
+        let path_text = repo.path.display().to_string();
+        let head_line = match &repo.head {
+            Some(head) => format!("{} · {}", head.short_sha, head.summary),
+            None => "No commits yet.".to_string(),
+        };
+        let title_row = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .w_full()
+            .child(
+                div()
+                    .text_color(rgb(0xe6e6e6))
+                    .text_size(px(16.))
+                    .font_family("monospace")
+                    .child(path_text),
+            );
+
+        let header = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap_1()
+            .px_4()
+            .py_3()
+            .border_b_1()
+            .border_color(rgb(0x2a2a2a))
+            .child(title_row)
+            .child(
+                div()
+                    .text_color(rgb(0x999999))
+                    .text_size(px(13.))
+                    .child(head_line),
+            );
+
+        let history = if repo.commits.is_empty() {
+            div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .id("commit-history-empty")
+                .text_color(rgb(0x999999))
+                .text_size(px(14.))
+                .child("This repository has no commits to review.")
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .id("commit-history")
+                .overflow_y_scroll()
+                .children(
+                    repo.commits
+                        .iter()
+                        .map(|commit| self.render_commit_row(commit))
+                        .collect::<Vec<_>>(),
+                )
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .h_full()
+            .bg(rgb(0x171717))
+            .child(header)
+            .child(history)
+    }
+
+    fn render_commit_row(&self, commit: &repo::CommitInfo) -> impl IntoElement {
+        let marker = if commit.is_head { "HEAD" } else { "" };
+        let secondary = format!("{} · {}", commit.author, commit.authored_date);
+
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .gap_3()
+            .px_4()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(0x242424))
+            .child(
+                div()
+                    .w(px(48.))
+                    .text_color(if commit.is_head {
+                        rgb(0x7dd3fc)
+                    } else {
+                        rgb(0x555555)
+                    })
+                    .text_size(px(11.))
+                    .font_family("monospace")
+                    .child(marker),
+            )
+            .child(
+                div()
+                    .w(px(72.))
+                    .text_color(rgb(0xa3e635))
+                    .text_size(px(12.))
+                    .font_family("monospace")
+                    .child(commit.short_sha.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_color(rgb(0xe6e6e6))
+                            .text_size(px(14.))
+                            .child(commit.summary.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(0x8a8a8a))
+                            .text_size(px(12.))
+                            .child(secondary),
+                    ),
+            )
+    }
+}
+
+impl Render for App {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match &self.mode {
-            Mode::NoRepo => body
-                .child(
-                    div()
-                        .text_color(rgb(0xe6e6e6))
-                        .text_size(px(20.))
-                        .child("No repository open"),
-                )
-                .child(
-                    div()
-                        .text_color(rgb(0x999999))
-                        .text_size(px(14.))
-                        .child("Open a repository to start a review."),
-                ),
-            Mode::RepoOpen { repo } => {
-                let path_text = repo.path.display().to_string();
-                let head_line = match &repo.head {
-                    Some(head) => format!("{} · {}", head.short_sha, head.summary),
-                    None => "No commits yet.".to_string(),
-                };
-
-                body.child(
-                    div()
-                        .text_color(rgb(0xe6e6e6))
-                        .text_size(px(20.))
-                        .font_family("monospace")
-                        .child(path_text),
-                )
-                .child(
-                    div()
-                        .text_color(rgb(0x999999))
-                        .text_size(px(14.))
-                        .child(head_line),
-                )
-            }
+            Mode::NoRepo => self.render_no_repo().into_any_element(),
+            Mode::RepoOpen { repo } => self.render_repo_open(repo, cx).into_any_element(),
         };
 
         div()
@@ -198,6 +310,33 @@ mod tests {
     use gpui::TestAppContext;
     use std::fs;
 
+    fn init_repo_with_one_commit() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("hello.txt"), "hello\n").expect("write file");
+
+        let mut index = repo.index().expect("open index");
+        index
+            .add_all(["*"], IndexAddOption::DEFAULT, None)
+            .expect("stage files");
+        index.write().expect("write index");
+        let tree_oid = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+
+        let sig =
+            Signature::now("Greviewer Tests", "tests@greviewer.invalid").expect("create signature");
+        let oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "Add hello.txt", &tree, &[])
+            .expect("create commit");
+
+        drop(tree);
+        drop(index);
+        drop(repo);
+
+        (dir, oid.to_string())
+    }
+
     #[gpui::test]
     async fn renders_placeholder(cx: &mut TestAppContext) {
         let _window = cx.add_window(App::new);
@@ -208,25 +347,8 @@ mod tests {
 
     #[gpui::test]
     async fn opening_a_real_repo_advances_to_repo_open_mode(cx: &mut TestAppContext) {
-        let dir = tempfile::tempdir().expect("create tempdir");
+        let (dir, _) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
-
-        let repo = Repository::init(&path).expect("init repo");
-        fs::write(path.join("hello.txt"), "hello\n").expect("write file");
-        let mut index = repo.index().expect("open index");
-        index
-            .add_all(["*"], IndexAddOption::DEFAULT, None)
-            .expect("stage files");
-        index.write().expect("write index");
-        let tree_oid = index.write_tree().expect("write tree");
-        let tree = repo.find_tree(tree_oid).expect("find tree");
-        let sig =
-            Signature::now("Greviewer Tests", "tests@greviewer.invalid").expect("create signature");
-        repo.commit(Some("HEAD"), &sig, &sig, "Add hello.txt", &tree, &[])
-            .expect("create commit");
-        drop(tree);
-        drop(index);
-        drop(repo);
 
         let window = cx.add_window(App::new);
 

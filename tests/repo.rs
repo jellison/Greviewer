@@ -13,6 +13,15 @@ fn open_at_reads_the_two_commits_fixture() {
 
     assert_eq!(head.short_sha.len(), 7);
     assert_eq!(head.summary, "Update hello.txt");
+    assert_eq!(snapshot.commits.len(), 2);
+    assert_eq!(snapshot.commits[0].summary, "Update hello.txt");
+    assert_eq!(snapshot.commits[1].summary, "Add hello.txt");
+    assert!(snapshot.commits[0].is_head);
+    assert!(!snapshot.commits[1].is_head);
+    assert_eq!(snapshot.commits[0].short_sha.len(), 7);
+    assert!(!snapshot.commits[0].sha.is_empty());
+    assert!(!snapshot.commits[0].author.is_empty());
+    assert!(!snapshot.commits[0].authored_date.is_empty());
 }
 
 #[test]

@@ -40,6 +40,10 @@ async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
             Mode::RepoOpen { repo } => {
                 let head = repo.head.as_ref().expect("head present");
                 assert_eq!(head.summary, "Update hello.txt");
+                assert_eq!(repo.commits.len(), 2);
+                assert_eq!(repo.commits[0].summary, "Update hello.txt");
+                assert_eq!(repo.commits[1].summary, "Add hello.txt");
+                assert!(repo.commits[0].is_head);
             }
             Mode::NoRepo => panic!("expected RepoOpen, got NoRepo"),
         })
