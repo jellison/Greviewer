@@ -8,7 +8,9 @@ pub mod common;
 
 use common::QueuedPathPicker;
 use gpui::TestAppContext;
-use greviewer::app::{bind_app_keys, App, Mode, PathPickerOutcome, OPEN_REPOSITORY_KEYSTROKE};
+use greviewer::app::{
+    bind_app_keys, App, Mode, PathPickerOutcome, Selection, OPEN_REPOSITORY_KEYSTROKE,
+};
 
 #[gpui::test]
 async fn boots_to_the_placeholder(cx: &mut TestAppContext) {
@@ -44,6 +46,7 @@ async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
                 assert_eq!(repo.commits[0].summary, "Update hello.txt");
                 assert_eq!(repo.commits[1].summary, "Add hello.txt");
                 assert!(repo.commits[0].is_head);
+                assert_eq!(app.selection, Selection::None);
             }
             Mode::NoRepo => panic!("expected RepoOpen, got NoRepo"),
         })

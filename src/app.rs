@@ -23,6 +23,7 @@ actions!(app, [OpenRepository]);
 
 pub struct App {
     pub mode: Mode,
+    pub selection: Selection,
     notifications: Entity<NotificationList>,
     path_picker: Box<dyn PathPicker>,
     focus_handle: FocusHandle,
@@ -31,6 +32,12 @@ pub struct App {
 pub enum Mode {
     NoRepo,
     RepoOpen { repo: repo::OpenRepository },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
+    None,
+    Single { sha: String },
 }
 
 /// Emitted whenever `open_repository_at` fails. Carries the user-facing
@@ -62,6 +69,7 @@ impl App {
 
         Self {
             mode: Mode::NoRepo,
+            selection: Selection::None,
             notifications,
             path_picker,
             focus_handle,
@@ -116,6 +124,7 @@ impl App {
         match repo::open_at(&path) {
             Ok(repo) => {
                 self.mode = Mode::RepoOpen { repo };
+                self.selection = Selection::None;
                 cx.notify();
             }
             Err(err) => {
@@ -123,6 +132,18 @@ impl App {
                 self.push_open_failed(message, window, cx);
             }
         }
+    }
+
+    fn select_single_commit(&mut self, sha: String, cx: &mut Context<Self>) {
+        self.selection = match &self.selection {
+            Selection::Single { sha: selected_sha } if selected_sha == &sha => Selection::None,
+            _ => Selection::Single { sha },
+        };
+        cx.notify();
+    }
+
+    fn is_commit_selected(&self, sha: &str) -> bool {
+        matches!(&self.selection, Selection::Single { sha: selected_sha } if selected_sha == sha)
     }
 
     #[cfg(test)]
@@ -153,11 +174,15 @@ impl App {
             )
     }
 
-    fn render_repo_open(&self, repo: &repo::OpenRepository, _cx: &mut Context<Self>) -> gpui::Div {
-        self.render_graph_screen(repo)
+    fn render_repo_open(&self, repo: &repo::OpenRepository, cx: &mut Context<Self>) -> gpui::Div {
+        self.render_graph_screen(repo, cx)
     }
 
-    fn render_graph_screen(&self, repo: &repo::OpenRepository) -> gpui::Div {
+    fn render_graph_screen(
+        &self,
+        repo: &repo::OpenRepository,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let path_text = repo.path.display().to_string();
         let head_line = match &repo.head {
             Some(head) => format!("{} · {}", head.short_sha, head.summary),
@@ -213,7 +238,15 @@ impl App {
                 .children(
                     repo.commits
                         .iter()
-                        .map(|commit| self.render_commit_row(commit))
+                        .enumerate()
+                        .map(|(index, commit)| {
+                            self.render_commit_row(
+                                index,
+                                commit,
+                                self.is_commit_selected(&commit.sha),
+                                cx,
+                            )
+                        })
                         .collect::<Vec<_>>(),
                 )
         };
@@ -228,9 +261,26 @@ impl App {
             .child(history)
     }
 
-    fn render_commit_row(&self, commit: &repo::CommitInfo) -> impl IntoElement {
+    fn render_commit_row(
+        &self,
+        index: usize,
+        commit: &repo::CommitInfo,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let marker = if commit.is_head { "HEAD" } else { "" };
         let secondary = format!("{} · {}", commit.author, commit.authored_date);
+        let row_bg = if selected {
+            rgb(0x223248)
+        } else {
+            rgb(0x171717)
+        };
+        let border_color = if selected {
+            rgb(0x3b82f6)
+        } else {
+            rgb(0x242424)
+        };
+        let sha = commit.sha.clone();
 
         div()
             .flex()
@@ -239,8 +289,15 @@ impl App {
             .gap_3()
             .px_4()
             .py_2()
+            .bg(row_bg)
             .border_b_1()
-            .border_color(rgb(0x242424))
+            .border_color(border_color)
+            .cursor_pointer()
+            .id(("commit-row", index))
+            .debug_selector(move || format!("commit-row-{index}"))
+            .on_click(cx.listener(move |app, _event, _window, cx| {
+                app.select_single_commit(sha.clone(), cx);
+            }))
             .child(
                 div()
                     .w(px(48.))
@@ -305,9 +362,9 @@ impl Render for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, Mode, OpenFailed};
+    use super::{App, Mode, OpenFailed, Selection};
     use git2::{IndexAddOption, Repository, Signature};
-    use gpui::TestAppContext;
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use std::fs;
 
     fn init_repo_with_one_commit() -> (tempfile::TempDir, String) {
@@ -367,6 +424,75 @@ mod tests {
                 Mode::NoRepo => panic!("expected RepoOpen, got NoRepo"),
             })
             .expect("read window");
+    }
+
+    #[gpui::test]
+    async fn selecting_commits_toggles_single_selection(cx: &mut TestAppContext) {
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.select_single_commit("first-sha".to_string(), cx);
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: "first-sha".to_string(),
+                    },
+                );
+
+                app.select_single_commit("second-sha".to_string(), cx);
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: "second-sha".to_string(),
+                    },
+                );
+
+                app.select_single_commit("second-sha".to_string(), cx);
+                assert_eq!(app.selection, Selection::None);
+            })
+            .expect("update window");
+    }
+
+    #[gpui::test]
+    async fn clicking_a_commit_row_toggles_selection(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row_bounds = visual
+            .debug_bounds("commit-row-0")
+            .expect("commit row debug bounds");
+
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: oid_hex.clone(),
+                    },
+                );
+            })
+            .expect("read selected state");
+
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(app.selection, Selection::None);
+            })
+            .expect("read cleared state");
     }
 
     #[gpui::test]
