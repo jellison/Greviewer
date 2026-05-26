@@ -26,6 +26,7 @@ pub struct App {
     pub mode: Mode,
     pub selection: Selection,
     pub review_screen: ReviewScreen,
+    pub selected_changed_file_path: Option<String>,
     notifications: Entity<NotificationList>,
     path_picker: Box<dyn PathPicker>,
     focus_handle: FocusHandle,
@@ -82,6 +83,7 @@ impl App {
             mode: Mode::NoRepo,
             selection: Selection::None,
             review_screen: ReviewScreen::Graph,
+            selected_changed_file_path: None,
             notifications,
             path_picker,
             focus_handle,
@@ -138,6 +140,7 @@ impl App {
                 self.mode = Mode::RepoOpen { repo };
                 self.selection = Selection::None;
                 self.review_screen = ReviewScreen::Graph;
+                self.selected_changed_file_path = None;
                 cx.notify();
             }
             Err(err) => {
@@ -167,6 +170,13 @@ impl App {
 
         match repo::changeset_for_single_commit(&repo_path, &sha) {
             Ok(changeset) => {
+                if !self
+                    .selected_changed_file_path
+                    .as_ref()
+                    .is_some_and(|path| changeset.files.iter().any(|file| &file.path == path))
+                {
+                    self.selected_changed_file_path = None;
+                }
                 self.review_screen = ReviewScreen::Changeset { sha, changeset };
                 cx.notify();
             }
@@ -179,8 +189,17 @@ impl App {
         cx.notify();
     }
 
+    fn select_changed_file(&mut self, path: String, cx: &mut Context<Self>) {
+        self.selected_changed_file_path = Some(path);
+        cx.notify();
+    }
+
     fn is_commit_selected(&self, sha: &str) -> bool {
         matches!(&self.selection, Selection::Single { sha: selected_sha } if selected_sha == sha)
+    }
+
+    fn is_changed_file_selected(&self, file: &repo::ChangedFile) -> bool {
+        self.selected_changed_file_path.as_deref() == Some(file.path.as_str())
     }
 
     #[cfg(test)]
@@ -380,7 +399,7 @@ impl App {
                     .child("Close"),
             );
 
-        let changed_files = if changeset.files.is_empty() {
+        let body: AnyElement = if changeset.files.is_empty() {
             div()
                 .flex()
                 .flex_1()
@@ -390,21 +409,41 @@ impl App {
                 .text_color(rgb(0x999999))
                 .text_size(px(14.))
                 .child("This changeset has no net file changes.")
+                .into_any_element()
         } else {
+            let selected_file = self.selected_changed_file(changeset);
+
             div()
                 .flex()
-                .flex_col()
                 .flex_1()
-                .id("changed-files")
-                .overflow_y_scroll()
-                .children(
-                    changeset
-                        .files
-                        .iter()
-                        .enumerate()
-                        .map(|(index, file)| self.render_changed_file_row(index, file))
-                        .collect::<Vec<_>>(),
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .w(px(340.))
+                        .h_full()
+                        .id("changed-files")
+                        .overflow_y_scroll()
+                        .border_1()
+                        .border_color(rgb(0x242424))
+                        .children(
+                            changeset
+                                .files
+                                .iter()
+                                .enumerate()
+                                .map(|(index, file)| {
+                                    self.render_changed_file_row(
+                                        index,
+                                        file,
+                                        self.is_changed_file_selected(file),
+                                        cx,
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
                 )
+                .child(self.render_file_detail(selected_file))
+                .into_any_element()
         };
 
         div()
@@ -414,10 +453,44 @@ impl App {
             .h_full()
             .bg(rgb(0x171717))
             .child(header)
-            .child(changed_files)
+            .child(body)
     }
 
-    fn render_changed_file_row(&self, index: usize, file: &repo::ChangedFile) -> impl IntoElement {
+    fn selected_changed_file<'a>(
+        &self,
+        changeset: &'a repo::ChangeSet,
+    ) -> Option<&'a repo::ChangedFile> {
+        let selected_path = self.selected_changed_file_path.as_deref()?;
+        changeset
+            .files
+            .iter()
+            .find(|file| file.path == selected_path)
+    }
+
+    fn render_changed_file_row(
+        &self,
+        index: usize,
+        file: &repo::ChangedFile,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let path = file.path.clone();
+        let row_bg = if selected {
+            rgb(0x223248)
+        } else {
+            rgb(0x171717)
+        };
+        let border_color = if selected {
+            rgb(0x3b82f6)
+        } else {
+            rgb(0x242424)
+        };
+        let debug_selector = if selected {
+            format!("selected-changed-file-row-{index}")
+        } else {
+            format!("changed-file-row-{index}")
+        };
+
         div()
             .flex()
             .items_center()
@@ -425,11 +498,15 @@ impl App {
             .gap_3()
             .px_4()
             .py_2()
+            .bg(row_bg)
             .border_b_1()
-            .border_color(rgb(0x242424))
+            .border_color(border_color)
             .cursor_pointer()
             .id(("changed-file-row", index))
-            .debug_selector(move || format!("changed-file-row-{index}"))
+            .debug_selector(move || debug_selector.clone())
+            .on_click(cx.listener(move |app, _event, _window, cx| {
+                app.select_changed_file(path.clone(), cx);
+            }))
             .child(
                 div()
                     .w(px(72.))
@@ -466,6 +543,86 @@ impl App {
                         )
                     }),
             )
+    }
+
+    fn render_file_detail(&self, selected_file: Option<&repo::ChangedFile>) -> AnyElement {
+        match selected_file {
+            Some(file) => {
+                let title = file.path.clone();
+                let kind = change_kind_label(file.kind);
+
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .h_full()
+                    .id("file-detail-shell")
+                    .debug_selector(|| "file-detail-shell".to_string())
+                    .px_4()
+                    .py_4()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_color(rgb(0xe6e6e6))
+                                    .text_size(px(16.))
+                                    .font_family("monospace")
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .border_1()
+                                    .border_color(change_kind_border(file.kind))
+                                    .bg(change_kind_background(file.kind))
+                                    .text_color(change_kind_text(file.kind))
+                                    .text_size(px(11.))
+                                    .font_family("monospace")
+                                    .child(kind),
+                            ),
+                    )
+                    .when_some(file.old_path.clone(), |detail, old_path| {
+                        detail.child(
+                            div()
+                                .text_color(rgb(0x999999))
+                                .text_size(px(12.))
+                                .font_family("monospace")
+                                .child(format!("Renamed from {old_path}")),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .items_center()
+                            .justify_center()
+                            .border_1()
+                            .border_color(rgb(0x2a2a2a))
+                            .bg(rgb(0x141414))
+                            .text_color(rgb(0x999999))
+                            .text_size(px(14.))
+                            .child("File diff will appear here in the next slice."),
+                    )
+                    .into_any_element()
+            }
+            None => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .h_full()
+                .id("file-detail-empty")
+                .items_center()
+                .justify_center()
+                .text_color(rgb(0x999999))
+                .text_size(px(14.))
+                .child("Select a file to inspect its diff.")
+                .into_any_element(),
+        }
     }
 
     fn render_commit_row(
@@ -766,6 +923,68 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn selecting_changed_file_records_path(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.select_changed_file("hello.txt".to_string(), cx);
+
+                assert_eq!(
+                    app.selected_changed_file_path,
+                    Some("hello.txt".to_string()),
+                );
+            })
+            .expect("select changed file");
+    }
+
+    #[gpui::test]
+    async fn reopening_changeset_preserves_valid_changed_file_selection(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.select_changed_file("hello.txt".to_string(), cx);
+                app.close_changeset(cx);
+                app.open_changeset(window, cx);
+
+                assert_eq!(
+                    app.selected_changed_file_path,
+                    Some("hello.txt".to_string()),
+                );
+            })
+            .expect("reopen changeset");
+    }
+
+    #[gpui::test]
+    async fn opening_changeset_clears_stale_changed_file_selection(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.selected_changed_file_path = Some("missing.txt".to_string());
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+
+                assert_eq!(app.selected_changed_file_path, None);
+            })
+            .expect("open changeset");
+    }
+
+    #[gpui::test]
     async fn closing_changeset_returns_to_graph_and_preserves_selection(cx: &mut TestAppContext) {
         let window = cx.add_window(App::new);
 
@@ -949,6 +1168,49 @@ mod tests {
         visual
             .debug_bounds("changed-file-row-0")
             .expect("changed file row debug bounds");
+    }
+
+    #[gpui::test]
+    async fn clicking_changed_file_renders_detail_shell(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+            })
+            .expect("open repo and select commit");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let open_bounds = visual
+            .debug_bounds("open-changeset")
+            .expect("open changeset debug bounds");
+        visual.simulate_click(open_bounds.center(), Modifiers::none());
+
+        let row_bounds = visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+
+        visual
+            .debug_bounds("selected-changed-file-row-0")
+            .expect("selected changed file row debug bounds");
+        visual
+            .debug_bounds("file-detail-shell")
+            .expect("file detail shell debug bounds");
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.selected_changed_file_path,
+                    Some("hello.txt".to_string()),
+                );
+            })
+            .expect("read selected changed file");
     }
 
     #[gpui::test]

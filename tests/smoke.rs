@@ -65,9 +65,17 @@ async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
         .expect("open changeset debug bounds");
     visual.simulate_click(open_bounds.center(), Modifiers::none());
 
-    visual
+    let changed_file_bounds = visual
         .debug_bounds("changed-file-row-0")
         .expect("changed file row debug bounds");
+    visual.simulate_click(changed_file_bounds.center(), Modifiers::none());
+
+    visual
+        .debug_bounds("selected-changed-file-row-0")
+        .expect("selected changed file row debug bounds");
+    visual
+        .debug_bounds("file-detail-shell")
+        .expect("file detail shell debug bounds");
 
     window
         .read_with(cx, |app, _cx| match &app.review_screen {
@@ -75,6 +83,10 @@ async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
                 assert_eq!(changeset.files.len(), 1);
                 assert_eq!(changeset.files[0].path, "hello.txt");
                 assert_eq!(changeset.files[0].kind, ChangeKind::Modified);
+                assert_eq!(
+                    app.selected_changed_file_path,
+                    Some("hello.txt".to_string()),
+                );
             }
             ReviewScreen::Graph => panic!("expected changeset review screen"),
         })
