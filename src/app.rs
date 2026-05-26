@@ -17,11 +17,17 @@ use gpui::{
 };
 use gpui_component::notification::{Notification, NotificationList};
 use similar::{DiffTag, TextDiff};
-use std::path::PathBuf;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 use crate::repo;
 
 actions!(app, [OpenRepository, OpenChangeset, CloseChangeset]);
+
+const MAX_RECENT_REPOSITORIES: usize = 10;
 
 pub struct App {
     pub mode: Mode,
@@ -29,8 +35,11 @@ pub struct App {
     pub review_screen: ReviewScreen,
     pub selected_changed_file_path: Option<String>,
     pub file_list_mode: FileListMode,
+    pub recent_repositories: Vec<RecentRepository>,
+    collapsed_file_tree_paths: BTreeSet<String>,
     notifications: Entity<NotificationList>,
     path_picker: Box<dyn PathPicker>,
+    recent_repository_store_path: Option<PathBuf>,
     file_diff_scroll: FileDiffScroll,
     focus_handle: FocusHandle,
 }
@@ -99,6 +108,121 @@ pub enum FileListMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentRepository {
+    pub path: PathBuf,
+    pub available: bool,
+}
+
+impl RecentRepository {
+    pub fn available(path: PathBuf) -> Self {
+        Self {
+            path,
+            available: true,
+        }
+    }
+
+    pub fn unavailable(path: PathBuf) -> Self {
+        Self {
+            path,
+            available: false,
+        }
+    }
+}
+
+fn load_recent_repositories(path: &Path) -> io::Result<Vec<RecentRepository>> {
+    let content = fs::read_to_string(path)?;
+
+    Ok(content
+        .lines()
+        .filter_map(parse_recent_repository_line)
+        .take(MAX_RECENT_REPOSITORIES)
+        .collect())
+}
+
+fn save_recent_repositories(
+    path: &Path,
+    recent_repositories: &[RecentRepository],
+) -> io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut content = String::new();
+    for recent in recent_repositories.iter().take(MAX_RECENT_REPOSITORIES) {
+        let availability = if recent.available { "1" } else { "0" };
+        content.push_str(availability);
+        content.push('\t');
+        content.push_str(&encode_recent_repository_path(&recent.path));
+        content.push('\n');
+    }
+
+    fs::write(path, content)
+}
+
+fn parse_recent_repository_line(line: &str) -> Option<RecentRepository> {
+    let (availability, encoded_path) = line.split_once('\t')?;
+    if encoded_path.is_empty() {
+        return None;
+    }
+
+    let path = decode_recent_repository_path(encoded_path);
+    match availability {
+        "1" => Some(RecentRepository::available(path)),
+        "0" => Some(RecentRepository::unavailable(path)),
+        _ => None,
+    }
+}
+
+fn encode_recent_repository_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('%', "%25")
+        .replace('\t', "%09")
+        .replace('\n', "%0A")
+        .replace('\r', "%0D")
+}
+
+fn decode_recent_repository_path(path: &str) -> PathBuf {
+    PathBuf::from(
+        path.replace("%0D", "\r")
+            .replace("%0A", "\n")
+            .replace("%09", "\t")
+            .replace("%25", "%"),
+    )
+}
+
+fn load_recent_repositories_or_default(path: Option<&Path>) -> Vec<RecentRepository> {
+    path.and_then(|path| load_recent_repositories(path).ok())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn default_recent_repository_store_path() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+fn default_recent_repository_store_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("Greviewer")
+            .join("recent-repositories")
+    })
+}
+
+#[cfg(all(not(test), not(target_os = "macos")))]
+fn default_recent_repository_store_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .map(|config_home| config_home.join("greviewer").join("recent-repositories"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum FileListEntry {
     Changed(repo::ChangedFile),
     Unchanged(repo::RepositoryFile),
@@ -113,6 +237,42 @@ impl FileListEntry {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileTreeRow {
+    Folder {
+        name: String,
+        path: String,
+        depth: usize,
+        collapsed: bool,
+    },
+    File {
+        name: String,
+        entry: FileListEntry,
+        depth: usize,
+    },
+}
+
+impl FileTreeRow {
+    fn path(&self) -> &str {
+        match self {
+            FileTreeRow::Folder { path, .. } => path,
+            FileTreeRow::File { entry, .. } => entry.path(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FileTreeBranch {
+    folders: BTreeMap<String, FileTreeBranch>,
+    files: Vec<FileTreeLeaf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileTreeLeaf {
+    name: String,
+    entry: FileListEntry,
+}
+
 /// Emitted whenever `open_repository_at` fails. Carries the user-facing
 /// message that was pushed onto the notification list. Tests subscribe to
 /// this event to verify the error path because `gpui-component`'s
@@ -124,13 +284,74 @@ impl EventEmitter<OpenFailed> for App {}
 
 impl App {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::new_with_picker(window, cx, Box::new(GpuiPathPicker))
+        let recent_repository_store_path = default_recent_repository_store_path();
+        let recent_repositories =
+            load_recent_repositories_or_default(recent_repository_store_path.as_deref());
+
+        Self::new_with_picker_recent_and_store_path(
+            window,
+            cx,
+            Box::new(GpuiPathPicker),
+            recent_repositories,
+            recent_repository_store_path,
+        )
     }
 
     pub fn new_with_picker(
         window: &mut Window,
         cx: &mut Context<Self>,
         path_picker: Box<dyn PathPicker>,
+    ) -> Self {
+        Self::new_with_picker_and_recent(window, cx, path_picker, Vec::new())
+    }
+
+    pub fn new_with_recent_repositories(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        recent_repositories: Vec<RecentRepository>,
+    ) -> Self {
+        Self::new_with_picker_and_recent(window, cx, Box::new(GpuiPathPicker), recent_repositories)
+    }
+
+    #[cfg(test)]
+    fn new_with_recent_repository_store_path(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        recent_repository_store_path: PathBuf,
+    ) -> Self {
+        let recent_repositories =
+            load_recent_repositories_or_default(Some(&recent_repository_store_path));
+
+        Self::new_with_picker_recent_and_store_path(
+            window,
+            cx,
+            Box::new(GpuiPathPicker),
+            recent_repositories,
+            Some(recent_repository_store_path),
+        )
+    }
+
+    fn new_with_picker_and_recent(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        path_picker: Box<dyn PathPicker>,
+        recent_repositories: Vec<RecentRepository>,
+    ) -> Self {
+        Self::new_with_picker_recent_and_store_path(
+            window,
+            cx,
+            path_picker,
+            recent_repositories,
+            None,
+        )
+    }
+
+    fn new_with_picker_recent_and_store_path(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        path_picker: Box<dyn PathPicker>,
+        recent_repositories: Vec<RecentRepository>,
+        recent_repository_store_path: Option<PathBuf>,
     ) -> Self {
         let notifications = cx.new(|cx| NotificationList::new(window, cx));
         let focus_handle = cx.focus_handle();
@@ -146,8 +367,11 @@ impl App {
             review_screen: ReviewScreen::Graph,
             selected_changed_file_path: None,
             file_list_mode: FileListMode::Changed,
+            recent_repositories,
+            collapsed_file_tree_paths: BTreeSet::new(),
             notifications,
             path_picker,
+            recent_repository_store_path,
             file_diff_scroll: FileDiffScroll::new(),
             focus_handle,
         }
@@ -199,19 +423,66 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         match repo::open_at(&path) {
-            Ok(repo) => {
-                self.mode = Mode::RepoOpen { repo };
-                self.selection = Selection::None;
-                self.review_screen = ReviewScreen::Graph;
-                self.selected_changed_file_path = None;
-                self.file_list_mode = FileListMode::Changed;
-                self.file_diff_scroll.reset();
-                cx.notify();
-            }
+            Ok(repo) => self.apply_open_repository(repo, cx),
             Err(err) => {
                 let message = err.to_string();
                 self.push_open_failed(message, window, cx);
             }
+        }
+    }
+
+    fn open_recent_repository(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match repo::open_at(&path) {
+            Ok(repo) => self.apply_open_repository(repo, cx),
+            Err(err) => {
+                self.mark_recent_repository_unavailable(&path);
+                self.persist_recent_repositories();
+                self.push_open_failed(err.to_string(), window, cx);
+            }
+        }
+    }
+
+    fn apply_open_repository(&mut self, repo: repo::OpenRepository, cx: &mut Context<Self>) {
+        let recent_path = repo.path.clone();
+
+        self.mode = Mode::RepoOpen { repo };
+        self.selection = Selection::None;
+        self.review_screen = ReviewScreen::Graph;
+        self.selected_changed_file_path = None;
+        self.file_list_mode = FileListMode::Changed;
+        self.collapsed_file_tree_paths.clear();
+        self.record_recent_repository(recent_path);
+        self.persist_recent_repositories();
+        self.file_diff_scroll.reset();
+        cx.notify();
+    }
+
+    fn record_recent_repository(&mut self, path: PathBuf) {
+        self.recent_repositories
+            .retain(|recent| recent.path != path);
+        self.recent_repositories
+            .insert(0, RecentRepository::available(path));
+        self.recent_repositories.truncate(MAX_RECENT_REPOSITORIES);
+    }
+
+    fn mark_recent_repository_unavailable(&mut self, path: &PathBuf) {
+        if let Some(recent) = self
+            .recent_repositories
+            .iter_mut()
+            .find(|recent| recent.path == *path)
+        {
+            recent.available = false;
+        }
+    }
+
+    fn persist_recent_repositories(&self) {
+        if let Some(path) = &self.recent_repository_store_path {
+            let _ = save_recent_repositories(path, &self.recent_repositories);
         }
     }
 
@@ -356,6 +627,13 @@ impl App {
         cx.notify();
     }
 
+    fn toggle_file_tree_folder(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.collapsed_file_tree_paths.insert(path.clone()) {
+            self.collapsed_file_tree_paths.remove(&path);
+        }
+        cx.notify();
+    }
+
     fn is_commit_selected(&self, sha: &str) -> bool {
         match &self.selection {
             Selection::Single { sha: selected_sha } => selected_sha == sha,
@@ -388,7 +666,42 @@ impl App {
         self.file_diff_scroll.side_by_side.max_offset()
     }
 
-    fn render_no_repo(&self) -> gpui::Div {
+    fn render_no_repo(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let recent_repositories = if self.recent_repositories.is_empty() {
+            None
+        } else {
+            Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w(px(520.))
+                    .max_w_full()
+                    .mt_6()
+                    .border_1()
+                    .border_color(rgb(0x2a2a2a))
+                    .bg(rgb(0x141414))
+                    .child(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(rgb(0x242424))
+                            .text_color(rgb(0x999999))
+                            .text_size(px(12.))
+                            .child("Recent repositories"),
+                    )
+                    .children(
+                        self.recent_repositories
+                            .iter()
+                            .enumerate()
+                            .map(|(index, recent)| {
+                                self.render_recent_repository_row(index, recent, cx)
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+            )
+        };
+
         div()
             .flex()
             .flex_col()
@@ -409,6 +722,65 @@ impl App {
                     .text_size(px(14.))
                     .child("Open a repository to start a review."),
             )
+            .when_some(recent_repositories, |view, recent| view.child(recent))
+    }
+
+    fn render_recent_repository_row(
+        &self,
+        index: usize,
+        recent: &RecentRepository,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let path = recent.path.clone();
+        let display_path = path.display().to_string();
+        let debug_selector = if recent.available {
+            format!("recent-repository-row-{index}")
+        } else {
+            format!("unavailable-recent-repository-row-{index}")
+        };
+        let path_color = if recent.available {
+            rgb(0xe6e6e6)
+        } else {
+            rgb(0x777777)
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .w_full()
+            .gap_3()
+            .px_4()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(0x242424))
+            .cursor_pointer()
+            .id(("recent-repository-row", index))
+            .debug_selector(move || debug_selector.clone())
+            .on_click(cx.listener(move |app, _event, window, cx| {
+                app.open_recent_repository(path.clone(), window, cx);
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .font_family("monospace")
+                    .text_size(px(13.))
+                    .text_color(path_color)
+                    .child(display_path),
+            )
+            .when(!recent.available, |row| {
+                row.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .border_1()
+                        .border_color(rgb(0x5a2a2a))
+                        .bg(rgb(0x241818))
+                        .text_color(rgb(0xfca5a5))
+                        .text_size(px(11.))
+                        .child("Unavailable"),
+                )
+            })
     }
 
     fn render_repo_open(&self, repo: &repo::OpenRepository, cx: &mut Context<Self>) -> AnyElement {
@@ -647,7 +1019,8 @@ impl App {
         entries: Vec<FileListEntry>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let list_content: AnyElement = if entries.is_empty() {
+        let rows = self.file_tree_rows(entries);
+        let list_content: AnyElement = if rows.is_empty() {
             div()
                 .flex()
                 .flex_1()
@@ -669,17 +1042,9 @@ impl App {
                 .debug_selector(|| "changed-files-scroll".to_string())
                 .overflow_y_scroll()
                 .children(
-                    entries
-                        .iter()
+                    rows.iter()
                         .enumerate()
-                        .map(|(index, entry)| {
-                            self.render_file_list_entry_row(
-                                index,
-                                entry,
-                                self.is_file_path_selected(entry.path()),
-                                cx,
-                            )
-                        })
+                        .map(|(index, row)| self.render_file_tree_row(index, row, cx))
                         .collect::<Vec<_>>(),
                 )
                 .into_any_element()
@@ -696,6 +1061,18 @@ impl App {
             .border_color(rgb(0x242424))
             .child(self.render_file_list_mode_toggle(cx))
             .child(list_content)
+    }
+
+    fn file_tree_rows(&self, entries: Vec<FileListEntry>) -> Vec<FileTreeRow> {
+        let mut root = FileTreeBranch::default();
+
+        for entry in entries {
+            insert_file_tree_entry(&mut root, entry);
+        }
+
+        let mut rows = Vec::new();
+        append_file_tree_rows(&root, 0, "", &self.collapsed_file_tree_paths, &mut rows);
+        rows
     }
 
     fn render_file_list_mode_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -749,21 +1126,81 @@ impl App {
             .child(label)
     }
 
-    fn render_file_list_entry_row(
+    fn render_file_tree_row(
         &self,
         index: usize,
-        entry: &FileListEntry,
-        selected: bool,
+        row: &FileTreeRow,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        match entry {
-            FileListEntry::Changed(file) => self
-                .render_changed_file_row(index, file, selected, cx)
+        match row {
+            FileTreeRow::Folder {
+                name,
+                path,
+                depth,
+                collapsed,
+            } => self
+                .render_file_tree_folder_row(index, name, path, *depth, *collapsed, cx)
                 .into_any_element(),
-            FileListEntry::Unchanged(file) => self
-                .render_unchanged_file_row(index, file, selected, cx)
-                .into_any_element(),
+            FileTreeRow::File { name, entry, depth } => {
+                let selected = self.is_file_path_selected(row.path());
+                match entry {
+                    FileListEntry::Changed(file) => self
+                        .render_changed_file_row(index, file, selected, *depth, name, cx)
+                        .into_any_element(),
+                    FileListEntry::Unchanged(file) => self
+                        .render_unchanged_file_row(index, file, selected, *depth, name, cx)
+                        .into_any_element(),
+                }
+            }
         }
+    }
+
+    fn render_file_tree_folder_row(
+        &self,
+        index: usize,
+        name: &str,
+        path: &str,
+        depth: usize,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let path = path.to_string();
+        let debug_selector = format!("file-tree-folder-{}", debug_path_fragment(&path));
+        let disclosure = if collapsed { ">" } else { "v" };
+
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .gap_3()
+            .px_4()
+            .py_2()
+            .bg(rgb(0x171717))
+            .border_b_1()
+            .border_color(rgb(0x242424))
+            .cursor_pointer()
+            .id(("file-tree-folder", index))
+            .debug_selector(move || debug_selector.clone())
+            .on_click(cx.listener(move |app, _event, _window, cx| {
+                app.toggle_file_tree_folder(path.clone(), cx);
+            }))
+            .child(depth_spacer(depth))
+            .child(
+                div()
+                    .w(px(16.))
+                    .text_color(rgb(0x999999))
+                    .text_size(px(12.))
+                    .font_family("monospace")
+                    .child(disclosure),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .text_color(rgb(0xe6e6e6))
+                    .text_size(px(14.))
+                    .font_family("monospace")
+                    .child(name.to_string()),
+            )
     }
 
     fn render_changed_file_row(
@@ -771,6 +1208,8 @@ impl App {
         index: usize,
         file: &repo::ChangedFile,
         selected: bool,
+        depth: usize,
+        display_name: &str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let path = file.path.clone();
@@ -806,6 +1245,7 @@ impl App {
             .on_click(cx.listener(move |app, _event, _window, cx| {
                 app.select_changed_file(path.clone(), cx);
             }))
+            .child(depth_spacer(depth))
             .child(
                 div()
                     .w(px(72.))
@@ -830,7 +1270,7 @@ impl App {
                             .text_color(rgb(0xe6e6e6))
                             .text_size(px(14.))
                             .font_family("monospace")
-                            .child(file.path.clone()),
+                            .child(display_name.to_string()),
                     )
                     .when_some(file.old_path.clone(), |column, old_path| {
                         column.child(
@@ -849,6 +1289,8 @@ impl App {
         index: usize,
         file: &repo::RepositoryFile,
         selected: bool,
+        depth: usize,
+        display_name: &str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let path = file.path.clone();
@@ -884,6 +1326,7 @@ impl App {
             .on_click(cx.listener(move |app, _event, _window, cx| {
                 app.select_changed_file(path.clone(), cx);
             }))
+            .child(depth_spacer(depth))
             .child(div().w(px(72.)))
             .child(
                 div()
@@ -891,7 +1334,7 @@ impl App {
                     .text_color(rgb(0xe6e6e6))
                     .text_size(px(14.))
                     .font_family("monospace")
-                    .child(file.path.clone()),
+                    .child(display_name.to_string()),
             )
     }
 
@@ -1522,7 +1965,7 @@ fn change_kind_text(kind: repo::ChangeKind) -> gpui::Rgba {
 impl Render for App {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match &self.mode {
-            Mode::NoRepo => self.render_no_repo().into_any_element(),
+            Mode::NoRepo => self.render_no_repo(cx).into_any_element(),
             Mode::RepoOpen { repo } => self.render_repo_open(repo, cx),
         };
 
@@ -1545,11 +1988,82 @@ impl Render for App {
     }
 }
 
+fn insert_file_tree_entry(root: &mut FileTreeBranch, entry: FileListEntry) {
+    let path = entry.path().to_string();
+    let mut parts = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let Some(file_name) = parts.pop() else {
+        return;
+    };
+
+    let mut branch = root;
+    for folder in parts {
+        branch = branch.folders.entry(folder.to_string()).or_default();
+    }
+
+    branch.files.push(FileTreeLeaf {
+        name: file_name.to_string(),
+        entry,
+    });
+    branch.files.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.entry.path().cmp(right.entry.path()))
+    });
+}
+
+fn append_file_tree_rows(
+    branch: &FileTreeBranch,
+    depth: usize,
+    prefix: &str,
+    collapsed_paths: &BTreeSet<String>,
+    rows: &mut Vec<FileTreeRow>,
+) {
+    for (name, child) in &branch.folders {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let collapsed = collapsed_paths.contains(&path);
+
+        rows.push(FileTreeRow::Folder {
+            name: name.clone(),
+            path: path.clone(),
+            depth,
+            collapsed,
+        });
+
+        if !collapsed {
+            append_file_tree_rows(child, depth + 1, &path, collapsed_paths, rows);
+        }
+    }
+
+    for leaf in &branch.files {
+        rows.push(FileTreeRow::File {
+            name: leaf.name.clone(),
+            entry: leaf.entry.clone(),
+            depth,
+        });
+    }
+}
+
+fn depth_spacer(depth: usize) -> gpui::Div {
+    div().w(px(depth as f32 * 16.))
+}
+
+fn debug_path_fragment(path: &str) -> String {
+    path.replace('/', "-")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        side_by_side_diff_rows, single_side_diff_rows, App, CloseChangeset, DiffLineStatus, Mode,
-        OpenChangeset, OpenFailed, ReviewScreen, Selection,
+        load_recent_repositories, save_recent_repositories, side_by_side_diff_rows,
+        single_side_diff_rows, App, CloseChangeset, DiffLineStatus, FileListMode, FileTreeRow,
+        Mode, OpenChangeset, OpenFailed, RecentRepository, ReviewScreen, Selection,
     };
     use crate::repo::{ChangeKind, DiffSide};
     use git2::{IndexAddOption, Repository, Signature};
@@ -1607,6 +2121,23 @@ mod tests {
         let root_oid = commit_all(&repo, "Initial", &[]);
 
         fs::write(dir.path().join("changed.txt"), "after\n").expect("update changed file");
+        let update_oid = commit_all(&repo, "Update changed file", &[root_oid]);
+
+        drop(repo);
+
+        (dir, update_oid.to_string())
+    }
+
+    fn init_repo_with_nested_changed_and_context_files() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::create_dir_all(dir.path().join("src")).expect("create src dir");
+        fs::write(dir.path().join("src/changed.txt"), "before\n").expect("write changed file");
+        fs::write(dir.path().join("src/context.txt"), "context\n").expect("write context file");
+        let root_oid = commit_all(&repo, "Initial", &[]);
+
+        fs::write(dir.path().join("src/changed.txt"), "after\n").expect("update changed file");
         let update_oid = commit_all(&repo, "Update changed file", &[root_oid]);
 
         drop(repo);
@@ -1766,6 +2297,24 @@ mod tests {
         assert_eq!(rows[2].new.text, "beta");
     }
 
+    #[test]
+    fn recent_repository_store_round_trips_paths_and_availability() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store_path = dir.path().join("state").join("recent-repositories");
+        let recent_repositories = vec![
+            RecentRepository::available(dir.path().join("repo-one")),
+            RecentRepository::unavailable(dir.path().join("repo%\t\n\r-two")),
+        ];
+
+        save_recent_repositories(&store_path, &recent_repositories)
+            .expect("save recent repositories");
+
+        assert_eq!(
+            load_recent_repositories(&store_path).expect("load recent repositories"),
+            recent_repositories,
+        );
+    }
+
     #[gpui::test]
     async fn renders_placeholder(cx: &mut TestAppContext) {
         let _window = cx.add_window(App::new);
@@ -1813,6 +2362,190 @@ mod tests {
                 Mode::NoRepo => panic!("expected RepoOpen, got NoRepo"),
             })
             .expect("read window");
+    }
+
+    #[gpui::test]
+    async fn opening_repositories_records_recent_paths_and_moves_reopened_repo_to_top(
+        cx: &mut TestAppContext,
+    ) {
+        let (first_dir, _) = init_repo_with_one_commit();
+        let first_path = first_dir
+            .path()
+            .canonicalize()
+            .expect("canonical first path");
+        let (second_dir, _) = init_repo_with_one_commit();
+        let second_path = second_dir
+            .path()
+            .canonicalize()
+            .expect("canonical second path");
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(first_path.clone(), window, cx);
+                app.open_repository_at(second_path.clone(), window, cx);
+                assert_eq!(
+                    app.recent_repositories,
+                    vec![
+                        RecentRepository::available(second_path.clone()),
+                        RecentRepository::available(first_path.clone()),
+                    ],
+                );
+
+                app.open_repository_at(first_path.clone(), window, cx);
+                assert_eq!(
+                    app.recent_repositories,
+                    vec![
+                        RecentRepository::available(first_path),
+                        RecentRepository::available(second_path),
+                    ],
+                );
+            })
+            .expect("open repositories");
+    }
+
+    #[gpui::test]
+    async fn persisted_recent_repositories_load_on_startup(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store_path = dir.path().join("recent-repositories");
+        let recent_repositories = vec![
+            RecentRepository::available(dir.path().join("repo-one")),
+            RecentRepository::unavailable(dir.path().join("repo-two")),
+        ];
+        save_recent_repositories(&store_path, &recent_repositories)
+            .expect("seed recent repository store");
+
+        let window = cx.add_window(|window, cx| {
+            App::new_with_recent_repository_store_path(window, cx, store_path.clone())
+        });
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(app.recent_repositories, recent_repositories);
+            })
+            .expect("read loaded recent repositories");
+    }
+
+    #[gpui::test]
+    async fn opening_repository_persists_recent_repositories_to_disk(cx: &mut TestAppContext) {
+        let (dir, _) = init_repo_with_one_commit();
+        let path = dir.path().canonicalize().expect("canonical repo path");
+        let state_dir = tempfile::tempdir().expect("create tempdir");
+        let store_path = state_dir.path().join("recent-repositories");
+        let window = cx.add_window(|window, cx| {
+            App::new_with_recent_repository_store_path(window, cx, store_path.clone())
+        });
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path.clone(), window, cx);
+            })
+            .expect("open repository");
+
+        assert_eq!(
+            load_recent_repositories(&store_path).expect("load recent repository store"),
+            vec![RecentRepository::available(path)],
+        );
+    }
+
+    #[gpui::test]
+    async fn clicking_recent_repository_opens_it(cx: &mut TestAppContext) {
+        let (dir, _) = init_repo_with_one_commit();
+        let path = dir.path().canonicalize().expect("canonical repo path");
+        let window = cx.add_window(|window, cx| {
+            App::new_with_recent_repositories(
+                window,
+                cx,
+                vec![RecentRepository::available(path.clone())],
+            )
+        });
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row_bounds = visual
+            .debug_bounds("recent-repository-row-0")
+            .expect("recent repository row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| match &app.mode {
+                Mode::RepoOpen { repo } => {
+                    let head = repo.head.as_ref().expect("head present");
+                    assert_eq!(head.summary, "Add hello.txt");
+                }
+                Mode::NoRepo => panic!("expected RepoOpen, got NoRepo"),
+            })
+            .expect("read opened recent repository");
+    }
+
+    #[gpui::test]
+    async fn clicking_unavailable_recent_repository_marks_it_unavailable(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let missing_path = dir.path().join("missing-repo");
+        let window = cx.add_window(|window, cx| {
+            App::new_with_recent_repositories(
+                window,
+                cx,
+                vec![RecentRepository::available(missing_path.clone())],
+            )
+        });
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row_bounds = visual
+            .debug_bounds("recent-repository-row-0")
+            .expect("recent repository row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, cx| {
+                assert!(matches!(app.mode, Mode::NoRepo));
+                assert_eq!(
+                    app.recent_repositories,
+                    vec![RecentRepository::unavailable(missing_path.clone())],
+                );
+                assert_eq!(app.notification_count(cx), 1);
+            })
+            .expect("read unavailable recent repository");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("unavailable-recent-repository-row-0")
+            .expect("unavailable recent repository row debug bounds");
+    }
+
+    #[gpui::test]
+    async fn failed_recent_repository_activation_persists_unavailable_state(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let missing_path = dir.path().join("missing-repo");
+        let store_path = dir.path().join("recent-repositories");
+        save_recent_repositories(
+            &store_path,
+            &[RecentRepository::available(missing_path.clone())],
+        )
+        .expect("seed recent repository store");
+        let window = cx.add_window(|window, cx| {
+            App::new_with_recent_repository_store_path(window, cx, store_path.clone())
+        });
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_recent_repository(missing_path.clone(), window, cx);
+            })
+            .expect("activate missing recent repository");
+
+        assert_eq!(
+            load_recent_repositories(&store_path).expect("load recent repository store"),
+            vec![RecentRepository::unavailable(missing_path)],
+        );
     }
 
     #[gpui::test]
@@ -2084,6 +2817,141 @@ mod tests {
         visual
             .debug_bounds("file-diff-side-new")
             .expect("new file diff side debug bounds");
+    }
+
+    #[gpui::test]
+    async fn file_list_renders_nested_paths_as_tree_folders(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_nested_changed_and_context_files();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open changeset");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("file-tree-folder-src")
+            .expect("src folder debug bounds");
+        visual
+            .debug_bounds("changed-file-row-1")
+            .expect("nested changed file row debug bounds");
+    }
+
+    #[gpui::test]
+    async fn collapsing_file_tree_folder_persists_across_file_list_mode_toggle(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, oid_hex) = init_repo_with_nested_changed_and_context_files();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open changeset");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let folder_bounds = visual
+            .debug_bounds("file-tree-folder-src")
+            .expect("src folder debug bounds");
+        visual.simulate_click(folder_bounds.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert!(app.collapsed_file_tree_paths.contains("src"));
+            })
+            .expect("read collapsed folder state");
+
+        window
+            .read_with(cx, |app, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected repo open mode");
+                };
+                let ReviewScreen::Changeset { changeset, .. } = &app.review_screen else {
+                    panic!("expected changeset screen");
+                };
+                let rows = app
+                    .file_list_entries(repo, changeset)
+                    .map(|entries| app.file_tree_rows(entries))
+                    .expect("file tree rows");
+
+                assert_eq!(rows.len(), 1, "collapsed folder should hide children");
+                assert!(matches!(
+                    &rows[0],
+                    FileTreeRow::Folder {
+                        path,
+                        collapsed: true,
+                        ..
+                    } if path == "src"
+                ));
+            })
+            .expect("read collapsed tree rows");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let all_files_bounds = visual
+            .debug_bounds("file-list-mode-all")
+            .expect("all files toggle debug bounds");
+        visual.simulate_click(all_files_bounds.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected repo open mode");
+                };
+                let ReviewScreen::Changeset { changeset, .. } = &app.review_screen else {
+                    panic!("expected changeset screen");
+                };
+                let rows = app
+                    .file_list_entries(repo, changeset)
+                    .map(|entries| app.file_tree_rows(entries))
+                    .expect("file tree rows");
+
+                assert_eq!(
+                    app.file_list_mode,
+                    FileListMode::All,
+                    "test should be in all-files mode"
+                );
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "collapsed folder should hide all file children after toggling mode"
+                );
+                assert!(matches!(
+                    &rows[0],
+                    FileTreeRow::Folder {
+                        path,
+                        collapsed: true,
+                        ..
+                    } if path == "src"
+                ));
+            })
+            .expect("read collapsed all-files tree rows");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let folder_bounds = visual
+            .debug_bounds("file-tree-folder-src")
+            .expect("src folder debug bounds after toggling mode");
+        visual.simulate_click(folder_bounds.center(), Modifiers::none());
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("changed-file-row-1")
+            .expect("changed file child after expanding folder");
+        visual
+            .debug_bounds("unchanged-file-row-2")
+            .expect("unchanged file child after expanding folder");
     }
 
     #[gpui::test]

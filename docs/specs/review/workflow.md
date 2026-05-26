@@ -4,7 +4,7 @@ This contract defines the review experience: opening a Git repository, navigatin
 
 ## Opening a repository
 
-The user opens a local Git repository through a folder picker. The application reads the repository's history and presents the commit graph for that repository. Recently opened repositories are surfaced on launch so the user can return to a repository without re-picking it. Only one repository is open per window in v1.
+The user opens a local Git repository through a folder picker. The application reads the repository's history and presents the commit graph for that repository. Recently opened repositories persist between application launches and are surfaced on launch so the user can return to a repository without re-picking it. Only one repository is open per window in v1.
 
 **Triggering conditions**
 
@@ -14,7 +14,7 @@ The user opens a local Git repository through a folder picker. The application r
 **Observable outcomes**
 
 - The window displays the commit graph of the chosen repository.
-- The chosen repository is added to (or moved to the top of) the recently opened list.
+- The chosen repository is added to (or moved to the top of) the recently opened list, and that ordering is retained for future launches.
 
 **Edge cases**
 
@@ -142,4 +142,3 @@ For files that exist on only one side of the selection — added or deleted file
 - Renamed files diff old-path content against new-path content; the file's pre-rename path is surfaced so the user can see what was renamed.
 - Binary files render an explanatory placeholder rather than attempting a textual diff.
 - Very large files load progressively rather than blocking the UI.
-
