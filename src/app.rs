@@ -45,7 +45,10 @@ pub enum Selection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewScreen {
     Graph,
-    Changeset { sha: String },
+    Changeset {
+        sha: String,
+        changeset: repo::ChangeSet,
+    },
 }
 
 /// Emitted whenever `open_repository_at` fails. Carries the user-facing
@@ -152,10 +155,22 @@ impl App {
         cx.notify();
     }
 
-    fn open_changeset(&mut self, cx: &mut Context<Self>) {
-        if let Selection::Single { sha } = &self.selection {
-            self.review_screen = ReviewScreen::Changeset { sha: sha.clone() };
-            cx.notify();
+    fn open_changeset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sha = match &self.selection {
+            Selection::Single { sha } => sha.clone(),
+            Selection::None => return,
+        };
+        let repo_path = match &self.mode {
+            Mode::RepoOpen { repo } => repo.path.clone(),
+            Mode::NoRepo => return,
+        };
+
+        match repo::changeset_for_single_commit(&repo_path, &sha) {
+            Ok(changeset) => {
+                self.review_screen = ReviewScreen::Changeset { sha, changeset };
+                cx.notify();
+            }
+            Err(err) => self.push_open_failed(err.to_string(), window, cx),
         }
     }
 
@@ -199,8 +214,8 @@ impl App {
     fn render_repo_open(&self, repo: &repo::OpenRepository, cx: &mut Context<Self>) -> AnyElement {
         match &self.review_screen {
             ReviewScreen::Graph => self.render_graph_screen(repo, cx).into_any_element(),
-            ReviewScreen::Changeset { sha } => self
-                .render_changeset_screen(repo, sha, cx)
+            ReviewScreen::Changeset { sha, changeset } => self
+                .render_changeset_screen(repo, sha, changeset, cx)
                 .into_any_element(),
         }
     }
@@ -242,8 +257,8 @@ impl App {
                         .cursor_pointer()
                         .id("open-changeset")
                         .debug_selector(|| "open-changeset".to_string())
-                        .on_click(cx.listener(|app, _event, _window, cx| {
-                            app.open_changeset(cx);
+                        .on_click(cx.listener(|app, _event, window, cx| {
+                            app.open_changeset(window, cx);
                         }))
                         .child("Open changeset"),
                 )
@@ -313,6 +328,7 @@ impl App {
         &self,
         repo: &repo::OpenRepository,
         sha: &str,
+        changeset: &repo::ChangeSet,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let path_text = repo.path.display().to_string();
@@ -364,6 +380,33 @@ impl App {
                     .child("Close"),
             );
 
+        let changed_files = if changeset.files.is_empty() {
+            div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .id("changed-files-empty")
+                .text_color(rgb(0x999999))
+                .text_size(px(14.))
+                .child("This changeset has no net file changes.")
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .id("changed-files")
+                .overflow_y_scroll()
+                .children(
+                    changeset
+                        .files
+                        .iter()
+                        .enumerate()
+                        .map(|(index, file)| self.render_changed_file_row(index, file))
+                        .collect::<Vec<_>>(),
+                )
+        };
+
         div()
             .flex()
             .flex_col()
@@ -371,15 +414,57 @@ impl App {
             .h_full()
             .bg(rgb(0x171717))
             .child(header)
+            .child(changed_files)
+    }
+
+    fn render_changed_file_row(&self, index: usize, file: &repo::ChangedFile) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .gap_3()
+            .px_4()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(0x242424))
+            .cursor_pointer()
+            .id(("changed-file-row", index))
+            .debug_selector(move || format!("changed-file-row-{index}"))
+            .child(
+                div()
+                    .w(px(72.))
+                    .px_2()
+                    .py_1()
+                    .border_1()
+                    .border_color(change_kind_border(file.kind))
+                    .bg(change_kind_background(file.kind))
+                    .text_color(change_kind_text(file.kind))
+                    .text_size(px(11.))
+                    .font_family("monospace")
+                    .child(change_kind_label(file.kind)),
+            )
             .child(
                 div()
                     .flex()
+                    .flex_col()
                     .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .text_color(rgb(0x999999))
-                    .text_size(px(14.))
-                    .child("Changed files will appear here in the next slice."),
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_color(rgb(0xe6e6e6))
+                            .text_size(px(14.))
+                            .font_family("monospace")
+                            .child(file.path.clone()),
+                    )
+                    .when_some(file.old_path.clone(), |column, old_path| {
+                        column.child(
+                            div()
+                                .text_color(rgb(0x8a8a8a))
+                                .text_size(px(12.))
+                                .font_family("monospace")
+                                .child(format!("from {old_path}")),
+                        )
+                    }),
             )
     }
 
@@ -462,6 +547,42 @@ impl App {
     }
 }
 
+fn change_kind_label(kind: repo::ChangeKind) -> &'static str {
+    match kind {
+        repo::ChangeKind::Added => "Added",
+        repo::ChangeKind::Modified => "Modified",
+        repo::ChangeKind::Deleted => "Deleted",
+        repo::ChangeKind::Renamed => "Renamed",
+    }
+}
+
+fn change_kind_background(kind: repo::ChangeKind) -> gpui::Rgba {
+    match kind {
+        repo::ChangeKind::Added => rgb(0x132b1a),
+        repo::ChangeKind::Modified => rgb(0x1d283a),
+        repo::ChangeKind::Deleted => rgb(0x341b1b),
+        repo::ChangeKind::Renamed => rgb(0x2f2a14),
+    }
+}
+
+fn change_kind_border(kind: repo::ChangeKind) -> gpui::Rgba {
+    match kind {
+        repo::ChangeKind::Added => rgb(0x2f7d46),
+        repo::ChangeKind::Modified => rgb(0x3b82f6),
+        repo::ChangeKind::Deleted => rgb(0x8b3a3a),
+        repo::ChangeKind::Renamed => rgb(0x9a7b22),
+    }
+}
+
+fn change_kind_text(kind: repo::ChangeKind) -> gpui::Rgba {
+    match kind {
+        repo::ChangeKind::Added => rgb(0x86efac),
+        repo::ChangeKind::Modified => rgb(0xdbeafe),
+        repo::ChangeKind::Deleted => rgb(0xfca5a5),
+        repo::ChangeKind::Renamed => rgb(0xfde68a),
+    }
+}
+
 impl Render for App {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match &self.mode {
@@ -477,8 +598,8 @@ impl Render for App {
             .on_action(cx.listener(|app, _: &OpenRepository, window, cx| {
                 app.prompt_and_open_repository(window, cx);
             }))
-            .on_action(cx.listener(|app, _: &OpenChangeset, _window, cx| {
-                app.open_changeset(cx);
+            .on_action(cx.listener(|app, _: &OpenChangeset, window, cx| {
+                app.open_changeset(window, cx);
             }))
             .on_action(cx.listener(|app, _: &CloseChangeset, _window, cx| {
                 app.close_changeset(cx);
@@ -491,6 +612,7 @@ impl Render for App {
 #[cfg(test)]
 mod tests {
     use super::{App, CloseChangeset, Mode, OpenChangeset, OpenFailed, ReviewScreen, Selection};
+    use crate::repo::ChangeKind;
     use git2::{IndexAddOption, Repository, Signature};
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use std::fs;
@@ -604,20 +726,43 @@ mod tests {
         let window = cx.add_window(App::new);
 
         window
-            .update(cx, |app, _window, cx| {
-                app.open_changeset(cx);
+            .update(cx, |app, window, cx| {
+                app.open_changeset(window, cx);
                 assert_eq!(app.review_screen, ReviewScreen::Graph);
 
                 app.select_single_commit("selected-sha".to_string(), cx);
-                app.open_changeset(cx);
-                assert_eq!(
-                    app.review_screen,
-                    ReviewScreen::Changeset {
-                        sha: "selected-sha".to_string(),
-                    },
-                );
+                app.open_changeset(window, cx);
+                assert_eq!(app.review_screen, ReviewScreen::Graph);
             })
             .expect("update window");
+    }
+
+    #[gpui::test]
+    async fn opening_changeset_loads_changed_files(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex.clone(), cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open changeset");
+
+        window
+            .read_with(cx, |app, _cx| match &app.review_screen {
+                ReviewScreen::Changeset { sha, changeset } => {
+                    assert_eq!(sha, &oid_hex);
+                    assert_eq!(changeset.commit_sha, oid_hex);
+                    assert_eq!(changeset.files.len(), 1);
+                    assert_eq!(changeset.files[0].path, "hello.txt");
+                    assert_eq!(changeset.files[0].kind, ChangeKind::Added);
+                }
+                ReviewScreen::Graph => panic!("expected changeset review screen"),
+            })
+            .expect("read changeset");
     }
 
     #[gpui::test]
@@ -625,9 +770,9 @@ mod tests {
         let window = cx.add_window(App::new);
 
         window
-            .update(cx, |app, _window, cx| {
+            .update(cx, |app, window, cx| {
                 app.select_single_commit("selected-sha".to_string(), cx);
-                app.open_changeset(cx);
+                app.open_changeset(window, cx);
                 app.close_changeset(cx);
 
                 assert_eq!(app.review_screen, ReviewScreen::Graph);
@@ -645,24 +790,26 @@ mod tests {
     async fn dispatching_open_and_close_changeset_actions_updates_review_screen(
         cx: &mut TestAppContext,
     ) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
         let window = cx.add_window(App::new);
 
         window
-            .update(cx, |app, _window, cx| {
-                app.select_single_commit("selected-sha".to_string(), cx);
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex.clone(), cx);
             })
             .expect("select commit");
 
         cx.dispatch_action(*window, OpenChangeset);
 
         window
-            .read_with(cx, |app, _cx| {
-                assert_eq!(
-                    app.review_screen,
-                    ReviewScreen::Changeset {
-                        sha: "selected-sha".to_string(),
-                    },
-                );
+            .read_with(cx, |app, _cx| match &app.review_screen {
+                ReviewScreen::Changeset { sha, changeset } => {
+                    assert_eq!(sha, &oid_hex);
+                    assert_eq!(changeset.files.len(), 1);
+                }
+                ReviewScreen::Graph => panic!("expected changeset review screen"),
             })
             .expect("read open changeset state");
 
@@ -674,7 +821,7 @@ mod tests {
                 assert_eq!(
                     app.selection,
                     Selection::Single {
-                        sha: "selected-sha".to_string(),
+                        sha: oid_hex.clone(),
                     },
                 );
             })
@@ -704,15 +851,18 @@ mod tests {
         visual.simulate_click(open_bounds.center(), Modifiers::none());
 
         window
-            .read_with(cx, |app, _cx| {
-                assert_eq!(
-                    app.review_screen,
-                    ReviewScreen::Changeset {
-                        sha: oid_hex.clone(),
-                    },
-                );
+            .read_with(cx, |app, _cx| match &app.review_screen {
+                ReviewScreen::Changeset { sha, changeset } => {
+                    assert_eq!(sha, &oid_hex);
+                    assert_eq!(changeset.files.len(), 1);
+                }
+                ReviewScreen::Graph => panic!("expected changeset review screen"),
             })
             .expect("read opened review state");
+
+        visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
 
         let close_bounds = visual
             .debug_bounds("close-changeset")
@@ -772,6 +922,33 @@ mod tests {
                 assert_eq!(app.selection, Selection::None);
             })
             .expect("read cleared state");
+    }
+
+    #[gpui::test]
+    async fn clicking_open_changeset_renders_changed_files(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+            })
+            .expect("open repo and select commit");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let open_bounds = visual
+            .debug_bounds("open-changeset")
+            .expect("open changeset debug bounds");
+
+        visual.simulate_click(open_bounds.center(), Modifiers::none());
+
+        visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
     }
 
     #[gpui::test]

@@ -2,7 +2,7 @@
 
 pub mod common;
 
-use greviewer::repo::{open_at, OpenError};
+use greviewer::repo::{changeset_for_single_commit, open_at, ChangeKind, OpenError};
 
 #[test]
 fn open_at_reads_the_two_commits_fixture() {
@@ -22,6 +22,25 @@ fn open_at_reads_the_two_commits_fixture() {
     assert!(!snapshot.commits[0].sha.is_empty());
     assert!(!snapshot.commits[0].author.is_empty());
     assert!(!snapshot.commits[0].authored_date.is_empty());
+}
+
+#[test]
+fn changeset_for_fixture_head_lists_modified_hello_file() {
+    let dir = common::load_fixture("two-commits");
+    let snapshot = open_at(dir.path()).expect("open succeeds");
+
+    let changeset =
+        changeset_for_single_commit(dir.path(), &snapshot.commits[0].sha).expect("changeset");
+
+    assert_eq!(changeset.commit_sha, snapshot.commits[0].sha);
+    assert_eq!(
+        changeset.base_sha.as_deref(),
+        Some(snapshot.commits[1].sha.as_str()),
+    );
+    assert_eq!(changeset.files.len(), 1);
+    assert_eq!(changeset.files[0].path, "hello.txt");
+    assert_eq!(changeset.files[0].old_path, None);
+    assert_eq!(changeset.files[0].kind, ChangeKind::Modified);
 }
 
 #[test]

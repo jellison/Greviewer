@@ -7,10 +7,11 @@
 pub mod common;
 
 use common::QueuedPathPicker;
-use gpui::TestAppContext;
+use gpui::{Modifiers, TestAppContext, VisualTestContext};
 use greviewer::app::{
     bind_app_keys, App, Mode, PathPickerOutcome, ReviewScreen, Selection, OPEN_REPOSITORY_KEYSTROKE,
 };
+use greviewer::repo::ChangeKind;
 
 #[gpui::test]
 async fn boots_to_the_placeholder(cx: &mut TestAppContext) {
@@ -52,4 +53,30 @@ async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
             Mode::NoRepo => panic!("expected RepoOpen, got NoRepo"),
         })
         .expect("read window");
+
+    let mut visual = VisualTestContext::from_window(*window, cx);
+    let row_bounds = visual
+        .debug_bounds("commit-row-0")
+        .expect("commit row debug bounds");
+    visual.simulate_click(row_bounds.center(), Modifiers::none());
+
+    let open_bounds = visual
+        .debug_bounds("open-changeset")
+        .expect("open changeset debug bounds");
+    visual.simulate_click(open_bounds.center(), Modifiers::none());
+
+    visual
+        .debug_bounds("changed-file-row-0")
+        .expect("changed file row debug bounds");
+
+    window
+        .read_with(cx, |app, _cx| match &app.review_screen {
+            ReviewScreen::Changeset { changeset, .. } => {
+                assert_eq!(changeset.files.len(), 1);
+                assert_eq!(changeset.files[0].path, "hello.txt");
+                assert_eq!(changeset.files[0].kind, ChangeKind::Modified);
+            }
+            ReviewScreen::Graph => panic!("expected changeset review screen"),
+        })
+        .expect("read changeset state");
 }

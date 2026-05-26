@@ -36,10 +36,38 @@ pub struct CommitInfo {
     pub is_head: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeSet {
+    pub commit_sha: String,
+    pub base_sha: Option<String>,
+    pub files: Vec<ChangedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedFile {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub kind: ChangeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+}
+
 #[derive(Debug)]
 pub enum OpenError {
     NotARepository,
     Io(io::Error),
+    Git(git2::Error),
+}
+
+#[derive(Debug)]
+pub enum ChangeSetError {
+    Open(OpenError),
     Git(git2::Error),
 }
 
@@ -63,6 +91,24 @@ impl std::error::Error for OpenError {
     }
 }
 
+impl fmt::Display for ChangeSetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChangeSetError::Open(err) => write!(f, "{err}"),
+            ChangeSetError::Git(err) => write!(f, "Couldn't read that changeset: {err}."),
+        }
+    }
+}
+
+impl std::error::Error for ChangeSetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ChangeSetError::Open(err) => Some(err),
+            ChangeSetError::Git(err) => Some(err),
+        }
+    }
+}
+
 pub fn open_at(path: &Path) -> Result<OpenRepository, OpenError> {
     let canonical = path.canonicalize().map_err(OpenError::Io)?;
 
@@ -76,6 +122,59 @@ pub fn open_at(path: &Path) -> Result<OpenRepository, OpenError> {
         path: canonical,
         head,
         commits,
+    })
+}
+
+pub fn changeset_for_single_commit(path: &Path, sha: &str) -> Result<ChangeSet, ChangeSetError> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|err| ChangeSetError::Open(OpenError::Io(err)))?;
+    let repo = git2::Repository::open(&canonical)
+        .map_err(classify_open_error)
+        .map_err(ChangeSetError::Open)?;
+    let oid = git2::Oid::from_str(sha).map_err(ChangeSetError::Git)?;
+    let commit = repo.find_commit(oid).map_err(ChangeSetError::Git)?;
+    let commit_tree = commit.tree().map_err(ChangeSetError::Git)?;
+    let base_commit = if commit.parent_count() > 0 {
+        Some(commit.parent(0).map_err(ChangeSetError::Git)?)
+    } else {
+        None
+    };
+    let base_sha = base_commit.as_ref().map(|commit| commit.id().to_string());
+    let base_tree = base_commit
+        .as_ref()
+        .map(|commit| commit.tree())
+        .transpose()
+        .map_err(ChangeSetError::Git)?;
+
+    let mut diff_options = git2::DiffOptions::new();
+    let mut diff = repo
+        .diff_tree_to_tree(
+            base_tree.as_ref(),
+            Some(&commit_tree),
+            Some(&mut diff_options),
+        )
+        .map_err(ChangeSetError::Git)?;
+
+    let mut find_options = git2::DiffFindOptions::new();
+    find_options.renames(true);
+    diff.find_similar(Some(&mut find_options))
+        .map_err(ChangeSetError::Git)?;
+
+    let mut files = diff
+        .deltas()
+        .filter_map(changed_file_from_delta)
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.old_path.cmp(&right.old_path))
+    });
+
+    Ok(ChangeSet {
+        commit_sha: commit.id().to_string(),
+        base_sha,
+        files,
     })
 }
 
@@ -152,6 +251,40 @@ fn short_sha(oid: git2::Oid) -> String {
     oid.to_string().chars().take(7).collect()
 }
 
+fn changed_file_from_delta(delta: git2::DiffDelta<'_>) -> Option<ChangedFile> {
+    match delta.status() {
+        git2::Delta::Added | git2::Delta::Copied => Some(ChangedFile {
+            path: diff_path(delta.new_file())?,
+            old_path: None,
+            kind: ChangeKind::Added,
+        }),
+        git2::Delta::Deleted => Some(ChangedFile {
+            path: diff_path(delta.old_file())?,
+            old_path: None,
+            kind: ChangeKind::Deleted,
+        }),
+        git2::Delta::Modified | git2::Delta::Typechange => Some(ChangedFile {
+            path: diff_path(delta.new_file())?,
+            old_path: None,
+            kind: ChangeKind::Modified,
+        }),
+        git2::Delta::Renamed => Some(ChangedFile {
+            path: diff_path(delta.new_file())?,
+            old_path: Some(diff_path(delta.old_file())?),
+            kind: ChangeKind::Renamed,
+        }),
+        git2::Delta::Unmodified
+        | git2::Delta::Ignored
+        | git2::Delta::Untracked
+        | git2::Delta::Unreadable
+        | git2::Delta::Conflicted => None,
+    }
+}
+
+fn diff_path(file: git2::DiffFile<'_>) -> Option<String> {
+    file.path().map(|path| path.to_string_lossy().into_owned())
+}
+
 fn format_authored_date(time: git2::Time) -> String {
     let local_seconds = time
         .seconds()
@@ -183,7 +316,7 @@ fn civil_from_unix_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
 mod tests {
     use super::*;
     use git2::{IndexAddOption, Repository, Signature};
-    use std::fs;
+    use std::{fs, path::Path};
     use tempfile::TempDir;
 
     fn init_repo_with_one_commit() -> (TempDir, String) {
@@ -224,6 +357,37 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         Repository::init(dir.path()).expect("init repo");
         dir
+    }
+
+    fn commit_workdir(repo: &Repository, message: &str, parent_oids: &[git2::Oid]) -> String {
+        let mut index = repo.index().expect("open index");
+        index
+            .add_all(["*"], IndexAddOption::DEFAULT, None)
+            .expect("stage files");
+        index.write().expect("write index");
+        let tree_oid = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+
+        let signature =
+            Signature::now("Greviewer Tests", "tests@greviewer.invalid").expect("create signature");
+        let parents = parent_oids
+            .iter()
+            .map(|oid| repo.find_commit(*oid).expect("find parent"))
+            .collect::<Vec<_>>();
+        let parent_refs = parents.iter().collect::<Vec<_>>();
+
+        let oid = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &parent_refs,
+            )
+            .expect("create commit");
+
+        oid.to_string()
     }
 
     #[test]
@@ -274,6 +438,89 @@ mod tests {
         let date = format_authored_date(git2::Time::new(0, 0));
 
         assert_eq!(date, "1970-01-01");
+    }
+
+    #[test]
+    fn changeset_for_root_commit_lists_added_files() {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+
+        let changeset = changeset_for_single_commit(dir.path(), &oid_hex).expect("changeset");
+
+        assert_eq!(changeset.commit_sha, oid_hex);
+        assert_eq!(changeset.base_sha, None);
+        assert_eq!(
+            changeset.files,
+            vec![ChangedFile {
+                path: "hello.txt".to_string(),
+                old_path: None,
+                kind: ChangeKind::Added,
+            }],
+        );
+    }
+
+    #[test]
+    fn changeset_for_commit_lists_deleted_files() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("obsolete.txt"), "obsolete\n").expect("write file");
+        let root_oid = git2::Oid::from_str(&commit_workdir(&repo, "Add obsolete.txt", &[]))
+            .expect("parse root oid");
+
+        fs::remove_file(dir.path().join("obsolete.txt")).expect("delete file");
+        let mut index = repo.index().expect("open index");
+        index
+            .remove_path(Path::new("obsolete.txt"))
+            .expect("stage deletion");
+        index.write().expect("write index");
+        drop(index);
+
+        let delete_oid = commit_workdir(&repo, "Delete obsolete.txt", &[root_oid]);
+
+        let changeset = changeset_for_single_commit(dir.path(), &delete_oid).expect("changeset");
+
+        assert_eq!(
+            changeset.files,
+            vec![ChangedFile {
+                path: "obsolete.txt".to_string(),
+                old_path: None,
+                kind: ChangeKind::Deleted,
+            }],
+        );
+    }
+
+    #[test]
+    fn changeset_for_commit_lists_renamed_files() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("old.txt"), "same content\n").expect("write old file");
+        let root_oid = git2::Oid::from_str(&commit_workdir(&repo, "Add old.txt", &[]))
+            .expect("parse root oid");
+
+        fs::rename(dir.path().join("old.txt"), dir.path().join("new.txt")).expect("rename file");
+        let mut index = repo.index().expect("open index");
+        index
+            .remove_path(Path::new("old.txt"))
+            .expect("stage old path removal");
+        index
+            .add_path(Path::new("new.txt"))
+            .expect("stage new path");
+        index.write().expect("write index");
+        drop(index);
+
+        let rename_oid = commit_workdir(&repo, "Rename old.txt", &[root_oid]);
+
+        let changeset = changeset_for_single_commit(dir.path(), &rename_oid).expect("changeset");
+
+        assert_eq!(
+            changeset.files,
+            vec![ChangedFile {
+                path: "new.txt".to_string(),
+                old_path: Some("old.txt".to_string()),
+                kind: ChangeKind::Renamed,
+            }],
+        );
     }
 
     #[test]
