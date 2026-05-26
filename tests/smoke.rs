@@ -82,6 +82,12 @@ async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
     visual
         .debug_bounds("file-diff-side-new")
         .expect("new file diff side debug bounds");
+    visual
+        .debug_bounds("file-diff-row-removed")
+        .expect("removed line row debug bounds");
+    visual
+        .debug_bounds("file-diff-row-added")
+        .expect("added line row debug bounds");
 
     window
         .read_with(cx, |app, _cx| match &app.review_screen {

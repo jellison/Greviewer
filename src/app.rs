@@ -11,11 +11,12 @@ pub use path_picker::{repository_prompt_options, GpuiPathPicker, PathPicker, Pat
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, div, px, rgb, AnyElement, AppContext, Context, Entity, EventEmitter, FocusHandle,
-    InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled,
-    Window,
+    actions, div, point, px, rgb, AnyElement, AppContext, Context, Entity, EventEmitter,
+    FocusHandle, InteractiveElement, IntoElement, ParentElement, Render, ScrollHandle,
+    StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::notification::{Notification, NotificationList};
+use similar::{DiffTag, TextDiff};
 use std::path::PathBuf;
 
 use crate::repo;
@@ -29,7 +30,35 @@ pub struct App {
     pub selected_changed_file_path: Option<String>,
     notifications: Entity<NotificationList>,
     path_picker: Box<dyn PathPicker>,
+    file_diff_scroll: FileDiffScroll,
     focus_handle: FocusHandle,
+}
+
+struct FileDiffScroll {
+    old: ScrollHandle,
+    new: ScrollHandle,
+}
+
+impl FileDiffScroll {
+    fn new() -> Self {
+        Self {
+            old: ScrollHandle::new(),
+            new: ScrollHandle::new(),
+        }
+    }
+
+    fn handle_for(&self, side: repo::DiffSide) -> &ScrollHandle {
+        match side {
+            repo::DiffSide::Old => &self.old,
+            repo::DiffSide::New => &self.new,
+        }
+    }
+
+    fn reset(&self) {
+        let origin = point(px(0.), px(0.));
+        self.old.set_offset(origin);
+        self.new.set_offset(origin);
+    }
 }
 
 pub enum Mode {
@@ -86,6 +115,7 @@ impl App {
             selected_changed_file_path: None,
             notifications,
             path_picker,
+            file_diff_scroll: FileDiffScroll::new(),
             focus_handle,
         }
     }
@@ -141,6 +171,7 @@ impl App {
                 self.selection = Selection::None;
                 self.review_screen = ReviewScreen::Graph;
                 self.selected_changed_file_path = None;
+                self.file_diff_scroll.reset();
                 cx.notify();
             }
             Err(err) => {
@@ -190,6 +221,7 @@ impl App {
     }
 
     fn select_changed_file(&mut self, path: String, cx: &mut Context<Self>) {
+        self.file_diff_scroll.reset();
         self.selected_changed_file_path = Some(path);
         cx.notify();
     }
@@ -205,6 +237,16 @@ impl App {
     #[cfg(test)]
     pub(crate) fn notification_count(&self, cx: &gpui::App) -> usize {
         self.notifications.read(cx).notifications().len()
+    }
+
+    #[cfg(test)]
+    fn file_diff_new_scroll_offset(&self) -> gpui::Point<gpui::Pixels> {
+        self.file_diff_scroll.new.offset()
+    }
+
+    #[cfg(test)]
+    fn file_diff_new_scroll_max_offset(&self) -> gpui::Size<gpui::Pixels> {
+        self.file_diff_scroll.new.max_offset()
     }
 
     fn render_no_repo(&self) -> gpui::Div {
@@ -416,12 +458,14 @@ impl App {
             div()
                 .flex()
                 .flex_1()
+                .min_h_0()
                 .child(
                     div()
                         .flex()
                         .flex_col()
                         .w(px(340.))
                         .h_full()
+                        .min_h_0()
                         .id("changed-files")
                         .overflow_y_scroll()
                         .border_1()
@@ -556,7 +600,7 @@ impl App {
                 let title = file.path.clone();
                 let kind = change_kind_label(file.kind);
                 let content = match repo::file_diff_for_changed_file(&repo.path, sha, file) {
-                    Ok(diff) => render_file_diff_content(diff.content),
+                    Ok(diff) => render_file_diff_content(diff.content, &self.file_diff_scroll),
                     Err(err) => render_file_diff_error(err.to_string()),
                 };
 
@@ -565,6 +609,8 @@ impl App {
                     .flex_col()
                     .flex_1()
                     .h_full()
+                    .min_h_0()
+                    .overflow_hidden()
                     .id("file-detail-shell")
                     .debug_selector(|| "file-detail-shell".to_string())
                     .px_4()
@@ -701,7 +747,7 @@ impl App {
     }
 }
 
-fn render_file_diff_content(content: repo::FileDiffContent) -> AnyElement {
+fn render_file_diff_content(content: repo::FileDiffContent, scroll: &FileDiffScroll) -> AnyElement {
     match content {
         repo::FileDiffContent::Single { side, text } => {
             let label = match side {
@@ -712,24 +758,41 @@ fn render_file_diff_content(content: repo::FileDiffContent) -> AnyElement {
                 repo::DiffSide::Old => "file-diff-side-old",
                 repo::DiffSide::New => "file-diff-side-new",
             };
+            let cells = single_side_diff_rows(side, &text)
+                .into_iter()
+                .map(|row| match side {
+                    repo::DiffSide::Old => row.old,
+                    repo::DiffSide::New => row.new,
+                })
+                .collect::<Vec<_>>();
 
-            render_file_diff_side(label, selector, text).into_any_element()
+            render_file_diff_side(label, selector, cells, scroll.handle_for(side))
+                .into_any_element()
         }
-        repo::FileDiffContent::SideBySide { old_text, new_text } => div()
-            .flex()
-            .flex_1()
-            .gap_3()
-            .child(render_file_diff_side(
-                "Before",
-                "file-diff-side-old",
-                old_text,
-            ))
-            .child(render_file_diff_side(
-                "After",
-                "file-diff-side-new",
-                new_text,
-            ))
-            .into_any_element(),
+        repo::FileDiffContent::SideBySide { old_text, new_text } => {
+            let rows = side_by_side_diff_rows(&old_text, &new_text);
+            let old_cells = rows.iter().map(|row| row.old.clone()).collect::<Vec<_>>();
+            let new_cells = rows.into_iter().map(|row| row.new).collect::<Vec<_>>();
+
+            div()
+                .flex()
+                .flex_1()
+                .gap_3()
+                .min_h_0()
+                .child(render_file_diff_side(
+                    "Before",
+                    "file-diff-side-old",
+                    old_cells,
+                    &scroll.old,
+                ))
+                .child(render_file_diff_side(
+                    "After",
+                    "file-diff-side-new",
+                    new_cells,
+                    &scroll.new,
+                ))
+                .into_any_element()
+        }
         repo::FileDiffContent::Binary => div()
             .flex()
             .flex_1()
@@ -764,12 +827,139 @@ fn render_file_diff_error(message: String) -> AnyElement {
         .into_any_element()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffLineStatus {
+    Unchanged,
+    Added,
+    Removed,
+    Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffLineCell {
+    line_number: Option<usize>,
+    text: String,
+    status: DiffLineStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffRow {
+    old: DiffLineCell,
+    new: DiffLineCell,
+}
+
+fn single_side_diff_rows(side: repo::DiffSide, text: &str) -> Vec<DiffRow> {
+    let status = match side {
+        repo::DiffSide::Old => DiffLineStatus::Removed,
+        repo::DiffSide::New => DiffLineStatus::Added,
+    };
+
+    content_lines(text)
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let visible = DiffLineCell {
+                line_number: Some(index + 1),
+                text: line,
+                status,
+            };
+
+            match side {
+                repo::DiffSide::Old => DiffRow {
+                    old: visible,
+                    new: empty_diff_cell(),
+                },
+                repo::DiffSide::New => DiffRow {
+                    old: empty_diff_cell(),
+                    new: visible,
+                },
+            }
+        })
+        .collect()
+}
+
+fn side_by_side_diff_rows(old_text: &str, new_text: &str) -> Vec<DiffRow> {
+    let diff = TextDiff::from_lines(old_text, new_text);
+    let old_lines = diff.old_slices();
+    let new_lines = diff.new_slices();
+    let mut rows = Vec::new();
+
+    for op in diff.ops() {
+        match op.tag() {
+            DiffTag::Equal => {
+                for (old_index, new_index) in op.old_range().zip(op.new_range()) {
+                    rows.push(DiffRow {
+                        old: diff_cell(old_index, old_lines[old_index], DiffLineStatus::Unchanged),
+                        new: diff_cell(new_index, new_lines[new_index], DiffLineStatus::Unchanged),
+                    });
+                }
+            }
+            DiffTag::Delete => {
+                for old_index in op.old_range() {
+                    rows.push(DiffRow {
+                        old: diff_cell(old_index, old_lines[old_index], DiffLineStatus::Removed),
+                        new: empty_diff_cell(),
+                    });
+                }
+            }
+            DiffTag::Insert => {
+                for new_index in op.new_range() {
+                    rows.push(DiffRow {
+                        old: empty_diff_cell(),
+                        new: diff_cell(new_index, new_lines[new_index], DiffLineStatus::Added),
+                    });
+                }
+            }
+            DiffTag::Replace => {
+                let old_indices = op.old_range().collect::<Vec<_>>();
+                let new_indices = op.new_range().collect::<Vec<_>>();
+                let len = old_indices.len().max(new_indices.len());
+
+                for index in 0..len {
+                    let old = old_indices
+                        .get(index)
+                        .map(|old_index| {
+                            diff_cell(*old_index, old_lines[*old_index], DiffLineStatus::Removed)
+                        })
+                        .unwrap_or_else(empty_diff_cell);
+                    let new = new_indices
+                        .get(index)
+                        .map(|new_index| {
+                            diff_cell(*new_index, new_lines[*new_index], DiffLineStatus::Added)
+                        })
+                        .unwrap_or_else(empty_diff_cell);
+
+                    rows.push(DiffRow { old, new });
+                }
+            }
+        }
+    }
+
+    rows
+}
+
+fn diff_cell(line_index: usize, line: &str, status: DiffLineStatus) -> DiffLineCell {
+    DiffLineCell {
+        line_number: Some(line_index + 1),
+        text: trim_line_ending(line),
+        status,
+    }
+}
+
+fn empty_diff_cell() -> DiffLineCell {
+    DiffLineCell {
+        line_number: None,
+        text: String::new(),
+        status: DiffLineStatus::Empty,
+    }
+}
+
 fn render_file_diff_side(
     label: &'static str,
     selector: &'static str,
-    text: String,
+    cells: Vec<DiffLineCell>,
+    scroll_handle: &ScrollHandle,
 ) -> impl IntoElement {
-    let lines = diff_lines(&text);
     let scroll_selector = match selector {
         "file-diff-side-old" => "file-diff-side-old-scroll",
         "file-diff-side-new" => "file-diff-side-new-scroll",
@@ -781,6 +971,8 @@ fn render_file_diff_side(
         .flex_col()
         .flex_1()
         .h_full()
+        .min_h_0()
+        .overflow_hidden()
         .border_1()
         .border_color(rgb(0x2a2a2a))
         .bg(rgb(0x141414))
@@ -802,23 +994,51 @@ fn render_file_diff_side(
                 .flex()
                 .flex_col()
                 .flex_1()
+                .min_h_0()
                 .id(scroll_selector)
+                .debug_selector(move || scroll_selector.to_string())
                 .overflow_y_scroll()
+                .scrollbar_width(px(12.))
+                .track_scroll(scroll_handle)
                 .children(
-                    lines
+                    cells
                         .into_iter()
                         .enumerate()
-                        .map(|(index, line)| render_file_diff_line(index + 1, line))
+                        .map(|(index, cell)| render_file_diff_line(selector, index, cell))
                         .collect::<Vec<_>>(),
                 ),
         )
 }
 
-fn render_file_diff_line(line_number: usize, line: String) -> gpui::Div {
+fn render_file_diff_line(
+    pane_selector: &'static str,
+    row_index: usize,
+    cell: DiffLineCell,
+) -> impl IntoElement {
+    let line_number = cell
+        .line_number
+        .map(|line_number| line_number.to_string())
+        .unwrap_or_default();
+    let pane_offset = match pane_selector {
+        "file-diff-side-old" => 0,
+        "file-diff-side-new" => 1,
+        _ => 2,
+    };
+    let id_index = row_index * 3 + pane_offset;
+    let row_selector = diff_line_debug_selector(cell.status);
+    let row_bg = diff_line_background(cell.status);
+    let text_color = match cell.status {
+        DiffLineStatus::Empty => rgb(0x666666),
+        _ => rgb(0xe6e6e6),
+    };
+
     div()
         .flex()
         .items_start()
         .min_h(px(18.))
+        .bg(row_bg)
+        .id(("file-diff-line", id_index))
+        .debug_selector(move || row_selector.to_string())
         .child(
             div()
                 .w(px(48.))
@@ -826,25 +1046,47 @@ fn render_file_diff_line(line_number: usize, line: String) -> gpui::Div {
                 .text_color(rgb(0x666666))
                 .text_size(px(12.))
                 .font_family("monospace")
-                .child(line_number.to_string()),
+                .child(line_number),
         )
         .child(
             div()
                 .flex_1()
                 .px_2()
-                .text_color(rgb(0xe6e6e6))
+                .text_color(text_color)
                 .text_size(px(12.))
                 .font_family("monospace")
-                .child(line),
+                .child(cell.text),
         )
 }
 
-fn diff_lines(text: &str) -> Vec<String> {
+fn diff_line_debug_selector(status: DiffLineStatus) -> &'static str {
+    match status {
+        DiffLineStatus::Unchanged => "file-diff-row-unchanged",
+        DiffLineStatus::Added => "file-diff-row-added",
+        DiffLineStatus::Removed => "file-diff-row-removed",
+        DiffLineStatus::Empty => "file-diff-row-empty",
+    }
+}
+
+fn diff_line_background(status: DiffLineStatus) -> gpui::Rgba {
+    match status {
+        DiffLineStatus::Unchanged => rgb(0x141414),
+        DiffLineStatus::Added => rgb(0x132b1a),
+        DiffLineStatus::Removed => rgb(0x341b1b),
+        DiffLineStatus::Empty => rgb(0x101010),
+    }
+}
+
+fn content_lines(text: &str) -> Vec<String> {
     if text.is_empty() {
         return vec![String::new()];
     }
 
     text.lines().map(str::to_string).collect()
+}
+
+fn trim_line_ending(line: &str) -> String {
+    line.trim_end_matches(['\n', '\r']).to_string()
 }
 
 fn change_kind_label(kind: repo::ChangeKind) -> &'static str {
@@ -911,8 +1153,11 @@ impl Render for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, CloseChangeset, Mode, OpenChangeset, OpenFailed, ReviewScreen, Selection};
-    use crate::repo::ChangeKind;
+    use super::{
+        side_by_side_diff_rows, single_side_diff_rows, App, CloseChangeset, DiffLineStatus, Mode,
+        OpenChangeset, OpenFailed, ReviewScreen, Selection,
+    };
+    use crate::repo::{ChangeKind, DiffSide};
     use git2::{IndexAddOption, Repository, Signature};
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use std::fs;
@@ -959,6 +1204,27 @@ mod tests {
         (dir, update_oid.to_string())
     }
 
+    fn init_repo_with_long_diff() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        let old_text = (1..=160)
+            .map(|line| format!("old line {line:03}\n"))
+            .collect::<String>();
+        fs::write(dir.path().join("long.txt"), old_text).expect("write old file");
+        let root_oid = commit_all(&repo, "Add long file", &[]);
+
+        let new_text = (1..=160)
+            .map(|line| format!("new line {line:03}\n"))
+            .collect::<String>();
+        fs::write(dir.path().join("long.txt"), new_text).expect("write new file");
+        let update_oid = commit_all(&repo, "Update long file", &[root_oid]);
+
+        drop(repo);
+
+        (dir, update_oid.to_string())
+    }
+
     fn commit_all(repo: &Repository, message: &str, parents: &[git2::Oid]) -> git2::Oid {
         let mut index = repo.index().expect("open index");
         index
@@ -978,6 +1244,57 @@ mod tests {
 
         repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)
             .expect("create commit")
+    }
+
+    #[test]
+    fn line_diff_single_side_added_marks_lines_as_added() {
+        let rows = single_side_diff_rows(DiffSide::New, "first\nsecond\n");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].new.status, DiffLineStatus::Added);
+        assert_eq!(rows[0].new.line_number, Some(1));
+        assert_eq!(rows[0].new.text, "first");
+        assert_eq!(rows[0].old.status, DiffLineStatus::Empty);
+        assert_eq!(rows[1].new.status, DiffLineStatus::Added);
+    }
+
+    #[test]
+    fn line_diff_single_side_deleted_marks_lines_as_removed() {
+        let rows = single_side_diff_rows(DiffSide::Old, "first\nsecond\n");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].old.status, DiffLineStatus::Removed);
+        assert_eq!(rows[0].old.line_number, Some(1));
+        assert_eq!(rows[0].old.text, "first");
+        assert_eq!(rows[0].new.status, DiffLineStatus::Empty);
+        assert_eq!(rows[1].old.status, DiffLineStatus::Removed);
+    }
+
+    #[test]
+    fn line_diff_side_by_side_aligns_equal_removed_and_added_rows() {
+        let rows = side_by_side_diff_rows("same\nold\n", "same\nnew\n");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].old.status, DiffLineStatus::Unchanged);
+        assert_eq!(rows[0].new.status, DiffLineStatus::Unchanged);
+        assert_eq!(rows[0].old.text, "same");
+        assert_eq!(rows[0].new.text, "same");
+        assert_eq!(rows[1].old.status, DiffLineStatus::Removed);
+        assert_eq!(rows[1].new.status, DiffLineStatus::Added);
+        assert_eq!(rows[1].old.text, "old");
+        assert_eq!(rows[1].new.text, "new");
+    }
+
+    #[test]
+    fn line_diff_side_by_side_pads_uneven_replacements() {
+        let rows = side_by_side_diff_rows("one\ntwo\n", "one\nalpha\nbeta\n");
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].old.status, DiffLineStatus::Removed);
+        assert_eq!(rows[1].new.status, DiffLineStatus::Added);
+        assert_eq!(rows[2].old.status, DiffLineStatus::Empty);
+        assert_eq!(rows[2].new.status, DiffLineStatus::Added);
+        assert_eq!(rows[2].new.text, "beta");
     }
 
     #[gpui::test]
@@ -1424,6 +1741,91 @@ mod tests {
         visual
             .debug_bounds("file-diff-side-new")
             .expect("new file diff side debug bounds");
+    }
+
+    #[gpui::test]
+    async fn clicking_changed_file_renders_line_highlights(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_two_commits();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+            })
+            .expect("open repo and select commit");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let open_bounds = visual
+            .debug_bounds("open-changeset")
+            .expect("open changeset debug bounds");
+        visual.simulate_click(open_bounds.center(), Modifiers::none());
+
+        let row_bounds = visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+
+        visual
+            .debug_bounds("file-diff-row-removed")
+            .expect("removed line row debug bounds");
+        visual
+            .debug_bounds("file-diff-row-added")
+            .expect("added line row debug bounds");
+    }
+
+    #[gpui::test]
+    async fn scrolling_long_file_diff_moves_the_diff_scroll_area(cx: &mut TestAppContext) {
+        use gpui::{point, px, size, ScrollDelta, ScrollWheelEvent};
+
+        let (dir, oid_hex) = init_repo_with_long_diff();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.select_changed_file("long.txt".to_string(), cx);
+            })
+            .expect("open long diff");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(320.)));
+
+        let scroll_bounds = visual
+            .debug_bounds("file-diff-side-new-scroll")
+            .expect("new file diff scroll debug bounds");
+        let max_offset = window
+            .read_with(cx, |app, _cx| app.file_diff_new_scroll_max_offset())
+            .expect("read new diff scroll max offset");
+        assert!(
+            max_offset.height > px(0.),
+            "long diff should exceed the visible diff scroll area"
+        );
+
+        let before = window
+            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .expect("read new diff scroll offset before wheel");
+        visual.simulate_event(ScrollWheelEvent {
+            position: scroll_bounds.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-240.))),
+            ..Default::default()
+        });
+        let after = window
+            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .expect("read new diff scroll offset after wheel");
+
+        assert!(
+            after.y < before.y,
+            "wheel scroll should move the diff content upward"
+        );
     }
 
     #[gpui::test]
