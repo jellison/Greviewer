@@ -19,3 +19,7 @@ Hiding entries from the file tree that the reviewer has already marked as review
 ## AI-powered changeset context
 
 When a changeset is opened, surface AI-generated context to help the reviewer get oriented: a brief summary of the changes from a business-rules perspective, and a recommended order in which to review the files for the best understanding.
+
+## AI questions about selected diff code
+
+Let a reviewer select code in the diff viewer and ask an AI a focused question about that selection, such as "explain this" or "why did we do this?" Depends on text selection in the diff viewer, an AI provider integration, and a prompt context model that can include the selected lines, file path, and surrounding changes.
