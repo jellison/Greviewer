@@ -23,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::repo;
+use crate::{graph, repo};
 
 actions!(app, [OpenRepository, OpenChangeset, CloseChangeset]);
 
@@ -867,6 +867,21 @@ impl App {
                 .text_size(px(14.))
                 .child("This repository has no commits to review.")
         } else {
+            let graph_commits = repo
+                .commits
+                .iter()
+                .map(|commit| graph::GraphCommit {
+                    sha: commit.sha.clone(),
+                    parent_shas: commit.parent_shas.clone(),
+                })
+                .collect::<Vec<_>>();
+            let graph_rows = graph::layout_graph(&graph_commits);
+            let max_graph_lanes = graph_rows
+                .iter()
+                .map(|row| row.lane_count)
+                .max()
+                .unwrap_or(1);
+
             div()
                 .flex()
                 .flex_col()
@@ -876,11 +891,14 @@ impl App {
                 .children(
                     repo.commits
                         .iter()
+                        .zip(graph_rows.iter())
                         .enumerate()
-                        .map(|(index, commit)| {
+                        .map(|(index, (commit, graph_row))| {
                             self.render_commit_row(
                                 index,
                                 commit,
+                                graph_row,
+                                max_graph_lanes,
                                 self.is_commit_selected(&commit.sha),
                                 cx,
                             )
@@ -1473,6 +1491,8 @@ impl App {
         &self,
         index: usize,
         commit: &repo::CommitInfo,
+        graph_row: &graph::GraphRow,
+        max_graph_lanes: usize,
         selected: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1523,6 +1543,11 @@ impl App {
                     .font_family("monospace")
                     .child(marker),
             )
+            .child(render_commit_graph_gutter(
+                index,
+                graph_row,
+                max_graph_lanes,
+            ))
             .child(
                 div()
                     .w(px(72.))
@@ -1551,6 +1576,64 @@ impl App {
                     ),
             )
     }
+}
+
+fn render_commit_graph_gutter(
+    row_index: usize,
+    row: &graph::GraphRow,
+    max_lanes: usize,
+) -> impl IntoElement {
+    let lane_count = max_lanes.max(1);
+    let debug_selector = format!("commit-graph-gutter-{row_index}");
+
+    div()
+        .flex()
+        .items_center()
+        .w(px((lane_count as f32 * 14.).max(28.)))
+        .font_family("monospace")
+        .id(("commit-graph-gutter", row_index))
+        .debug_selector(move || debug_selector.clone())
+        .children(
+            (0..lane_count)
+                .map(|lane| render_commit_graph_lane(row_index, lane, row))
+                .collect::<Vec<_>>(),
+        )
+}
+
+fn render_commit_graph_lane(row_index: usize, lane: usize, row: &graph::GraphRow) -> gpui::Div {
+    let is_commit = lane == row.lane;
+    let is_active = row.active_lanes.contains(&lane);
+    let is_parent = row.parent_lanes.contains(&lane);
+    let glyph = if is_commit {
+        "o"
+    } else if is_active || is_parent {
+        "|"
+    } else {
+        " "
+    };
+    let color = if is_commit {
+        rgb(0xa3e635)
+    } else if is_parent {
+        rgb(0x60a5fa)
+    } else {
+        rgb(0x555555)
+    };
+    let debug_selector = if is_commit {
+        format!("commit-graph-dot-{row_index}")
+    } else {
+        format!("commit-graph-lane-{row_index}-{lane}")
+    };
+
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(14.))
+        .h(px(28.))
+        .text_size(px(12.))
+        .text_color(color)
+        .debug_selector(move || debug_selector.clone())
+        .child(glyph)
 }
 
 fn render_file_diff_content(content: repo::FileDiffContent, scroll: &FileDiffScroll) -> AnyElement {
@@ -2644,6 +2727,41 @@ mod tests {
                 assert_eq!(app.selection, Selection::Single { sha: left_sha });
             })
             .expect("attempt invalid range selection");
+    }
+
+    #[gpui::test]
+    async fn commit_graph_renders_merge_lanes(cx: &mut TestAppContext) {
+        let (dir, _left_sha, _right_sha) = init_repo_with_diverged_history();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected repo open mode");
+                };
+                assert_eq!(repo.commits[0].parent_shas.len(), 2);
+            })
+            .expect("read merge commit");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("commit-graph-gutter-0")
+            .expect("merge commit graph gutter debug bounds");
+        visual
+            .debug_bounds("commit-graph-dot-0")
+            .expect("merge commit graph dot debug bounds");
+        visual
+            .debug_bounds("commit-graph-lane-0-1")
+            .expect("merge commit second parent lane debug bounds");
     }
 
     #[gpui::test]

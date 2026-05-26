@@ -33,6 +33,7 @@ pub struct CommitInfo {
     pub author: String,
     pub authored_timestamp: i64,
     pub authored_date: String,
+    pub parent_shas: Vec<String>,
     pub parent_count: usize,
     pub is_head: bool,
 }
@@ -544,6 +545,10 @@ fn commit_info_from_commit(commit: &git2::Commit<'_>, head_oid: Option<git2::Oid
         Some(name) if !name.is_empty() => name.to_string(),
         _ => "Unknown author".to_string(),
     };
+    let parent_shas = commit
+        .parent_ids()
+        .map(|parent_oid| parent_oid.to_string())
+        .collect();
 
     CommitInfo {
         short_sha: short_sha(commit.id()),
@@ -552,6 +557,7 @@ fn commit_info_from_commit(commit: &git2::Commit<'_>, head_oid: Option<git2::Oid
         author,
         authored_timestamp: commit.time().seconds(),
         authored_date: format_authored_date(commit.time()),
+        parent_shas,
         parent_count: commit.parent_count(),
         is_head: Some(commit.id()) == head_oid,
     }
@@ -722,6 +728,29 @@ mod tests {
         assert_eq!(snapshot.commits[0].sha, oid_hex);
         assert_eq!(snapshot.commits[0].summary, "Add hello.txt");
         assert!(snapshot.commits[0].is_head);
+    }
+
+    #[test]
+    fn open_at_returns_commit_parent_shas() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("history.txt"), "root\n").expect("write root file");
+        let root_oid =
+            git2::Oid::from_str(&commit_workdir(&repo, "Root", &[])).expect("parse root oid");
+
+        fs::write(dir.path().join("history.txt"), "tip\n").expect("write tip file");
+        let tip_oid =
+            git2::Oid::from_str(&commit_workdir(&repo, "Tip", &[root_oid])).expect("parse tip oid");
+
+        drop(repo);
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+
+        assert_eq!(snapshot.commits[0].sha, tip_oid.to_string());
+        assert_eq!(snapshot.commits[0].parent_shas, vec![root_oid.to_string()]);
+        assert_eq!(snapshot.commits[1].sha, root_oid.to_string());
+        assert!(snapshot.commits[1].parent_shas.is_empty());
     }
 
     #[test]

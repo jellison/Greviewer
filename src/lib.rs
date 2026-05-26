@@ -6,6 +6,7 @@ use gpui::{
 };
 
 pub mod app;
+pub mod graph;
 pub mod repo;
 
 pub fn run() {
