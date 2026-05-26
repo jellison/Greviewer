@@ -51,6 +51,11 @@ pub struct ChangedFile {
     pub kind: ChangeKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryFile {
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
     Added,
@@ -71,6 +76,18 @@ pub struct FileDiff {
 pub enum FileDiffContent {
     Single { side: DiffSide, text: String },
     SideBySide { old_text: String, new_text: String },
+    Binary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileContent {
+    pub path: String,
+    pub content: FileContentBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileContentBody {
+    Text(String),
     Binary,
 }
 
@@ -303,6 +320,49 @@ pub fn file_diff_for_changed_file_between(
     let repo = open_changeset_repository(path)?;
 
     file_diff_for_changed_file_in_repo(&repo, target_sha, base_sha, file)
+}
+
+pub fn files_at_commit(path: &Path, sha: &str) -> Result<Vec<RepositoryFile>, ChangeSetError> {
+    let repo = open_changeset_repository(path)?;
+    let oid = git2::Oid::from_str(sha).map_err(ChangeSetError::Git)?;
+    let commit = repo.find_commit(oid).map_err(ChangeSetError::Git)?;
+    let tree = commit.tree().map_err(ChangeSetError::Git)?;
+    let mut files = Vec::new();
+
+    tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+        if entry.kind() == Some(git2::ObjectType::Blob) {
+            let name = String::from_utf8_lossy(entry.name_bytes());
+            files.push(RepositoryFile {
+                path: format!("{root}{name}"),
+            });
+        }
+
+        git2::TreeWalkResult::Ok
+    })
+    .map_err(ChangeSetError::Git)?;
+
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
+pub fn file_content_at_commit(
+    path: &Path,
+    sha: &str,
+    file_path: &str,
+) -> Result<FileContent, ChangeSetError> {
+    let repo = open_changeset_repository(path)?;
+    let oid = git2::Oid::from_str(sha).map_err(ChangeSetError::Git)?;
+    let commit = repo.find_commit(oid).map_err(ChangeSetError::Git)?;
+    let tree = commit.tree().map_err(ChangeSetError::Git)?;
+    let content = match read_text_blob(&repo, &tree, file_path)? {
+        Some(text) => FileContentBody::Text(text),
+        None => FileContentBody::Binary,
+    };
+
+    Ok(FileContent {
+        path: file_path.to_string(),
+        content,
+    })
 }
 
 fn file_diff_for_changed_file_in_repo(
@@ -757,6 +817,57 @@ mod tests {
                 old_text: "before\n".to_string(),
                 new_text: "after\n".to_string(),
             },
+        );
+    }
+
+    #[test]
+    fn files_at_commit_lists_repository_tree_at_that_commit() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("changed.txt"), "before\n").expect("write changed file");
+        fs::create_dir_all(dir.path().join("docs")).expect("create docs dir");
+        fs::write(dir.path().join("docs/context.txt"), "context\n").expect("write context file");
+        let root_oid =
+            git2::Oid::from_str(&commit_workdir(&repo, "Initial", &[])).expect("parse root oid");
+
+        fs::write(dir.path().join("changed.txt"), "after\n").expect("update changed file");
+        let tip_sha = commit_workdir(&repo, "Update changed file", &[root_oid]);
+
+        let files = files_at_commit(dir.path(), &tip_sha).expect("files at commit");
+
+        assert_eq!(
+            files,
+            vec![
+                RepositoryFile {
+                    path: "changed.txt".to_string(),
+                },
+                RepositoryFile {
+                    path: "docs/context.txt".to_string(),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn file_content_at_commit_reads_text_from_that_commit() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("context.txt"), "before\n").expect("write context file");
+        let root_oid =
+            git2::Oid::from_str(&commit_workdir(&repo, "Initial", &[])).expect("parse root oid");
+
+        fs::write(dir.path().join("context.txt"), "after\n").expect("update context file");
+        let tip_sha = commit_workdir(&repo, "Update context file", &[root_oid]);
+
+        let content =
+            file_content_at_commit(dir.path(), &tip_sha, "context.txt").expect("file content");
+
+        assert_eq!(content.path, "context.txt");
+        assert_eq!(
+            content.content,
+            FileContentBody::Text("after\n".to_string()),
         );
     }
 

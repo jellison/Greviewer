@@ -28,6 +28,7 @@ pub struct App {
     pub selection: Selection,
     pub review_screen: ReviewScreen,
     pub selected_changed_file_path: Option<String>,
+    pub file_list_mode: FileListMode,
     notifications: Entity<NotificationList>,
     path_picker: Box<dyn PathPicker>,
     file_diff_scroll: FileDiffScroll,
@@ -91,6 +92,27 @@ pub enum ReviewScreen {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileListMode {
+    Changed,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileListEntry {
+    Changed(repo::ChangedFile),
+    Unchanged(repo::RepositoryFile),
+}
+
+impl FileListEntry {
+    fn path(&self) -> &str {
+        match self {
+            FileListEntry::Changed(file) => &file.path,
+            FileListEntry::Unchanged(file) => &file.path,
+        }
+    }
+}
+
 /// Emitted whenever `open_repository_at` fails. Carries the user-facing
 /// message that was pushed onto the notification list. Tests subscribe to
 /// this event to verify the error path because `gpui-component`'s
@@ -123,6 +145,7 @@ impl App {
             selection: Selection::None,
             review_screen: ReviewScreen::Graph,
             selected_changed_file_path: None,
+            file_list_mode: FileListMode::Changed,
             notifications,
             path_picker,
             file_diff_scroll: FileDiffScroll::new(),
@@ -181,6 +204,7 @@ impl App {
                 self.selection = Selection::None;
                 self.review_screen = ReviewScreen::Graph;
                 self.selected_changed_file_path = None;
+                self.file_list_mode = FileListMode::Changed;
                 self.file_diff_scroll.reset();
                 cx.notify();
             }
@@ -323,6 +347,15 @@ impl App {
         cx.notify();
     }
 
+    fn set_file_list_mode(&mut self, mode: FileListMode, cx: &mut Context<Self>) {
+        if self.file_list_mode == mode {
+            return;
+        }
+
+        self.file_list_mode = mode;
+        cx.notify();
+    }
+
     fn is_commit_selected(&self, sha: &str) -> bool {
         match &self.selection {
             Selection::Single { sha: selected_sha } => selected_sha == sha,
@@ -331,8 +364,8 @@ impl App {
         }
     }
 
-    fn is_changed_file_selected(&self, file: &repo::ChangedFile) -> bool {
-        self.selected_changed_file_path.as_deref() == Some(file.path.as_str())
+    fn is_file_path_selected(&self, path: &str) -> bool {
+        self.selected_changed_file_path.as_deref() == Some(path)
     }
 
     #[cfg(test)]
@@ -550,53 +583,22 @@ impl App {
                     .child("Close"),
             );
 
-        let body: AnyElement = if changeset.files.is_empty() {
-            div()
-                .flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .id("changed-files-empty")
-                .text_color(rgb(0x999999))
-                .text_size(px(14.))
-                .child("This changeset has no net file changes.")
-                .into_any_element()
-        } else {
-            let selected_file = self.selected_changed_file(changeset);
+        let body: AnyElement = match self.file_list_entries(repo, changeset) {
+            Ok(entries) => {
+                let selected_path = self
+                    .selected_changed_file_path
+                    .as_deref()
+                    .filter(|path| entries.iter().any(|entry| entry.path() == *path));
 
-            div()
-                .flex()
-                .flex_1()
-                .min_h_0()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .w(px(340.))
-                        .h_full()
-                        .min_h_0()
-                        .id("changed-files")
-                        .overflow_y_scroll()
-                        .border_1()
-                        .border_color(rgb(0x242424))
-                        .children(
-                            changeset
-                                .files
-                                .iter()
-                                .enumerate()
-                                .map(|(index, file)| {
-                                    self.render_changed_file_row(
-                                        index,
-                                        file,
-                                        self.is_changed_file_selected(file),
-                                        cx,
-                                    )
-                                })
-                                .collect::<Vec<_>>(),
-                        ),
-                )
-                .child(self.render_file_detail(repo, changeset, selected_file))
-                .into_any_element()
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_file_list(entries, cx))
+                    .child(self.render_file_detail(repo, changeset, selected_path))
+                    .into_any_element()
+            }
+            Err(err) => render_file_diff_error(err.to_string()),
         };
 
         div()
@@ -609,15 +611,159 @@ impl App {
             .child(body)
     }
 
-    fn selected_changed_file<'a>(
+    fn file_list_entries(
         &self,
-        changeset: &'a repo::ChangeSet,
-    ) -> Option<&'a repo::ChangedFile> {
-        let selected_path = self.selected_changed_file_path.as_deref()?;
-        changeset
-            .files
-            .iter()
-            .find(|file| file.path == selected_path)
+        repo: &repo::OpenRepository,
+        changeset: &repo::ChangeSet,
+    ) -> Result<Vec<FileListEntry>, repo::ChangeSetError> {
+        match self.file_list_mode {
+            FileListMode::Changed => Ok(changeset
+                .files
+                .iter()
+                .cloned()
+                .map(FileListEntry::Changed)
+                .collect()),
+            FileListMode::All => {
+                repo::files_at_commit(&repo.path, &changeset.commit_sha).map(|files| {
+                    files
+                        .into_iter()
+                        .map(|file| {
+                            changeset
+                                .files
+                                .iter()
+                                .find(|changed_file| changed_file.path == file.path)
+                                .cloned()
+                                .map(FileListEntry::Changed)
+                                .unwrap_or(FileListEntry::Unchanged(file))
+                        })
+                        .collect()
+                })
+            }
+        }
+    }
+
+    fn render_file_list(
+        &self,
+        entries: Vec<FileListEntry>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let list_content: AnyElement = if entries.is_empty() {
+            div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .id("changed-files-empty")
+                .debug_selector(|| "changed-files-empty".to_string())
+                .text_color(rgb(0x999999))
+                .text_size(px(14.))
+                .child("This changeset has no net file changes.")
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .id("changed-files-scroll")
+                .debug_selector(|| "changed-files-scroll".to_string())
+                .overflow_y_scroll()
+                .children(
+                    entries
+                        .iter()
+                        .enumerate()
+                        .map(|(index, entry)| {
+                            self.render_file_list_entry_row(
+                                index,
+                                entry,
+                                self.is_file_path_selected(entry.path()),
+                                cx,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .into_any_element()
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .w(px(340.))
+            .h_full()
+            .min_h_0()
+            .id("changed-files")
+            .border_1()
+            .border_color(rgb(0x242424))
+            .child(self.render_file_list_mode_toggle(cx))
+            .child(list_content)
+    }
+
+    fn render_file_list_mode_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .gap_1()
+            .px_2()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(0x242424))
+            .child(self.render_file_list_mode_button(
+                FileListMode::Changed,
+                "Changed",
+                "file-list-mode-changed",
+                cx,
+            ))
+            .child(self.render_file_list_mode_button(
+                FileListMode::All,
+                "All files",
+                "file-list-mode-all",
+                cx,
+            ))
+    }
+
+    fn render_file_list_mode_button(
+        &self,
+        mode: FileListMode,
+        label: &'static str,
+        selector: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.file_list_mode == mode;
+        let border_color = if active { rgb(0x3b82f6) } else { rgb(0x343434) };
+        let background = if active { rgb(0x1d283a) } else { rgb(0x171717) };
+        let text_color = if active { rgb(0xdbeafe) } else { rgb(0x999999) };
+
+        div()
+            .px_2()
+            .py_1()
+            .border_1()
+            .border_color(border_color)
+            .bg(background)
+            .text_color(text_color)
+            .text_size(px(12.))
+            .cursor_pointer()
+            .id(selector)
+            .debug_selector(move || selector.to_string())
+            .on_click(cx.listener(move |app, _event, _window, cx| {
+                app.set_file_list_mode(mode, cx);
+            }))
+            .child(label)
+    }
+
+    fn render_file_list_entry_row(
+        &self,
+        index: usize,
+        entry: &FileListEntry,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match entry {
+            FileListEntry::Changed(file) => self
+                .render_changed_file_row(index, file, selected, cx)
+                .into_any_element(),
+            FileListEntry::Unchanged(file) => self
+                .render_unchanged_file_row(index, file, selected, cx)
+                .into_any_element(),
+        }
     }
 
     fn render_changed_file_row(
@@ -698,74 +844,70 @@ impl App {
             )
     }
 
+    fn render_unchanged_file_row(
+        &self,
+        index: usize,
+        file: &repo::RepositoryFile,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let path = file.path.clone();
+        let row_bg = if selected {
+            rgb(0x223248)
+        } else {
+            rgb(0x171717)
+        };
+        let border_color = if selected {
+            rgb(0x3b82f6)
+        } else {
+            rgb(0x242424)
+        };
+        let debug_selector = if selected {
+            format!("selected-unchanged-file-row-{index}")
+        } else {
+            format!("unchanged-file-row-{index}")
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .gap_3()
+            .px_4()
+            .py_2()
+            .bg(row_bg)
+            .border_b_1()
+            .border_color(border_color)
+            .cursor_pointer()
+            .id(("unchanged-file-row", index))
+            .debug_selector(move || debug_selector.clone())
+            .on_click(cx.listener(move |app, _event, _window, cx| {
+                app.select_changed_file(path.clone(), cx);
+            }))
+            .child(div().w(px(72.)))
+            .child(
+                div()
+                    .flex_1()
+                    .text_color(rgb(0xe6e6e6))
+                    .text_size(px(14.))
+                    .font_family("monospace")
+                    .child(file.path.clone()),
+            )
+    }
+
     fn render_file_detail(
         &self,
         repo: &repo::OpenRepository,
         changeset: &repo::ChangeSet,
-        selected_file: Option<&repo::ChangedFile>,
+        selected_path: Option<&str>,
     ) -> AnyElement {
-        match selected_file {
-            Some(file) => {
-                let title = file.path.clone();
-                let kind = change_kind_label(file.kind);
-                let content = match repo::file_diff_for_changed_file_between(
-                    &repo.path,
-                    &changeset.commit_sha,
-                    changeset.base_sha.as_deref(),
-                    file,
-                ) {
-                    Ok(diff) => render_file_diff_content(diff.content, &self.file_diff_scroll),
-                    Err(err) => render_file_diff_error(err.to_string()),
-                };
+        match selected_path {
+            Some(path) => {
+                if let Some(file) = changeset.files.iter().find(|file| file.path == path) {
+                    return self.render_changed_file_detail(repo, changeset, file);
+                }
 
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .h_full()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .id("file-detail-shell")
-                    .debug_selector(|| "file-detail-shell".to_string())
-                    .px_4()
-                    .py_4()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .text_color(rgb(0xe6e6e6))
-                                    .text_size(px(16.))
-                                    .font_family("monospace")
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .border_1()
-                                    .border_color(change_kind_border(file.kind))
-                                    .bg(change_kind_background(file.kind))
-                                    .text_color(change_kind_text(file.kind))
-                                    .text_size(px(11.))
-                                    .font_family("monospace")
-                                    .child(kind),
-                            ),
-                    )
-                    .when_some(file.old_path.clone(), |detail, old_path| {
-                        detail.child(
-                            div()
-                                .text_color(rgb(0x999999))
-                                .text_size(px(12.))
-                                .font_family("monospace")
-                                .child(format!("Renamed from {old_path}")),
-                        )
-                    })
-                    .child(content)
-                    .into_any_element()
+                self.render_read_only_file_detail(repo, changeset, path)
             }
             None => div()
                 .flex()
@@ -780,6 +922,108 @@ impl App {
                 .child("Select a file to inspect its diff.")
                 .into_any_element(),
         }
+    }
+
+    fn render_changed_file_detail(
+        &self,
+        repo: &repo::OpenRepository,
+        changeset: &repo::ChangeSet,
+        file: &repo::ChangedFile,
+    ) -> AnyElement {
+        let title = file.path.clone();
+        let kind = change_kind_label(file.kind);
+        let content = match repo::file_diff_for_changed_file_between(
+            &repo.path,
+            &changeset.commit_sha,
+            changeset.base_sha.as_deref(),
+            file,
+        ) {
+            Ok(diff) => render_file_diff_content(diff.content, &self.file_diff_scroll),
+            Err(err) => render_file_diff_error(err.to_string()),
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .h_full()
+            .min_h_0()
+            .overflow_hidden()
+            .id("file-detail-shell")
+            .debug_selector(|| "file-detail-shell".to_string())
+            .px_4()
+            .py_4()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_color(rgb(0xe6e6e6))
+                            .text_size(px(16.))
+                            .font_family("monospace")
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .border_1()
+                            .border_color(change_kind_border(file.kind))
+                            .bg(change_kind_background(file.kind))
+                            .text_color(change_kind_text(file.kind))
+                            .text_size(px(11.))
+                            .font_family("monospace")
+                            .child(kind),
+                    ),
+            )
+            .when_some(file.old_path.clone(), |detail, old_path| {
+                detail.child(
+                    div()
+                        .text_color(rgb(0x999999))
+                        .text_size(px(12.))
+                        .font_family("monospace")
+                        .child(format!("Renamed from {old_path}")),
+                )
+            })
+            .child(content)
+            .into_any_element()
+    }
+
+    fn render_read_only_file_detail(
+        &self,
+        repo: &repo::OpenRepository,
+        changeset: &repo::ChangeSet,
+        path: &str,
+    ) -> AnyElement {
+        let content = match repo::file_content_at_commit(&repo.path, &changeset.commit_sha, path) {
+            Ok(content) => render_file_content(content.content, &self.file_diff_scroll),
+            Err(err) => render_file_diff_error(err.to_string()),
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .h_full()
+            .min_h_0()
+            .overflow_hidden()
+            .id("file-detail-shell")
+            .debug_selector(|| "file-detail-shell".to_string())
+            .px_4()
+            .py_4()
+            .gap_3()
+            .child(
+                div()
+                    .text_color(rgb(0xe6e6e6))
+                    .text_size(px(16.))
+                    .font_family("monospace")
+                    .child(path.to_string()),
+            )
+            .child(content)
+            .into_any_element()
     }
 
     fn render_commit_row(
@@ -929,6 +1173,25 @@ fn render_file_diff_content(content: repo::FileDiffContent, scroll: &FileDiffScr
     }
 }
 
+fn render_file_content(content: repo::FileContentBody, scroll: &FileDiffScroll) -> AnyElement {
+    match content {
+        repo::FileContentBody::Text(text) => {
+            let cells = read_only_file_cells(&text);
+
+            render_file_diff_side(
+                "Contents",
+                "file-read-only-content",
+                cells,
+                scroll.handle_for(repo::DiffSide::New),
+            )
+            .into_any_element()
+        }
+        repo::FileContentBody::Binary => {
+            render_file_diff_content(repo::FileDiffContent::Binary, scroll)
+        }
+    }
+}
+
 fn render_file_diff_error(message: String) -> AnyElement {
     div()
         .flex()
@@ -1071,6 +1334,18 @@ fn empty_diff_cell() -> DiffLineCell {
         text: String::new(),
         status: DiffLineStatus::Empty,
     }
+}
+
+fn read_only_file_cells(text: &str) -> Vec<DiffLineCell> {
+    content_lines(text)
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| DiffLineCell {
+            line_number: Some(index + 1),
+            text: line,
+            status: DiffLineStatus::Unchanged,
+        })
+        .collect()
 }
 
 fn render_file_diff_side(
@@ -1317,6 +1592,22 @@ mod tests {
 
         fs::write(dir.path().join("hello.txt"), "hello world\n").expect("update file");
         let update_oid = commit_all(&repo, "Update hello.txt", &[root_oid]);
+
+        drop(repo);
+
+        (dir, update_oid.to_string())
+    }
+
+    fn init_repo_with_changed_and_context_files() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("changed.txt"), "before\n").expect("write changed file");
+        fs::write(dir.path().join("context.txt"), "context\n").expect("write context file");
+        let root_oid = commit_all(&repo, "Initial", &[]);
+
+        fs::write(dir.path().join("changed.txt"), "after\n").expect("update changed file");
+        let update_oid = commit_all(&repo, "Update changed file", &[root_oid]);
 
         drop(repo);
 
@@ -1713,6 +2004,86 @@ mod tests {
         visual
             .debug_bounds("changed-file-row-0")
             .expect("changed file row debug bounds");
+    }
+
+    #[gpui::test]
+    async fn toggling_all_files_shows_unchanged_files_and_opens_read_only_content(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, oid_hex) = init_repo_with_changed_and_context_files();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open changeset");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let all_files_bounds = visual
+            .debug_bounds("file-list-mode-all")
+            .expect("all files toggle debug bounds");
+        visual.simulate_click(all_files_bounds.center(), Modifiers::none());
+
+        let unchanged_bounds = visual
+            .debug_bounds("unchanged-file-row-1")
+            .expect("unchanged file row debug bounds");
+        visual.simulate_click(unchanged_bounds.center(), Modifiers::none());
+
+        visual
+            .debug_bounds("file-read-only-content")
+            .expect("read-only file content debug bounds");
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.selected_changed_file_path,
+                    Some("context.txt".to_string()),
+                );
+            })
+            .expect("read selected context file");
+    }
+
+    #[gpui::test]
+    async fn selecting_changed_file_in_all_files_mode_still_renders_side_by_side_diff(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, oid_hex) = init_repo_with_changed_and_context_files();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open changeset");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let all_files_bounds = visual
+            .debug_bounds("file-list-mode-all")
+            .expect("all files toggle debug bounds");
+        visual.simulate_click(all_files_bounds.center(), Modifiers::none());
+
+        let changed_bounds = visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
+        visual.simulate_click(changed_bounds.center(), Modifiers::none());
+
+        visual
+            .debug_bounds("file-diff-side-old")
+            .expect("old file diff side debug bounds");
+        visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new file diff side debug bounds");
     }
 
     #[gpui::test]
