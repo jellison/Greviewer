@@ -148,20 +148,11 @@ pub fn open_at(path: &Path) -> Result<OpenRepository, OpenError> {
 }
 
 pub fn changeset_for_single_commit(path: &Path, sha: &str) -> Result<ChangeSet, ChangeSetError> {
-    let canonical = path
-        .canonicalize()
-        .map_err(|err| ChangeSetError::Open(OpenError::Io(err)))?;
-    let repo = git2::Repository::open(&canonical)
-        .map_err(classify_open_error)
-        .map_err(ChangeSetError::Open)?;
+    let repo = open_changeset_repository(path)?;
     let oid = git2::Oid::from_str(sha).map_err(ChangeSetError::Git)?;
     let commit = repo.find_commit(oid).map_err(ChangeSetError::Git)?;
     let commit_tree = commit.tree().map_err(ChangeSetError::Git)?;
-    let base_commit = if commit.parent_count() > 0 {
-        Some(commit.parent(0).map_err(ChangeSetError::Git)?)
-    } else {
-        None
-    };
+    let base_commit = first_parent_commit(&commit)?;
     let base_sha = base_commit.as_ref().map(|commit| commit.id().to_string());
     let base_tree = base_commit
         .as_ref()
@@ -169,13 +160,78 @@ pub fn changeset_for_single_commit(path: &Path, sha: &str) -> Result<ChangeSet, 
         .transpose()
         .map_err(ChangeSetError::Git)?;
 
+    changeset_between_trees(
+        &repo,
+        commit.id().to_string(),
+        base_sha,
+        base_tree.as_ref(),
+        &commit_tree,
+    )
+}
+
+pub fn changeset_for_commit_range(
+    path: &Path,
+    oldest_sha: &str,
+    newest_sha: &str,
+) -> Result<ChangeSet, ChangeSetError> {
+    let repo = open_changeset_repository(path)?;
+    let oldest_oid = git2::Oid::from_str(oldest_sha).map_err(ChangeSetError::Git)?;
+    let newest_oid = git2::Oid::from_str(newest_sha).map_err(ChangeSetError::Git)?;
+
+    if oldest_oid != newest_oid
+        && !repo
+            .graph_descendant_of(newest_oid, oldest_oid)
+            .map_err(ChangeSetError::Git)?
+    {
+        return Err(ChangeSetError::Git(git2::Error::from_str(
+            "Range newest commit does not descend from oldest commit",
+        )));
+    }
+
+    let oldest_commit = repo.find_commit(oldest_oid).map_err(ChangeSetError::Git)?;
+    let newest_commit = repo.find_commit(newest_oid).map_err(ChangeSetError::Git)?;
+    let newest_tree = newest_commit.tree().map_err(ChangeSetError::Git)?;
+    let base_commit = first_parent_commit(&oldest_commit)?;
+    let base_sha = base_commit.as_ref().map(|commit| commit.id().to_string());
+    let base_tree = base_commit
+        .as_ref()
+        .map(|commit| commit.tree())
+        .transpose()
+        .map_err(ChangeSetError::Git)?;
+
+    changeset_between_trees(
+        &repo,
+        newest_commit.id().to_string(),
+        base_sha,
+        base_tree.as_ref(),
+        &newest_tree,
+    )
+}
+
+fn changeset_between_trees(
+    repo: &git2::Repository,
+    commit_sha: String,
+    base_sha: Option<String>,
+    base_tree: Option<&git2::Tree<'_>>,
+    target_tree: &git2::Tree<'_>,
+) -> Result<ChangeSet, ChangeSetError> {
+    let files = changed_files_between_trees(repo, base_tree, target_tree)?;
+
+    Ok(ChangeSet {
+        commit_sha,
+        base_sha,
+        files,
+    })
+}
+
+fn changed_files_between_trees(
+    repo: &git2::Repository,
+    base_tree: Option<&git2::Tree<'_>>,
+    target_tree: &git2::Tree<'_>,
+) -> Result<Vec<ChangedFile>, ChangeSetError> {
     let mut diff_options = git2::DiffOptions::new();
     let mut diff = repo
-        .diff_tree_to_tree(
-            base_tree.as_ref(),
-            Some(&commit_tree),
-            Some(&mut diff_options),
-        )
+        .diff_tree_to_tree(base_tree, Some(target_tree), Some(&mut diff_options))
         .map_err(ChangeSetError::Git)?;
 
     let mut find_options = git2::DiffFindOptions::new();
@@ -193,11 +249,35 @@ pub fn changeset_for_single_commit(path: &Path, sha: &str) -> Result<ChangeSet, 
             .then_with(|| left.old_path.cmp(&right.old_path))
     });
 
-    Ok(ChangeSet {
-        commit_sha: commit.id().to_string(),
-        base_sha,
-        files,
-    })
+    Ok(files)
+}
+
+pub fn commits_share_linear_ancestry(
+    path: &Path,
+    first_sha: &str,
+    second_sha: &str,
+) -> Result<bool, ChangeSetError> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|err| ChangeSetError::Open(OpenError::Io(err)))?;
+    let repo = git2::Repository::open(&canonical)
+        .map_err(classify_open_error)
+        .map_err(ChangeSetError::Open)?;
+    let first = git2::Oid::from_str(first_sha).map_err(ChangeSetError::Git)?;
+    let second = git2::Oid::from_str(second_sha).map_err(ChangeSetError::Git)?;
+
+    if first == second {
+        return Ok(true);
+    }
+
+    let first_descends_from_second = repo
+        .graph_descendant_of(first, second)
+        .map_err(ChangeSetError::Git)?;
+    let second_descends_from_first = repo
+        .graph_descendant_of(second, first)
+        .map_err(ChangeSetError::Git)?;
+
+    Ok(first_descends_from_second || second_descends_from_first)
 }
 
 pub fn file_diff_for_changed_file(
@@ -205,32 +285,62 @@ pub fn file_diff_for_changed_file(
     sha: &str,
     file: &ChangedFile,
 ) -> Result<FileDiff, ChangeSetError> {
-    let canonical = path
-        .canonicalize()
-        .map_err(|err| ChangeSetError::Open(OpenError::Io(err)))?;
-    let repo = git2::Repository::open(&canonical)
-        .map_err(classify_open_error)
-        .map_err(ChangeSetError::Open)?;
-    let oid = git2::Oid::from_str(sha).map_err(ChangeSetError::Git)?;
-    let commit = repo.find_commit(oid).map_err(ChangeSetError::Git)?;
-    let commit_tree = commit.tree().map_err(ChangeSetError::Git)?;
-    let base_tree = first_parent_tree(&commit)?;
+    let repo = open_changeset_repository(path)?;
+    let target_oid = git2::Oid::from_str(sha).map_err(ChangeSetError::Git)?;
+    let target_commit = repo.find_commit(target_oid).map_err(ChangeSetError::Git)?;
+    let base_commit = first_parent_commit(&target_commit)?;
+    let base_sha = base_commit.as_ref().map(|commit| commit.id().to_string());
+
+    file_diff_for_changed_file_in_repo(&repo, sha, base_sha.as_deref(), file)
+}
+
+pub fn file_diff_for_changed_file_between(
+    path: &Path,
+    target_sha: &str,
+    base_sha: Option<&str>,
+    file: &ChangedFile,
+) -> Result<FileDiff, ChangeSetError> {
+    let repo = open_changeset_repository(path)?;
+
+    file_diff_for_changed_file_in_repo(&repo, target_sha, base_sha, file)
+}
+
+fn file_diff_for_changed_file_in_repo(
+    repo: &git2::Repository,
+    target_sha: &str,
+    base_sha: Option<&str>,
+    file: &ChangedFile,
+) -> Result<FileDiff, ChangeSetError> {
+    let target_oid = git2::Oid::from_str(target_sha).map_err(ChangeSetError::Git)?;
+    let target_commit = repo.find_commit(target_oid).map_err(ChangeSetError::Git)?;
+    let target_tree = target_commit.tree().map_err(ChangeSetError::Git)?;
+    let base_commit = base_sha
+        .map(|sha| {
+            let oid = git2::Oid::from_str(sha).map_err(ChangeSetError::Git)?;
+            repo.find_commit(oid).map_err(ChangeSetError::Git)
+        })
+        .transpose()?;
+    let base_tree = base_commit
+        .as_ref()
+        .map(|commit| commit.tree())
+        .transpose()
+        .map_err(ChangeSetError::Git)?;
 
     let content = match file.kind {
         ChangeKind::Added => {
-            let text = read_text_blob(&repo, &commit_tree, &file.path)?;
+            let text = read_text_blob(repo, &target_tree, &file.path)?;
             single_file_content(DiffSide::New, text)
         }
         ChangeKind::Deleted => {
             let base_tree = required_base_tree(base_tree.as_ref())?;
             let old_path = file.old_path.as_deref().unwrap_or(&file.path);
-            let text = read_text_blob(&repo, base_tree, old_path)?;
+            let text = read_text_blob(repo, base_tree, old_path)?;
             single_file_content(DiffSide::Old, text)
         }
         ChangeKind::Modified => {
             let base_tree = required_base_tree(base_tree.as_ref())?;
-            let old_text = read_text_blob(&repo, base_tree, &file.path)?;
-            let new_text = read_text_blob(&repo, &commit_tree, &file.path)?;
+            let old_text = read_text_blob(repo, base_tree, &file.path)?;
+            let new_text = read_text_blob(repo, &target_tree, &file.path)?;
             side_by_side_file_content(old_text, new_text)
         }
         ChangeKind::Renamed => {
@@ -238,8 +348,8 @@ pub fn file_diff_for_changed_file(
             let old_path = file.old_path.as_deref().ok_or_else(|| {
                 ChangeSetError::Git(git2::Error::from_str("Missing rename source path"))
             })?;
-            let old_text = read_text_blob(&repo, base_tree, old_path)?;
-            let new_text = read_text_blob(&repo, &commit_tree, &file.path)?;
+            let old_text = read_text_blob(repo, base_tree, old_path)?;
+            let new_text = read_text_blob(repo, &target_tree, &file.path)?;
             side_by_side_file_content(old_text, new_text)
         }
     };
@@ -252,6 +362,16 @@ pub fn file_diff_for_changed_file(
     })
 }
 
+fn open_changeset_repository(path: &Path) -> Result<git2::Repository, ChangeSetError> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|err| ChangeSetError::Open(OpenError::Io(err)))?;
+
+    git2::Repository::open(&canonical)
+        .map_err(classify_open_error)
+        .map_err(ChangeSetError::Open)
+}
+
 fn classify_open_error(err: git2::Error) -> OpenError {
     use git2::ErrorCode;
     match err.code() {
@@ -260,18 +380,14 @@ fn classify_open_error(err: git2::Error) -> OpenError {
     }
 }
 
-fn first_parent_tree<'repo>(
+fn first_parent_commit<'repo>(
     commit: &git2::Commit<'repo>,
-) -> Result<Option<git2::Tree<'repo>>, ChangeSetError> {
+) -> Result<Option<git2::Commit<'repo>>, ChangeSetError> {
     if commit.parent_count() == 0 {
         return Ok(None);
     }
 
-    commit
-        .parent(0)
-        .and_then(|parent| parent.tree())
-        .map(Some)
-        .map_err(ChangeSetError::Git)
+    commit.parent(0).map(Some).map_err(ChangeSetError::Git)
 }
 
 fn required_base_tree<'a>(
@@ -589,6 +705,58 @@ mod tests {
                 old_path: None,
                 kind: ChangeKind::Added,
             }],
+        );
+    }
+
+    #[test]
+    fn changeset_for_commit_range_rolls_up_oldest_parent_to_newest() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("rollup.txt"), "before\n").expect("write file");
+        let root_oid = git2::Oid::from_str(&commit_workdir(&repo, "Add rollup.txt", &[]))
+            .expect("parse root oid");
+
+        fs::write(dir.path().join("rollup.txt"), "middle\n").expect("update file");
+        let middle_oid = git2::Oid::from_str(&commit_workdir(&repo, "Middle", &[root_oid]))
+            .expect("parse middle oid");
+
+        fs::write(dir.path().join("rollup.txt"), "after\n").expect("update file again");
+        let tip_oid = git2::Oid::from_str(&commit_workdir(&repo, "Tip", &[middle_oid]))
+            .expect("parse tip oid");
+
+        let root_sha = root_oid.to_string();
+        let middle_sha = middle_oid.to_string();
+        let tip_sha = tip_oid.to_string();
+
+        let changeset =
+            changeset_for_commit_range(dir.path(), &middle_sha, &tip_sha).expect("range changeset");
+
+        assert_eq!(changeset.commit_sha, tip_sha);
+        assert_eq!(changeset.base_sha, Some(root_sha.clone()));
+        assert_eq!(
+            changeset.files,
+            vec![ChangedFile {
+                path: "rollup.txt".to_string(),
+                old_path: None,
+                kind: ChangeKind::Modified,
+            }],
+        );
+
+        let diff = file_diff_for_changed_file_between(
+            dir.path(),
+            &changeset.commit_sha,
+            Some(&root_sha),
+            &changeset.files[0],
+        )
+        .expect("range file diff");
+
+        assert_eq!(
+            diff.content,
+            FileDiffContent::SideBySide {
+                old_text: "before\n".to_string(),
+                new_text: "after\n".to_string(),
+            },
         );
     }
 

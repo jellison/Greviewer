@@ -11,9 +11,9 @@ pub use path_picker::{repository_prompt_options, GpuiPathPicker, PathPicker, Pat
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, div, point, px, rgb, AnyElement, AppContext, Context, Entity, EventEmitter,
-    FocusHandle, InteractiveElement, IntoElement, ParentElement, Render, ScrollHandle,
-    StatefulInteractiveElement, Styled, Window,
+    actions, div, point, px, rgb, AnyElement, AppContext, ClickEvent, Context, Entity,
+    EventEmitter, FocusHandle, InteractiveElement, IntoElement, Modifiers, ParentElement, Render,
+    ScrollHandle, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::notification::{Notification, NotificationList};
 use similar::{DiffTag, TextDiff};
@@ -72,7 +72,14 @@ pub enum Mode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
     None,
-    Single { sha: String },
+    Single {
+        sha: String,
+    },
+    Range {
+        start_sha: String,
+        end_sha: String,
+        shas: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,17 +199,103 @@ impl App {
         cx.notify();
     }
 
-    fn open_changeset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let sha = match &self.selection {
-            Selection::Single { sha } => sha.clone(),
-            Selection::None => return,
+    fn select_commit(
+        &mut self,
+        sha: String,
+        modifiers: Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !modifiers.shift {
+            self.select_single_commit(sha, cx);
+            return;
+        }
+
+        let Selection::Single { sha: start_sha } = &self.selection else {
+            self.select_single_commit(sha, cx);
+            return;
         };
+        let start_sha = start_sha.clone();
+
+        if start_sha == sha {
+            return;
+        }
+
+        match self.range_shas_between(&start_sha, &sha) {
+            Ok(Some(shas)) => {
+                self.selection = Selection::Range {
+                    start_sha,
+                    end_sha: sha,
+                    shas,
+                };
+                cx.notify();
+            }
+            Ok(None) => self.push_open_failed(
+                "Those commits are not on a single ancestry path.".to_string(),
+                window,
+                cx,
+            ),
+            Err(err) => self.push_open_failed(err.to_string(), window, cx),
+        }
+    }
+
+    fn range_shas_between(
+        &self,
+        start_sha: &str,
+        end_sha: &str,
+    ) -> Result<Option<Vec<String>>, repo::ChangeSetError> {
+        let open_repo = match &self.mode {
+            Mode::RepoOpen { repo } => repo,
+            Mode::NoRepo => return Ok(None),
+        };
+
+        let Some(start_index) = open_repo
+            .commits
+            .iter()
+            .position(|commit| commit.sha == start_sha)
+        else {
+            return Ok(None);
+        };
+        let Some(end_index) = open_repo
+            .commits
+            .iter()
+            .position(|commit| commit.sha == end_sha)
+        else {
+            return Ok(None);
+        };
+
+        if !repo::commits_share_linear_ancestry(&open_repo.path, start_sha, end_sha)? {
+            return Ok(None);
+        }
+
+        let first_index = start_index.min(end_index);
+        let last_index = start_index.max(end_index);
+        Ok(Some(
+            open_repo.commits[first_index..=last_index]
+                .iter()
+                .map(|commit| commit.sha.clone())
+                .collect(),
+        ))
+    }
+
+    fn open_changeset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let repo_path = match &self.mode {
             Mode::RepoOpen { repo } => repo.path.clone(),
             Mode::NoRepo => return,
         };
 
-        match repo::changeset_for_single_commit(&repo_path, &sha) {
+        let changeset = match &self.selection {
+            Selection::Single { sha } => repo::changeset_for_single_commit(&repo_path, sha),
+            Selection::Range { shas, .. } => {
+                let (Some(newest_sha), Some(oldest_sha)) = (shas.first(), shas.last()) else {
+                    return;
+                };
+                repo::changeset_for_commit_range(&repo_path, oldest_sha, newest_sha)
+            }
+            Selection::None => return,
+        };
+
+        match changeset {
             Ok(changeset) => {
                 if !self
                     .selected_changed_file_path
@@ -211,6 +304,7 @@ impl App {
                 {
                     self.selected_changed_file_path = None;
                 }
+                let sha = changeset.commit_sha.clone();
                 self.review_screen = ReviewScreen::Changeset { sha, changeset };
                 cx.notify();
             }
@@ -230,7 +324,11 @@ impl App {
     }
 
     fn is_commit_selected(&self, sha: &str) -> bool {
-        matches!(&self.selection, Selection::Single { sha: selected_sha } if selected_sha == sha)
+        match &self.selection {
+            Selection::Single { sha: selected_sha } => selected_sha == sha,
+            Selection::Range { shas, .. } => shas.iter().any(|selected_sha| selected_sha == sha),
+            Selection::None => false,
+        }
     }
 
     fn is_changed_file_selected(&self, file: &repo::ChangedFile) -> bool {
@@ -299,7 +397,10 @@ impl App {
             Some(head) => format!("{} · {}", head.short_sha, head.summary),
             None => "No commits yet.".to_string(),
         };
-        let can_open_changeset = matches!(self.selection, Selection::Single { .. });
+        let can_open_changeset = matches!(
+            self.selection,
+            Selection::Single { .. } | Selection::Range { .. }
+        );
 
         let title_row = div()
             .flex()
@@ -494,7 +595,7 @@ impl App {
                                 .collect::<Vec<_>>(),
                         ),
                 )
-                .child(self.render_file_detail(repo, sha, selected_file))
+                .child(self.render_file_detail(repo, changeset, selected_file))
                 .into_any_element()
         };
 
@@ -600,14 +701,19 @@ impl App {
     fn render_file_detail(
         &self,
         repo: &repo::OpenRepository,
-        sha: &str,
+        changeset: &repo::ChangeSet,
         selected_file: Option<&repo::ChangedFile>,
     ) -> AnyElement {
         match selected_file {
             Some(file) => {
                 let title = file.path.clone();
                 let kind = change_kind_label(file.kind);
-                let content = match repo::file_diff_for_changed_file(&repo.path, sha, file) {
+                let content = match repo::file_diff_for_changed_file_between(
+                    &repo.path,
+                    &changeset.commit_sha,
+                    changeset.base_sha.as_deref(),
+                    file,
+                ) {
                     Ok(diff) => render_file_diff_content(diff.content, &self.file_diff_scroll),
                     Err(err) => render_file_diff_error(err.to_string()),
                 };
@@ -695,6 +801,11 @@ impl App {
         } else {
             rgb(0x242424)
         };
+        let debug_selector = if selected {
+            format!("selected-commit-row-{index}")
+        } else {
+            format!("commit-row-{index}")
+        };
         let sha = commit.sha.clone();
 
         div()
@@ -709,9 +820,9 @@ impl App {
             .border_color(border_color)
             .cursor_pointer()
             .id(("commit-row", index))
-            .debug_selector(move || format!("commit-row-{index}"))
-            .on_click(cx.listener(move |app, _event, _window, cx| {
-                app.select_single_commit(sha.clone(), cx);
+            .debug_selector(move || debug_selector.clone())
+            .on_click(cx.listener(move |app, event: &ClickEvent, window, cx| {
+                app.select_commit(sha.clone(), event.modifiers(), window, cx);
             }))
             .child(
                 div()
@@ -1212,6 +1323,55 @@ mod tests {
         (dir, update_oid.to_string())
     }
 
+    fn init_repo_with_three_commits() -> (tempfile::TempDir, Vec<String>) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("range.txt"), "one\n").expect("write file");
+        let first_oid = commit_all(&repo, "First", &[]);
+
+        fs::write(dir.path().join("range.txt"), "two\n").expect("update file");
+        let second_oid = commit_all(&repo, "Second", &[first_oid]);
+
+        fs::write(dir.path().join("range.txt"), "three\n").expect("update file again");
+        let third_oid = commit_all(&repo, "Third", &[second_oid]);
+
+        drop(repo);
+
+        (
+            dir,
+            vec![
+                third_oid.to_string(),
+                second_oid.to_string(),
+                first_oid.to_string(),
+            ],
+        )
+    }
+
+    fn init_repo_with_diverged_history() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("base.txt"), "base\n").expect("write base file");
+        let root_oid = commit_all(&repo, "Root", &[]);
+
+        fs::write(dir.path().join("left.txt"), "left\n").expect("write left file");
+        let left_oid = commit_all_to_ref(&repo, Some("refs/heads/left"), "Left", &[root_oid]);
+
+        fs::remove_file(dir.path().join("left.txt")).expect("remove left file");
+        fs::write(dir.path().join("right.txt"), "right\n").expect("write right file");
+        let right_oid = commit_all_to_ref(&repo, Some("refs/heads/right"), "Right", &[root_oid]);
+
+        fs::write(dir.path().join("left.txt"), "left\n").expect("restore left file");
+        let merge_oid = commit_all_to_ref(&repo, None, "Merge", &[left_oid, right_oid]);
+        repo.reference("refs/heads/master", merge_oid, true, "update test HEAD")
+            .expect("point HEAD branch at merge");
+
+        drop(repo);
+
+        (dir, left_oid.to_string(), right_oid.to_string())
+    }
+
     fn init_repo_with_long_diff() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("create tempdir");
         let repo = Repository::init(dir.path()).expect("init repo");
@@ -1234,7 +1394,17 @@ mod tests {
     }
 
     fn commit_all(repo: &Repository, message: &str, parents: &[git2::Oid]) -> git2::Oid {
+        commit_all_to_ref(repo, Some("HEAD"), message, parents)
+    }
+
+    fn commit_all_to_ref(
+        repo: &Repository,
+        update_ref: Option<&str>,
+        message: &str,
+        parents: &[git2::Oid],
+    ) -> git2::Oid {
         let mut index = repo.index().expect("open index");
+        index.clear().expect("clear index");
         index
             .add_all(["*"], IndexAddOption::DEFAULT, None)
             .expect("stage files");
@@ -1250,7 +1420,7 @@ mod tests {
             .collect::<Vec<_>>();
         let parent_refs = parent_commits.iter().collect::<Vec<_>>();
 
-        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)
+        repo.commit(update_ref, &sig, &sig, message, &tree, &parent_refs)
             .expect("create commit")
     }
 
@@ -1383,6 +1553,76 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn shift_clicking_linear_commits_selects_an_inclusive_range(cx: &mut TestAppContext) {
+        let (dir, shas) = init_repo_with_three_commits();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let tip_bounds = visual
+            .debug_bounds("commit-row-0")
+            .expect("tip commit row debug bounds");
+        visual.simulate_click(tip_bounds.center(), Modifiers::none());
+
+        let root_bounds = visual
+            .debug_bounds("commit-row-2")
+            .expect("root commit row debug bounds");
+        visual.simulate_click(root_bounds.center(), Modifiers::shift());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.selection,
+                    Selection::Range {
+                        start_sha: shas[0].clone(),
+                        end_sha: shas[2].clone(),
+                        shas: shas.clone(),
+                    },
+                );
+            })
+            .expect("read range selection");
+
+        visual
+            .debug_bounds("selected-commit-row-0")
+            .expect("selected tip row debug bounds");
+        visual
+            .debug_bounds("selected-commit-row-1")
+            .expect("selected middle row debug bounds");
+        visual
+            .debug_bounds("selected-commit-row-2")
+            .expect("selected root row debug bounds");
+    }
+
+    #[gpui::test]
+    async fn shift_clicking_diverged_commits_preserves_the_original_selection(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+
+        let (dir, left_sha, right_sha) = init_repo_with_diverged_history();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_commit(left_sha.clone(), Modifiers::none(), window, cx);
+                app.select_commit(right_sha, Modifiers::shift(), window, cx);
+
+                assert_eq!(app.selection, Selection::Single { sha: left_sha });
+            })
+            .expect("attempt invalid range selection");
+    }
+
+    #[gpui::test]
     async fn opening_changeset_requires_a_selection(cx: &mut TestAppContext) {
         let window = cx.add_window(App::new);
 
@@ -1424,6 +1664,55 @@ mod tests {
                 ReviewScreen::Graph => panic!("expected changeset review screen"),
             })
             .expect("read changeset");
+    }
+
+    #[gpui::test]
+    async fn opening_range_changeset_renders_rollup_changed_files(cx: &mut TestAppContext) {
+        let (dir, shas) = init_repo_with_three_commits();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let tip_bounds = visual
+            .debug_bounds("commit-row-0")
+            .expect("tip commit row debug bounds");
+        visual.simulate_click(tip_bounds.center(), Modifiers::none());
+
+        let root_bounds = visual
+            .debug_bounds("commit-row-2")
+            .expect("root commit row debug bounds");
+        visual.simulate_click(root_bounds.center(), Modifiers::shift());
+
+        let open_bounds = visual
+            .debug_bounds("open-changeset")
+            .expect("open changeset debug bounds");
+        visual.simulate_click(open_bounds.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| match &app.review_screen {
+                ReviewScreen::Changeset { sha, changeset } => {
+                    assert_eq!(sha, &shas[0]);
+                    assert_eq!(changeset.commit_sha, shas[0]);
+                    assert_eq!(changeset.base_sha, None);
+                    assert_eq!(changeset.files.len(), 1);
+                    assert_eq!(changeset.files[0].path, "range.txt");
+                    assert_eq!(changeset.files[0].kind, ChangeKind::Added);
+                }
+                ReviewScreen::Graph => panic!("expected changeset review screen"),
+            })
+            .expect("read range changeset");
+
+        visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
     }
 
     #[gpui::test]
