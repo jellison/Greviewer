@@ -1496,7 +1496,6 @@ impl App {
         selected: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let marker = if commit.is_head { "HEAD" } else { "" };
         let secondary = format!("{} · {}", commit.author, commit.authored_date);
         let row_bg = if selected {
             rgb(0x223248)
@@ -1531,18 +1530,7 @@ impl App {
             .on_click(cx.listener(move |app, event: &ClickEvent, window, cx| {
                 app.select_commit(sha.clone(), event.modifiers(), window, cx);
             }))
-            .child(
-                div()
-                    .w(px(48.))
-                    .text_color(if commit.is_head {
-                        rgb(0x7dd3fc)
-                    } else {
-                        rgb(0x555555)
-                    })
-                    .text_size(px(11.))
-                    .font_family("monospace")
-                    .child(marker),
-            )
+            .child(render_commit_ref_labels(index, commit))
             .child(render_commit_graph_gutter(
                 index,
                 graph_row,
@@ -1576,6 +1564,68 @@ impl App {
                     ),
             )
     }
+}
+
+fn render_commit_ref_labels(row_index: usize, commit: &repo::CommitInfo) -> gpui::Div {
+    let mut labels = Vec::new();
+    if commit.is_head {
+        labels.push(CommitRefLabel {
+            name: "HEAD".to_string(),
+            kind: CommitRefLabelKind::Head,
+        });
+    }
+    labels.extend(
+        commit
+            .branch_names
+            .iter()
+            .cloned()
+            .map(|name| CommitRefLabel {
+                name,
+                kind: CommitRefLabelKind::Branch,
+            }),
+    );
+
+    div().flex().items_center().gap_1().w(px(156.)).children(
+        labels
+            .into_iter()
+            .map(|label| render_commit_ref_label(row_index, label))
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommitRefLabel {
+    name: String,
+    kind: CommitRefLabelKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitRefLabelKind {
+    Head,
+    Branch,
+}
+
+fn render_commit_ref_label(row_index: usize, label: CommitRefLabel) -> gpui::Div {
+    let selector = format!(
+        "commit-ref-label-{row_index}-{}",
+        debug_ref_label_fragment(&label.name)
+    );
+    let (border_color, background, text_color) = match label.kind {
+        CommitRefLabelKind::Head => (rgb(0x0ea5e9), rgb(0x102536), rgb(0x7dd3fc)),
+        CommitRefLabelKind::Branch => (rgb(0x3f6212), rgb(0x17230f), rgb(0xa3e635)),
+    };
+
+    div()
+        .px_1()
+        .py_0p5()
+        .border_1()
+        .border_color(border_color)
+        .bg(background)
+        .text_color(text_color)
+        .text_size(px(10.))
+        .font_family("monospace")
+        .debug_selector(move || selector.clone())
+        .child(label.name)
 }
 
 fn render_commit_graph_gutter(
@@ -2404,6 +2454,19 @@ fn debug_path_fragment(path: &str) -> String {
     path.replace('/', "-")
 }
 
+fn debug_ref_label_fragment(label: &str) -> String {
+    label
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2530,17 +2593,19 @@ mod tests {
         let repo = Repository::init(dir.path()).expect("init repo");
 
         fs::write(dir.path().join("base.txt"), "base\n").expect("write base file");
-        let root_oid = commit_all(&repo, "Root", &[]);
+        let root_oid = commit_all_to_ref_at_time(&repo, Some("HEAD"), "Root", &[], 10);
 
         fs::write(dir.path().join("left.txt"), "left\n").expect("write left file");
-        let left_oid = commit_all_to_ref(&repo, Some("refs/heads/left"), "Left", &[root_oid]);
+        let left_oid =
+            commit_all_to_ref_at_time(&repo, Some("refs/heads/left"), "Left", &[root_oid], 30);
 
         fs::remove_file(dir.path().join("left.txt")).expect("remove left file");
         fs::write(dir.path().join("right.txt"), "right\n").expect("write right file");
-        let right_oid = commit_all_to_ref(&repo, Some("refs/heads/right"), "Right", &[root_oid]);
+        let right_oid =
+            commit_all_to_ref_at_time(&repo, Some("refs/heads/right"), "Right", &[root_oid], 20);
 
         fs::write(dir.path().join("left.txt"), "left\n").expect("restore left file");
-        let merge_oid = commit_all_to_ref(&repo, None, "Merge", &[left_oid, right_oid]);
+        let merge_oid = commit_all_to_ref_at_time(&repo, None, "Merge", &[left_oid, right_oid], 40);
         repo.reference("refs/heads/master", merge_oid, true, "update test HEAD")
             .expect("point HEAD branch at merge");
 
@@ -2580,6 +2645,31 @@ mod tests {
         message: &str,
         parents: &[git2::Oid],
     ) -> git2::Oid {
+        let sig =
+            Signature::now("Greviewer Tests", "tests@greviewer.invalid").expect("create signature");
+        commit_all_to_ref_with_signature(repo, update_ref, message, parents, &sig)
+    }
+
+    fn commit_all_to_ref_at_time(
+        repo: &Repository,
+        update_ref: Option<&str>,
+        message: &str,
+        parents: &[git2::Oid],
+        seconds: i64,
+    ) -> git2::Oid {
+        let time = git2::Time::new(seconds, 0);
+        let sig = Signature::new("Greviewer Tests", "tests@greviewer.invalid", &time)
+            .expect("create signature");
+        commit_all_to_ref_with_signature(repo, update_ref, message, parents, &sig)
+    }
+
+    fn commit_all_to_ref_with_signature(
+        repo: &Repository,
+        update_ref: Option<&str>,
+        message: &str,
+        parents: &[git2::Oid],
+        sig: &Signature<'_>,
+    ) -> git2::Oid {
         let mut index = repo.index().expect("open index");
         index.clear().expect("clear index");
         index
@@ -2589,15 +2679,13 @@ mod tests {
         let tree_oid = index.write_tree().expect("write tree");
         let tree = repo.find_tree(tree_oid).expect("find tree");
 
-        let sig =
-            Signature::now("Greviewer Tests", "tests@greviewer.invalid").expect("create signature");
         let parent_commits = parents
             .iter()
             .map(|oid| repo.find_commit(*oid).expect("find parent commit"))
             .collect::<Vec<_>>();
         let parent_refs = parent_commits.iter().collect::<Vec<_>>();
 
-        repo.commit(update_ref, &sig, &sig, message, &tree, &parent_refs)
+        repo.commit(update_ref, sig, sig, message, &tree, &parent_refs)
             .expect("create commit")
     }
 
@@ -3123,6 +3211,64 @@ mod tests {
             merge_in_vertical_bounds.origin.y,
             "merge-in elbow should connect to the parent lane",
         );
+    }
+
+    #[gpui::test]
+    async fn commit_rows_render_head_and_branch_labels(cx: &mut TestAppContext) {
+        let (dir, _left_sha, _right_sha) = init_repo_with_diverged_history();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+
+        cx.run_until_parked();
+
+        let (head_row, master_row, left_row, right_row) = window
+            .read_with(cx, |app, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected repo open mode");
+                };
+                let row_for_branch = |branch_name: &str| {
+                    repo.commits
+                        .iter()
+                        .position(|commit| {
+                            commit.branch_names.iter().any(|name| name == branch_name)
+                        })
+                        .expect("branch row")
+                };
+
+                (
+                    repo.commits
+                        .iter()
+                        .position(|commit| commit.is_head)
+                        .expect("head row"),
+                    row_for_branch("master"),
+                    row_for_branch("left"),
+                    row_for_branch("right"),
+                )
+            })
+            .expect("read branch label rows");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let label_selector = |row: usize, label: &str| {
+            Box::leak(format!("commit-ref-label-{row}-{label}").into_boxed_str()) as &'static str
+        };
+        visual
+            .debug_bounds(label_selector(head_row, "head"))
+            .expect("head label on merge commit");
+        visual
+            .debug_bounds(label_selector(master_row, "master"))
+            .expect("master label on merge commit");
+        visual
+            .debug_bounds(label_selector(left_row, "left"))
+            .expect("left branch label on left commit");
+        visual
+            .debug_bounds(label_selector(right_row, "right"))
+            .expect("right branch label on right commit");
     }
 
     #[gpui::test]

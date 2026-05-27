@@ -24,7 +24,7 @@ The user opens a local Git repository through a folder picker. The application r
 
 ## Viewing the commit graph
 
-The user sees a graphical history of the repository's commits with branch lanes and merge connectors. Each commit displays its short identifier, summary line, author, and authored date. The graph is scrollable; older commits load progressively as the user scrolls. The currently checked-out tip is visually marked, but selection is independent of checkout state — reviewing never moves HEAD.
+The user sees a graphical history of the repository's commits with branch lanes and merge connectors. Each commit displays its short identifier, summary line, author, authored date, and any local branch names that point at it. The graph is scrollable; older commits load progressively as the user scrolls. The currently checked-out tip is visually marked, but selection is independent of checkout state — reviewing never moves HEAD.
 
 **Triggering conditions**
 
@@ -34,6 +34,7 @@ The user sees a graphical history of the repository's commits with branch lanes 
 
 - Commits appear in graphical order with branch lanes and merge connectors.
 - Each visible commit shows its short identifier, summary line, author, and authored date.
+- Local branch names are shown on the commits they point to.
 - The currently checked-out tip carries a visual marker.
 
 **Edge cases**

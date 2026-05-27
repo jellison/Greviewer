@@ -5,6 +5,7 @@
 //! open time; live updates come in a later slice.
 
 use std::{
+    collections::BTreeMap,
     fmt, io,
     path::{Path, PathBuf},
     str,
@@ -34,6 +35,7 @@ pub struct CommitInfo {
     pub authored_timestamp: i64,
     pub authored_date: String,
     pub parent_shas: Vec<String>,
+    pub branch_names: Vec<String>,
     pub parent_count: usize,
     pub is_head: bool,
 }
@@ -156,7 +158,8 @@ pub fn open_at(path: &Path) -> Result<OpenRepository, OpenError> {
     let head_commit = read_head_commit(&repo)?;
     let head_oid = head_commit.as_ref().map(|commit| commit.id());
     let head = head_commit.as_ref().map(head_info_from_commit);
-    let commits = read_commits(&repo, head_oid, INITIAL_COMMIT_LIMIT)?;
+    let branch_names_by_oid = read_local_branch_names_by_oid(&repo)?;
+    let commits = read_commits(&repo, head_oid, &branch_names_by_oid, INITIAL_COMMIT_LIMIT)?;
 
     Ok(OpenRepository {
         path: canonical,
@@ -509,6 +512,7 @@ fn read_head_commit(repo: &git2::Repository) -> Result<Option<git2::Commit<'_>>,
 fn read_commits(
     repo: &git2::Repository,
     head_oid: Option<git2::Oid>,
+    branch_names_by_oid: &BTreeMap<git2::Oid, Vec<String>>,
     limit: usize,
 ) -> Result<Vec<CommitInfo>, OpenError> {
     if head_oid.is_none() {
@@ -525,10 +529,47 @@ fn read_commits(
     for oid in revwalk.take(limit) {
         let oid = oid.map_err(OpenError::Git)?;
         let commit = repo.find_commit(oid).map_err(OpenError::Git)?;
-        commits.push(commit_info_from_commit(&commit, head_oid));
+        commits.push(commit_info_from_commit(
+            &commit,
+            head_oid,
+            branch_names_by_oid
+                .get(&commit.id())
+                .cloned()
+                .unwrap_or_default(),
+        ));
     }
 
     Ok(commits)
+}
+
+fn read_local_branch_names_by_oid(
+    repo: &git2::Repository,
+) -> Result<BTreeMap<git2::Oid, Vec<String>>, OpenError> {
+    let mut branch_names_by_oid = BTreeMap::<git2::Oid, Vec<String>>::new();
+    let branches = repo
+        .branches(Some(git2::BranchType::Local))
+        .map_err(OpenError::Git)?;
+
+    for branch in branches {
+        let (branch, _branch_type) = branch.map_err(OpenError::Git)?;
+        let Some(target_oid) = branch.get().target() else {
+            continue;
+        };
+        let Some(name) = branch.name().map_err(OpenError::Git)? else {
+            continue;
+        };
+
+        branch_names_by_oid
+            .entry(target_oid)
+            .or_default()
+            .push(name.to_string());
+    }
+
+    for branch_names in branch_names_by_oid.values_mut() {
+        branch_names.sort();
+    }
+
+    Ok(branch_names_by_oid)
 }
 
 fn head_info_from_commit(commit: &git2::Commit<'_>) -> HeadInfo {
@@ -538,7 +579,11 @@ fn head_info_from_commit(commit: &git2::Commit<'_>) -> HeadInfo {
     }
 }
 
-fn commit_info_from_commit(commit: &git2::Commit<'_>, head_oid: Option<git2::Oid>) -> CommitInfo {
+fn commit_info_from_commit(
+    commit: &git2::Commit<'_>,
+    head_oid: Option<git2::Oid>,
+    branch_names: Vec<String>,
+) -> CommitInfo {
     let sha = commit.id().to_string();
     let author = commit.author();
     let author = match author.name().map(str::trim) {
@@ -558,6 +603,7 @@ fn commit_info_from_commit(commit: &git2::Commit<'_>, head_oid: Option<git2::Oid
         authored_timestamp: commit.time().seconds(),
         authored_date: format_authored_date(commit.time()),
         parent_shas,
+        branch_names,
         parent_count: commit.parent_count(),
         is_head: Some(commit.id()) == head_oid,
     }
@@ -751,6 +797,50 @@ mod tests {
         assert_eq!(snapshot.commits[0].parent_shas, vec![root_oid.to_string()]);
         assert_eq!(snapshot.commits[1].sha, root_oid.to_string());
         assert!(snapshot.commits[1].parent_shas.is_empty());
+    }
+
+    #[test]
+    fn open_at_returns_local_branch_names_for_commits() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("history.txt"), "root\n").expect("write root file");
+        let root_oid =
+            git2::Oid::from_str(&commit_workdir(&repo, "Root", &[])).expect("parse root oid");
+
+        fs::write(dir.path().join("history.txt"), "tip\n").expect("write tip file");
+        let tip_oid =
+            git2::Oid::from_str(&commit_workdir(&repo, "Tip", &[root_oid])).expect("parse tip oid");
+
+        repo.reference(
+            "refs/heads/feature",
+            root_oid,
+            true,
+            "create feature branch",
+        )
+        .expect("create feature branch");
+        repo.reference(
+            "refs/heads/review/topic",
+            tip_oid,
+            true,
+            "create topic branch",
+        )
+        .expect("create topic branch");
+
+        drop(repo);
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+
+        assert_eq!(snapshot.commits[0].sha, tip_oid.to_string());
+        assert_eq!(
+            snapshot.commits[0].branch_names,
+            vec!["master".to_string(), "review/topic".to_string()]
+        );
+        assert_eq!(snapshot.commits[1].sha, root_oid.to_string());
+        assert_eq!(
+            snapshot.commits[1].branch_names,
+            vec!["feature".to_string()]
+        );
     }
 
     #[test]
