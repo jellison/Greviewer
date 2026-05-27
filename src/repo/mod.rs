@@ -59,6 +59,7 @@ pub struct ChangedFile {
     pub path: String,
     pub old_path: Option<String>,
     pub kind: ChangeKind,
+    pub is_binary: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,10 +296,14 @@ fn changed_files_between_trees(
     diff.find_similar(Some(&mut find_options))
         .map_err(ChangeSetError::Git)?;
 
-    let mut files = diff
-        .deltas()
-        .filter_map(changed_file_from_delta)
-        .collect::<Vec<_>>();
+    let mut files = Vec::new();
+    for delta in diff.deltas() {
+        let Some(mut file) = changed_file_from_delta(delta) else {
+            continue;
+        };
+        file.is_binary = changed_file_is_binary(repo, base_tree, target_tree, &file)?;
+        files.push(file);
+    }
     files.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
@@ -518,6 +523,45 @@ fn read_text_blob(
         .or(Ok(None))
 }
 
+fn blob_has_text(
+    repo: &git2::Repository,
+    tree: &git2::Tree<'_>,
+    path: &str,
+) -> Result<bool, ChangeSetError> {
+    read_text_blob(repo, tree, path).map(|text| text.is_some())
+}
+
+fn changed_file_is_binary(
+    repo: &git2::Repository,
+    base_tree: Option<&git2::Tree<'_>>,
+    target_tree: &git2::Tree<'_>,
+    file: &ChangedFile,
+) -> Result<bool, ChangeSetError> {
+    match file.kind {
+        ChangeKind::Added => blob_has_text(repo, target_tree, &file.path).map(|has_text| !has_text),
+        ChangeKind::Deleted => {
+            let base_tree = required_base_tree(base_tree)?;
+            let old_path = file.old_path.as_deref().unwrap_or(&file.path);
+            blob_has_text(repo, base_tree, old_path).map(|has_text| !has_text)
+        }
+        ChangeKind::Modified => {
+            let base_tree = required_base_tree(base_tree)?;
+            let old_has_text = blob_has_text(repo, base_tree, &file.path)?;
+            let new_has_text = blob_has_text(repo, target_tree, &file.path)?;
+            Ok(!old_has_text || !new_has_text)
+        }
+        ChangeKind::Renamed => {
+            let base_tree = required_base_tree(base_tree)?;
+            let old_path = file.old_path.as_deref().ok_or_else(|| {
+                ChangeSetError::Git(git2::Error::from_str("Missing rename source path"))
+            })?;
+            let old_has_text = blob_has_text(repo, base_tree, old_path)?;
+            let new_has_text = blob_has_text(repo, target_tree, &file.path)?;
+            Ok(!old_has_text || !new_has_text)
+        }
+    }
+}
+
 fn single_file_content(side: DiffSide, text: Option<String>) -> FileDiffContent {
     match text {
         Some(text) => FileDiffContent::Single { side, text },
@@ -694,21 +738,25 @@ fn changed_file_from_delta(delta: git2::DiffDelta<'_>) -> Option<ChangedFile> {
             path: diff_path(delta.new_file())?,
             old_path: None,
             kind: ChangeKind::Added,
+            is_binary: false,
         }),
         git2::Delta::Deleted => Some(ChangedFile {
             path: diff_path(delta.old_file())?,
             old_path: None,
             kind: ChangeKind::Deleted,
+            is_binary: false,
         }),
         git2::Delta::Modified | git2::Delta::Typechange => Some(ChangedFile {
             path: diff_path(delta.new_file())?,
             old_path: None,
             kind: ChangeKind::Modified,
+            is_binary: false,
         }),
         git2::Delta::Renamed => Some(ChangedFile {
             path: diff_path(delta.new_file())?,
             old_path: Some(diff_path(delta.old_file())?),
             kind: ChangeKind::Renamed,
+            is_binary: false,
         }),
         git2::Delta::Unmodified
         | git2::Delta::Ignored
@@ -1012,6 +1060,7 @@ mod tests {
                 path: "hello.txt".to_string(),
                 old_path: None,
                 kind: ChangeKind::Added,
+                is_binary: false,
             }],
         );
     }
@@ -1048,6 +1097,7 @@ mod tests {
                 path: "rollup.txt".to_string(),
                 old_path: None,
                 kind: ChangeKind::Modified,
+                is_binary: false,
             }],
         );
 
@@ -1126,6 +1176,7 @@ mod tests {
             path: "hello.txt".to_string(),
             old_path: None,
             kind: ChangeKind::Added,
+            is_binary: false,
         };
 
         let diff = file_diff_for_changed_file(dir.path(), &oid_hex, &file).expect("file diff");
@@ -1169,6 +1220,7 @@ mod tests {
                 path: "obsolete.txt".to_string(),
                 old_path: None,
                 kind: ChangeKind::Deleted,
+                is_binary: false,
             }],
         );
     }
@@ -1195,6 +1247,7 @@ mod tests {
             path: "obsolete.txt".to_string(),
             old_path: None,
             kind: ChangeKind::Deleted,
+            is_binary: false,
         };
 
         let diff = file_diff_for_changed_file(dir.path(), &delete_oid, &file).expect("file diff");
@@ -1223,6 +1276,7 @@ mod tests {
             path: "hello.txt".to_string(),
             old_path: None,
             kind: ChangeKind::Modified,
+            is_binary: false,
         };
 
         let diff = file_diff_for_changed_file(dir.path(), &update_oid, &file).expect("file diff");
@@ -1266,6 +1320,7 @@ mod tests {
                 path: "new.txt".to_string(),
                 old_path: Some("old.txt".to_string()),
                 kind: ChangeKind::Renamed,
+                is_binary: false,
             }],
         );
     }
@@ -1296,6 +1351,7 @@ mod tests {
             path: "new.txt".to_string(),
             old_path: Some("old.txt".to_string()),
             kind: ChangeKind::Renamed,
+            is_binary: false,
         };
 
         let diff = file_diff_for_changed_file(dir.path(), &rename_oid, &file).expect("file diff");
@@ -1322,11 +1378,33 @@ mod tests {
             path: "binary.dat".to_string(),
             old_path: None,
             kind: ChangeKind::Added,
+            is_binary: true,
         };
 
         let diff = file_diff_for_changed_file(dir.path(), &oid_hex, &file).expect("file diff");
 
         assert_eq!(diff.content, FileDiffContent::Binary);
+    }
+
+    #[test]
+    fn changeset_for_binary_file_marks_text_diff_unavailable() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("binary.dat"), b"\xff\xfe\0data").expect("write binary file");
+        let oid_hex = commit_workdir(&repo, "Add binary.dat", &[]);
+
+        let changeset = changeset_for_single_commit(dir.path(), &oid_hex).expect("changeset");
+
+        assert_eq!(
+            changeset.files,
+            vec![ChangedFile {
+                path: "binary.dat".to_string(),
+                old_path: None,
+                kind: ChangeKind::Added,
+                is_binary: true,
+            }],
+        );
     }
 
     #[test]

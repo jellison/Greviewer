@@ -1326,6 +1326,10 @@ impl App {
         } else {
             format!("changed-file-row-{index}")
         };
+        let path_fragment = debug_path_fragment(&file.path);
+        let kind_selector = format!("changed-file-kind-{path_fragment}");
+        let binary_selector = format!("changed-file-binary-indicator-{path_fragment}");
+        let rename_source_selector = format!("changed-file-rename-source-{path_fragment}");
 
         div()
             .flex()
@@ -1355,6 +1359,7 @@ impl App {
                     .text_color(change_kind_text(file.kind))
                     .text_size(px(11.))
                     .font_family("monospace")
+                    .debug_selector(move || kind_selector.clone())
                     .child(change_kind_label(file.kind)),
             )
             .child(
@@ -1365,10 +1370,31 @@ impl App {
                     .gap_1()
                     .child(
                         div()
-                            .text_color(rgb(0xe6e6e6))
-                            .text_size(px(14.))
-                            .font_family("monospace")
-                            .child(display_name.to_string()),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(rgb(0xe6e6e6))
+                                    .text_size(px(14.))
+                                    .font_family("monospace")
+                                    .child(display_name.to_string()),
+                            )
+                            .when(file.is_binary, |row| {
+                                row.child(
+                                    div()
+                                        .px_1()
+                                        .py_0p5()
+                                        .border_1()
+                                        .border_color(rgb(0x525252))
+                                        .bg(rgb(0x242424))
+                                        .text_color(rgb(0xbdbdbd))
+                                        .text_size(px(10.))
+                                        .font_family("monospace")
+                                        .debug_selector(move || binary_selector.clone())
+                                        .child("Binary"),
+                                )
+                            }),
                     )
                     .when_some(file.old_path.clone(), |column, old_path| {
                         column.child(
@@ -1376,6 +1402,7 @@ impl App {
                                 .text_color(rgb(0x8a8a8a))
                                 .text_size(px(12.))
                                 .font_family("monospace")
+                                .debug_selector(move || rename_source_selector.clone())
                                 .child(format!("from {old_path}")),
                         )
                     }),
@@ -1473,6 +1500,10 @@ impl App {
     ) -> AnyElement {
         let title = file.path.clone();
         let kind = change_kind_label(file.kind);
+        let rename_source_selector = format!(
+            "file-detail-rename-source-{}",
+            debug_path_fragment(&file.path)
+        );
         let content = match repo::file_diff_for_changed_file_between(
             &repo.path,
             &changeset.commit_sha,
@@ -1526,6 +1557,7 @@ impl App {
                         .text_color(rgb(0x999999))
                         .text_size(px(12.))
                         .font_family("monospace")
+                        .debug_selector(move || rename_source_selector.clone())
                         .child(format!("Renamed from {old_path}")),
                 )
             })
@@ -2963,6 +2995,21 @@ mod tests {
         )
     }
 
+    fn init_repo_with_deleted_file() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("obsolete.txt"), "obsolete\n").expect("write obsolete file");
+        let root_oid = commit_all(&repo, "Add obsolete.txt", &[]);
+
+        fs::remove_file(dir.path().join("obsolete.txt")).expect("delete obsolete file");
+        let delete_oid = commit_all(&repo, "Delete obsolete.txt", &[root_oid]);
+
+        drop(repo);
+
+        (dir, delete_oid.to_string())
+    }
+
     fn init_repo_with_long_diff() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("create tempdir");
         let repo = Repository::init(dir.path()).expect("init repo");
@@ -2982,6 +3029,42 @@ mod tests {
         drop(repo);
 
         (dir, update_oid.to_string())
+    }
+
+    fn init_repo_with_binary_file() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("binary.dat"), b"\xff\xfe\0data").expect("write binary file");
+        let oid = commit_all(&repo, "Add binary file", &[]);
+
+        drop(repo);
+
+        (dir, oid.to_string())
+    }
+
+    fn init_repo_with_renamed_file() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(
+            dir.path().join("old.txt"),
+            "line one\nline two\nline three\nold line\nline five\n",
+        )
+        .expect("write old file");
+        let root_oid = commit_all(&repo, "Add old.txt", &[]);
+
+        fs::rename(dir.path().join("old.txt"), dir.path().join("new.txt")).expect("rename file");
+        fs::write(
+            dir.path().join("new.txt"),
+            "line one\nline two\nline three\nnew line\nline five\n",
+        )
+        .expect("update renamed file");
+        let rename_oid = commit_all(&repo, "Rename old.txt", &[root_oid]);
+
+        drop(repo);
+
+        (dir, rename_oid.to_string())
     }
 
     fn test_debug_selector(selector: String) -> &'static str {
@@ -4706,6 +4789,97 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn binary_changed_files_show_no_text_indicator(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_binary_file();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open binary changeset");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("changed-file-binary-indicator-binary.dat")
+            .expect("binary changed file indicator debug bounds");
+
+        let row_bounds = visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+
+        visual
+            .debug_bounds("file-diff-binary")
+            .expect("binary file placeholder debug bounds");
+    }
+
+    #[gpui::test]
+    async fn renamed_changed_files_surface_old_path_and_render_side_by_side_diff(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, oid_hex) = init_repo_with_renamed_file();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open renamed changeset");
+
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _cx| match &app.review_screen {
+                ReviewScreen::Changeset { changeset, .. } => {
+                    assert_eq!(changeset.files.len(), 1);
+                    assert_eq!(changeset.files[0].path, "new.txt");
+                    assert_eq!(changeset.files[0].old_path.as_deref(), Some("old.txt"));
+                    assert_eq!(changeset.files[0].kind, ChangeKind::Renamed);
+                }
+                ReviewScreen::Graph => panic!("expected changeset review screen"),
+            })
+            .expect("read renamed changeset");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("changed-file-kind-new.txt")
+            .expect("renamed change kind debug bounds");
+        visual
+            .debug_bounds("changed-file-rename-source-new.txt")
+            .expect("changed file rename source debug bounds");
+
+        let row_bounds = visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+
+        visual
+            .debug_bounds("file-detail-rename-source-new.txt")
+            .expect("file detail rename source debug bounds");
+        visual
+            .debug_bounds("file-diff-side-old")
+            .expect("old file diff side debug bounds");
+        visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new file diff side debug bounds");
+        visual
+            .debug_bounds("file-diff-row-removed")
+            .expect("old renamed content diff row debug bounds");
+        visual
+            .debug_bounds("file-diff-row-added")
+            .expect("new renamed content diff row debug bounds");
+    }
+
+    #[gpui::test]
     async fn clicking_changed_file_renders_detail_shell(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
@@ -4780,6 +4954,96 @@ mod tests {
         visual
             .debug_bounds("file-diff-side-new")
             .expect("new file diff side debug bounds");
+    }
+
+    #[gpui::test]
+    async fn added_file_diff_renders_only_the_new_side(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open added file changeset");
+
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _cx| match &app.review_screen {
+                ReviewScreen::Changeset { changeset, .. } => {
+                    assert_eq!(changeset.files.len(), 1);
+                    assert_eq!(changeset.files[0].path, "hello.txt");
+                    assert_eq!(changeset.files[0].kind, ChangeKind::Added);
+                }
+                ReviewScreen::Graph => panic!("expected changeset review screen"),
+            })
+            .expect("read added file changeset");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row_bounds = visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+
+        visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new file diff side debug bounds");
+        visual
+            .debug_bounds("file-diff-row-added")
+            .expect("added line row debug bounds");
+        assert!(
+            visual.debug_bounds("file-diff-side-old").is_none(),
+            "added file diff should not render an empty old-side pane"
+        );
+    }
+
+    #[gpui::test]
+    async fn deleted_file_diff_renders_only_the_old_side(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_deleted_file();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open deleted file changeset");
+
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _cx| match &app.review_screen {
+                ReviewScreen::Changeset { changeset, .. } => {
+                    assert_eq!(changeset.files.len(), 1);
+                    assert_eq!(changeset.files[0].path, "obsolete.txt");
+                    assert_eq!(changeset.files[0].kind, ChangeKind::Deleted);
+                }
+                ReviewScreen::Graph => panic!("expected changeset review screen"),
+            })
+            .expect("read deleted file changeset");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row_bounds = visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+
+        visual
+            .debug_bounds("file-diff-side-old")
+            .expect("old file diff side debug bounds");
+        visual
+            .debug_bounds("file-diff-row-removed")
+            .expect("removed line row debug bounds");
+        assert!(
+            visual.debug_bounds("file-diff-side-new").is_none(),
+            "deleted file diff should not render an empty new-side pane"
+        );
     }
 
     #[gpui::test]
