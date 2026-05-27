@@ -483,6 +483,13 @@ impl App {
         }
     }
 
+    fn remove_recent_repository(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.recent_repositories
+            .retain(|recent| recent.path.as_path() != path);
+        self.persist_recent_repositories();
+        cx.notify();
+    }
+
     fn persist_recent_repositories(&self) {
         if let Some(path) = &self.recent_repository_store_path {
             let _ = save_recent_repositories(path, &self.recent_repositories);
@@ -772,13 +779,15 @@ impl App {
         recent: &RecentRepository,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let path = recent.path.clone();
-        let display_path = path.display().to_string();
+        let open_path = recent.path.clone();
+        let remove_path = recent.path.clone();
+        let display_path = recent.path.display().to_string();
         let debug_selector = if recent.available {
             format!("recent-repository-row-{index}")
         } else {
             format!("unavailable-recent-repository-row-{index}")
         };
+        let remove_selector = format!("unavailable-recent-repository-remove-{index}");
         let path_color = if recent.available {
             rgb(0xe6e6e6)
         } else {
@@ -799,7 +808,7 @@ impl App {
             .id(("recent-repository-row", index))
             .debug_selector(move || debug_selector.clone())
             .on_click(cx.listener(move |app, _event, window, cx| {
-                app.open_recent_repository(path.clone(), window, cx);
+                app.open_recent_repository(open_path.clone(), window, cx);
             }))
             .child(
                 div()
@@ -812,14 +821,38 @@ impl App {
             .when(!recent.available, |row| {
                 row.child(
                     div()
-                        .px_2()
-                        .py_1()
-                        .border_1()
-                        .border_color(rgb(0x5a2a2a))
-                        .bg(rgb(0x241818))
-                        .text_color(rgb(0xfca5a5))
-                        .text_size(px(11.))
-                        .child("Unavailable"),
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .border_1()
+                                .border_color(rgb(0x5a2a2a))
+                                .bg(rgb(0x241818))
+                                .text_color(rgb(0xfca5a5))
+                                .text_size(px(11.))
+                                .child("Unavailable"),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .border_1()
+                                .border_color(rgb(0x3a3a3a))
+                                .bg(rgb(0x1f1f1f))
+                                .text_color(rgb(0xbdbdbd))
+                                .text_size(px(11.))
+                                .cursor_pointer()
+                                .id(("unavailable-recent-repository-remove", index))
+                                .debug_selector(move || remove_selector.clone())
+                                .on_click(cx.listener(move |app, _event, _window, cx| {
+                                    app.remove_recent_repository(&remove_path, cx);
+                                    cx.stop_propagation();
+                                }))
+                                .child("Remove"),
+                        ),
                 )
             })
     }
@@ -904,6 +937,7 @@ impl App {
                 .items_center()
                 .justify_center()
                 .id("commit-history-empty")
+                .debug_selector(|| "commit-history-empty".to_string())
                 .text_color(rgb(0x999999))
                 .text_size(px(14.))
                 .child("This repository has no commits to review.")
@@ -2756,6 +2790,22 @@ mod tests {
         (dir, update_oid.to_string())
     }
 
+    fn init_repo_with_detached_head() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("detached.txt"), "base\n").expect("write file");
+        let root_oid = commit_all(&repo, "Base", &[]);
+
+        fs::write(dir.path().join("detached.txt"), "tip\n").expect("update file");
+        let tip_oid = commit_all(&repo, "Tip", &[root_oid]);
+        repo.set_head_detached(tip_oid).expect("detach HEAD");
+
+        drop(repo);
+
+        (dir, tip_oid.to_string())
+    }
+
     fn init_repo_with_changed_and_context_files() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("create tempdir");
         let repo = Repository::init(dir.path()).expect("init repo");
@@ -3111,6 +3161,41 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn opening_an_unborn_repo_renders_empty_commit_history(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().to_path_buf();
+        Repository::init(&path).expect("init repo");
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open unborn repo");
+
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _cx| match &app.mode {
+                Mode::RepoOpen { repo } => {
+                    assert!(repo.head.is_none());
+                    assert!(repo.commits.is_empty());
+                }
+                Mode::NoRepo => panic!("expected RepoOpen, got NoRepo"),
+            })
+            .expect("read unborn repo mode");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("commit-history-empty")
+            .expect("empty commit history debug bounds");
+        assert!(
+            visual.debug_bounds("open-changeset").is_none(),
+            "unborn repos should not offer opening a changeset"
+        );
+    }
+
+    #[gpui::test]
     async fn opening_repositories_records_recent_paths_and_moves_reopened_repo_to_top(
         cx: &mut TestAppContext,
     ) {
@@ -3291,6 +3376,49 @@ mod tests {
         assert_eq!(
             load_recent_repositories(&store_path).expect("load recent repository store"),
             vec![RecentRepository::unavailable(missing_path)],
+        );
+    }
+
+    #[gpui::test]
+    async fn unavailable_recent_repository_can_be_removed(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let missing_path = dir.path().join("missing-repo");
+        let store_path = dir.path().join("recent-repositories");
+        save_recent_repositories(
+            &store_path,
+            &[RecentRepository::available(missing_path.clone())],
+        )
+        .expect("seed recent repository store");
+        let window = cx.add_window(|window, cx| {
+            App::new_with_recent_repository_store_path(window, cx, store_path.clone())
+        });
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row_bounds = visual
+            .debug_bounds("recent-repository-row-0")
+            .expect("recent repository row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let remove_bounds = visual
+            .debug_bounds("unavailable-recent-repository-remove-0")
+            .expect("unavailable recent repository remove debug bounds");
+        visual.simulate_click(remove_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, cx| {
+                assert!(app.recent_repositories.is_empty());
+                assert_eq!(app.notification_count(cx), 1);
+            })
+            .expect("read removed recent repository");
+        assert_eq!(
+            load_recent_repositories(&store_path).expect("load recent repository store"),
+            Vec::<RecentRepository>::new(),
         );
     }
 
@@ -3787,6 +3915,55 @@ mod tests {
         visual
             .debug_bounds(label_selector(right_row, "right"))
             .expect("right branch label on right commit");
+    }
+
+    #[gpui::test]
+    async fn detached_head_repositories_render_without_a_head_marker(cx: &mut TestAppContext) {
+        let (dir, tip_sha) = init_repo_with_detached_head();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open detached HEAD repo");
+
+        cx.run_until_parked();
+
+        let master_row = window
+            .read_with(cx, |app, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected repo open mode");
+                };
+
+                assert_eq!(repo.commits.len(), 2);
+                assert_eq!(repo.commits[0].sha, tip_sha);
+                assert!(
+                    repo.commits.iter().all(|commit| !commit.is_head),
+                    "detached HEAD should not mark a checked-out branch tip"
+                );
+
+                repo.commits
+                    .iter()
+                    .position(|commit| commit.branch_names.iter().any(|name| name == "master"))
+                    .expect("master branch row")
+            })
+            .expect("read detached HEAD repo");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("commit-row-0")
+            .expect("tip commit row debug bounds");
+        visual
+            .debug_bounds(test_debug_selector(format!(
+                "commit-ref-label-{master_row}-master"
+            )))
+            .expect("master branch label debug bounds");
+        assert!(
+            visual.debug_bounds("commit-ref-label-0-head").is_none(),
+            "detached HEAD should not render a HEAD label"
+        );
     }
 
     #[gpui::test]

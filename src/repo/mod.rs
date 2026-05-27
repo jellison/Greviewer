@@ -165,10 +165,12 @@ pub fn open_at(path: &Path) -> Result<OpenRepository, OpenError> {
     let head_commit = read_head_commit(&repo)?;
     let head_oid = head_commit.as_ref().map(|commit| commit.id());
     let head = head_commit.as_ref().map(head_info_from_commit);
+    let checked_out_branch_oid = read_checked_out_branch_oid(&repo)?;
     let branch_names_by_oid = read_local_branch_names_by_oid(&repo)?;
     let page = read_commit_page(
         &repo,
         head_oid,
+        checked_out_branch_oid,
         &branch_names_by_oid,
         None,
         INITIAL_COMMIT_LIMIT,
@@ -187,12 +189,14 @@ pub fn load_commits_after(path: &Path, after_sha: &str) -> Result<CommitPage, Op
     let repo = git2::Repository::open(&canonical).map_err(classify_open_error)?;
     let head_commit = read_head_commit(&repo)?;
     let head_oid = head_commit.as_ref().map(|commit| commit.id());
+    let checked_out_branch_oid = read_checked_out_branch_oid(&repo)?;
     let branch_names_by_oid = read_local_branch_names_by_oid(&repo)?;
     let after_oid = git2::Oid::from_str(after_sha).map_err(OpenError::Git)?;
 
     read_commit_page(
         &repo,
         head_oid,
+        checked_out_branch_oid,
         &branch_names_by_oid,
         Some(after_oid),
         INITIAL_COMMIT_LIMIT,
@@ -540,9 +544,23 @@ fn read_head_commit(repo: &git2::Repository) -> Result<Option<git2::Commit<'_>>,
     }
 }
 
+fn read_checked_out_branch_oid(repo: &git2::Repository) -> Result<Option<git2::Oid>, OpenError> {
+    match repo.head() {
+        Ok(reference) if reference.is_branch() => reference
+            .peel_to_commit()
+            .map(|commit| Some(commit.id()))
+            .map_err(OpenError::Git),
+        Ok(_) => Ok(None),
+        Err(err) if err.code() == git2::ErrorCode::UnbornBranch => Ok(None),
+        Err(err) if err.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(err) => Err(OpenError::Git(err)),
+    }
+}
+
 fn read_commit_page(
     repo: &git2::Repository,
     head_oid: Option<git2::Oid>,
+    checked_out_branch_oid: Option<git2::Oid>,
     branch_names_by_oid: &BTreeMap<git2::Oid, Vec<String>>,
     after_oid: Option<git2::Oid>,
     limit: usize,
@@ -579,7 +597,7 @@ fn read_commit_page(
         let commit = repo.find_commit(oid).map_err(OpenError::Git)?;
         commits.push(commit_info_from_commit(
             &commit,
-            head_oid,
+            checked_out_branch_oid,
             branch_names_by_oid
                 .get(&commit.id())
                 .cloned()
