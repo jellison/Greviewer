@@ -16,6 +16,14 @@ Persisting per-file or per-hunk review state so a reviewer can track progress th
 
 Hiding entries from the file tree that the reviewer has already marked as reviewed, so the remaining work is easier to see. Builds on the reviewed-state idea above.
 
+## Live repository refresh
+
+Reflecting commits made to the open repository without requiring the user to re-open it. This is deferred from the MVP so the core review flow can stay focused on opening a repository, selecting commits, opening a changeset, and inspecting files.
+
+## Progressive large-file diff loading
+
+Loading and rendering very large file diffs incrementally so opening a large changed file does not block the review UI. This is deferred from the MVP because the current core workflow only needs scrollable diffs, not a progressive diff-loading architecture.
+
 ## AI-powered changeset context
 
 When a changeset is opened, surface AI-generated context to help the reviewer get oriented: a brief summary of the changes from a business-rules perspective, and a recommended order in which to review the files for the best understanding.

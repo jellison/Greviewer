@@ -42,17 +42,16 @@ The user sees a graphical history of the repository's commits with branch lanes 
 - Very large histories load progressively rather than blocking the UI.
 - Histories with several active branches remain legible: the visible first-parent history of the top commit anchors the left-most lane, active branch lanes keep a stable horizontal position until they end, branch lanes render as continuous vertical lines through and between rows without row separators interrupting them, new branch lanes use the nearest available lane to the right and do not reuse occupied lanes, multi-lane connectors stay continuous across intermediate lanes even when those lanes have no active branch, and branch labels do not obscure the graph.
 - Detached-HEAD repositories render normally with no checked-out branch marker.
-- New commits made to the repository while the window is open are reflected in the graph without requiring the user to re-open the repository.
 
 ## Selecting commits to review
 
-The user stages a review by selecting either a single commit or a contiguous sequential range from the graph. Selection is tentative: no review activity begins until the user explicitly opens the changeset (described below). Clicking a commit selects it. Shift-clicking a second commit extends the selection to a range, provided the two commits lie on a single ancestry path (one is an ancestor of the other). The selection is the inclusive set of commits between the two endpoints along that path. Clicking a single commit again, or activating the clear-selection affordance, clears the selection.
+The user stages a review by selecting either a single commit or a contiguous sequential range from the graph. Selection is tentative: no review activity begins until the user explicitly opens the changeset (described below). Clicking a commit selects it. Shift-clicking a second commit extends the selection to a range, provided the two commits lie on a single ancestry path (one is an ancestor of the other). The selection is the inclusive set of commits between the two endpoints along that path. Clicking the selected commit again clears the selection.
 
 **Triggering conditions**
 
 - The user clicks a commit in the graph.
 - The user shift-clicks a second commit while a single-commit selection is active.
-- The user clears the selection.
+- The user clicks the selected commit again.
 
 **Observable outcomes**
 
@@ -143,4 +142,3 @@ For files that exist on only one side of the selection — added or deleted file
 
 - Renamed files diff old-path content against new-path content; the file's pre-rename path is surfaced so the user can see what was renamed.
 - Binary files render an explanatory placeholder rather than attempting a textual diff.
-- Very large files load progressively rather than blocking the UI.
