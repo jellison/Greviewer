@@ -40,7 +40,7 @@ The user sees a graphical history of the repository's commits with branch lanes 
 **Edge cases**
 
 - Very large histories load progressively rather than blocking the UI.
-- Histories with several active branches remain legible: the visible first-parent history of the top commit anchors the left-most lane, active branch lanes keep a stable horizontal position until they end, branch lanes render as continuous vertical lines through rows without commits, new branch lanes use the nearest available lane to the right and do not reuse occupied lanes, multi-lane connectors stay continuous across intermediate lanes even when those lanes have no active branch, and branch labels do not obscure the graph.
+- Histories with several active branches remain legible: the visible first-parent history of the top commit anchors the left-most lane, active branch lanes keep a stable horizontal position until they end, branch lanes render as continuous vertical lines through and between rows without row separators interrupting them, new branch lanes use the nearest available lane to the right and do not reuse occupied lanes, multi-lane connectors stay continuous across intermediate lanes even when those lanes have no active branch, and branch labels do not obscure the graph.
 - Detached-HEAD repositories render normally with no checked-out branch marker.
 - New commits made to the repository while the window is open are reflected in the graph without requiring the user to re-open the repository.
 

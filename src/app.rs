@@ -1559,11 +1559,6 @@ impl App {
         } else {
             rgb(0x171717)
         };
-        let border_color = if selected {
-            rgb(0x3b82f6)
-        } else {
-            rgb(0x242424)
-        };
         let debug_selector = if selected {
             format!("selected-commit-row-{index}")
         } else {
@@ -1575,12 +1570,14 @@ impl App {
             .flex()
             .items_center()
             .w_full()
+            .h(px(COMMIT_ROW_HEIGHT))
             .gap_3()
             .px_4()
-            .py_2()
             .bg(row_bg)
-            .border_b_1()
-            .border_color(border_color)
+            .when(commit_row_separator_width() > 0., |row| {
+                row.border_b(px(commit_row_separator_width()))
+                    .border_color(commit_row_separator_color(selected))
+            })
             .cursor_pointer()
             .id(("commit-row", index))
             .debug_selector(move || debug_selector.clone())
@@ -1620,6 +1617,20 @@ impl App {
                             .child(secondary),
                     ),
             )
+    }
+}
+
+const COMMIT_ROW_HEIGHT: f32 = 64.;
+
+fn commit_row_separator_width() -> f32 {
+    0.
+}
+
+fn commit_row_separator_color(selected: bool) -> gpui::Rgba {
+    if selected {
+        rgb(0x3b82f6)
+    } else {
+        rgb(0x242424)
     }
 }
 
@@ -1722,9 +1733,10 @@ fn render_commit_graph_gutter(
 }
 
 const COMMIT_GRAPH_LANE_WIDTH: f32 = 22.;
-const COMMIT_GRAPH_LANE_HEIGHT: f32 = 28.;
-const COMMIT_GRAPH_VERTICAL_HEIGHT: f32 = 9.;
+const COMMIT_GRAPH_LANE_HEIGHT: f32 = COMMIT_ROW_HEIGHT;
 const COMMIT_GRAPH_MIDDLE_HEIGHT: f32 = 10.;
+const COMMIT_GRAPH_VERTICAL_HEIGHT: f32 =
+    (COMMIT_GRAPH_LANE_HEIGHT - COMMIT_GRAPH_MIDDLE_HEIGHT) / 2.;
 const COMMIT_GRAPH_LINE_WIDTH: f32 = 2.;
 const COMMIT_GRAPH_DOT_SIZE: f32 = 8.;
 
@@ -2638,10 +2650,11 @@ fn debug_ref_label_fragment(label: &str) -> String {
 mod tests {
     use super::{
         commit_graph_connector_color_lane, commit_graph_connector_for_lane,
-        commit_graph_spanning_connector_requires_center_fill, debug_ref_label_fragment,
-        load_recent_repositories, save_recent_repositories, side_by_side_diff_rows,
-        single_side_diff_rows, App, CloseChangeset, DiffLineStatus, FileListMode, FileTreeRow,
-        Mode, OpenChangeset, OpenFailed, RecentRepository, ReviewScreen, Selection,
+        commit_graph_spanning_connector_requires_center_fill, commit_row_separator_width,
+        debug_ref_label_fragment, load_recent_repositories, save_recent_repositories,
+        side_by_side_diff_rows, single_side_diff_rows, App, CloseChangeset, DiffLineStatus,
+        FileListMode, FileTreeRow, Mode, OpenChangeset, OpenFailed, RecentRepository, ReviewScreen,
+        Selection,
     };
     use crate::graph::{self, GraphConnectorKind};
     use crate::repo::{ChangeKind, DiffSide, INITIAL_COMMIT_LIMIT};
@@ -3350,6 +3363,11 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn commit_rows_do_not_draw_separators_between_graph_segments() {
+        assert_eq!(commit_row_separator_width(), 0.);
+    }
+
     #[gpui::test]
     async fn commit_graph_renders_merge_lanes(cx: &mut TestAppContext) {
         let (dir, _left_sha, _right_sha) = init_repo_with_diverged_history();
@@ -3468,6 +3486,41 @@ mod tests {
             merge_in_elbow_bounds.origin.y + merge_in_elbow_bounds.size.height,
             merge_in_vertical_bounds.origin.y,
             "merge-in elbow should connect to the parent lane",
+        );
+    }
+
+    #[gpui::test]
+    async fn commit_graph_vertical_segments_connect_between_rows(cx: &mut TestAppContext) {
+        let (dir, _) = init_repo_with_two_commits();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let first_row_bottom = visual
+            .debug_bounds("commit-graph-vertical-0-0-bottom")
+            .expect("first row outgoing vertical debug bounds");
+        let second_row_top = visual
+            .debug_bounds("commit-graph-vertical-1-0-top")
+            .expect("second row incoming vertical debug bounds");
+        let first_row = visual
+            .debug_bounds("commit-row-0")
+            .expect("first commit row debug bounds");
+        let second_row = visual
+            .debug_bounds("commit-row-1")
+            .expect("second commit row debug bounds");
+
+        assert_eq!(
+            first_row_bottom.origin.y + first_row_bottom.size.height,
+            second_row_top.origin.y,
+            "commit graph vertical segments should connect across adjacent rows; first row: {first_row:?}, second row: {second_row:?}, first bottom: {first_row_bottom:?}, second top: {second_row_top:?}",
         );
     }
 
