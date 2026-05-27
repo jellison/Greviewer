@@ -547,33 +547,22 @@ impl App {
             Mode::NoRepo => return Ok(None),
         };
 
-        let Some(start_index) = open_repo
+        if !open_repo
             .commits
             .iter()
-            .position(|commit| commit.sha == start_sha)
-        else {
+            .any(|commit| commit.sha == start_sha)
+        {
             return Ok(None);
-        };
-        let Some(end_index) = open_repo
-            .commits
-            .iter()
-            .position(|commit| commit.sha == end_sha)
-        else {
+        }
+        if !open_repo.commits.iter().any(|commit| commit.sha == end_sha) {
             return Ok(None);
-        };
+        }
 
         if !repo::commits_share_linear_ancestry(&open_repo.path, start_sha, end_sha)? {
             return Ok(None);
         }
 
-        let first_index = start_index.min(end_index);
-        let last_index = start_index.max(end_index);
-        Ok(Some(
-            open_repo.commits[first_index..=last_index]
-                .iter()
-                .map(|commit| commit.sha.clone())
-                .collect(),
-        ))
+        Ok(commit_ancestry_path(&open_repo.commits, start_sha, end_sha))
     }
 
     fn open_changeset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2625,6 +2614,62 @@ fn append_file_tree_rows(
     }
 }
 
+fn commit_ancestry_path(
+    commits: &[repo::CommitInfo],
+    first_sha: &str,
+    second_sha: &str,
+) -> Option<Vec<String>> {
+    let commits_by_sha = commits
+        .iter()
+        .map(|commit| (commit.sha.as_str(), commit))
+        .collect::<BTreeMap<_, _>>();
+
+    commit_ancestry_path_from_descendant(
+        &commits_by_sha,
+        first_sha,
+        second_sha,
+        &mut BTreeSet::new(),
+    )
+    .or_else(|| {
+        commit_ancestry_path_from_descendant(
+            &commits_by_sha,
+            second_sha,
+            first_sha,
+            &mut BTreeSet::new(),
+        )
+    })
+}
+
+fn commit_ancestry_path_from_descendant(
+    commits_by_sha: &BTreeMap<&str, &repo::CommitInfo>,
+    current_sha: &str,
+    ancestor_sha: &str,
+    visited_shas: &mut BTreeSet<String>,
+) -> Option<Vec<String>> {
+    if current_sha == ancestor_sha {
+        return Some(vec![current_sha.to_string()]);
+    }
+
+    if !visited_shas.insert(current_sha.to_string()) {
+        return None;
+    }
+
+    let commit = commits_by_sha.get(current_sha)?;
+    for parent_sha in &commit.parent_shas {
+        if let Some(mut path) = commit_ancestry_path_from_descendant(
+            commits_by_sha,
+            parent_sha,
+            ancestor_sha,
+            visited_shas,
+        ) {
+            path.insert(0, current_sha.to_string());
+            return Some(path);
+        }
+    }
+
+    None
+}
+
 fn depth_spacer(depth: usize) -> gpui::Div {
     div().w(px(depth as f32 * 16.))
 }
@@ -2769,6 +2814,31 @@ mod tests {
         )
     }
 
+    fn init_repo_with_empty_rollup_range() -> (tempfile::TempDir, Vec<String>) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("roundtrip.txt"), "base\n").expect("write base file");
+        let base_oid = commit_all(&repo, "Base", &[]);
+
+        fs::write(dir.path().join("roundtrip.txt"), "changed\n").expect("change file");
+        let change_oid = commit_all(&repo, "Change file", &[base_oid]);
+
+        fs::write(dir.path().join("roundtrip.txt"), "base\n").expect("revert file");
+        let revert_oid = commit_all(&repo, "Revert file", &[change_oid]);
+
+        drop(repo);
+
+        (
+            dir,
+            vec![
+                revert_oid.to_string(),
+                change_oid.to_string(),
+                base_oid.to_string(),
+            ],
+        )
+    }
+
     fn init_repo_with_linear_history(count: usize) -> (tempfile::TempDir, Vec<String>) {
         let dir = tempfile::tempdir().expect("create tempdir");
         let repo = Repository::init(dir.path()).expect("init repo");
@@ -2813,6 +2883,36 @@ mod tests {
         (dir, left_oid.to_string(), right_oid.to_string())
     }
 
+    fn init_repo_with_merge_range() -> (tempfile::TempDir, String, String, String, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("base.txt"), "base\n").expect("write base file");
+        let root_oid = commit_all_to_ref_at_time(&repo, Some("HEAD"), "Root", &[], 10);
+
+        fs::write(dir.path().join("side.txt"), "side\n").expect("write side file");
+        let side_oid =
+            commit_all_to_ref_at_time(&repo, Some("refs/heads/side"), "Side", &[root_oid], 20);
+
+        fs::remove_file(dir.path().join("side.txt")).expect("remove side file");
+        fs::write(dir.path().join("main.txt"), "main\n").expect("write main file");
+        let main_oid = commit_all_to_ref_at_time(&repo, Some("HEAD"), "Main", &[root_oid], 30);
+
+        fs::write(dir.path().join("side.txt"), "side\n").expect("restore side file");
+        let merge_oid =
+            commit_all_to_ref_at_time(&repo, Some("HEAD"), "Merge", &[main_oid, side_oid], 40);
+
+        drop(repo);
+
+        (
+            dir,
+            merge_oid.to_string(),
+            main_oid.to_string(),
+            side_oid.to_string(),
+            root_oid.to_string(),
+        )
+    }
+
     fn init_repo_with_long_diff() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("create tempdir");
         let repo = Repository::init(dir.path()).expect("init repo");
@@ -2832,6 +2932,10 @@ mod tests {
         drop(repo);
 
         (dir, update_oid.to_string())
+    }
+
+    fn test_debug_selector(selector: String) -> &'static str {
+        Box::leak(selector.into_boxed_str())
     }
 
     fn commit_all(repo: &Repository, message: &str, parents: &[git2::Oid]) -> git2::Oid {
@@ -3286,6 +3390,109 @@ mod tests {
                 assert_eq!(app.selection, Selection::Single { sha: left_sha });
             })
             .expect("attempt invalid range selection");
+    }
+
+    #[gpui::test]
+    async fn selecting_merge_to_second_parent_uses_that_ancestry_path_and_rolls_up_merge_files(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, merge_sha, main_sha, side_sha, root_sha) = init_repo_with_merge_range();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+
+        cx.run_until_parked();
+
+        let (merge_index, main_index, side_index) = window
+            .read_with(cx, |app, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected repo open mode");
+                };
+                let merge_index = repo
+                    .commits
+                    .iter()
+                    .position(|commit| commit.sha == merge_sha)
+                    .expect("merge commit row");
+                let main_index = repo
+                    .commits
+                    .iter()
+                    .position(|commit| commit.sha == main_sha)
+                    .expect("main commit row");
+                let side_index = repo
+                    .commits
+                    .iter()
+                    .position(|commit| commit.sha == side_sha)
+                    .expect("side commit row");
+
+                (merge_index, main_index, side_index)
+            })
+            .expect("read commit row indexes");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let merge_bounds = visual
+            .debug_bounds(test_debug_selector(format!("commit-row-{merge_index}")))
+            .expect("merge commit row debug bounds");
+        visual.simulate_click(merge_bounds.center(), Modifiers::none());
+
+        let side_bounds = visual
+            .debug_bounds(test_debug_selector(format!("commit-row-{side_index}")))
+            .expect("side commit row debug bounds");
+        visual.simulate_click(side_bounds.center(), Modifiers::shift());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.selection,
+                    Selection::Range {
+                        start_sha: merge_sha.clone(),
+                        end_sha: side_sha.clone(),
+                        shas: vec![merge_sha.clone(), side_sha.clone()],
+                    },
+                );
+            })
+            .expect("read merge range selection");
+
+        assert!(
+            visual
+                .debug_bounds(test_debug_selector(format!(
+                    "selected-commit-row-{main_index}"
+                )))
+                .is_none(),
+            "first-parent commit should not be selected when the range follows the second parent"
+        );
+
+        let open_bounds = visual
+            .debug_bounds("open-changeset")
+            .expect("open changeset debug bounds");
+        visual.simulate_click(open_bounds.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| match &app.review_screen {
+                ReviewScreen::Changeset { changeset, .. } => {
+                    let files = changeset
+                        .files
+                        .iter()
+                        .map(|file| (file.path.as_str(), file.kind))
+                        .collect::<Vec<_>>();
+
+                    assert_eq!(changeset.commit_sha, merge_sha);
+                    assert_eq!(changeset.base_sha, Some(root_sha));
+                    assert_eq!(
+                        files,
+                        vec![
+                            ("main.txt", ChangeKind::Added),
+                            ("side.txt", ChangeKind::Added),
+                        ],
+                    );
+                }
+                ReviewScreen::Graph => panic!("expected changeset review screen"),
+            })
+            .expect("read merge changeset");
     }
 
     #[test]
@@ -3809,6 +4016,53 @@ mod tests {
         visual
             .debug_bounds("changed-file-row-0")
             .expect("changed file row debug bounds");
+    }
+
+    #[gpui::test]
+    async fn opening_empty_rollup_changeset_shows_empty_state(cx: &mut TestAppContext) {
+        let (dir, shas) = init_repo_with_empty_rollup_range();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let revert_bounds = visual
+            .debug_bounds("commit-row-0")
+            .expect("revert commit row debug bounds");
+        visual.simulate_click(revert_bounds.center(), Modifiers::none());
+
+        let change_bounds = visual
+            .debug_bounds("commit-row-1")
+            .expect("change commit row debug bounds");
+        visual.simulate_click(change_bounds.center(), Modifiers::shift());
+
+        let open_bounds = visual
+            .debug_bounds("open-changeset")
+            .expect("open changeset debug bounds");
+        visual.simulate_click(open_bounds.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| match &app.review_screen {
+                ReviewScreen::Changeset { sha, changeset } => {
+                    assert_eq!(sha, &shas[0]);
+                    assert_eq!(changeset.commit_sha, shas[0]);
+                    assert_eq!(changeset.base_sha, Some(shas[2].clone()));
+                    assert!(changeset.files.is_empty());
+                }
+                ReviewScreen::Graph => panic!("expected changeset review screen"),
+            })
+            .expect("read empty rollup changeset");
+
+        visual
+            .debug_bounds("changed-files-empty")
+            .expect("empty changeset state debug bounds");
     }
 
     #[gpui::test]
