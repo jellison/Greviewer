@@ -1601,39 +1601,302 @@ fn render_commit_graph_gutter(
 }
 
 fn render_commit_graph_lane(row_index: usize, lane: usize, row: &graph::GraphRow) -> gpui::Div {
-    let is_commit = lane == row.lane;
-    let is_active = row.active_lanes.contains(&lane);
-    let is_parent = row.parent_lanes.contains(&lane);
-    let glyph = if is_commit {
-        "o"
-    } else if is_active || is_parent {
-        "|"
-    } else {
-        " "
-    };
-    let color = if is_commit {
-        rgb(0xa3e635)
-    } else if is_parent {
-        rgb(0x60a5fa)
-    } else {
-        rgb(0x555555)
-    };
-    let debug_selector = if is_commit {
-        format!("commit-graph-dot-{row_index}")
-    } else {
-        format!("commit-graph-lane-{row_index}-{lane}")
-    };
+    let has_incoming = row.incoming_lanes.contains(&lane);
+    let has_outgoing = row.outgoing_lanes.contains(&lane);
+    let lane_color = commit_graph_lane_color(row, lane);
+    let lane_selector = format!("commit-graph-lane-{row_index}-{lane}");
+
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .w(px(14.))
+        .h(px(28.))
+        .debug_selector(move || lane_selector.clone())
+        .child(render_commit_graph_vertical_segment(
+            row_index,
+            lane,
+            "top",
+            has_incoming,
+            lane_color,
+        ))
+        .child(render_commit_graph_middle_segment(
+            row_index, lane, row, lane_color,
+        ))
+        .child(render_commit_graph_vertical_segment(
+            row_index,
+            lane,
+            "bottom",
+            has_outgoing,
+            lane_color,
+        ))
+}
+
+fn commit_graph_lane_color(row: &graph::GraphRow, lane: usize) -> gpui::Rgba {
+    const PALETTE: [u32; 6] = [0x60a5fa, 0xa3e635, 0xfbbf24, 0xf472b6, 0x2dd4bf, 0xc084fc];
+
+    row.lane_colors
+        .get(lane)
+        .and_then(|color| *color)
+        .map(|color| rgb(PALETTE[color % PALETTE.len()]))
+        .unwrap_or_else(|| rgb(0x555555))
+}
+
+fn render_commit_graph_vertical_segment(
+    row_index: usize,
+    lane: usize,
+    position: &'static str,
+    visible: bool,
+    color: gpui::Rgba,
+) -> gpui::Div {
+    let selector = format!("commit-graph-vertical-{row_index}-{lane}-{position}");
+    let segment = div().w(px(2.)).h(px(9.)).when(visible, |segment| {
+        segment.bg(color).debug_selector(move || selector.clone())
+    });
 
     div()
         .flex()
         .items_center()
         .justify_center()
         .w(px(14.))
-        .h(px(28.))
-        .text_size(px(12.))
-        .text_color(color)
-        .debug_selector(move || debug_selector.clone())
-        .child(glyph)
+        .h(px(9.))
+        .child(segment)
+}
+
+fn render_commit_graph_middle_segment(
+    row_index: usize,
+    lane: usize,
+    row: &graph::GraphRow,
+    color: gpui::Rgba,
+) -> gpui::Div {
+    let is_commit = lane == row.lane;
+    let has_connector = row.connector_lanes.contains(&lane);
+    let connector_selector = format!("commit-graph-connector-{row_index}-{lane}");
+    let dot_selector = format!("commit-graph-dot-{row_index}");
+    let non_commit_connector_selector = connector_selector.clone();
+    let commit_connector_selector = connector_selector;
+
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(14.))
+        .h(px(10.))
+        .when(has_connector && !is_commit, |middle| {
+            middle.child(render_commit_graph_non_commit_connector(
+                row_index,
+                lane,
+                row,
+                non_commit_connector_selector.clone(),
+            ))
+        })
+        .when(is_commit, |middle| {
+            let lane_span = row.connector_lanes.iter().copied();
+            let min_lane = lane_span.clone().min().unwrap_or(lane);
+            let max_lane = lane_span.max().unwrap_or(lane);
+            let has_left_connector = has_connector && lane > min_lane;
+            let has_right_connector = has_connector && lane < max_lane;
+            let left_connector_color = commit_graph_connector_on_side(row, lane, false)
+                .map(|connector| commit_graph_connector_color(row, connector))
+                .unwrap_or(color);
+            let right_connector_color = commit_graph_connector_on_side(row, lane, true)
+                .map(|connector| commit_graph_connector_color(row, connector))
+                .unwrap_or(color);
+
+            middle.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(14.))
+                    .h(px(10.))
+                    .child(
+                        div()
+                            .w(px(3.))
+                            .h(px(2.))
+                            .when(has_left_connector, |line| line.bg(left_connector_color)),
+                    )
+                    .child(
+                        div()
+                            .w(px(8.))
+                            .h(px(8.))
+                            .rounded_full()
+                            .bg(color)
+                            .debug_selector(move || dot_selector.clone()),
+                    )
+                    .child(div().w(px(3.)).h(px(2.)).when(has_right_connector, |line| {
+                        line.bg(right_connector_color)
+                            .debug_selector(move || commit_connector_selector.clone())
+                    })),
+            )
+        })
+}
+
+fn commit_graph_connector_for_lane(
+    row: &graph::GraphRow,
+    lane: usize,
+) -> Option<graph::GraphConnector> {
+    row.connectors
+        .iter()
+        .copied()
+        .find(|connector| connector.to_lane == lane)
+}
+
+fn commit_graph_connector_on_side(
+    row: &graph::GraphRow,
+    lane: usize,
+    right: bool,
+) -> Option<graph::GraphConnector> {
+    row.connectors
+        .iter()
+        .copied()
+        .filter(|connector| {
+            (right && connector.to_lane > lane) || (!right && connector.to_lane < lane)
+        })
+        .min_by_key(|connector| connector.to_lane.abs_diff(lane))
+}
+
+fn commit_graph_connector_color(
+    row: &graph::GraphRow,
+    connector: graph::GraphConnector,
+) -> gpui::Rgba {
+    commit_graph_lane_color(row, commit_graph_connector_color_lane(connector))
+}
+
+fn commit_graph_connector_color_lane(connector: graph::GraphConnector) -> usize {
+    match connector.kind {
+        graph::GraphConnectorKind::BranchOut => connector.to_lane,
+        graph::GraphConnectorKind::MergeIn => connector.from_lane,
+        graph::GraphConnectorKind::Straight => connector.to_lane,
+    }
+}
+
+fn render_commit_graph_non_commit_connector(
+    row_index: usize,
+    lane: usize,
+    row: &graph::GraphRow,
+    connector_selector: String,
+) -> gpui::Div {
+    let connector = commit_graph_connector_for_lane(row, lane);
+    let has_incoming = row.incoming_lanes.contains(&lane);
+    let has_outgoing = row.outgoing_lanes.contains(&lane);
+    let lane_color = commit_graph_lane_color(row, lane);
+    let color = connector
+        .map(|connector| commit_graph_connector_color(row, connector))
+        .unwrap_or(lane_color);
+    let (left_visible, right_visible) = match connector.map(|connector| connector.kind) {
+        Some(graph::GraphConnectorKind::BranchOut) => (true, false),
+        Some(graph::GraphConnectorKind::MergeIn) => (false, true),
+        _ => (true, true),
+    };
+    let kind_selector = connector.and_then(|connector| match connector.kind {
+        graph::GraphConnectorKind::BranchOut => {
+            Some(format!("commit-graph-branch-out-{row_index}-{lane}"))
+        }
+        graph::GraphConnectorKind::MergeIn => {
+            Some(format!("commit-graph-merge-in-{row_index}-{lane}"))
+        }
+        graph::GraphConnectorKind::Straight => None,
+    });
+    let elbow_selector = connector.and_then(|connector| match connector.kind {
+        graph::GraphConnectorKind::BranchOut => {
+            Some(format!("commit-graph-branch-out-elbow-{row_index}-{lane}"))
+        }
+        graph::GraphConnectorKind::MergeIn => {
+            Some(format!("commit-graph-merge-in-elbow-{row_index}-{lane}"))
+        }
+        graph::GraphConnectorKind::Straight => None,
+    });
+    let elbow_top = if has_incoming { 0. } else { 4. };
+    let elbow_bottom = if has_outgoing { 10. } else { 6. };
+    let elbow_height = elbow_bottom - elbow_top;
+    let middle_vertical_selector = format!("commit-graph-middle-vertical-{row_index}-{lane}");
+    let has_middle_vertical = has_incoming || has_outgoing;
+
+    let mut connector_shape = div()
+        .relative()
+        .w(px(14.))
+        .h(px(10.))
+        .child(
+            div()
+                .absolute()
+                .left(px(0.))
+                .top(px(4.))
+                .w(px(6.))
+                .h(px(2.))
+                .when(left_visible, |line| {
+                    line.bg(color).when_some(
+                        connector.and_then(|connector| {
+                            (connector.kind == graph::GraphConnectorKind::BranchOut).then(|| {
+                                format!("commit-graph-branch-out-horizontal-{row_index}-{lane}")
+                            })
+                        }),
+                        |line, selector| line.debug_selector(move || selector.clone()),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(8.))
+                .top(px(4.))
+                .w(px(6.))
+                .h(px(2.))
+                .when(right_visible, |line| {
+                    line.bg(color).when_some(
+                        connector.and_then(|connector| {
+                            (connector.kind == graph::GraphConnectorKind::MergeIn).then(|| {
+                                format!("commit-graph-merge-in-horizontal-{row_index}-{lane}")
+                            })
+                        }),
+                        |line, selector| line.debug_selector(move || selector.clone()),
+                    )
+                }),
+        );
+
+    if let Some(kind_selector) = kind_selector {
+        connector_shape = connector_shape.debug_selector(move || kind_selector.clone());
+    }
+
+    if let Some(elbow_selector) = elbow_selector {
+        connector_shape = connector_shape.child(
+            div()
+                .absolute()
+                .left(px(6.))
+                .top(px(elbow_top))
+                .w(px(2.))
+                .h(px(elbow_height))
+                .bg(if has_middle_vertical {
+                    lane_color
+                } else {
+                    color
+                })
+                .debug_selector(move || elbow_selector.clone()),
+        );
+    }
+
+    if has_middle_vertical {
+        connector_shape = connector_shape.child(
+            div()
+                .absolute()
+                .left(px(6.))
+                .top(px(elbow_top))
+                .w(px(2.))
+                .h(px(elbow_height))
+                .bg(lane_color)
+                .debug_selector(move || middle_vertical_selector.clone()),
+        );
+    }
+
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(14.))
+        .h(px(10.))
+        .debug_selector(move || connector_selector.clone())
+        .child(connector_shape)
 }
 
 fn render_file_diff_content(content: repo::FileDiffContent, scroll: &FileDiffScroll) -> AnyElement {
@@ -2144,10 +2407,12 @@ fn debug_path_fragment(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        load_recent_repositories, save_recent_repositories, side_by_side_diff_rows,
-        single_side_diff_rows, App, CloseChangeset, DiffLineStatus, FileListMode, FileTreeRow,
-        Mode, OpenChangeset, OpenFailed, RecentRepository, ReviewScreen, Selection,
+        commit_graph_connector_color_lane, load_recent_repositories, save_recent_repositories,
+        side_by_side_diff_rows, single_side_diff_rows, App, CloseChangeset, DiffLineStatus,
+        FileListMode, FileTreeRow, Mode, OpenChangeset, OpenFailed, RecentRepository, ReviewScreen,
+        Selection,
     };
+    use crate::graph::{self, GraphConnectorKind};
     use crate::repo::{ChangeKind, DiffSide};
     use git2::{IndexAddOption, Repository, Signature};
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
@@ -2178,6 +2443,13 @@ mod tests {
         drop(repo);
 
         (dir, oid.to_string())
+    }
+
+    fn graph_commit(sha: &str, parent_shas: &[&str]) -> graph::GraphCommit {
+        graph::GraphCommit {
+            sha: sha.to_string(),
+            parent_shas: parent_shas.iter().map(|sha| sha.to_string()).collect(),
+        }
     }
 
     fn init_repo_with_two_commits() -> (tempfile::TempDir, String) {
@@ -2729,6 +3001,32 @@ mod tests {
             .expect("attempt invalid range selection");
     }
 
+    #[test]
+    fn commit_graph_horizontal_connectors_use_branch_lane_color() {
+        let rows = graph::layout_graph(&[
+            graph_commit("merge", &["left", "right"]),
+            graph_commit("left", &["base"]),
+            graph_commit("right", &["base"]),
+            graph_commit("base", &[]),
+        ]);
+
+        let branch_out = rows[0]
+            .connectors
+            .iter()
+            .copied()
+            .find(|connector| connector.kind == GraphConnectorKind::BranchOut)
+            .expect("branch-out connector");
+        assert_eq!(commit_graph_connector_color_lane(branch_out), 1);
+
+        let merge_in = rows[2]
+            .connectors
+            .iter()
+            .copied()
+            .find(|connector| connector.kind == GraphConnectorKind::MergeIn)
+            .expect("merge-in connector");
+        assert_eq!(commit_graph_connector_color_lane(merge_in), 1);
+    }
+
     #[gpui::test]
     async fn commit_graph_renders_merge_lanes(cx: &mut TestAppContext) {
         let (dir, _left_sha, _right_sha) = init_repo_with_diverged_history();
@@ -2762,6 +3060,69 @@ mod tests {
         visual
             .debug_bounds("commit-graph-lane-0-1")
             .expect("merge commit second parent lane debug bounds");
+        visual
+            .debug_bounds("commit-graph-connector-0-1")
+            .expect("merge commit second parent connector debug bounds");
+        visual
+            .debug_bounds("commit-graph-branch-out-0-1")
+            .expect("merge commit branch-out connector debug bounds");
+        let branch_out_elbow_bounds = visual
+            .debug_bounds("commit-graph-branch-out-elbow-0-1")
+            .expect("merge commit branch-out elbow debug bounds");
+        let branch_out_middle_vertical_bounds = visual
+            .debug_bounds("commit-graph-middle-vertical-0-1")
+            .expect("merge commit branch-out middle vertical debug bounds");
+        let branch_out_horizontal_bounds = visual
+            .debug_bounds("commit-graph-branch-out-horizontal-0-1")
+            .expect("merge commit branch-out horizontal debug bounds");
+        assert_eq!(
+            branch_out_middle_vertical_bounds.origin.y, branch_out_horizontal_bounds.origin.y,
+            "branch-out middle vertical should not protrude above the horizontal turn",
+        );
+        let branch_out_vertical_bounds = visual
+            .debug_bounds("commit-graph-vertical-0-1-bottom")
+            .expect("merge commit second parent outgoing vertical debug bounds");
+        assert_eq!(
+            branch_out_elbow_bounds.origin.x, branch_out_vertical_bounds.origin.x,
+            "branch-out elbow should align with the outgoing lane",
+        );
+        assert_eq!(
+            branch_out_elbow_bounds.origin.y + branch_out_elbow_bounds.size.height,
+            branch_out_vertical_bounds.origin.y,
+            "branch-out elbow should connect to the outgoing lane",
+        );
+        visual
+            .debug_bounds("commit-graph-vertical-0-1-bottom")
+            .expect("merge commit second parent outgoing vertical debug bounds");
+        visual
+            .debug_bounds("commit-graph-vertical-1-1-top")
+            .expect("continued second lane incoming vertical debug bounds");
+        let merge_in_elbow_bounds = visual
+            .debug_bounds("commit-graph-merge-in-elbow-2-0")
+            .expect("right branch merge-in elbow debug bounds");
+        let merge_in_vertical_bounds = visual
+            .debug_bounds("commit-graph-vertical-2-0-bottom")
+            .expect("right branch merge-in outgoing vertical debug bounds");
+        let merge_in_middle_vertical_bounds = visual
+            .debug_bounds("commit-graph-middle-vertical-2-0")
+            .expect("right branch merge-in middle trunk vertical debug bounds");
+        let merge_in_horizontal_bounds = visual
+            .debug_bounds("commit-graph-merge-in-horizontal-2-0")
+            .expect("right branch merge-in horizontal debug bounds");
+        assert_eq!(
+            merge_in_horizontal_bounds.origin.x,
+            merge_in_middle_vertical_bounds.origin.x + merge_in_middle_vertical_bounds.size.width,
+            "merge-in horizontal should start at the trunk lane",
+        );
+        assert_eq!(
+            merge_in_elbow_bounds.origin.x, merge_in_vertical_bounds.origin.x,
+            "merge-in elbow should align with the parent lane",
+        );
+        assert_eq!(
+            merge_in_elbow_bounds.origin.y + merge_in_elbow_bounds.size.height,
+            merge_in_vertical_bounds.origin.y,
+            "merge-in elbow should connect to the parent lane",
+        );
     }
 
     #[gpui::test]
