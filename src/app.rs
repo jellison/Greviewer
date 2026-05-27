@@ -12,8 +12,8 @@ pub use path_picker::{repository_prompt_options, GpuiPathPicker, PathPicker, Pat
 use gpui::prelude::FluentBuilder;
 use gpui::{
     actions, div, point, px, rgb, AnyElement, AppContext, ClickEvent, Context, Entity,
-    EventEmitter, FocusHandle, InteractiveElement, IntoElement, Modifiers, ParentElement, Render,
-    ScrollHandle, StatefulInteractiveElement, Styled, Window,
+    EventEmitter, FocusHandle, InteractiveElement, IntoElement, Modifiers, ParentElement, Pixels,
+    Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::notification::{Notification, NotificationList};
 use similar::{DiffTag, TextDiff};
@@ -41,6 +41,7 @@ pub struct App {
     path_picker: Box<dyn PathPicker>,
     recent_repository_store_path: Option<PathBuf>,
     file_diff_scroll: FileDiffScroll,
+    commit_history_scroll: ScrollHandle,
     focus_handle: FocusHandle,
 }
 
@@ -373,6 +374,7 @@ impl App {
             path_picker,
             recent_repository_store_path,
             file_diff_scroll: FileDiffScroll::new(),
+            commit_history_scroll: ScrollHandle::new(),
             focus_handle,
         }
     }
@@ -459,6 +461,7 @@ impl App {
         self.record_recent_repository(recent_path);
         self.persist_recent_repositories();
         self.file_diff_scroll.reset();
+        self.commit_history_scroll.set_offset(point(px(0.), px(0.)));
         cx.notify();
     }
 
@@ -632,6 +635,55 @@ impl App {
             self.collapsed_file_tree_paths.remove(&path);
         }
         cx.notify();
+    }
+
+    fn load_older_commits_after_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.commit_history_distance_from_bottom_after_scroll(event, window) > px(84.) {
+            return;
+        }
+
+        self.load_older_commits(window, cx);
+    }
+
+    fn commit_history_distance_from_bottom_after_scroll(
+        &self,
+        event: &ScrollWheelEvent,
+        window: &Window,
+    ) -> Pixels {
+        let max_offset = self.commit_history_scroll.max_offset().height;
+        let current_offset = self.commit_history_scroll.offset().y;
+        let delta = event.delta.pixel_delta(window.line_height()).y;
+        let next_offset = (current_offset + delta).clamp(-max_offset, px(0.));
+
+        max_offset + next_offset
+    }
+
+    fn load_older_commits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (path, oldest_sha) = match &self.mode {
+            Mode::RepoOpen { repo } if repo.has_more_commits => {
+                let Some(oldest_commit) = repo.commits.last() else {
+                    return;
+                };
+                (repo.path.clone(), oldest_commit.sha.clone())
+            }
+            _ => return,
+        };
+
+        match repo::load_commits_after(&path, &oldest_sha) {
+            Ok(page) => {
+                if let Mode::RepoOpen { repo } = &mut self.mode {
+                    repo.commits.extend(page.commits);
+                    repo.has_more_commits = page.has_more;
+                    cx.notify();
+                }
+            }
+            Err(err) => self.push_open_failed(err.to_string(), window, cx),
+        }
     }
 
     fn is_commit_selected(&self, sha: &str) -> bool {
@@ -888,6 +940,11 @@ impl App {
                 .flex_1()
                 .id("commit-history")
                 .overflow_y_scroll()
+                .scrollbar_width(px(12.))
+                .track_scroll(&self.commit_history_scroll)
+                .on_scroll_wheel(cx.listener(|app, event, window, cx| {
+                    app.load_older_commits_after_scroll(event, window, cx);
+                }))
                 .children(
                     repo.commits
                         .iter()
@@ -1585,13 +1642,23 @@ fn render_commit_ref_labels(row_index: usize, commit: &repo::CommitInfo) -> gpui
             }),
     );
 
-    div().flex().items_center().gap_1().w(px(156.)).children(
-        labels
-            .into_iter()
-            .map(|label| render_commit_ref_label(row_index, label))
-            .collect::<Vec<_>>(),
-    )
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .w(px(COMMIT_REF_LABELS_WIDTH))
+        .overflow_hidden()
+        .flex_shrink_0()
+        .children(
+            labels
+                .into_iter()
+                .map(|label| render_commit_ref_label(row_index, label))
+                .collect::<Vec<_>>(),
+        )
 }
+
+const COMMIT_REF_LABELS_WIDTH: f32 = 156.;
+const COMMIT_REF_LABEL_MAX_WIDTH: f32 = COMMIT_REF_LABELS_WIDTH - 8.;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommitRefLabel {
@@ -1624,6 +1691,8 @@ fn render_commit_ref_label(row_index: usize, label: CommitRefLabel) -> gpui::Div
         .text_color(text_color)
         .text_size(px(10.))
         .font_family("monospace")
+        .max_w(px(COMMIT_REF_LABEL_MAX_WIDTH))
+        .truncate()
         .debug_selector(move || selector.clone())
         .child(label.name)
 }
@@ -1639,7 +1708,9 @@ fn render_commit_graph_gutter(
     div()
         .flex()
         .items_center()
-        .w(px((lane_count as f32 * 14.).max(28.)))
+        .w(px(
+            (lane_count as f32 * COMMIT_GRAPH_LANE_WIDTH).max(COMMIT_GRAPH_LANE_WIDTH * 2.)
+        ))
         .font_family("monospace")
         .id(("commit-graph-gutter", row_index))
         .debug_selector(move || debug_selector.clone())
@@ -1648,6 +1719,29 @@ fn render_commit_graph_gutter(
                 .map(|lane| render_commit_graph_lane(row_index, lane, row))
                 .collect::<Vec<_>>(),
         )
+}
+
+const COMMIT_GRAPH_LANE_WIDTH: f32 = 22.;
+const COMMIT_GRAPH_LANE_HEIGHT: f32 = 28.;
+const COMMIT_GRAPH_VERTICAL_HEIGHT: f32 = 9.;
+const COMMIT_GRAPH_MIDDLE_HEIGHT: f32 = 10.;
+const COMMIT_GRAPH_LINE_WIDTH: f32 = 2.;
+const COMMIT_GRAPH_DOT_SIZE: f32 = 8.;
+
+fn commit_graph_line_x() -> f32 {
+    (COMMIT_GRAPH_LANE_WIDTH - COMMIT_GRAPH_LINE_WIDTH) / 2.
+}
+
+fn commit_graph_right_line_x() -> f32 {
+    commit_graph_line_x() + COMMIT_GRAPH_LINE_WIDTH
+}
+
+fn commit_graph_right_line_width() -> f32 {
+    COMMIT_GRAPH_LANE_WIDTH - commit_graph_right_line_x()
+}
+
+fn commit_graph_dot_side_line_width() -> f32 {
+    (COMMIT_GRAPH_LANE_WIDTH - COMMIT_GRAPH_DOT_SIZE) / 2.
 }
 
 fn render_commit_graph_lane(row_index: usize, lane: usize, row: &graph::GraphRow) -> gpui::Div {
@@ -1661,8 +1755,8 @@ fn render_commit_graph_lane(row_index: usize, lane: usize, row: &graph::GraphRow
         .flex_col()
         .items_center()
         .justify_center()
-        .w(px(14.))
-        .h(px(28.))
+        .w(px(COMMIT_GRAPH_LANE_WIDTH))
+        .h(px(COMMIT_GRAPH_LANE_HEIGHT))
         .debug_selector(move || lane_selector.clone())
         .child(render_commit_graph_vertical_segment(
             row_index,
@@ -1701,16 +1795,19 @@ fn render_commit_graph_vertical_segment(
     color: gpui::Rgba,
 ) -> gpui::Div {
     let selector = format!("commit-graph-vertical-{row_index}-{lane}-{position}");
-    let segment = div().w(px(2.)).h(px(9.)).when(visible, |segment| {
-        segment.bg(color).debug_selector(move || selector.clone())
-    });
+    let segment = div()
+        .w(px(COMMIT_GRAPH_LINE_WIDTH))
+        .h(px(COMMIT_GRAPH_VERTICAL_HEIGHT))
+        .when(visible, |segment| {
+            segment.bg(color).debug_selector(move || selector.clone())
+        });
 
     div()
         .flex()
         .items_center()
         .justify_center()
-        .w(px(14.))
-        .h(px(9.))
+        .w(px(COMMIT_GRAPH_LANE_WIDTH))
+        .h(px(COMMIT_GRAPH_VERTICAL_HEIGHT))
         .child(segment)
 }
 
@@ -1722,7 +1819,10 @@ fn render_commit_graph_middle_segment(
 ) -> gpui::Div {
     let is_commit = lane == row.lane;
     let has_connector = row.connector_lanes.contains(&lane);
+    let has_middle_vertical =
+        row.incoming_lanes.contains(&lane) || row.outgoing_lanes.contains(&lane);
     let connector_selector = format!("commit-graph-connector-{row_index}-{lane}");
+    let middle_vertical_selector = format!("commit-graph-middle-vertical-{row_index}-{lane}");
     let dot_selector = format!("commit-graph-dot-{row_index}");
     let non_commit_connector_selector = connector_selector.clone();
     let commit_connector_selector = connector_selector;
@@ -1731,8 +1831,8 @@ fn render_commit_graph_middle_segment(
         .flex()
         .items_center()
         .justify_center()
-        .w(px(14.))
-        .h(px(10.))
+        .w(px(COMMIT_GRAPH_LANE_WIDTH))
+        .h(px(COMMIT_GRAPH_MIDDLE_HEIGHT))
         .when(has_connector && !is_commit, |middle| {
             middle.child(render_commit_graph_non_commit_connector(
                 row_index,
@@ -1741,6 +1841,18 @@ fn render_commit_graph_middle_segment(
                 non_commit_connector_selector.clone(),
             ))
         })
+        .when(
+            has_middle_vertical && !has_connector && !is_commit,
+            |middle| {
+                middle.child(
+                    div()
+                        .w(px(COMMIT_GRAPH_LINE_WIDTH))
+                        .h(px(COMMIT_GRAPH_MIDDLE_HEIGHT))
+                        .bg(color)
+                        .debug_selector(move || middle_vertical_selector.clone()),
+                )
+            },
+        )
         .when(is_commit, |middle| {
             let lane_span = row.connector_lanes.iter().copied();
             let min_lane = lane_span.clone().min().unwrap_or(lane);
@@ -1759,26 +1871,31 @@ fn render_commit_graph_middle_segment(
                     .flex()
                     .items_center()
                     .justify_center()
-                    .w(px(14.))
-                    .h(px(10.))
+                    .w(px(COMMIT_GRAPH_LANE_WIDTH))
+                    .h(px(COMMIT_GRAPH_MIDDLE_HEIGHT))
                     .child(
                         div()
-                            .w(px(3.))
-                            .h(px(2.))
+                            .w(px(commit_graph_dot_side_line_width()))
+                            .h(px(COMMIT_GRAPH_LINE_WIDTH))
                             .when(has_left_connector, |line| line.bg(left_connector_color)),
                     )
                     .child(
                         div()
-                            .w(px(8.))
-                            .h(px(8.))
+                            .w(px(COMMIT_GRAPH_DOT_SIZE))
+                            .h(px(COMMIT_GRAPH_DOT_SIZE))
                             .rounded_full()
                             .bg(color)
                             .debug_selector(move || dot_selector.clone()),
                     )
-                    .child(div().w(px(3.)).h(px(2.)).when(has_right_connector, |line| {
-                        line.bg(right_connector_color)
-                            .debug_selector(move || commit_connector_selector.clone())
-                    })),
+                    .child(
+                        div()
+                            .w(px(commit_graph_dot_side_line_width()))
+                            .h(px(COMMIT_GRAPH_LINE_WIDTH))
+                            .when(has_right_connector, |line| {
+                                line.bg(right_connector_color)
+                                    .debug_selector(move || commit_connector_selector.clone())
+                            }),
+                    ),
             )
         })
 }
@@ -1787,10 +1904,43 @@ fn commit_graph_connector_for_lane(
     row: &graph::GraphRow,
     lane: usize,
 ) -> Option<graph::GraphConnector> {
+    commit_graph_target_connector_for_lane(row, lane)
+        .or_else(|| commit_graph_spanning_connector_for_lane(row, lane))
+}
+
+fn commit_graph_target_connector_for_lane(
+    row: &graph::GraphRow,
+    lane: usize,
+) -> Option<graph::GraphConnector> {
     row.connectors
         .iter()
         .copied()
         .find(|connector| connector.to_lane == lane)
+}
+
+fn commit_graph_spanning_connector_for_lane(
+    row: &graph::GraphRow,
+    lane: usize,
+) -> Option<graph::GraphConnector> {
+    row.connectors.iter().copied().find(|connector| {
+        if connector.kind == graph::GraphConnectorKind::Straight {
+            return false;
+        }
+
+        let min_lane = connector.from_lane.min(connector.to_lane);
+        let max_lane = connector.from_lane.max(connector.to_lane);
+        lane > min_lane && lane < max_lane
+    })
+}
+
+fn commit_graph_spanning_connector_requires_center_fill(
+    row: &graph::GraphRow,
+    lane: usize,
+) -> bool {
+    commit_graph_target_connector_for_lane(row, lane).is_none()
+        && commit_graph_spanning_connector_for_lane(row, lane).is_some()
+        && !row.incoming_lanes.contains(&lane)
+        && !row.outgoing_lanes.contains(&lane)
 }
 
 fn commit_graph_connector_on_side(
@@ -1828,6 +1978,7 @@ fn render_commit_graph_non_commit_connector(
     row: &graph::GraphRow,
     connector_selector: String,
 ) -> gpui::Div {
+    let target_connector = commit_graph_target_connector_for_lane(row, lane);
     let connector = commit_graph_connector_for_lane(row, lane);
     let has_incoming = row.incoming_lanes.contains(&lane);
     let has_outgoing = row.outgoing_lanes.contains(&lane);
@@ -1835,12 +1986,12 @@ fn render_commit_graph_non_commit_connector(
     let color = connector
         .map(|connector| commit_graph_connector_color(row, connector))
         .unwrap_or(lane_color);
-    let (left_visible, right_visible) = match connector.map(|connector| connector.kind) {
+    let (left_visible, right_visible) = match target_connector.map(|connector| connector.kind) {
         Some(graph::GraphConnectorKind::BranchOut) => (true, false),
         Some(graph::GraphConnectorKind::MergeIn) => (false, true),
         _ => (true, true),
     };
-    let kind_selector = connector.and_then(|connector| match connector.kind {
+    let kind_selector = target_connector.and_then(|connector| match connector.kind {
         graph::GraphConnectorKind::BranchOut => {
             Some(format!("commit-graph-branch-out-{row_index}-{lane}"))
         }
@@ -1849,7 +2000,7 @@ fn render_commit_graph_non_commit_connector(
         }
         graph::GraphConnectorKind::Straight => None,
     });
-    let elbow_selector = connector.and_then(|connector| match connector.kind {
+    let elbow_selector = target_connector.and_then(|connector| match connector.kind {
         graph::GraphConnectorKind::BranchOut => {
             Some(format!("commit-graph-branch-out-elbow-{row_index}-{lane}"))
         }
@@ -1863,21 +2014,24 @@ fn render_commit_graph_non_commit_connector(
     let elbow_height = elbow_bottom - elbow_top;
     let middle_vertical_selector = format!("commit-graph-middle-vertical-{row_index}-{lane}");
     let has_middle_vertical = has_incoming || has_outgoing;
+    let center_fill_selector =
+        format!("commit-graph-spanning-horizontal-center-{row_index}-{lane}");
+    let fill_spanning_center = commit_graph_spanning_connector_requires_center_fill(row, lane);
 
     let mut connector_shape = div()
         .relative()
-        .w(px(14.))
-        .h(px(10.))
+        .w(px(COMMIT_GRAPH_LANE_WIDTH))
+        .h(px(COMMIT_GRAPH_MIDDLE_HEIGHT))
         .child(
             div()
                 .absolute()
                 .left(px(0.))
                 .top(px(4.))
-                .w(px(6.))
-                .h(px(2.))
+                .w(px(commit_graph_line_x()))
+                .h(px(COMMIT_GRAPH_LINE_WIDTH))
                 .when(left_visible, |line| {
                     line.bg(color).when_some(
-                        connector.and_then(|connector| {
+                        target_connector.and_then(|connector| {
                             (connector.kind == graph::GraphConnectorKind::BranchOut).then(|| {
                                 format!("commit-graph-branch-out-horizontal-{row_index}-{lane}")
                             })
@@ -1889,13 +2043,13 @@ fn render_commit_graph_non_commit_connector(
         .child(
             div()
                 .absolute()
-                .left(px(8.))
+                .left(px(commit_graph_right_line_x()))
                 .top(px(4.))
-                .w(px(6.))
-                .h(px(2.))
+                .w(px(commit_graph_right_line_width()))
+                .h(px(COMMIT_GRAPH_LINE_WIDTH))
                 .when(right_visible, |line| {
                     line.bg(color).when_some(
-                        connector.and_then(|connector| {
+                        target_connector.and_then(|connector| {
                             (connector.kind == graph::GraphConnectorKind::MergeIn).then(|| {
                                 format!("commit-graph-merge-in-horizontal-{row_index}-{lane}")
                             })
@@ -1905,6 +2059,19 @@ fn render_commit_graph_non_commit_connector(
                 }),
         );
 
+    if fill_spanning_center {
+        connector_shape = connector_shape.child(
+            div()
+                .absolute()
+                .left(px(commit_graph_line_x()))
+                .top(px(4.))
+                .w(px(COMMIT_GRAPH_LINE_WIDTH))
+                .h(px(COMMIT_GRAPH_LINE_WIDTH))
+                .bg(color)
+                .debug_selector(move || center_fill_selector.clone()),
+        );
+    }
+
     if let Some(kind_selector) = kind_selector {
         connector_shape = connector_shape.debug_selector(move || kind_selector.clone());
     }
@@ -1913,9 +2080,9 @@ fn render_commit_graph_non_commit_connector(
         connector_shape = connector_shape.child(
             div()
                 .absolute()
-                .left(px(6.))
+                .left(px(commit_graph_line_x()))
                 .top(px(elbow_top))
-                .w(px(2.))
+                .w(px(COMMIT_GRAPH_LINE_WIDTH))
                 .h(px(elbow_height))
                 .bg(if has_middle_vertical {
                     lane_color
@@ -1930,9 +2097,9 @@ fn render_commit_graph_non_commit_connector(
         connector_shape = connector_shape.child(
             div()
                 .absolute()
-                .left(px(6.))
+                .left(px(commit_graph_line_x()))
                 .top(px(elbow_top))
-                .w(px(2.))
+                .w(px(COMMIT_GRAPH_LINE_WIDTH))
                 .h(px(elbow_height))
                 .bg(lane_color)
                 .debug_selector(move || middle_vertical_selector.clone()),
@@ -1943,8 +2110,8 @@ fn render_commit_graph_non_commit_connector(
         .flex()
         .items_center()
         .justify_center()
-        .w(px(14.))
-        .h(px(10.))
+        .w(px(COMMIT_GRAPH_LANE_WIDTH))
+        .h(px(COMMIT_GRAPH_MIDDLE_HEIGHT))
         .debug_selector(move || connector_selector.clone())
         .child(connector_shape)
 }
@@ -2470,13 +2637,14 @@ fn debug_ref_label_fragment(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_graph_connector_color_lane, load_recent_repositories, save_recent_repositories,
-        side_by_side_diff_rows, single_side_diff_rows, App, CloseChangeset, DiffLineStatus,
-        FileListMode, FileTreeRow, Mode, OpenChangeset, OpenFailed, RecentRepository, ReviewScreen,
-        Selection,
+        commit_graph_connector_color_lane, commit_graph_connector_for_lane,
+        commit_graph_spanning_connector_requires_center_fill, debug_ref_label_fragment,
+        load_recent_repositories, save_recent_repositories, side_by_side_diff_rows,
+        single_side_diff_rows, App, CloseChangeset, DiffLineStatus, FileListMode, FileTreeRow,
+        Mode, OpenChangeset, OpenFailed, RecentRepository, ReviewScreen, Selection,
     };
     use crate::graph::{self, GraphConnectorKind};
-    use crate::repo::{ChangeKind, DiffSide};
+    use crate::repo::{ChangeKind, DiffSide, INITIAL_COMMIT_LIMIT};
     use git2::{IndexAddOption, Repository, Signature};
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
     use std::fs;
@@ -2586,6 +2754,24 @@ mod tests {
                 first_oid.to_string(),
             ],
         )
+    }
+
+    fn init_repo_with_linear_history(count: usize) -> (tempfile::TempDir, Vec<String>) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+        let mut newest_first = Vec::with_capacity(count);
+        let mut parents = Vec::new();
+
+        for index in 0..count {
+            fs::write(dir.path().join("history.txt"), format!("commit {index}\n"))
+                .expect("write history file");
+            let oid = commit_all(&repo, &format!("Commit {index}"), &parents);
+            newest_first.insert(0, oid.to_string());
+            parents = vec![oid];
+        }
+
+        drop(repo);
+        (dir, newest_first)
     }
 
     fn init_repo_with_diverged_history() -> (tempfile::TempDir, String, String) {
@@ -3115,6 +3301,55 @@ mod tests {
         assert_eq!(commit_graph_connector_color_lane(merge_in), 1);
     }
 
+    #[test]
+    fn commit_graph_connectors_span_intermediate_lanes() {
+        let connector = graph::GraphConnector {
+            from_lane: 0,
+            to_lane: 2,
+            kind: GraphConnectorKind::BranchOut,
+        };
+        let row = graph::GraphRow {
+            sha: "wide-branch".to_string(),
+            lane: 0,
+            lane_count: 3,
+            active_lanes: vec![0],
+            incoming_lanes: Vec::new(),
+            outgoing_lanes: vec![0, 2],
+            parent_lanes: vec![0, 2],
+            connector_lanes: vec![0, 1, 2],
+            connectors: vec![connector],
+            lane_colors: vec![Some(0), None, Some(1)],
+        };
+
+        assert_eq!(commit_graph_connector_for_lane(&row, 1), Some(connector));
+        assert_eq!(commit_graph_connector_color_lane(connector), 2);
+    }
+
+    #[test]
+    fn commit_graph_empty_spanning_connectors_fill_the_center_gap() {
+        let connector = graph::GraphConnector {
+            from_lane: 0,
+            to_lane: 2,
+            kind: GraphConnectorKind::BranchOut,
+        };
+        let row = graph::GraphRow {
+            sha: "wide-branch".to_string(),
+            lane: 0,
+            lane_count: 3,
+            active_lanes: vec![0],
+            incoming_lanes: Vec::new(),
+            outgoing_lanes: vec![0, 2],
+            parent_lanes: vec![0, 2],
+            connector_lanes: vec![0, 1, 2],
+            connectors: vec![connector],
+            lane_colors: vec![Some(0), None, Some(1)],
+        };
+
+        assert!(commit_graph_spanning_connector_requires_center_fill(
+            &row, 1
+        ));
+    }
+
     #[gpui::test]
     async fn commit_graph_renders_merge_lanes(cx: &mut TestAppContext) {
         let (dir, _left_sha, _right_sha) = init_repo_with_diverged_history();
@@ -3185,6 +3420,29 @@ mod tests {
         visual
             .debug_bounds("commit-graph-vertical-1-1-top")
             .expect("continued second lane incoming vertical debug bounds");
+        let continued_lane_top_bounds = visual
+            .debug_bounds("commit-graph-vertical-1-1-top")
+            .expect("continued second lane incoming vertical debug bounds");
+        let continued_lane_middle_bounds = visual
+            .debug_bounds("commit-graph-middle-vertical-1-1")
+            .expect("continued second lane middle vertical debug bounds");
+        let continued_lane_bottom_bounds = visual
+            .debug_bounds("commit-graph-vertical-1-1-bottom")
+            .expect("continued second lane outgoing vertical debug bounds");
+        assert_eq!(
+            continued_lane_middle_bounds.origin.x, continued_lane_top_bounds.origin.x,
+            "continued lane middle vertical should align with the incoming vertical",
+        );
+        assert_eq!(
+            continued_lane_top_bounds.origin.y + continued_lane_top_bounds.size.height,
+            continued_lane_middle_bounds.origin.y,
+            "continued lane middle vertical should connect to the incoming vertical",
+        );
+        assert_eq!(
+            continued_lane_middle_bounds.origin.y + continued_lane_middle_bounds.size.height,
+            continued_lane_bottom_bounds.origin.y,
+            "continued lane middle vertical should connect to the outgoing vertical",
+        );
         let merge_in_elbow_bounds = visual
             .debug_bounds("commit-graph-merge-in-elbow-2-0")
             .expect("right branch merge-in elbow debug bounds");
@@ -3269,6 +3527,142 @@ mod tests {
         visual
             .debug_bounds(label_selector(right_row, "right"))
             .expect("right branch label on right commit");
+    }
+
+    #[gpui::test]
+    async fn long_branch_labels_do_not_cover_the_commit_graph(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let branch_name = "not-merged-branch-with-a-name-that-would-cover-the-graph".to_string();
+        let label_selector = Box::leak(
+            format!(
+                "commit-ref-label-0-{}",
+                debug_ref_label_fragment(&branch_name)
+            )
+            .into_boxed_str(),
+        ) as &'static str;
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.mode = Mode::RepoOpen {
+                    repo: crate::repo::OpenRepository {
+                        path: dir.path().to_path_buf(),
+                        head: Some(crate::repo::HeadInfo {
+                            short_sha: "abcdef0".to_string(),
+                            summary: "Long branch label".to_string(),
+                        }),
+                        commits: vec![crate::repo::CommitInfo {
+                            sha: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+                            short_sha: "abcdef0".to_string(),
+                            summary: "Long branch label".to_string(),
+                            author: "Greviewer Tests".to_string(),
+                            authored_timestamp: 0,
+                            authored_date: "1970-01-01".to_string(),
+                            parent_shas: Vec::new(),
+                            branch_names: vec![branch_name],
+                            parent_count: 0,
+                            is_head: false,
+                        }],
+                        has_more_commits: false,
+                    },
+                };
+                cx.notify();
+            })
+            .expect("seed open repository");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let label_bounds = visual
+            .debug_bounds(label_selector)
+            .expect("long branch label debug bounds");
+        let graph_bounds = visual
+            .debug_bounds("commit-graph-gutter-0")
+            .expect("commit graph gutter debug bounds");
+
+        assert!(
+            label_bounds.origin.x + label_bounds.size.width <= graph_bounds.origin.x,
+            "branch label should end before the graph gutter starts; label: {label_bounds:?}, graph: {graph_bounds:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn scrolling_commit_history_loads_older_commits(cx: &mut TestAppContext) {
+        use gpui::{point, px, size, ScrollDelta, ScrollWheelEvent};
+
+        let (dir, shas) = init_repo_with_linear_history(INITIAL_COMMIT_LIMIT + 2);
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected repo open mode");
+                };
+                assert_eq!(repo.commits.len(), INITIAL_COMMIT_LIMIT);
+                assert!(repo.has_more_commits);
+            })
+            .expect("read initial commit page");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(320.)));
+        let first_row_bounds = visual
+            .debug_bounds("commit-row-0")
+            .expect("first commit row debug bounds");
+        let before_scroll = window
+            .read_with(cx, |app, _cx| app.commit_history_scroll.offset())
+            .expect("read commit history offset before wheel");
+        visual.simulate_event(ScrollWheelEvent {
+            position: first_row_bounds.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-10_000.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        let (after_scroll, max_scroll) = window
+            .read_with(cx, |app, _cx| {
+                (
+                    app.commit_history_scroll.offset(),
+                    app.commit_history_scroll.max_offset(),
+                )
+            })
+            .expect("read commit history offset after wheel");
+        assert!(
+            max_scroll.height > px(0.),
+            "long commit history should exceed the visible graph area"
+        );
+        assert!(
+            after_scroll.y < before_scroll.y,
+            "wheel scroll should move the commit history upward; before: {before_scroll:?}, after: {after_scroll:?}, max: {max_scroll:?}"
+        );
+
+        window
+            .read_with(cx, |app, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected repo open mode");
+                };
+                assert_eq!(repo.commits.len(), INITIAL_COMMIT_LIMIT + 2);
+                assert!(!repo.has_more_commits);
+                assert_eq!(
+                    repo.commits.last().expect("oldest loaded commit").sha,
+                    shas[INITIAL_COMMIT_LIMIT + 1]
+                );
+            })
+            .expect("read loaded commit page");
+
+        let oldest_row_selector =
+            Box::leak(format!("commit-row-{}", INITIAL_COMMIT_LIMIT + 1).into_boxed_str())
+                as &'static str;
+        visual
+            .debug_bounds(oldest_row_selector)
+            .expect("oldest loaded commit row debug bounds");
     }
 
     #[gpui::test]

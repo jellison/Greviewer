@@ -18,6 +18,7 @@ pub struct OpenRepository {
     pub path: PathBuf,
     pub head: Option<HeadInfo>,
     pub commits: Vec<CommitInfo>,
+    pub has_more_commits: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +39,12 @@ pub struct CommitInfo {
     pub branch_names: Vec<String>,
     pub parent_count: usize,
     pub is_head: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitPage {
+    pub commits: Vec<CommitInfo>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,13 +166,37 @@ pub fn open_at(path: &Path) -> Result<OpenRepository, OpenError> {
     let head_oid = head_commit.as_ref().map(|commit| commit.id());
     let head = head_commit.as_ref().map(head_info_from_commit);
     let branch_names_by_oid = read_local_branch_names_by_oid(&repo)?;
-    let commits = read_commits(&repo, head_oid, &branch_names_by_oid, INITIAL_COMMIT_LIMIT)?;
+    let page = read_commit_page(
+        &repo,
+        head_oid,
+        &branch_names_by_oid,
+        None,
+        INITIAL_COMMIT_LIMIT,
+    )?;
 
     Ok(OpenRepository {
         path: canonical,
         head,
-        commits,
+        commits: page.commits,
+        has_more_commits: page.has_more,
     })
+}
+
+pub fn load_commits_after(path: &Path, after_sha: &str) -> Result<CommitPage, OpenError> {
+    let canonical = path.canonicalize().map_err(OpenError::Io)?;
+    let repo = git2::Repository::open(&canonical).map_err(classify_open_error)?;
+    let head_commit = read_head_commit(&repo)?;
+    let head_oid = head_commit.as_ref().map(|commit| commit.id());
+    let branch_names_by_oid = read_local_branch_names_by_oid(&repo)?;
+    let after_oid = git2::Oid::from_str(after_sha).map_err(OpenError::Git)?;
+
+    read_commit_page(
+        &repo,
+        head_oid,
+        &branch_names_by_oid,
+        Some(after_oid),
+        INITIAL_COMMIT_LIMIT,
+    )
 }
 
 pub fn changeset_for_single_commit(path: &Path, sha: &str) -> Result<ChangeSet, ChangeSetError> {
@@ -509,14 +540,18 @@ fn read_head_commit(repo: &git2::Repository) -> Result<Option<git2::Commit<'_>>,
     }
 }
 
-fn read_commits(
+fn read_commit_page(
     repo: &git2::Repository,
     head_oid: Option<git2::Oid>,
     branch_names_by_oid: &BTreeMap<git2::Oid, Vec<String>>,
+    after_oid: Option<git2::Oid>,
     limit: usize,
-) -> Result<Vec<CommitInfo>, OpenError> {
+) -> Result<CommitPage, OpenError> {
     if head_oid.is_none() {
-        return Ok(Vec::new());
+        return Ok(CommitPage {
+            commits: Vec::new(),
+            has_more: false,
+        });
     }
 
     let mut revwalk = repo.revwalk().map_err(OpenError::Git)?;
@@ -526,8 +561,21 @@ fn read_commits(
     revwalk.push_head().map_err(OpenError::Git)?;
 
     let mut commits = Vec::new();
-    for oid in revwalk.take(limit) {
+    let mut after_seen = after_oid.is_none();
+    for oid in revwalk {
         let oid = oid.map_err(OpenError::Git)?;
+        if !after_seen {
+            after_seen = Some(oid) == after_oid;
+            continue;
+        }
+
+        if commits.len() == limit {
+            return Ok(CommitPage {
+                commits,
+                has_more: true,
+            });
+        }
+
         let commit = repo.find_commit(oid).map_err(OpenError::Git)?;
         commits.push(commit_info_from_commit(
             &commit,
@@ -539,7 +587,16 @@ fn read_commits(
         ));
     }
 
-    Ok(commits)
+    if !after_seen {
+        return Err(OpenError::Git(git2::Error::from_str(
+            "Commit cursor was not found in HEAD history",
+        )));
+    }
+
+    Ok(CommitPage {
+        commits,
+        has_more: false,
+    })
 }
 
 fn read_local_branch_names_by_oid(
@@ -721,6 +778,26 @@ mod tests {
         dir
     }
 
+    fn init_repo_with_linear_history(count: usize) -> (TempDir, Vec<String>) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+        let mut newest_first = Vec::with_capacity(count);
+        let mut parents = Vec::new();
+
+        for index in 0..count {
+            fs::write(dir.path().join("history.txt"), format!("commit {index}\n"))
+                .expect("write history file");
+            let oid =
+                git2::Oid::from_str(&commit_workdir(&repo, &format!("Commit {index}"), &parents))
+                    .expect("parse commit oid");
+            newest_first.insert(0, oid.to_string());
+            parents = vec![oid];
+        }
+
+        drop(repo);
+        (dir, newest_first)
+    }
+
     fn commit_workdir(repo: &Repository, message: &str, parent_oids: &[git2::Oid]) -> String {
         let mut index = repo.index().expect("open index");
         index
@@ -774,6 +851,40 @@ mod tests {
         assert_eq!(snapshot.commits[0].sha, oid_hex);
         assert_eq!(snapshot.commits[0].summary, "Add hello.txt");
         assert!(snapshot.commits[0].is_head);
+    }
+
+    #[test]
+    fn open_at_marks_more_commits_when_initial_page_is_limited() {
+        let (dir, shas) = init_repo_with_linear_history(INITIAL_COMMIT_LIMIT + 2);
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+
+        assert_eq!(snapshot.commits.len(), INITIAL_COMMIT_LIMIT);
+        assert!(snapshot.has_more_commits);
+        assert_eq!(snapshot.commits[0].sha, shas[0]);
+        assert_eq!(
+            snapshot.commits.last().expect("last visible commit").sha,
+            shas[INITIAL_COMMIT_LIMIT - 1]
+        );
+    }
+
+    #[test]
+    fn load_commits_after_returns_the_next_history_page() {
+        let (dir, shas) = init_repo_with_linear_history(INITIAL_COMMIT_LIMIT + 2);
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+        let last_visible_sha = snapshot
+            .commits
+            .last()
+            .expect("last visible commit")
+            .sha
+            .clone();
+
+        let page = load_commits_after(dir.path(), &last_visible_sha).expect("load next page");
+
+        assert_eq!(page.commits.len(), 2);
+        assert!(!page.has_more);
+        assert_eq!(page.commits[0].sha, shas[INITIAL_COMMIT_LIMIT]);
+        assert_eq!(page.commits[1].sha, shas[INITIAL_COMMIT_LIMIT + 1]);
     }
 
     #[test]
