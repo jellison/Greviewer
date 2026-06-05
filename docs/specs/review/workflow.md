@@ -37,7 +37,7 @@ The user can quit Greviewer with the standard quit keyboard shortcut.
 
 ## Viewing the commit graph
 
-The user sees a graphical history of the repository's commits with branch lanes and merge connectors. Each commit is presented as a single-row entry whose reading order is graph, short identifier, summary line, author, authored date, and any local branch names that point at it. The graph is scrollable; older commits load progressively as the user scrolls. The currently checked-out tip is visually marked, but selection is independent of checkout state — reviewing never moves HEAD.
+The user sees a graphical history of the repository's commits with branch lanes and merge connectors. Branch and merge lines use smooth rounded bends where they turn between lanes, including the final turn into a branch commit. Each commit is presented as a single-row entry whose reading order is graph, short identifier, summary line, author, authored date, and any local branch names that point at it. The graph is scrollable; older commits load progressively as the user scrolls. The currently checked-out tip is visually marked, but selection is independent of checkout state — reviewing never moves HEAD.
 
 **Triggering conditions**
 
@@ -53,7 +53,7 @@ The user sees a graphical history of the repository's commits with branch lanes 
 **Edge cases**
 
 - Very large histories load progressively rather than blocking the UI.
-- Histories with several active branches remain legible: the visible first-parent history of the top commit anchors the left-most lane, active branch lanes keep a stable horizontal position until they end, branch lanes render as continuous vertical lines through and between rows without row separators interrupting them, new branch lanes use the nearest available lane to the right and do not reuse occupied lanes, multi-lane connectors stay continuous across intermediate lanes even when those lanes have no active branch, and branch labels do not obscure the graph.
+- Histories with several active branches remain legible: the visible first-parent history of the top commit anchors the left-most lane, active branch lanes keep a stable horizontal position until they end, branch lanes render as continuous vertical lines through and between rows without row separators or rounded branch/merge joins interrupting them, new branch lanes use the nearest available lane to the right and do not reuse occupied lanes, multi-lane connectors stay continuous and horizontally aligned across intermediate lanes even when those lanes are occupied by other active branches, and branch labels do not obscure the graph.
 - Detached-HEAD repositories render normally with no checked-out branch marker.
 
 ## Selecting commits to review
