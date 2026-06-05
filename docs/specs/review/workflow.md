@@ -14,11 +14,12 @@ The user opens a local Git repository through a folder picker. The application r
 **Observable outcomes**
 
 - The window displays the commit graph of the chosen repository.
+- The native titlebar identifies the open repository by repository name only.
 - The chosen repository is added to (or moved to the top of) the recently opened list, and that ordering is retained for future launches.
 
 **Edge cases**
 
-- A chosen folder that is not a Git repository surfaces a clear error and the previous window state is preserved.
+- A chosen folder that is not a Git repository surfaces a clear error and the previous window state is preserved, including the native titlebar text. If no repository was open, the native titlebar remains blank.
 - A repository with zero commits opens to an empty graph with a message explaining there is nothing to review.
 - A recently opened repository whose folder has been moved or deleted is shown as unavailable; activating it surfaces a clear error and offers to remove it from the list.
 

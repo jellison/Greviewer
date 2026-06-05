@@ -23,7 +23,7 @@ pub fn run() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some(SharedString::from("Greviewer")),
+                    title: Some(SharedString::from("")),
                     ..Default::default()
                 }),
                 ..Default::default()

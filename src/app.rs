@@ -425,7 +425,7 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         match repo::open_at(&path) {
-            Ok(repo) => self.apply_open_repository(repo, cx),
+            Ok(repo) => self.apply_open_repository(repo, window, cx),
             Err(err) => {
                 let message = err.to_string();
                 self.push_open_failed(message, window, cx);
@@ -440,7 +440,7 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         match repo::open_at(&path) {
-            Ok(repo) => self.apply_open_repository(repo, cx),
+            Ok(repo) => self.apply_open_repository(repo, window, cx),
             Err(err) => {
                 self.mark_recent_repository_unavailable(&path);
                 self.persist_recent_repositories();
@@ -449,7 +449,13 @@ impl App {
         }
     }
 
-    fn apply_open_repository(&mut self, repo: repo::OpenRepository, cx: &mut Context<Self>) {
+    fn apply_open_repository(
+        &mut self,
+        repo: repo::OpenRepository,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.set_window_title(&repository_title(&repo.path));
         let recent_path = repo.path.clone();
 
         self.mode = Mode::RepoOpen { repo };
@@ -2757,6 +2763,12 @@ fn debug_ref_label_fragment(label: &str) -> String {
         .collect()
 }
 
+fn repository_title(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3241,6 +3253,99 @@ mod tests {
                 Mode::NoRepo => panic!("expected RepoOpen, got NoRepo"),
             })
             .expect("read window");
+    }
+
+    #[gpui::test]
+    async fn opening_a_real_repo_sets_the_window_title_to_the_repo_name(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+
+        let (dir, _) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let expected_title = path
+            .file_name()
+            .expect("repo directory name")
+            .to_string_lossy()
+            .to_string();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert_eq!(visual.window_title(), Some(expected_title));
+    }
+
+    #[gpui::test]
+    async fn opening_another_real_repo_replaces_the_window_title(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+
+        let (first_dir, _) = init_repo_with_one_commit();
+        let (second_dir, _) = init_repo_with_one_commit();
+        let first_path = first_dir.path().to_path_buf();
+        let second_path = second_dir.path().to_path_buf();
+        let second_title = second_path
+            .file_name()
+            .expect("repo directory name")
+            .to_string_lossy()
+            .to_string();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(first_path, window, cx);
+                app.open_repository_at(second_path, window, cx);
+            })
+            .expect("open repos");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert_eq!(visual.window_title(), Some(second_title));
+    }
+
+    #[gpui::test]
+    async fn opening_a_non_repo_preserves_the_existing_window_title(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+
+        let (repo_dir, _) = init_repo_with_one_commit();
+        let repo_path = repo_dir.path().to_path_buf();
+        let expected_title = repo_path
+            .file_name()
+            .expect("repo directory name")
+            .to_string_lossy()
+            .to_string();
+        let non_repo_dir = tempfile::tempdir().expect("create tempdir");
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(repo_path, window, cx);
+                app.open_repository_at(non_repo_dir.path().to_path_buf(), window, cx);
+            })
+            .expect("open repo then non-repo");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert_eq!(visual.window_title(), Some(expected_title));
+    }
+
+    #[gpui::test]
+    async fn opening_a_non_repo_without_prior_repo_leaves_the_window_title_empty(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+
+        let non_repo_dir = tempfile::tempdir().expect("create tempdir");
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(non_repo_dir.path().to_path_buf(), window, cx);
+            })
+            .expect("open non-repo");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert_eq!(visual.window_title(), None);
     }
 
     #[gpui::test]
