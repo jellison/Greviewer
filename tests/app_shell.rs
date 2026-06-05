@@ -8,7 +8,8 @@ use std::{cell::RefCell, rc::Rc};
 use common::QueuedPathPicker;
 use greviewer::app::{
     bind_app_keys, build_app_menus, App, Mode, OpenFailed, OpenRepository, PathPickerOutcome,
-    GREVIEWER_MENU_LABEL, OPEN_REPOSITORY_KEYSTROKE, OPEN_REPOSITORY_MENU_LABEL,
+    QuitApplication, QuitRequested, GREVIEWER_MENU_LABEL, OPEN_REPOSITORY_KEYSTROKE,
+    OPEN_REPOSITORY_MENU_LABEL, QUIT_APPLICATION_KEYSTROKE,
 };
 
 #[gpui::test]
@@ -30,6 +31,52 @@ async fn keymap_binds_cmd_o_to_open_repository(cx: &mut TestAppContext) {
             "expected {OPEN_REPOSITORY_KEYSTROKE} to bind OpenRepository"
         );
     });
+}
+
+#[gpui::test]
+async fn keymap_binds_cmd_q_to_quit_application(cx: &mut TestAppContext) {
+    cx.update(bind_app_keys);
+
+    cx.update(|cx| {
+        let action = QuitApplication;
+        let typed = [Keystroke::parse(QUIT_APPLICATION_KEYSTROKE).expect("parse keystroke")];
+        let bindings = cx.key_bindings();
+        let keymap = bindings.borrow();
+
+        let found = keymap
+            .bindings_for_action(&action)
+            .any(|binding| binding.match_keystrokes(&typed) == Some(false));
+
+        assert!(
+            found,
+            "expected {QUIT_APPLICATION_KEYSTROKE} to bind QuitApplication"
+        );
+    });
+}
+
+#[gpui::test]
+async fn cmd_q_requests_application_quit(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    cx.update(bind_app_keys);
+
+    let window = cx.add_window(App::new);
+    let app_entity = window.entity(cx).expect("get app entity");
+
+    let quit_requested = Rc::new(RefCell::new(0usize));
+    let quit_requested_clone = quit_requested.clone();
+    let _subscription = app_entity.update(cx, |_, cx| {
+        cx.subscribe(&app_entity, move |_, _, _event: &QuitRequested, _| {
+            *quit_requested_clone.borrow_mut() += 1;
+        })
+    });
+
+    cx.simulate_keystrokes(*window, QUIT_APPLICATION_KEYSTROKE);
+
+    assert_eq!(
+        *quit_requested.borrow(),
+        1,
+        "cmd-q should request application quit"
+    );
 }
 
 #[gpui::test]

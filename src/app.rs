@@ -4,8 +4,9 @@ pub mod menu;
 pub mod path_picker;
 
 pub use menu::{
-    bind_app_keys, build_app_menus, open_repository_key_binding, MenuSnapshot,
-    GREVIEWER_MENU_LABEL, OPEN_REPOSITORY_KEYSTROKE, OPEN_REPOSITORY_MENU_LABEL,
+    bind_app_keys, build_app_menus, open_repository_key_binding, quit_application_key_binding,
+    MenuSnapshot, GREVIEWER_MENU_LABEL, OPEN_REPOSITORY_KEYSTROKE, OPEN_REPOSITORY_MENU_LABEL,
+    QUIT_APPLICATION_KEYSTROKE,
 };
 pub use path_picker::{repository_prompt_options, GpuiPathPicker, PathPicker, PathPickerOutcome};
 
@@ -25,7 +26,15 @@ use std::{
 
 use crate::{graph, repo};
 
-actions!(app, [OpenRepository, OpenChangeset, CloseChangeset]);
+actions!(
+    app,
+    [
+        OpenRepository,
+        OpenChangeset,
+        CloseChangeset,
+        QuitApplication
+    ]
+);
 
 const MAX_RECENT_REPOSITORIES: usize = 10;
 
@@ -282,6 +291,14 @@ struct FileTreeLeaf {
 pub struct OpenFailed(pub String);
 
 impl EventEmitter<OpenFailed> for App {}
+
+/// Emitted immediately before the app asks gpui to quit. The gpui test
+/// platform does not expose a quit flag, so app-shell tests observe this event
+/// to verify that the public key-dispatch path reached the quit handler.
+#[derive(Debug, Clone)]
+pub struct QuitRequested;
+
+impl EventEmitter<QuitRequested> for App {}
 
 impl App {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -615,6 +632,11 @@ impl App {
     fn close_changeset(&mut self, cx: &mut Context<Self>) {
         self.review_screen = ReviewScreen::Graph;
         cx.notify();
+    }
+
+    fn quit_application(&mut self, cx: &mut Context<Self>) {
+        cx.emit(QuitRequested);
+        cx.quit();
     }
 
     fn select_changed_file(&mut self, path: String, cx: &mut Context<Self>) {
@@ -2618,6 +2640,9 @@ impl Render for App {
             }))
             .on_action(cx.listener(|app, _: &CloseChangeset, _window, cx| {
                 app.close_changeset(cx);
+            }))
+            .on_action(cx.listener(|app, _: &QuitApplication, _window, cx| {
+                app.quit_application(cx);
             }))
             .child(body)
             .child(self.notifications.clone())

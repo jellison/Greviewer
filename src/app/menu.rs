@@ -2,11 +2,12 @@
 
 use gpui::{Action, App as GpuiApp, KeyBinding, Menu, MenuItem, SharedString};
 
-use super::OpenRepository;
+use super::{OpenRepository, QuitApplication};
 
 pub const GREVIEWER_MENU_LABEL: &str = "Greviewer";
 pub const OPEN_REPOSITORY_MENU_LABEL: &str = "Open Repository\u{2026}";
 pub const OPEN_REPOSITORY_KEYSTROKE: &str = "cmd-o";
+pub const QUIT_APPLICATION_KEYSTROKE: &str = "cmd-q";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuSnapshot {
@@ -43,8 +44,15 @@ pub fn open_repository_key_binding() -> KeyBinding {
     KeyBinding::new(OPEN_REPOSITORY_KEYSTROKE, OpenRepository, None)
 }
 
+pub fn quit_application_key_binding() -> KeyBinding {
+    KeyBinding::new(QUIT_APPLICATION_KEYSTROKE, QuitApplication, None)
+}
+
 pub fn bind_app_keys(cx: &mut GpuiApp) {
-    cx.bind_keys([open_repository_key_binding()]);
+    cx.bind_keys([
+        open_repository_key_binding(),
+        quit_application_key_binding(),
+    ]);
 }
 
 pub fn build_app_menus() -> (Vec<Menu>, MenuSnapshot) {

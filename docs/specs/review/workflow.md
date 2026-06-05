@@ -23,6 +23,18 @@ The user opens a local Git repository through a folder picker. The application r
 - A repository with zero commits opens to an empty graph with a message explaining there is nothing to review.
 - A recently opened repository whose folder has been moved or deleted is shown as unavailable; activating it surfaces a clear error and offers to remove it from the list.
 
+## Quitting the application
+
+The user can quit Greviewer with the standard quit keyboard shortcut.
+
+**Triggering conditions**
+
+- The user presses Cmd-Q while the Greviewer window is focused.
+
+**Observable outcomes**
+
+- The application begins its normal quit flow.
+
 ## Viewing the commit graph
 
 The user sees a graphical history of the repository's commits with branch lanes and merge connectors. Each commit displays its short identifier, summary line, author, authored date, and any local branch names that point at it. The graph is scrollable; older commits load progressively as the user scrolls. The currently checked-out tip is visually marked, but selection is independent of checkout state — reviewing never moves HEAD.
