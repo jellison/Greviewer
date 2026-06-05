@@ -2155,8 +2155,11 @@ fn commit_graph_rounded_elbow_preserves_target_vertical(
 }
 
 fn commit_graph_rounded_elbow_tangent_y(row: &graph::GraphRow, lane: usize) -> Option<f32> {
-    let connector = commit_graph_target_connector_for_lane(row, lane)?;
-    match connector.kind {
+    let connector_kind = commit_graph_target_connector_for_lane(row, lane)
+        .or_else(|| commit_graph_spanning_branch_end_connector_for_lane(row, lane))
+        .map(|connector| connector.kind)?;
+
+    match connector_kind {
         graph::GraphConnectorKind::BranchOut | graph::GraphConnectorKind::MergeIn => {}
         graph::GraphConnectorKind::Straight => return None,
     }
@@ -2351,6 +2354,18 @@ fn commit_graph_spanning_connector_for_lane(
     })
 }
 
+fn commit_graph_spanning_branch_end_connector_for_lane(
+    row: &graph::GraphRow,
+    lane: usize,
+) -> Option<graph::GraphConnector> {
+    if !row.incoming_lanes.contains(&lane) || row.outgoing_lanes.contains(&lane) {
+        return None;
+    }
+
+    commit_graph_spanning_connector_for_lane(row, lane)
+        .filter(|connector| connector.kind == graph::GraphConnectorKind::BranchOut)
+}
+
 fn commit_graph_spanning_connector_requires_center_fill(
     row: &graph::GraphRow,
     lane: usize,
@@ -2482,6 +2497,50 @@ fn render_commit_graph_rounded_elbow(
                         }
                         graph::GraphConnectorKind::Straight => {}
                     }
+
+                    if let Ok(path) = connector.build() {
+                        window.paint_path(path, connector_color);
+                    }
+                },
+            )
+            .absolute()
+            .left_0()
+            .top_0()
+            .w(px(commit_graph_bend_overlay_width()))
+            .h(px(commit_graph_bend_overlay_height())),
+        )
+}
+
+fn render_commit_graph_rounded_spanning_branch_end_bend(
+    selector: String,
+    connector_color: gpui::Rgba,
+) -> gpui::Div {
+    div()
+        .absolute()
+        .left(px(commit_graph_bend_overlay_x()))
+        .top(px(commit_graph_bend_overlay_top()))
+        .w(px(commit_graph_bend_overlay_width()))
+        .h(px(commit_graph_bend_overlay_height()))
+        .debug_selector(move || selector.clone())
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let line_width = commit_graph_line_width();
+                    let lane_offset_x = commit_graph_bend_overlay_lane_offset_x();
+                    let center_x = bounds.origin.x
+                        + px(lane_offset_x + commit_graph_line_x() + line_width / 2.);
+                    let center_y = bounds.origin.y + px(commit_graph_bend_overlay_center_y());
+                    let radius = px(commit_graph_bend_radius());
+                    let control = px(commit_graph_bend_radius() * COMMIT_GRAPH_BEND_CUBIC_CONTROL);
+
+                    let mut connector = PathBuilder::stroke(px(line_width));
+                    connector.move_to(point(center_x - radius, center_y));
+                    connector.cubic_bezier_to(
+                        point(center_x, center_y - radius),
+                        point(center_x - radius + control, center_y),
+                        point(center_x, center_y - radius + control),
+                    );
 
                     if let Ok(path) = connector.build() {
                         window.paint_path(path, connector_color);
@@ -2674,6 +2733,10 @@ fn render_commit_graph_non_commit_connector(
         graph::GraphConnectorKind::MergeIn => None,
         graph::GraphConnectorKind::Straight => None,
     });
+    let rounded_spanning_branch_end =
+        commit_graph_spanning_branch_end_connector_for_lane(row, lane)
+            .map(|_| format!("commit-graph-rounded-spanning-branch-end-elbow-{row_index}-{lane}"));
+    let has_rounded_spanning_branch_end = rounded_spanning_branch_end.is_some();
     let lower_merge_in_source_bend = target_connector.and_then(|connector| {
         (connector.kind == graph::GraphConnectorKind::MergeIn && uses_lower_merge_in_line).then(
             || {
@@ -2684,7 +2747,15 @@ fn render_commit_graph_non_commit_connector(
             },
         )
     });
-    let has_rounded_elbow = rounded_elbow.is_some() || lower_merge_in_source_bend.is_some();
+    let left_horizontal_is_rounded = rounded_elbow
+        .as_ref()
+        .is_some_and(|(_, kind)| *kind == graph::GraphConnectorKind::BranchOut)
+        || has_rounded_spanning_branch_end;
+    let right_horizontal_is_rounded = rounded_elbow
+        .as_ref()
+        .is_some_and(|(_, kind)| *kind == graph::GraphConnectorKind::MergeIn)
+        || lower_merge_in_source_bend.is_some();
+    let has_rounded_elbow = left_horizontal_is_rounded || right_horizontal_is_rounded;
     let horizontal_top_y = if uses_lower_merge_in_line {
         commit_graph_lower_merge_in_horizontal_top_in_middle()
     } else {
@@ -2709,7 +2780,10 @@ fn render_commit_graph_non_commit_connector(
         format!("commit-graph-spanning-horizontal-left-{row_index}-{lane}");
     let spanning_right_selector =
         format!("commit-graph-spanning-horizontal-right-{row_index}-{lane}");
-    let fill_spanning_center = commit_graph_spanning_connector_requires_center_fill(row, lane);
+    let spanning_overlap_selector =
+        format!("commit-graph-spanning-horizontal-overlap-{row_index}-{lane}");
+    let fill_spanning_center = commit_graph_spanning_connector_requires_center_fill(row, lane)
+        || has_rounded_spanning_branch_end;
 
     let mut connector_shape = div()
         .relative()
@@ -2723,7 +2797,7 @@ fn render_commit_graph_non_commit_connector(
                 .w(px(commit_graph_line_x()))
                 .h(px(COMMIT_GRAPH_LINE_WIDTH))
                 .when(left_visible, |line| {
-                    line.when(!has_rounded_elbow, |line| line.bg(color))
+                    line.when(!left_horizontal_is_rounded, |line| line.bg(color))
                         .when_some(
                             target_connector.and_then(|connector| {
                                 (connector.kind == graph::GraphConnectorKind::BranchOut).then(
@@ -2751,7 +2825,7 @@ fn render_commit_graph_non_commit_connector(
                 .w(px(commit_graph_right_line_width()))
                 .h(px(COMMIT_GRAPH_LINE_WIDTH))
                 .when(right_visible, |line| {
-                    line.when(!has_rounded_elbow, |line| line.bg(color))
+                    line.when(!right_horizontal_is_rounded, |line| line.bg(color))
                         .when_some(
                             target_connector.and_then(|connector| {
                                 (connector.kind == graph::GraphConnectorKind::MergeIn).then(|| {
@@ -2830,6 +2904,14 @@ fn render_commit_graph_non_commit_connector(
             ));
     }
 
+    if let Some(rounded_branch_end_selector) = rounded_spanning_branch_end {
+        connector_shape =
+            connector_shape.child(render_commit_graph_rounded_spanning_branch_end_bend(
+                rounded_branch_end_selector,
+                lane_color,
+            ));
+    }
+
     if let Some((rounded_elbow_selector, rounded_elbow_kind)) = rounded_elbow {
         connector_shape = connector_shape.child(render_commit_graph_rounded_elbow(
             rounded_elbow_selector,
@@ -2838,6 +2920,19 @@ fn render_commit_graph_non_commit_connector(
             has_outgoing,
             color,
         ));
+    }
+
+    if has_rounded_spanning_branch_end {
+        connector_shape = connector_shape.child(
+            div()
+                .absolute()
+                .left(px(0.))
+                .top(px(horizontal_top_y))
+                .w(px(COMMIT_GRAPH_LANE_WIDTH))
+                .h(px(COMMIT_GRAPH_LINE_WIDTH))
+                .bg(color)
+                .debug_selector(move || spanning_overlap_selector.clone()),
+        );
     }
 
     div()
@@ -4971,6 +5066,116 @@ mod tests {
             merge_in_middle_vertical_bounds.origin.y + merge_in_middle_vertical_bounds.size.height,
             merge_in_vertical_bounds.origin.y,
             "merge-in target trunk should stay connected below the rounded branch join",
+        );
+    }
+
+    #[gpui::test]
+    async fn commit_graph_rounds_ending_intermediate_branch_into_spanning_branch_out(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, _window, cx| {
+                seed_repo_open_mode_with_commits(
+                    app,
+                    dir.path().to_path_buf(),
+                    vec![
+                        commit_info_for_graph("merge-tip", &["main-a", "teal-tip"]),
+                        commit_info_for_graph("main-a", &["teal-tip", "purple-tip"]),
+                        commit_info_for_graph("teal-tip", &["main-base"]),
+                        commit_info_for_graph("purple-tip", &["main-base"]),
+                        commit_info_for_graph("main-base", &[]),
+                    ],
+                );
+                cx.notify();
+            })
+            .expect("seed open repository");
+
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected repo open mode");
+                };
+                let graph_commits = repo
+                    .commits
+                    .iter()
+                    .map(|commit| graph::GraphCommit {
+                        sha: commit.sha.clone(),
+                        parent_shas: commit.parent_shas.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let rows = graph::layout_graph(&graph_commits);
+                assert_eq!(rows[1].lane, 0);
+                assert_eq!(rows[1].incoming_lanes, vec![0, 1]);
+                assert_eq!(rows[1].outgoing_lanes, vec![0, 2]);
+                assert_eq!(rows[1].connector_lanes, vec![0, 1, 2]);
+                assert!(
+                    rows[1].connectors.iter().any(|connector| {
+                        connector.from_lane == 0
+                            && connector.to_lane == 2
+                            && connector.kind == GraphConnectorKind::BranchOut
+                    }),
+                    "row should branch out across the ending intermediate lane",
+                );
+            })
+            .expect("inspect graph layout");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let left_horizontal = visual
+            .debug_bounds("commit-graph-spanning-horizontal-left-1-1")
+            .expect("ending intermediate lane left horizontal debug bounds");
+        let right_horizontal = visual
+            .debug_bounds("commit-graph-spanning-horizontal-right-1-1")
+            .expect("ending intermediate lane right horizontal debug bounds");
+        let center_fill = visual
+            .debug_bounds("commit-graph-spanning-horizontal-center-1-1")
+            .expect("ending intermediate lane center fill debug bounds");
+        let rounded_branch_end = visual
+            .debug_bounds("commit-graph-rounded-spanning-branch-end-elbow-1-1")
+            .expect("ending intermediate branch rounded bend debug bounds");
+        let top_horizontal = visual
+            .debug_bounds("commit-graph-spanning-horizontal-overlap-1-1")
+            .expect("ending intermediate lane top horizontal debug bounds");
+
+        assert_eq!(
+            left_horizontal.origin.y, right_horizontal.origin.y,
+            "spanning branch-out should remain horizontally aligned through the ending lane",
+        );
+        assert_eq!(
+            center_fill.origin.y, left_horizontal.origin.y,
+            "center fill should close the crossing point on the spanning branch-out",
+        );
+        assert_eq!(
+            top_horizontal.origin.y, left_horizontal.origin.y,
+            "spanning branch-out should be repainted above the rounded branch-end curve",
+        );
+        assert!(
+            visual
+                .debug_bounds("commit-graph-spanning-horizontal-mask-1-1")
+                .is_none(),
+            "spanning branch-out should not use a background mask that can cut into the rounded bend",
+        );
+        assert!(
+            top_horizontal.origin.x <= left_horizontal.origin.x,
+            "top spanning branch-out should cover the left side of the ending lane",
+        );
+        assert!(
+            top_horizontal.origin.x + top_horizontal.size.width
+                >= right_horizontal.origin.x + right_horizontal.size.width,
+            "top spanning branch-out should cover through the right side of the ending lane",
+        );
+        assert!(
+            rounded_branch_end.origin.y < left_horizontal.origin.y,
+            "ending branch bend should curve upward into the vertical lane",
+        );
+        assert!(
+            rounded_branch_end.origin.y + rounded_branch_end.size.height
+                > left_horizontal.origin.y + left_horizontal.size.height,
+            "ending branch bend should have enough height for a circular quadrant",
         );
     }
 
