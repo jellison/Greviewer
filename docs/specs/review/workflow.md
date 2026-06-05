@@ -37,7 +37,7 @@ The user can quit Greviewer with the standard quit keyboard shortcut.
 
 ## Viewing the commit graph
 
-The user sees a graphical history of the repository's commits with branch lanes and merge connectors. Each commit displays its short identifier, summary line, author, authored date, and any local branch names that point at it. The graph is scrollable; older commits load progressively as the user scrolls. The currently checked-out tip is visually marked, but selection is independent of checkout state — reviewing never moves HEAD.
+The user sees a graphical history of the repository's commits with branch lanes and merge connectors. Each commit is presented as a single-row entry whose reading order is graph, short identifier, summary line, author, authored date, and any local branch names that point at it. The graph is scrollable; older commits load progressively as the user scrolls. The currently checked-out tip is visually marked, but selection is independent of checkout state — reviewing never moves HEAD.
 
 **Triggering conditions**
 

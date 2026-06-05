@@ -1636,7 +1636,6 @@ impl App {
         selected: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let secondary = format!("{} · {}", commit.author, commit.authored_date);
         let row_bg = if selected {
             rgb(0x223248)
         } else {
@@ -1667,7 +1666,6 @@ impl App {
             .on_click(cx.listener(move |app, event: &ClickEvent, window, cx| {
                 app.select_commit(sha.clone(), event.modifiers(), window, cx);
             }))
-            .child(render_commit_ref_labels(index, commit))
             .child(render_commit_graph_gutter(
                 index,
                 graph_row,
@@ -1675,35 +1673,52 @@ impl App {
             ))
             .child(
                 div()
-                    .w(px(72.))
+                    .w(px(COMMIT_HASH_WIDTH))
+                    .flex_shrink_0()
                     .text_color(rgb(0xa3e635))
                     .text_size(px(12.))
                     .font_family("monospace")
+                    .debug_selector(move || format!("commit-hash-{index}"))
                     .child(commit.short_sha.clone()),
             )
             .child(
                 div()
-                    .flex()
-                    .flex_col()
                     .flex_1()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_color(rgb(0xe6e6e6))
-                            .text_size(px(14.))
-                            .child(commit.summary.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_color(rgb(0x8a8a8a))
-                            .text_size(px(12.))
-                            .child(secondary),
-                    ),
+                    .min_w_0()
+                    .text_color(rgb(0xe6e6e6))
+                    .text_size(px(14.))
+                    .truncate()
+                    .debug_selector(move || format!("commit-summary-{index}"))
+                    .child(commit.summary.clone()),
             )
+            .child(
+                div()
+                    .w(px(COMMIT_AUTHOR_WIDTH))
+                    .flex_shrink_0()
+                    .min_w_0()
+                    .text_color(rgb(0xa3a3a3))
+                    .text_size(px(12.))
+                    .truncate()
+                    .debug_selector(move || format!("commit-author-{index}"))
+                    .child(commit.author.clone()),
+            )
+            .child(
+                div()
+                    .w(px(COMMIT_TIME_WIDTH))
+                    .flex_shrink_0()
+                    .text_color(rgb(0x8a8a8a))
+                    .text_size(px(12.))
+                    .debug_selector(move || format!("commit-time-{index}"))
+                    .child(commit.authored_date.clone()),
+            )
+            .child(render_commit_ref_labels(index, commit))
     }
 }
 
-const COMMIT_ROW_HEIGHT: f32 = 64.;
+const COMMIT_ROW_HEIGHT: f32 = 44.;
+const COMMIT_HASH_WIDTH: f32 = 72.;
+const COMMIT_AUTHOR_WIDTH: f32 = 168.;
+const COMMIT_TIME_WIDTH: f32 = 96.;
 
 fn commit_row_separator_width() -> f32 {
     0.
@@ -1743,6 +1758,7 @@ fn render_commit_ref_labels(row_index: usize, commit: &repo::CommitInfo) -> gpui
         .w(px(COMMIT_REF_LABELS_WIDTH))
         .overflow_hidden()
         .flex_shrink_0()
+        .debug_selector(move || format!("commit-ref-labels-{row_index}"))
         .children(
             labels
                 .into_iter()
@@ -2807,7 +2823,7 @@ mod tests {
     use crate::graph::{self, GraphConnectorKind};
     use crate::repo::{ChangeKind, DiffSide, INITIAL_COMMIT_LIMIT};
     use git2::{IndexAddOption, Repository, Signature};
-    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{px, Modifiers, TestAppContext, VisualTestContext};
     use std::fs;
 
     fn init_repo_with_one_commit() -> (tempfile::TempDir, String) {
@@ -4073,6 +4089,84 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn commit_rows_render_as_single_line_columns_in_requested_order(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.mode = Mode::RepoOpen {
+                    repo: crate::repo::OpenRepository {
+                        path: dir.path().to_path_buf(),
+                        head: Some(crate::repo::HeadInfo {
+                            short_sha: "abcdef0".to_string(),
+                            summary: "Compact row".to_string(),
+                        }),
+                        commits: vec![crate::repo::CommitInfo {
+                            sha: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+                            short_sha: "abcdef0".to_string(),
+                            summary: "Collapse graph row into columns".to_string(),
+                            author: "Greviewer Tests".to_string(),
+                            authored_timestamp: 0,
+                            authored_date: "1970-01-01".to_string(),
+                            parent_shas: Vec::new(),
+                            branch_names: vec!["main".to_string()],
+                            parent_count: 0,
+                            is_head: true,
+                        }],
+                        has_more_commits: false,
+                    },
+                };
+                cx.notify();
+            })
+            .expect("seed open repository");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row = visual
+            .debug_bounds("commit-row-0")
+            .expect("commit row debug bounds");
+        let graph = visual
+            .debug_bounds("commit-graph-gutter-0")
+            .expect("graph gutter debug bounds");
+        let hash = visual
+            .debug_bounds("commit-hash-0")
+            .expect("commit hash debug bounds");
+        let summary = visual
+            .debug_bounds("commit-summary-0")
+            .expect("commit summary debug bounds");
+        let author = visual
+            .debug_bounds("commit-author-0")
+            .expect("commit author debug bounds");
+        let time = visual
+            .debug_bounds("commit-time-0")
+            .expect("commit time debug bounds");
+        let labels = visual
+            .debug_bounds("commit-ref-labels-0")
+            .expect("commit labels debug bounds");
+
+        assert!(
+            row.size.height <= px(44.),
+            "commit row should be compact enough for a single-line layout: {row:?}"
+        );
+        assert!(graph.origin.x < hash.origin.x, "graph should be first");
+        assert!(hash.origin.x < summary.origin.x, "hash should follow graph");
+        assert!(
+            summary.origin.x < author.origin.x,
+            "summary should precede author"
+        );
+        assert!(
+            author.origin.x < time.origin.x,
+            "author should precede time"
+        );
+        assert!(
+            time.origin.x < labels.origin.x,
+            "time should precede labels"
+        );
+    }
+
+    #[gpui::test]
     async fn commit_rows_render_head_and_branch_labels(cx: &mut TestAppContext) {
         let (dir, _left_sha, _right_sha) = init_repo_with_diverged_history();
         let path = dir.path().to_path_buf();
@@ -4231,8 +4325,8 @@ mod tests {
             .expect("commit graph gutter debug bounds");
 
         assert!(
-            label_bounds.origin.x + label_bounds.size.width <= graph_bounds.origin.x,
-            "branch label should end before the graph gutter starts; label: {label_bounds:?}, graph: {graph_bounds:?}"
+            label_bounds.origin.x >= graph_bounds.origin.x + graph_bounds.size.width,
+            "branch label should not cover the graph gutter; label: {label_bounds:?}, graph: {graph_bounds:?}"
         );
     }
 
