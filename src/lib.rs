@@ -5,13 +5,15 @@ use gpui::{
     WindowOptions,
 };
 
+use crate::assets::Assets;
+
 pub mod app;
 pub mod assets;
 pub mod graph;
 pub mod repo;
 
 pub fn run() {
-    Application::new().run(|cx: &mut App| {
+    Application::new().with_assets(Assets).run(|cx: &mut App| {
         gpui_component::init(cx);
 
         app::bind_app_keys(cx);
