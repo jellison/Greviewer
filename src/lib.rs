@@ -10,6 +10,7 @@ use crate::assets::Assets;
 pub mod app;
 pub mod assets;
 pub mod graph;
+pub mod icons;
 pub mod repo;
 
 pub fn run() {
