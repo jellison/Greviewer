@@ -120,22 +120,27 @@ With a changeset open, the user sees the rollup change set: a file tree containi
 
 ## Seeing all files for context
 
-The user can toggle a view that shows every file in the repository at the newest selected commit, not just the files in the change set. Files that are part of the change set remain marked so they are distinguishable from unchanged files. Selecting an unchanged file opens it for read-only viewing rather than as a diff.
+The file tree carries a row of icon-only controls that float over the top-right of the tree and stay pinned as the tree scrolls. A single show-all-files toggle switches between the change set and the all-files view; it reads as active while the all-files view is showing. Two further controls collapse every folder or expand every folder in one action. Each control names itself through a hover tooltip.
+
+The show-all-files toggle reveals every file in the repository at the newest selected commit, not just the files in the change set. Files that are part of the change set remain marked so they are distinguishable from unchanged files. Selecting an unchanged file opens it for read-only viewing rather than as a diff.
 
 **Triggering conditions**
 
-- The user toggles the all-files view while a changeset is open.
+- The user activates the show-all-files toggle while a changeset is open.
+- The user activates collapse-all or expand-all in either the change-set or the all-files view.
 
 **Observable outcomes**
 
-- The file tree shows every file at the newest selected commit.
+- The all-files view shows every file at the newest selected commit.
 - Folders that do not lead to a changed file are collapsed by default, so the change set stays visible without scrolling past unrelated files. Folders on the path to a changed file remain expanded.
 - Files in the change set retain their change indicator; unchanged files render without one.
 - Selecting an unchanged file opens it as a read-only view of its contents at the newest selected commit.
+- Collapse-all closes every folder in the tree; expand-all opens every folder, including folders that were collapsed by default.
 
 **Edge cases**
 
 - The user can manually expand a collapsed folder or collapse an expanded one; manual toggles override the default and persist while the changeset stays open, including across switches between the change-set and all-files views.
+- Collapse-all and expand-all establish a new baseline; subsequent manual folder toggles adjust from there.
 
 ## Inspecting a file's diff
 

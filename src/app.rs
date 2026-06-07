@@ -19,6 +19,7 @@ use gpui::{
 };
 use gpui_component::notification::{Notification, NotificationList};
 use gpui_component::resizable::{h_resizable, resizable_panel, ResizableState};
+use gpui_component::tooltip::Tooltip;
 use gpui_component::Icon;
 use similar::{DiffTag, TextDiff};
 use std::{
@@ -53,6 +54,8 @@ const FILE_TREE_FOLDER_ICON_SIZE: f32 = 16.;
 const FILE_TREE_STATUS_ICON_SIZE: f32 = 14.;
 const FILE_TREE_INDENT_GUIDE_WIDTH: f32 = 1.;
 const FILE_TREE_GUIDE_TO_ITEM_GAP: f32 = 4.;
+const FILE_TREE_CONTROL_BUTTON_SIZE: f32 = 22.;
+const FILE_TREE_CONTROL_ICON_SIZE: f32 = 15.;
 
 pub struct App {
     pub mode: Mode,
@@ -673,6 +676,59 @@ impl App {
         cx.notify();
     }
 
+    fn toggle_file_list_mode(&mut self, cx: &mut Context<Self>) {
+        let next = match self.file_list_mode {
+            FileListMode::Changed => FileListMode::All,
+            FileListMode::All => FileListMode::Changed,
+        };
+        self.set_file_list_mode(next, cx);
+    }
+
+    /// Enumerate every folder in the tree built from `entries`, paired with
+    /// whether it collapses by default in the current view. Used by the
+    /// collapse-all / expand-all controls, which need the full folder universe
+    /// regardless of what is currently visible.
+    fn file_tree_folder_defaults(&self, entries: &[FileListEntry]) -> Vec<(String, bool)> {
+        let collapse_unchanged_by_default = matches!(self.file_list_mode, FileListMode::All);
+        let changed_ancestor_paths = if collapse_unchanged_by_default {
+            changed_file_ancestor_paths(entries)
+        } else {
+            BTreeSet::new()
+        };
+
+        let mut root = FileTreeBranch::default();
+        for entry in entries.iter().cloned() {
+            insert_file_tree_entry(&mut root, entry);
+        }
+
+        let mut folders = Vec::new();
+        collect_file_tree_folder_defaults(
+            &root,
+            "",
+            collapse_unchanged_by_default,
+            &changed_ancestor_paths,
+            &mut folders,
+        );
+        folders
+    }
+
+    /// Drive every folder to `collapsed`. The collapse model stores a delta
+    /// XOR'd against per-folder defaults, so a folder is recorded only when the
+    /// desired state differs from its default.
+    fn apply_folder_collapse(
+        &mut self,
+        folders: &[(String, bool)],
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.collapsed_file_tree_paths = folders
+            .iter()
+            .filter(|(_, collapsed_by_default)| collapsed != *collapsed_by_default)
+            .map(|(path, _)| path.clone())
+            .collect();
+        cx.notify();
+    }
+
     fn toggle_file_tree_folder(&mut self, path: String, cx: &mut Context<Self>) {
         if !self.collapsed_file_tree_paths.insert(path.clone()) {
             self.collapsed_file_tree_paths.remove(&path);
@@ -1189,6 +1245,7 @@ impl App {
         entries: Vec<FileListEntry>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let folder_defaults = self.file_tree_folder_defaults(&entries);
         let rows = self.file_tree_rows(entries);
         let list_content: AnyElement = if rows.is_empty() {
             div()
@@ -1221,6 +1278,7 @@ impl App {
         };
 
         div()
+            .relative()
             .flex()
             .flex_col()
             .w_full()
@@ -1229,8 +1287,8 @@ impl App {
             .id("changed-files")
             .border_1()
             .border_color(rgb(0x242424))
-            .child(self.render_file_list_mode_toggle(cx))
             .child(list_content)
+            .child(self.render_file_tree_controls(folder_defaults, cx))
     }
 
     fn file_tree_rows(&self, entries: Vec<FileListEntry>) -> Vec<FileTreeRow> {
@@ -1264,55 +1322,85 @@ impl App {
         rows
     }
 
-    fn render_file_list_mode_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The icon-only controls that float over the top-right of the file tree:
+    /// a show-all-files toggle plus collapse-all / expand-all. The controls sit
+    /// outside the scroll area so they stay pinned while the tree scrolls.
+    fn render_file_tree_controls(
+        &self,
+        folder_defaults: Vec<(String, bool)>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let collapse_folders = folder_defaults.clone();
+        let expand_folders = folder_defaults;
+        let show_all_active = matches!(self.file_list_mode, FileListMode::All);
+
         div()
+            .absolute()
+            .top(px(2.))
+            .right(px(2.))
             .flex()
-            .gap_1()
-            .px_2()
-            .py_2()
-            .border_b_1()
-            .border_color(rgb(0x242424))
-            .child(self.render_file_list_mode_button(
-                FileListMode::Changed,
-                "Changed",
-                "file-list-mode-changed",
+            .items_center()
+            .gap(px(2.))
+            // The controls float over the first tree row; occlude so clicks
+            // land on the buttons instead of falling through to the row.
+            .occlude()
+            .child(self.render_file_tree_icon_button(
+                LucideIcon::ListTree,
+                "file-list-mode-toggle",
+                "Show all files",
+                show_all_active,
+                |app, _window, cx| app.toggle_file_list_mode(cx),
                 cx,
             ))
-            .child(self.render_file_list_mode_button(
-                FileListMode::All,
-                "All files",
-                "file-list-mode-all",
+            .child(self.render_file_tree_icon_button(
+                LucideIcon::ChevronsDownUp,
+                "file-tree-collapse-all",
+                "Collapse all",
+                false,
+                move |app, _window, cx| app.apply_folder_collapse(&collapse_folders, true, cx),
+                cx,
+            ))
+            .child(self.render_file_tree_icon_button(
+                LucideIcon::ChevronsUpDown,
+                "file-tree-expand-all",
+                "Expand all",
+                false,
+                move |app, _window, cx| app.apply_folder_collapse(&expand_folders, false, cx),
                 cx,
             ))
     }
 
-    fn render_file_list_mode_button(
+    fn render_file_tree_icon_button(
         &self,
-        mode: FileListMode,
-        label: &'static str,
+        icon: LucideIcon,
         selector: &'static str,
+        tooltip: &'static str,
+        active: bool,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active = self.file_list_mode == mode;
-        let border_color = if active { rgb(0x3b82f6) } else { rgb(0x343434) };
-        let background = if active { rgb(0x1d283a) } else { rgb(0x171717) };
+        let background = if active { rgb(0x1d283a) } else { rgb(0x202020) };
         let text_color = if active { rgb(0xdbeafe) } else { rgb(0x999999) };
 
         div()
-            .px_2()
-            .py_1()
-            .border_1()
-            .border_color(border_color)
-            .bg(background)
-            .text_color(text_color)
-            .text_size(px(12.))
-            .cursor_pointer()
             .id(selector)
             .debug_selector(move || selector.to_string())
-            .on_click(cx.listener(move |app, _event, _window, cx| {
-                app.set_file_list_mode(mode, cx);
-            }))
-            .child(label)
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(FILE_TREE_CONTROL_BUTTON_SIZE))
+            .rounded(px(4.))
+            .bg(background)
+            .text_color(text_color)
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(0x2c3a4f)).text_color(rgb(0xdbeafe)))
+            .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+            .on_click(cx.listener(move |app, _event, window, cx| on_click(app, window, cx)))
+            .child(
+                Icon::new(icon)
+                    .text_color(text_color)
+                    .size(px(FILE_TREE_CONTROL_ICON_SIZE)),
+            )
     }
 
     fn render_file_tree_row(
@@ -4190,6 +4278,35 @@ fn changed_file_ancestor_paths(entries: &[FileListEntry]) -> BTreeSet<String> {
     paths
 }
 
+/// Walk every folder in the tree (regardless of collapse state) recording its
+/// path and whether it collapses by default. Mirrors the default-collapse logic
+/// in [`append_file_tree_rows`] so bulk collapse/expand stays consistent.
+fn collect_file_tree_folder_defaults(
+    branch: &FileTreeBranch,
+    prefix: &str,
+    collapse_unchanged_by_default: bool,
+    changed_ancestor_paths: &BTreeSet<String>,
+    folders: &mut Vec<(String, bool)>,
+) {
+    for (name, child) in &branch.folders {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let collapsed_by_default =
+            collapse_unchanged_by_default && !changed_ancestor_paths.contains(&path);
+        folders.push((path.clone(), collapsed_by_default));
+        collect_file_tree_folder_defaults(
+            child,
+            &path,
+            collapse_unchanged_by_default,
+            changed_ancestor_paths,
+            folders,
+        );
+    }
+}
+
 fn append_file_tree_rows(
     branch: &FileTreeBranch,
     depth: usize,
@@ -6994,7 +7111,7 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let all_files_bounds = visual
-            .debug_bounds("file-list-mode-all")
+            .debug_bounds("file-list-mode-toggle")
             .expect("all files toggle debug bounds");
         visual.simulate_click(all_files_bounds.center(), Modifiers::none());
 
@@ -7037,7 +7154,7 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let all_files_bounds = visual
-            .debug_bounds("file-list-mode-all")
+            .debug_bounds("file-list-mode-toggle")
             .expect("all files toggle debug bounds");
         visual.simulate_click(all_files_bounds.center(), Modifiers::none());
 
@@ -7074,7 +7191,7 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let all_files_bounds = visual
-            .debug_bounds("file-list-mode-all")
+            .debug_bounds("file-list-mode-toggle")
             .expect("all files toggle debug bounds");
         visual.simulate_click(all_files_bounds.center(), Modifiers::none());
 
@@ -7316,7 +7433,7 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let all_files_bounds = visual
-            .debug_bounds("file-list-mode-all")
+            .debug_bounds("file-list-mode-toggle")
             .expect("all files toggle debug bounds");
         visual.simulate_click(all_files_bounds.center(), Modifiers::none());
 
@@ -7434,6 +7551,85 @@ mod tests {
         assert!(
             !rows.iter().any(|row| row.path() == "docs/readme.md"),
             "collapsed folder hides its files"
+        );
+    }
+
+    #[gpui::test]
+    async fn toggle_file_list_mode_flips_between_changed_and_all(cx: &mut TestAppContext) {
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, _window, cx| {
+                assert_eq!(app.file_list_mode, FileListMode::Changed);
+                app.toggle_file_list_mode(cx);
+                assert_eq!(app.file_list_mode, FileListMode::All);
+                app.toggle_file_list_mode(cx);
+                assert_eq!(app.file_list_mode, FileListMode::Changed);
+            })
+            .expect("toggle file list mode");
+    }
+
+    #[gpui::test]
+    async fn collapse_all_collapses_every_folder(cx: &mut TestAppContext) {
+        let window = add_app_window(cx);
+
+        let rows = window
+            .update(cx, |app, _window, cx| {
+                app.file_list_mode = FileListMode::Changed;
+                let entries = vec![
+                    changed_file_entry("src/app/a.rs"),
+                    changed_file_entry("src/b.rs"),
+                    changed_file_entry("docs/c.md"),
+                ];
+                let folders = app.file_tree_folder_defaults(&entries);
+                app.apply_folder_collapse(&folders, true, cx);
+                app.file_tree_rows(entries)
+            })
+            .expect("collapse-all tree rows");
+
+        assert!(folder_collapsed(&rows, "src"), "top-level folder collapsed");
+        assert!(
+            folder_collapsed(&rows, "docs"),
+            "top-level folder collapsed"
+        );
+        assert!(
+            !rows.iter().any(|row| row.path() == "src/app"),
+            "collapsing the parent hides nested folders"
+        );
+        assert!(
+            !rows.iter().any(|row| row.path() == "src/b.rs"),
+            "collapsing hides files"
+        );
+    }
+
+    #[gpui::test]
+    async fn expand_all_expands_every_folder(cx: &mut TestAppContext) {
+        let window = add_app_window(cx);
+
+        let rows = window
+            .update(cx, |app, _window, cx| {
+                app.file_list_mode = FileListMode::All;
+                let entries = vec![
+                    changed_file_entry("src/app/changed.rs"),
+                    unchanged_file_entry("docs/nested/readme.md"),
+                ];
+                let folders = app.file_tree_folder_defaults(&entries);
+                app.apply_folder_collapse(&folders, false, cx);
+                app.file_tree_rows(entries)
+            })
+            .expect("expand-all tree rows");
+
+        assert!(
+            !folder_collapsed(&rows, "docs"),
+            "expand-all overrides the default collapse of unchanged folders"
+        );
+        assert!(
+            !folder_collapsed(&rows, "docs/nested"),
+            "expand-all reaches nested folders"
+        );
+        assert!(
+            rows.iter().any(|row| row.path() == "docs/nested/readme.md"),
+            "expanded folders reveal their files"
         );
     }
 
