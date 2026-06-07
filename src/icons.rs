@@ -18,7 +18,8 @@ pub enum LucideIcon {
 
 impl LucideIcon {
     /// Every variant, used by tests to assert each has a vendored asset.
-    pub const ALL: [LucideIcon; 3] = [
+    /// Keep in sync with the enum variants when adding or removing an icon.
+    pub const ALL: &[LucideIcon] = &[
         LucideIcon::SquareDot,
         LucideIcon::SquareMinus,
         LucideIcon::SquarePlus,
