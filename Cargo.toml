@@ -10,6 +10,7 @@ repository = "https://gitlab.cicd.dc/justin.ellison/greviewer"
 git2 = "0.20"
 gpui = "0.2"
 gpui-component = { version = "0.5", features = ["tree-sitter-languages"] }
+include_dir = "0.7"
 similar = "2"
 
 [dev-dependencies]
