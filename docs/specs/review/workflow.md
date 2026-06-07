@@ -106,7 +106,10 @@ With a changeset open, the user sees the rollup change set: a file tree containi
 **Observable outcomes**
 
 - The change set lists every net-changed file across the selection.
-- Each entry shows its path and its change indicator (added / modified / deleted / renamed).
+- Paths are grouped into a tree with open and closed folder icons and vertical nesting guides for files under folders.
+- Each changed file entry shows a compact change marker: plus for added, dot for modified, horizontal bar for deleted, and rename marker for renamed.
+- Deleted file entries render their filename struck through.
+- Changed entries show added and removed line counts so the user can estimate review size before opening a file.
 - Selecting a file opens it for inspection.
 
 **Edge cases**

@@ -60,6 +60,13 @@ pub struct ChangedFile {
     pub old_path: Option<String>,
     pub kind: ChangeKind,
     pub is_binary: bool,
+    pub line_stats: LineStats,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LineStats {
+    pub added: usize,
+    pub removed: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,11 +304,12 @@ fn changed_files_between_trees(
         .map_err(ChangeSetError::Git)?;
 
     let mut files = Vec::new();
-    for delta in diff.deltas() {
+    for (delta_index, delta) in diff.deltas().enumerate() {
         let Some(mut file) = changed_file_from_delta(delta) else {
             continue;
         };
         file.is_binary = changed_file_is_binary(repo, base_tree, target_tree, &file)?;
+        file.line_stats = line_stats_for_delta(&diff, delta_index)?;
         files.push(file);
     }
     files.sort_by(|left, right| {
@@ -562,6 +570,19 @@ fn changed_file_is_binary(
     }
 }
 
+fn line_stats_for_delta(
+    diff: &git2::Diff<'_>,
+    delta_index: usize,
+) -> Result<LineStats, ChangeSetError> {
+    let Some(patch) = git2::Patch::from_diff(diff, delta_index).map_err(ChangeSetError::Git)?
+    else {
+        return Ok(LineStats::default());
+    };
+    let (_context, added, removed) = patch.line_stats().map_err(ChangeSetError::Git)?;
+
+    Ok(LineStats { added, removed })
+}
+
 fn single_file_content(side: DiffSide, text: Option<String>) -> FileDiffContent {
     match text {
         Some(text) => FileDiffContent::Single { side, text },
@@ -739,24 +760,28 @@ fn changed_file_from_delta(delta: git2::DiffDelta<'_>) -> Option<ChangedFile> {
             old_path: None,
             kind: ChangeKind::Added,
             is_binary: false,
+            line_stats: LineStats::default(),
         }),
         git2::Delta::Deleted => Some(ChangedFile {
             path: diff_path(delta.old_file())?,
             old_path: None,
             kind: ChangeKind::Deleted,
             is_binary: false,
+            line_stats: LineStats::default(),
         }),
         git2::Delta::Modified | git2::Delta::Typechange => Some(ChangedFile {
             path: diff_path(delta.new_file())?,
             old_path: None,
             kind: ChangeKind::Modified,
             is_binary: false,
+            line_stats: LineStats::default(),
         }),
         git2::Delta::Renamed => Some(ChangedFile {
             path: diff_path(delta.new_file())?,
             old_path: Some(diff_path(delta.old_file())?),
             kind: ChangeKind::Renamed,
             is_binary: false,
+            line_stats: LineStats::default(),
         }),
         git2::Delta::Unmodified
         | git2::Delta::Ignored
@@ -1061,6 +1086,10 @@ mod tests {
                 old_path: None,
                 kind: ChangeKind::Added,
                 is_binary: false,
+                line_stats: LineStats {
+                    added: 1,
+                    removed: 0,
+                },
             }],
         );
     }
@@ -1098,6 +1127,10 @@ mod tests {
                 old_path: None,
                 kind: ChangeKind::Modified,
                 is_binary: false,
+                line_stats: LineStats {
+                    added: 1,
+                    removed: 1,
+                },
             }],
         );
 
@@ -1177,6 +1210,7 @@ mod tests {
             old_path: None,
             kind: ChangeKind::Added,
             is_binary: false,
+            line_stats: LineStats::default(),
         };
 
         let diff = file_diff_for_changed_file(dir.path(), &oid_hex, &file).expect("file diff");
@@ -1221,6 +1255,10 @@ mod tests {
                 old_path: None,
                 kind: ChangeKind::Deleted,
                 is_binary: false,
+                line_stats: LineStats {
+                    added: 0,
+                    removed: 1,
+                },
             }],
         );
     }
@@ -1248,6 +1286,7 @@ mod tests {
             old_path: None,
             kind: ChangeKind::Deleted,
             is_binary: false,
+            line_stats: LineStats::default(),
         };
 
         let diff = file_diff_for_changed_file(dir.path(), &delete_oid, &file).expect("file diff");
@@ -1277,6 +1316,7 @@ mod tests {
             old_path: None,
             kind: ChangeKind::Modified,
             is_binary: false,
+            line_stats: LineStats::default(),
         };
 
         let diff = file_diff_for_changed_file(dir.path(), &update_oid, &file).expect("file diff");
@@ -1321,6 +1361,10 @@ mod tests {
                 old_path: Some("old.txt".to_string()),
                 kind: ChangeKind::Renamed,
                 is_binary: false,
+                line_stats: LineStats {
+                    added: 0,
+                    removed: 0,
+                },
             }],
         );
     }
@@ -1352,6 +1396,7 @@ mod tests {
             old_path: Some("old.txt".to_string()),
             kind: ChangeKind::Renamed,
             is_binary: false,
+            line_stats: LineStats::default(),
         };
 
         let diff = file_diff_for_changed_file(dir.path(), &rename_oid, &file).expect("file diff");
@@ -1379,6 +1424,7 @@ mod tests {
             old_path: None,
             kind: ChangeKind::Added,
             is_binary: true,
+            line_stats: LineStats::default(),
         };
 
         let diff = file_diff_for_changed_file(dir.path(), &oid_hex, &file).expect("file diff");
@@ -1403,6 +1449,10 @@ mod tests {
                 old_path: None,
                 kind: ChangeKind::Added,
                 is_binary: true,
+                line_stats: LineStats {
+                    added: 0,
+                    removed: 0,
+                },
             }],
         );
     }

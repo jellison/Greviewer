@@ -38,6 +38,17 @@ actions!(
 );
 
 const MAX_RECENT_REPOSITORIES: usize = 10;
+const FILE_TREE_FONT_FAMILY: &str = "BerkeleyMono Nerd Font";
+const FILE_TREE_INDENT_WIDTH: f32 = 16.;
+const FILE_TREE_ROW_HEIGHT: f32 = 24.;
+const FILE_TREE_TEXT_SIZE: f32 = 14.;
+const FILE_TREE_SECONDARY_TEXT_SIZE: f32 = 10.;
+const FILE_TREE_BADGE_TEXT_SIZE: f32 = 9.;
+const FILE_TREE_DIFF_STAT_TEXT_SIZE: f32 = 13.;
+const FILE_TREE_FOLDER_ICON_SIZE: f32 = 16.;
+const FILE_TREE_STATUS_ICON_SIZE: f32 = 14.;
+const FILE_TREE_INDENT_GUIDE_WIDTH: f32 = 1.;
+const FILE_TREE_GUIDE_TO_ITEM_GAP: f32 = 4.;
 
 pub struct App {
     pub mode: Mode,
@@ -1306,39 +1317,36 @@ impl App {
     ) -> impl IntoElement {
         let path = path.to_string();
         let debug_selector = format!("file-tree-folder-{}", debug_path_fragment(&path));
-        let disclosure = if collapsed { ">" } else { "v" };
+        let path_fragment = debug_path_fragment(&path);
 
         div()
             .flex()
             .items_center()
             .w_full()
-            .gap_3()
-            .px_4()
-            .py_2()
+            .min_h(px(FILE_TREE_ROW_HEIGHT))
+            .gap_2()
+            .px_2()
             .bg(rgb(0x171717))
-            .border_b_1()
-            .border_color(rgb(0x242424))
             .cursor_pointer()
             .id(("file-tree-folder", index))
             .debug_selector(move || debug_selector.clone())
             .on_click(cx.listener(move |app, _event, _window, cx| {
                 app.toggle_file_tree_folder(path.clone(), cx);
             }))
-            .child(depth_spacer(depth))
-            .child(
-                div()
-                    .w(px(16.))
-                    .text_color(rgb(0x999999))
-                    .text_size(px(12.))
-                    .font_family("monospace")
-                    .child(disclosure),
-            )
+            .child(render_file_tree_indent_guides(depth, &path_fragment))
+            .child(render_file_tree_folder_icon(
+                &path_fragment,
+                collapsed,
+                rgb(0x8aa6bd),
+            ))
             .child(
                 div()
                     .flex_1()
-                    .text_color(rgb(0xe6e6e6))
-                    .text_size(px(14.))
-                    .font_family("monospace")
+                    .min_w_0()
+                    .text_color(rgb(0x8aa6bd))
+                    .text_size(px(FILE_TREE_TEXT_SIZE))
+                    .font_family(FILE_TREE_FONT_FAMILY)
+                    .truncate()
                     .child(name.to_string()),
             )
     }
@@ -1358,11 +1366,6 @@ impl App {
         } else {
             rgb(0x171717)
         };
-        let border_color = if selected {
-            rgb(0x3b82f6)
-        } else {
-            rgb(0x242424)
-        };
         let debug_selector = if selected {
             format!("selected-changed-file-row-{index}")
         } else {
@@ -1372,56 +1375,49 @@ impl App {
         let kind_selector = format!("changed-file-kind-{path_fragment}");
         let binary_selector = format!("changed-file-binary-indicator-{path_fragment}");
         let rename_source_selector = format!("changed-file-rename-source-{path_fragment}");
+        let status_icon_selector = format!("changed-file-status-icon-{path_fragment}");
+        let diff_stat_selector = format!("changed-file-diff-stat-{path_fragment}");
+        let file_name_selector = format!("changed-file-name-{path_fragment}");
+        let deleted_strike_selector = format!("changed-file-deleted-strike-{path_fragment}");
 
         div()
             .flex()
             .items_center()
             .w_full()
-            .gap_3()
-            .px_4()
-            .py_2()
+            .min_h(px(FILE_TREE_ROW_HEIGHT))
+            .gap_2()
+            .px_2()
             .bg(row_bg)
-            .border_b_1()
-            .border_color(border_color)
             .cursor_pointer()
             .id(("changed-file-row", index))
             .debug_selector(move || debug_selector.clone())
             .on_click(cx.listener(move |app, _event, _window, cx| {
                 app.select_changed_file(path.clone(), cx);
             }))
-            .child(depth_spacer(depth))
-            .child(
-                div()
-                    .w(px(72.))
-                    .px_2()
-                    .py_1()
-                    .border_1()
-                    .border_color(change_kind_border(file.kind))
-                    .bg(change_kind_background(file.kind))
-                    .text_color(change_kind_text(file.kind))
-                    .text_size(px(11.))
-                    .font_family("monospace")
-                    .debug_selector(move || kind_selector.clone())
-                    .child(change_kind_label(file.kind)),
-            )
+            .child(render_file_tree_indent_guides(depth, &path_fragment))
+            .child(render_change_status_icon(
+                file.kind,
+                kind_selector,
+                status_icon_selector,
+            ))
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .flex_1()
+                    .min_w_0()
                     .gap_1()
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(
-                                div()
-                                    .text_color(rgb(0xe6e6e6))
-                                    .text_size(px(14.))
-                                    .font_family("monospace")
-                                    .child(display_name.to_string()),
-                            )
+                            .child(render_file_tree_file_name(
+                                file_name_selector,
+                                display_name,
+                                file.kind == repo::ChangeKind::Deleted,
+                                deleted_strike_selector,
+                            ))
                             .when(file.is_binary, |row| {
                                 row.child(
                                     div()
@@ -1431,8 +1427,8 @@ impl App {
                                         .border_color(rgb(0x525252))
                                         .bg(rgb(0x242424))
                                         .text_color(rgb(0xbdbdbd))
-                                        .text_size(px(10.))
-                                        .font_family("monospace")
+                                        .text_size(px(FILE_TREE_BADGE_TEXT_SIZE))
+                                        .font_family(FILE_TREE_FONT_FAMILY)
                                         .debug_selector(move || binary_selector.clone())
                                         .child("Binary"),
                                 )
@@ -1442,13 +1438,15 @@ impl App {
                         column.child(
                             div()
                                 .text_color(rgb(0x8a8a8a))
-                                .text_size(px(12.))
-                                .font_family("monospace")
+                                .text_size(px(FILE_TREE_SECONDARY_TEXT_SIZE))
+                                .font_family(FILE_TREE_FONT_FAMILY)
+                                .truncate()
                                 .debug_selector(move || rename_source_selector.clone())
                                 .child(format!("from {old_path}")),
                         )
                     }),
             )
+            .child(render_file_diff_stat(diff_stat_selector, file.line_stats))
     }
 
     fn render_unchanged_file_row(
@@ -1466,11 +1464,6 @@ impl App {
         } else {
             rgb(0x171717)
         };
-        let border_color = if selected {
-            rgb(0x3b82f6)
-        } else {
-            rgb(0x242424)
-        };
         let debug_selector = if selected {
             format!("selected-unchanged-file-row-{index}")
         } else {
@@ -1481,26 +1474,32 @@ impl App {
             .flex()
             .items_center()
             .w_full()
-            .gap_3()
-            .px_4()
-            .py_2()
+            .min_h(px(FILE_TREE_ROW_HEIGHT))
+            .gap_2()
+            .px_2()
             .bg(row_bg)
-            .border_b_1()
-            .border_color(border_color)
             .cursor_pointer()
             .id(("unchanged-file-row", index))
             .debug_selector(move || debug_selector.clone())
             .on_click(cx.listener(move |app, _event, _window, cx| {
                 app.select_changed_file(path.clone(), cx);
             }))
-            .child(depth_spacer(depth))
-            .child(div().w(px(72.)))
+            .child(render_file_tree_indent_guides(
+                depth,
+                &debug_path_fragment(&file.path),
+            ))
+            .child(render_file_tree_file_icon(
+                format!("unchanged-file-icon-{}", debug_path_fragment(&file.path)),
+                rgb(0x6f7d87),
+            ))
             .child(
                 div()
                     .flex_1()
-                    .text_color(rgb(0xe6e6e6))
-                    .text_size(px(14.))
-                    .font_family("monospace")
+                    .min_w_0()
+                    .text_color(rgb(0xb8c0c7))
+                    .text_size(px(FILE_TREE_TEXT_SIZE))
+                    .font_family(FILE_TREE_FONT_FAMILY)
+                    .truncate()
                     .child(display_name.to_string()),
             )
     }
@@ -3773,20 +3772,294 @@ fn change_kind_background(kind: repo::ChangeKind) -> gpui::Rgba {
 
 fn change_kind_border(kind: repo::ChangeKind) -> gpui::Rgba {
     match kind {
-        repo::ChangeKind::Added => rgb(0x2f7d46),
-        repo::ChangeKind::Modified => rgb(0x3b82f6),
-        repo::ChangeKind::Deleted => rgb(0x8b3a3a),
-        repo::ChangeKind::Renamed => rgb(0x9a7b22),
+        repo::ChangeKind::Added => rgb(0xb8f77a),
+        repo::ChangeKind::Modified => rgb(0x7da4ff),
+        repo::ChangeKind::Deleted => rgb(0xff5f78),
+        repo::ChangeKind::Renamed => rgb(0xf3d36b),
     }
 }
 
 fn change_kind_text(kind: repo::ChangeKind) -> gpui::Rgba {
     match kind {
-        repo::ChangeKind::Added => rgb(0x86efac),
-        repo::ChangeKind::Modified => rgb(0xdbeafe),
-        repo::ChangeKind::Deleted => rgb(0xfca5a5),
-        repo::ChangeKind::Renamed => rgb(0xfde68a),
+        repo::ChangeKind::Added => rgb(0xb8f77a),
+        repo::ChangeKind::Modified => rgb(0x7da4ff),
+        repo::ChangeKind::Deleted => rgb(0xff5f78),
+        repo::ChangeKind::Renamed => rgb(0xf3d36b),
     }
+}
+
+fn render_file_tree_folder_icon(
+    path_fragment: &str,
+    collapsed: bool,
+    color: gpui::Rgba,
+) -> gpui::Div {
+    let state = if collapsed { "closed" } else { "open" };
+    let selector = format!("file-tree-folder-icon-{state}-{path_fragment}");
+
+    let icon = div()
+        .relative()
+        .w(px(FILE_TREE_FOLDER_ICON_SIZE))
+        .h(px(FILE_TREE_FOLDER_ICON_SIZE))
+        .flex_none()
+        .debug_selector(move || selector.clone());
+
+    if collapsed {
+        icon.child(render_file_tree_icon_part(
+            format!("file-tree-folder-icon-closed-body-{path_fragment}"),
+            1.,
+            6.,
+            14.,
+            8.,
+            color,
+        ))
+        .child(render_file_tree_icon_part(
+            format!("file-tree-folder-icon-closed-tab-{path_fragment}"),
+            2.,
+            3.,
+            7.,
+            4.,
+            color,
+        ))
+    } else {
+        icon.child(render_file_tree_open_folder_outline(
+            format!("file-tree-folder-icon-open-outline-{path_fragment}"),
+            color,
+        ))
+    }
+}
+
+fn render_file_tree_icon_part(
+    selector: String,
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    color: gpui::Rgba,
+) -> gpui::Div {
+    div()
+        .absolute()
+        .left(px(left))
+        .top(px(top))
+        .w(px(width))
+        .h(px(height))
+        .rounded(px(1.5))
+        .border_1()
+        .border_color(color)
+        .debug_selector(move || selector.clone())
+}
+
+fn render_file_tree_open_folder_outline(selector: String, color: gpui::Rgba) -> gpui::Div {
+    div()
+        .absolute()
+        .left_0()
+        .top_0()
+        .w(px(FILE_TREE_FOLDER_ICON_SIZE))
+        .h(px(FILE_TREE_FOLDER_ICON_SIZE))
+        .debug_selector(move || selector.clone())
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let point_at = |x, y| point(bounds.origin.x + px(x), bounds.origin.y + px(y));
+                    let mut outline = PathBuilder::stroke(px(1.35));
+
+                    outline.move_to(point_at(2.5, 8.));
+                    outline.line_to(point_at(2.5, 5.));
+                    outline.line_to(point_at(6.5, 5.));
+                    outline.line_to(point_at(8., 7.));
+                    outline.line_to(point_at(13., 7.));
+                    outline.line_to(point_at(13.8, 9.));
+
+                    outline.move_to(point_at(1.5, 9.));
+                    outline.line_to(point_at(14.5, 9.));
+                    outline.line_to(point_at(13., 14.));
+                    outline.line_to(point_at(2.5, 14.));
+                    outline.line_to(point_at(1.5, 9.));
+
+                    if let Ok(path) = outline.build() {
+                        window.paint_path(path, color);
+                    }
+                },
+            )
+            .w_full()
+            .h_full(),
+        )
+}
+
+fn render_file_tree_file_icon(selector: String, color: gpui::Rgba) -> gpui::Div {
+    let folded_corner_selector = format!("{selector}-folded-corner");
+
+    div()
+        .relative()
+        .w(px(FILE_TREE_FOLDER_ICON_SIZE))
+        .h(px(FILE_TREE_FOLDER_ICON_SIZE))
+        .flex_none()
+        .debug_selector(move || selector.clone())
+        .child(
+            div()
+                .absolute()
+                .left(px(3.))
+                .top(px(2.))
+                .w(px(10.))
+                .h(px(12.))
+                .rounded(px(1.5))
+                .border_1()
+                .border_color(color),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(9.))
+                .top(px(2.))
+                .w(px(4.))
+                .h(px(4.))
+                .border_1()
+                .border_color(color)
+                .debug_selector(move || folded_corner_selector.clone()),
+        )
+}
+
+fn render_file_tree_indent_guides(depth: usize, path_fragment: &str) -> gpui::Div {
+    let guides = (0..depth)
+        .map(|level| {
+            let selector = format!("file-tree-indent-guide-{path_fragment}-{level}");
+            div()
+                .absolute()
+                .left(px(
+                    (level + 1) as f32 * FILE_TREE_INDENT_WIDTH - FILE_TREE_INDENT_GUIDE_WIDTH / 2.
+                ))
+                .top_0()
+                .w(px(FILE_TREE_INDENT_GUIDE_WIDTH))
+                .h(px(FILE_TREE_ROW_HEIGHT))
+                .bg(rgb(0x2b383f))
+                .debug_selector(move || selector.clone())
+        })
+        .collect::<Vec<_>>();
+
+    div()
+        .relative()
+        .flex_none()
+        .w(px(file_tree_indent_guides_width(depth)))
+        .min_h(px(FILE_TREE_ROW_HEIGHT))
+        .children(guides)
+}
+
+fn file_tree_indent_guides_width(depth: usize) -> f32 {
+    depth as f32 * FILE_TREE_INDENT_WIDTH
+        + if depth > 0 {
+            FILE_TREE_GUIDE_TO_ITEM_GAP
+        } else {
+            0.
+        }
+}
+
+fn render_file_tree_file_name(
+    selector: String,
+    display_name: &str,
+    deleted: bool,
+    deleted_strike_selector: String,
+) -> gpui::Div {
+    div()
+        .relative()
+        .flex()
+        .items_center()
+        .min_w_0()
+        .text_color(rgb(0xe6eef0))
+        .text_size(px(FILE_TREE_TEXT_SIZE))
+        .font_family(FILE_TREE_FONT_FAMILY)
+        .truncate()
+        .debug_selector(move || selector.clone())
+        .child(display_name.to_string())
+        .when(deleted, |label| {
+            label.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(px(11.))
+                    .h(px(1.))
+                    .bg(rgb(0xe6eef0))
+                    .debug_selector(move || deleted_strike_selector.clone()),
+            )
+        })
+}
+
+fn render_change_status_icon(
+    kind: repo::ChangeKind,
+    selector: String,
+    icon_selector: String,
+) -> gpui::Div {
+    let color = change_kind_text(kind);
+    let content: AnyElement = match kind {
+        repo::ChangeKind::Added => div()
+            .text_size(px(10.))
+            .font_family(FILE_TREE_FONT_FAMILY)
+            .text_color(color)
+            .child("+")
+            .into_any_element(),
+        repo::ChangeKind::Deleted => div()
+            .w(px(6.))
+            .h(px(1.5))
+            .rounded(px(1.))
+            .bg(color)
+            .into_any_element(),
+        repo::ChangeKind::Modified => div()
+            .size(px(3.))
+            .rounded_full()
+            .bg(color)
+            .into_any_element(),
+        repo::ChangeKind::Renamed => div()
+            .text_size(px(FILE_TREE_BADGE_TEXT_SIZE))
+            .font_family(FILE_TREE_FONT_FAMILY)
+            .text_color(color)
+            .child("R")
+            .into_any_element(),
+    };
+
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(FILE_TREE_STATUS_ICON_SIZE))
+        .h(px(FILE_TREE_STATUS_ICON_SIZE))
+        .flex_none()
+        .border_1()
+        .rounded(px(2.))
+        .border_color(change_kind_border(kind))
+        .debug_selector(move || selector.clone())
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w_full()
+                .h_full()
+                .debug_selector(move || icon_selector.clone())
+                .child(content),
+        )
+}
+
+fn render_file_diff_stat(selector: String, stats: repo::LineStats) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_end()
+        .gap_2()
+        .w(px(68.))
+        .flex_none()
+        .font_family(FILE_TREE_FONT_FAMILY)
+        .text_size(px(FILE_TREE_DIFF_STAT_TEXT_SIZE))
+        .debug_selector(move || selector.clone())
+        .child(
+            div()
+                .text_color(rgb(0xb8f77a))
+                .child(format!("+ {}", stats.added)),
+        )
+        .child(
+            div()
+                .text_color(rgb(0xff5f78))
+                .child(format!("- {}", stats.removed)),
+        )
 }
 
 impl Render for App {
@@ -3936,10 +4209,6 @@ fn commit_ancestry_path_from_descendant(
     None
 }
 
-fn depth_spacer(depth: usize) -> gpui::Div {
-    div().w(px(depth as f32 * 16.))
-}
-
 fn debug_path_fragment(path: &str) -> String {
     path.replace('/', "-")
 }
@@ -3972,12 +4241,13 @@ mod tests {
         debug_ref_label_fragment, load_recent_repositories, save_recent_repositories,
         side_by_side_diff_rows, single_side_diff_rows, App, CloseChangeset, DiffLineStatus,
         FileListMode, FileTreeRow, Mode, OpenChangeset, OpenFailed, RecentRepository, ReviewScreen,
-        Selection,
+        Selection, FILE_TREE_FOLDER_ICON_SIZE, FILE_TREE_FONT_FAMILY, FILE_TREE_INDENT_WIDTH,
+        FILE_TREE_ROW_HEIGHT, FILE_TREE_STATUS_ICON_SIZE, FILE_TREE_TEXT_SIZE,
     };
     use crate::graph::{self, GraphConnectorKind};
     use crate::repo::{ChangeKind, DiffSide, INITIAL_COMMIT_LIMIT};
     use git2::{IndexAddOption, Repository, Signature};
-    use gpui::{px, Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{font, px, Modifiers, TestAppContext, VisualTestContext};
     use std::{fs, path::PathBuf};
 
     fn init_repo_with_one_commit() -> (tempfile::TempDir, String) {
@@ -4073,6 +4343,23 @@ mod tests {
 
         fs::write(dir.path().join("src/changed.txt"), "after\n").expect("update changed file");
         let update_oid = commit_all(&repo, "Update changed file", &[root_oid]);
+
+        drop(repo);
+
+        (dir, update_oid.to_string())
+    }
+
+    fn init_repo_with_nested_line_stat_changes() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::create_dir_all(dir.path().join("src")).expect("create src dir");
+        fs::write(dir.path().join("src/notes.txt"), "keep\nold\n").expect("write notes file");
+        let root_oid = commit_all(&repo, "Initial", &[]);
+
+        fs::write(dir.path().join("src/notes.txt"), "keep\nnew\nextra\n")
+            .expect("update notes file");
+        let update_oid = commit_all(&repo, "Update notes file", &[root_oid]);
 
         drop(repo);
 
@@ -6644,6 +6931,43 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn all_files_mode_aligns_unchanged_and_changed_file_icons_at_the_same_depth(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, oid_hex) = init_repo_with_nested_changed_and_context_files();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open changeset");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let all_files_bounds = visual
+            .debug_bounds("file-list-mode-all")
+            .expect("all files toggle debug bounds");
+        visual.simulate_click(all_files_bounds.center(), Modifiers::none());
+
+        let changed_icon_bounds = visual
+            .debug_bounds("changed-file-kind-src-changed.txt")
+            .expect("changed file icon debug bounds");
+        let unchanged_icon_bounds = visual
+            .debug_bounds("unchanged-file-icon-src-context.txt")
+            .expect("unchanged file icon debug bounds");
+
+        assert_eq!(
+            unchanged_icon_bounds.origin.x, changed_icon_bounds.origin.x,
+            "unchanged files should use the same icon slot as changed files at the same depth"
+        );
+    }
+
+    #[gpui::test]
     async fn selecting_changed_file_in_all_files_mode_still_renders_side_by_side_diff(
         cx: &mut TestAppContext,
     ) {
@@ -6706,6 +7030,129 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn file_tree_rows_render_icons_status_icons_and_diff_stats(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_nested_line_stat_changes();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open changeset");
+
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _cx| match &app.review_screen {
+                ReviewScreen::Changeset { changeset, .. } => {
+                    assert_eq!(changeset.files.len(), 1);
+                    assert_eq!(changeset.files[0].path, "src/notes.txt");
+                    assert_eq!(changeset.files[0].line_stats.added, 2);
+                    assert_eq!(changeset.files[0].line_stats.removed, 1);
+                }
+                ReviewScreen::Graph => panic!("expected changeset review screen"),
+            })
+            .expect("read changeset line stats");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let folder_icon_bounds = visual
+            .debug_bounds("file-tree-folder-icon-open-src")
+            .expect("folder icon debug bounds");
+        visual
+            .debug_bounds("file-tree-folder-icon-open-outline-src")
+            .expect("open folder outline debug bounds");
+        let guide_bounds = visual
+            .debug_bounds("file-tree-indent-guide-src-notes.txt-0")
+            .expect("nested file indent guide debug bounds");
+        let changed_kind_bounds = visual
+            .debug_bounds("changed-file-kind-src-notes.txt")
+            .expect("changed file kind marker debug bounds");
+        assert_eq!(
+            guide_bounds.origin.x + guide_bounds.size.width / 2.,
+            folder_icon_bounds.origin.x + folder_icon_bounds.size.width / 2.,
+            "nested guide should be centered under its parent folder icon"
+        );
+        assert!(
+            changed_kind_bounds.origin.x - (guide_bounds.origin.x + guide_bounds.size.width)
+                >= px(11.),
+            "nested file item should have breathing room after the guide"
+        );
+        visual
+            .debug_bounds("changed-file-status-icon-src-notes.txt")
+            .expect("changed file status icon debug bounds");
+        let status_icon_bounds = visual
+            .debug_bounds("changed-file-status-icon-src-notes.txt")
+            .expect("changed file status icon debug bounds");
+        assert_eq!(status_icon_bounds.size.width, px(12.));
+        assert_eq!(status_icon_bounds.size.height, px(12.));
+        visual
+            .debug_bounds("changed-file-diff-stat-src-notes.txt")
+            .expect("changed file diff stat debug bounds");
+    }
+
+    #[test]
+    fn file_tree_indent_width_is_compact() {
+        assert_eq!(FILE_TREE_INDENT_WIDTH, 16.);
+    }
+
+    #[test]
+    fn file_tree_density_matches_zed_reference_scale() {
+        assert_eq!(FILE_TREE_ROW_HEIGHT, 24.);
+        assert_eq!(FILE_TREE_TEXT_SIZE, 14.);
+        assert_eq!(FILE_TREE_FOLDER_ICON_SIZE, 16.);
+        assert_eq!(FILE_TREE_STATUS_ICON_SIZE, 14.);
+    }
+
+    #[test]
+    fn file_tree_font_family_uses_installed_berkeley_mono_family() {
+        assert_eq!(FILE_TREE_FONT_FAMILY, "BerkeleyMono Nerd Font");
+    }
+
+    #[gpui::test]
+    async fn file_tree_font_family_resolves_without_fallback(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let requested_font = font(FILE_TREE_FONT_FAMILY);
+            let font_id = cx.text_system().resolve_font(&requested_font);
+            let resolved_font = cx
+                .text_system()
+                .get_font_for_id(font_id)
+                .expect("resolved font should be cached");
+
+            assert_eq!(resolved_font.family.as_ref(), FILE_TREE_FONT_FAMILY);
+        });
+    }
+
+    #[gpui::test]
+    async fn deleted_file_tree_rows_render_deletion_marker_and_struck_name(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, oid_hex) = init_repo_with_deleted_file();
+        let path = dir.path().to_path_buf();
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open deleted file changeset");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("changed-file-status-icon-obsolete.txt")
+            .expect("deleted file status icon debug bounds");
+        visual
+            .debug_bounds("changed-file-deleted-strike-obsolete.txt")
+            .expect("deleted file strike debug bounds");
+    }
+
+    #[gpui::test]
     async fn collapsing_file_tree_folder_persists_across_file_list_mode_toggle(
         cx: &mut TestAppContext,
     ) {
@@ -6727,7 +7174,21 @@ mod tests {
         let folder_bounds = visual
             .debug_bounds("file-tree-folder-src")
             .expect("src folder debug bounds");
+        visual
+            .debug_bounds("file-tree-folder-icon-open-src")
+            .expect("open folder icon debug bounds");
         visual.simulate_click(folder_bounds.center(), Modifiers::none());
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("file-tree-folder-icon-closed-src")
+            .expect("closed folder icon debug bounds");
+        visual
+            .debug_bounds("file-tree-folder-icon-closed-body-src")
+            .expect("closed folder body debug bounds");
+        visual
+            .debug_bounds("file-tree-folder-icon-closed-tab-src")
+            .expect("closed folder tab debug bounds");
 
         window
             .read_with(cx, |app, _cx| {
