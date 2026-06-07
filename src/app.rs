@@ -73,6 +73,8 @@ pub struct App {
     commit_history_scroll: ScrollHandle,
     changeset_resizable: Entity<ResizableState>,
     focus_handle: FocusHandle,
+    /// Whether the title-bar context popover (the diff "switcher") is open.
+    context_popover_open: bool,
 }
 
 struct FileDiffScroll {
@@ -416,6 +418,7 @@ impl App {
             commit_history_scroll: ScrollHandle::new(),
             changeset_resizable,
             focus_handle,
+            context_popover_open: false,
         }
     }
 
@@ -646,6 +649,7 @@ impl App {
                 }
                 let sha = changeset.commit_sha.clone();
                 self.review_screen = ReviewScreen::Changeset { sha, changeset };
+                self.context_popover_open = false;
                 cx.notify();
             }
             Err(err) => self.push_open_failed(err.to_string(), window, cx),
@@ -654,6 +658,7 @@ impl App {
 
     fn close_changeset(&mut self, cx: &mut Context<Self>) {
         self.review_screen = ReviewScreen::Graph;
+        self.context_popover_open = false;
         cx.notify();
     }
 
@@ -6916,6 +6921,56 @@ mod tests {
                 ReviewScreen::Graph => panic!("expected changeset review screen"),
             })
             .expect("read changeset");
+    }
+
+    #[gpui::test]
+    async fn closing_changeset_clears_the_context_popover(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex.clone(), cx);
+                app.open_changeset(window, cx);
+                app.context_popover_open = true;
+                app.close_changeset(cx);
+            })
+            .expect("close changeset");
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert!(!app.context_popover_open);
+                assert!(matches!(app.review_screen, ReviewScreen::Graph));
+            })
+            .expect("read state");
+    }
+
+    #[gpui::test]
+    async fn opening_changeset_clears_the_context_popover(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex.clone(), cx);
+                app.open_changeset(window, cx);
+                // Simulate the popover being left open, then re-open the
+                // changeset: opening must dismiss the popover.
+                app.context_popover_open = true;
+                app.open_changeset(window, cx);
+            })
+            .expect("reopen changeset");
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert!(!app.context_popover_open);
+                assert!(matches!(app.review_screen, ReviewScreen::Changeset { .. }));
+            })
+            .expect("read state");
     }
 
     #[gpui::test]
