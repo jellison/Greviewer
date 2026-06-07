@@ -2,6 +2,7 @@
 
 pub mod menu;
 pub mod path_picker;
+mod title_bar;
 
 pub use menu::{
     bind_app_keys, build_app_menus, open_repository_key_binding, quit_application_key_binding,
