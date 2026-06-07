@@ -18,6 +18,7 @@ use gpui::{
     Styled, Window,
 };
 use gpui_component::notification::{Notification, NotificationList};
+use gpui_component::resizable::{h_resizable, resizable_panel, ResizableState};
 use similar::{DiffTag, TextDiff};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -64,6 +65,7 @@ pub struct App {
     recent_repository_store_path: Option<PathBuf>,
     file_diff_scroll: FileDiffScroll,
     commit_history_scroll: ScrollHandle,
+    changeset_resizable: Entity<ResizableState>,
     focus_handle: FocusHandle,
 }
 
@@ -385,6 +387,7 @@ impl App {
         recent_repository_store_path: Option<PathBuf>,
     ) -> Self {
         let notifications = cx.new(|cx| NotificationList::new(window, cx));
+        let changeset_resizable = cx.new(|_| ResizableState::default());
         let focus_handle = cx.focus_handle();
 
         window.focus(&focus_handle);
@@ -405,6 +408,7 @@ impl App {
             recent_repository_store_path,
             file_diff_scroll: FileDiffScroll::new(),
             commit_history_scroll: ScrollHandle::new(),
+            changeset_resizable,
             focus_handle,
         }
     }
@@ -1118,8 +1122,20 @@ impl App {
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_file_list(entries, cx))
-                    .child(self.render_file_detail(repo, changeset, selected_path))
+                    .child(
+                        h_resizable("changeset-split")
+                            .with_state(&self.changeset_resizable)
+                            .child(
+                                resizable_panel()
+                                    .size(px(340.))
+                                    .child(self.render_file_list(entries, cx)),
+                            )
+                            .child(resizable_panel().child(self.render_file_detail(
+                                repo,
+                                changeset,
+                                selected_path,
+                            ))),
+                    )
                     .into_any_element()
             }
             Err(err) => render_file_diff_error(err.to_string()),
@@ -1205,7 +1221,7 @@ impl App {
         div()
             .flex()
             .flex_col()
-            .w(px(340.))
+            .w_full()
             .h_full()
             .min_h_0()
             .id("changed-files")
@@ -4346,8 +4362,16 @@ mod tests {
     use crate::graph::{self, GraphConnectorKind};
     use crate::repo::{ChangeKind, DiffSide, INITIAL_COMMIT_LIMIT};
     use git2::{IndexAddOption, Repository, Signature};
-    use gpui::{font, px, Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{font, px, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
     use std::{fs, path::PathBuf};
+
+    /// Open a window holding a freshly constructed `App`, with the
+    /// gpui-component theme installed. The theme global is required by themed
+    /// widgets such as the changeset resizable split.
+    fn add_app_window(cx: &mut TestAppContext) -> WindowHandle<App> {
+        cx.update(gpui_component::init);
+        cx.add_window(App::new)
+    }
 
     fn init_repo_with_one_commit() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -4833,7 +4857,7 @@ mod tests {
 
     #[gpui::test]
     async fn renders_placeholder(cx: &mut TestAppContext) {
-        let _window = cx.add_window(App::new);
+        let _window = add_app_window(cx);
         // The contract: booting the App in the gpui test harness must not panic
         // and the entity must construct successfully. Once the App gains user-
         // visible interactivity, this test grows to assert on observable events.
@@ -4861,7 +4885,7 @@ mod tests {
         drop(index);
         drop(repo);
 
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -4882,8 +4906,6 @@ mod tests {
 
     #[gpui::test]
     async fn opening_a_real_repo_sets_the_window_title_to_the_repo_name(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-
         let (dir, _) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
         let expected_title = path
@@ -4891,7 +4913,7 @@ mod tests {
             .expect("repo directory name")
             .to_string_lossy()
             .to_string();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -4905,8 +4927,6 @@ mod tests {
 
     #[gpui::test]
     async fn opening_another_real_repo_replaces_the_window_title(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-
         let (first_dir, _) = init_repo_with_one_commit();
         let (second_dir, _) = init_repo_with_one_commit();
         let first_path = first_dir.path().to_path_buf();
@@ -4916,7 +4936,7 @@ mod tests {
             .expect("repo directory name")
             .to_string_lossy()
             .to_string();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -4931,8 +4951,6 @@ mod tests {
 
     #[gpui::test]
     async fn opening_a_non_repo_preserves_the_existing_window_title(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-
         let (repo_dir, _) = init_repo_with_one_commit();
         let repo_path = repo_dir.path().to_path_buf();
         let expected_title = repo_path
@@ -4941,7 +4959,7 @@ mod tests {
             .to_string_lossy()
             .to_string();
         let non_repo_dir = tempfile::tempdir().expect("create tempdir");
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -4958,10 +4976,8 @@ mod tests {
     async fn opening_a_non_repo_without_prior_repo_leaves_the_window_title_empty(
         cx: &mut TestAppContext,
     ) {
-        cx.update(gpui_component::init);
-
         let non_repo_dir = tempfile::tempdir().expect("create tempdir");
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -4978,7 +4994,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().to_path_buf();
         Repository::init(&path).expect("init repo");
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -5022,7 +5038,7 @@ mod tests {
             .path()
             .canonicalize()
             .expect("canonical second path");
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -5237,7 +5253,7 @@ mod tests {
 
     #[gpui::test]
     async fn selecting_commits_toggles_single_selection(cx: &mut TestAppContext) {
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, _window, cx| {
@@ -5267,7 +5283,7 @@ mod tests {
     async fn shift_clicking_linear_commits_selects_an_inclusive_range(cx: &mut TestAppContext) {
         let (dir, shas) = init_repo_with_three_commits();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -5316,11 +5332,9 @@ mod tests {
     async fn shift_clicking_diverged_commits_preserves_the_original_selection(
         cx: &mut TestAppContext,
     ) {
-        cx.update(gpui_component::init);
-
         let (dir, left_sha, right_sha) = init_repo_with_diverged_history();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -5339,7 +5353,7 @@ mod tests {
     ) {
         let (dir, merge_sha, main_sha, side_sha, root_sha) = init_repo_with_merge_range();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -5882,7 +5896,7 @@ mod tests {
     async fn commit_graph_renders_merge_lanes(cx: &mut TestAppContext) {
         let (dir, _left_sha, _right_sha) = init_repo_with_diverged_history();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -6129,7 +6143,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, _window, cx| {
@@ -6380,7 +6394,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, _window, cx| {
@@ -6453,7 +6467,7 @@ mod tests {
     async fn commit_graph_vertical_segments_connect_between_rows(cx: &mut TestAppContext) {
         let (dir, _) = init_repo_with_two_commits();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -6528,7 +6542,7 @@ mod tests {
     #[gpui::test]
     async fn commit_rows_render_as_single_line_columns_in_requested_order(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, _window, cx| {
@@ -6607,7 +6621,7 @@ mod tests {
     async fn commit_rows_render_head_and_branch_labels(cx: &mut TestAppContext) {
         let (dir, _left_sha, _right_sha) = init_repo_with_diverged_history();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -6665,7 +6679,7 @@ mod tests {
     async fn detached_head_repositories_render_without_a_head_marker(cx: &mut TestAppContext) {
         let (dir, tip_sha) = init_repo_with_detached_head();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -6721,7 +6735,7 @@ mod tests {
             )
             .into_boxed_str(),
         ) as &'static str;
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, _window, cx| {
@@ -6773,7 +6787,7 @@ mod tests {
 
         let (dir, shas) = init_repo_with_linear_history(INITIAL_COMMIT_LIMIT + 2);
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -6848,7 +6862,7 @@ mod tests {
 
     #[gpui::test]
     async fn opening_changeset_requires_a_selection(cx: &mut TestAppContext) {
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -6866,7 +6880,7 @@ mod tests {
     async fn opening_changeset_loads_changed_files(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -6894,7 +6908,7 @@ mod tests {
     async fn opening_range_changeset_renders_rollup_changed_files(cx: &mut TestAppContext) {
         let (dir, shas) = init_repo_with_three_commits();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -6943,7 +6957,7 @@ mod tests {
     async fn opening_empty_rollup_changeset_shows_empty_state(cx: &mut TestAppContext) {
         let (dir, shas) = init_repo_with_empty_rollup_range();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -6992,7 +7006,7 @@ mod tests {
     ) {
         let (dir, oid_hex) = init_repo_with_changed_and_context_files();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7035,7 +7049,7 @@ mod tests {
     ) {
         let (dir, oid_hex) = init_repo_with_nested_changed_and_context_files();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7072,7 +7086,7 @@ mod tests {
     ) {
         let (dir, oid_hex) = init_repo_with_changed_and_context_files();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7107,7 +7121,7 @@ mod tests {
     async fn file_list_renders_nested_paths_as_tree_folders(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_nested_changed_and_context_files();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7132,7 +7146,7 @@ mod tests {
     async fn file_tree_rows_render_icons_status_icons_and_diff_stats(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_nested_line_stat_changes();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7230,7 +7244,7 @@ mod tests {
     ) {
         let (dir, oid_hex) = init_repo_with_deleted_file();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7257,7 +7271,7 @@ mod tests {
     ) {
         let (dir, oid_hex) = init_repo_with_nested_changed_and_context_files();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7404,7 +7418,7 @@ mod tests {
 
     #[gpui::test]
     async fn all_files_mode_collapses_folders_without_changes_by_default(cx: &mut TestAppContext) {
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         let rows = window
             .update(cx, |app, _window, _cx| {
@@ -7445,7 +7459,7 @@ mod tests {
 
     #[gpui::test]
     async fn changed_mode_keeps_all_folders_expanded_by_default(cx: &mut TestAppContext) {
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         let rows = window
             .update(cx, |app, _window, _cx| {
@@ -7465,7 +7479,7 @@ mod tests {
     async fn selecting_changed_file_records_path(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7486,7 +7500,7 @@ mod tests {
     async fn reopening_changeset_preserves_valid_changed_file_selection(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7509,7 +7523,7 @@ mod tests {
     async fn opening_changeset_clears_stale_changed_file_selection(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7525,7 +7539,7 @@ mod tests {
 
     #[gpui::test]
     async fn closing_changeset_returns_to_graph_and_preserves_selection(cx: &mut TestAppContext) {
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7550,7 +7564,7 @@ mod tests {
     ) {
         let (dir, oid_hex) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7590,7 +7604,7 @@ mod tests {
     async fn clicking_changeset_affordances_enters_and_exits_review_mode(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7645,7 +7659,7 @@ mod tests {
     async fn clicking_a_commit_row_toggles_selection(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7686,7 +7700,7 @@ mod tests {
     async fn clicking_open_changeset_renders_changed_files(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7713,7 +7727,7 @@ mod tests {
     async fn binary_changed_files_show_no_text_indicator(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_binary_file();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7746,7 +7760,7 @@ mod tests {
     ) {
         let (dir, oid_hex) = init_repo_with_renamed_file();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7804,7 +7818,7 @@ mod tests {
     async fn clicking_changed_file_renders_detail_shell(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7844,10 +7858,51 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn changeset_resizable_split_lays_file_tree_left_of_the_diff(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+            })
+            .expect("open repo and select commit");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let open_bounds = visual
+            .debug_bounds("open-changeset")
+            .expect("open changeset debug bounds");
+        visual.simulate_click(open_bounds.center(), Modifiers::none());
+
+        let row_bounds = visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+
+        let tree_bounds = visual
+            .debug_bounds("changed-files-scroll")
+            .expect("changed files scroll debug bounds");
+        let detail_bounds = visual
+            .debug_bounds("file-detail-shell")
+            .expect("file detail shell debug bounds");
+
+        assert!(
+            tree_bounds.right() <= detail_bounds.left(),
+            "file tree should sit left of the diff panel: tree right {:?}, detail left {:?}",
+            tree_bounds.right(),
+            detail_bounds.left(),
+        );
+    }
+
+    #[gpui::test]
     async fn clicking_changed_file_renders_text_diff_content(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_two_commits();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7881,7 +7936,7 @@ mod tests {
     async fn added_file_diff_renders_only_the_new_side(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7926,7 +7981,7 @@ mod tests {
     async fn deleted_file_diff_renders_only_the_old_side(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_deleted_file();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -7971,7 +8026,7 @@ mod tests {
     async fn clicking_changed_file_renders_line_highlights(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_two_commits();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -8007,7 +8062,7 @@ mod tests {
 
         let (dir, oid_hex) = init_repo_with_long_diff();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -8058,7 +8113,7 @@ mod tests {
 
         let (dir, oid_hex) = init_repo_with_long_diff();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -8117,7 +8172,7 @@ mod tests {
 
         let (dir, oid_hex) = init_repo_with_long_diff();
         let path = dir.path().to_path_buf();
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
@@ -8180,11 +8235,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().to_path_buf();
 
-        // The notification path renders gpui-component widgets that look up
-        // the active theme; the theme global is installed by `gpui_component::init`.
-        cx.update(gpui_component::init);
-
-        let window = cx.add_window(App::new);
+        let window = add_app_window(cx);
         let app_entity = window.entity(cx).expect("get app entity");
 
         // Subscribe to the App's `OpenFailed` event before triggering the open;
