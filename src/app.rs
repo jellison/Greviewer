@@ -42,6 +42,7 @@ const FILE_TREE_FONT_FAMILY: &str = "BerkeleyMono Nerd Font";
 const FILE_TREE_INDENT_WIDTH: f32 = 16.;
 const FILE_TREE_ROW_HEIGHT: f32 = 24.;
 const FILE_TREE_TEXT_SIZE: f32 = 14.;
+const FILE_TREE_ROW_TEXT_LINE_HEIGHT: f32 = 20.;
 const FILE_TREE_SECONDARY_TEXT_SIZE: f32 = 10.;
 const FILE_TREE_BADGE_TEXT_SIZE: f32 = 9.;
 const FILE_TREE_DIFF_STAT_TEXT_SIZE: f32 = 13.;
@@ -1364,6 +1365,7 @@ impl App {
                     .min_w_0()
                     .text_color(rgb(0x8aa6bd))
                     .text_size(px(FILE_TREE_TEXT_SIZE))
+                    .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
                     .font_family(FILE_TREE_FONT_FAMILY)
                     .truncate()
                     .child(name.to_string()),
@@ -1517,6 +1519,7 @@ impl App {
                     .min_w_0()
                     .text_color(rgb(0xb8c0c7))
                     .text_size(px(FILE_TREE_TEXT_SIZE))
+                    .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
                     .font_family(FILE_TREE_FONT_FAMILY)
                     .truncate()
                     .child(display_name.to_string()),
@@ -3985,6 +3988,7 @@ fn render_file_tree_file_name(
         .min_w_0()
         .text_color(rgb(0xe6eef0))
         .text_size(px(FILE_TREE_TEXT_SIZE))
+        .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
         .font_family(FILE_TREE_FONT_FAMILY)
         .truncate()
         .debug_selector(move || selector.clone())
@@ -3995,7 +3999,7 @@ fn render_file_tree_file_name(
                     .absolute()
                     .left_0()
                     .right_0()
-                    .top(px(11.))
+                    .top(px(10.))
                     .h(px(1.))
                     .bg(rgb(0xe6eef0))
                     .debug_selector(move || deleted_strike_selector.clone()),
@@ -4011,19 +4015,38 @@ fn render_change_status_icon(
     let color = change_kind_text(kind);
     let content: AnyElement = match kind {
         repo::ChangeKind::Added => div()
-            .text_size(px(10.))
-            .font_family(FILE_TREE_FONT_FAMILY)
-            .text_color(color)
-            .child("+")
+            .relative()
+            .w(px(6.))
+            .h(px(6.))
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(px(2.))
+                    .w(px(6.))
+                    .h(px(2.))
+                    .rounded(px(1.))
+                    .bg(color),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(2.))
+                    .top_0()
+                    .w(px(2.))
+                    .h(px(6.))
+                    .rounded(px(1.))
+                    .bg(color),
+            )
             .into_any_element(),
         repo::ChangeKind::Deleted => div()
             .w(px(6.))
-            .h(px(1.5))
+            .h(px(2.))
             .rounded(px(1.))
             .bg(color)
             .into_any_element(),
         repo::ChangeKind::Modified => div()
-            .size(px(3.))
+            .size(px(4.))
             .rounded_full()
             .bg(color)
             .into_any_element(),
@@ -4039,22 +4062,31 @@ fn render_change_status_icon(
         .flex()
         .items_center()
         .justify_center()
-        .w(px(FILE_TREE_STATUS_ICON_SIZE))
-        .h(px(FILE_TREE_STATUS_ICON_SIZE))
+        .w(px(FILE_TREE_FOLDER_ICON_SIZE))
+        .h(px(FILE_TREE_FOLDER_ICON_SIZE))
         .flex_none()
-        .border_1()
-        .rounded(px(2.))
-        .border_color(change_kind_border(kind))
         .debug_selector(move || selector.clone())
         .child(
             div()
                 .flex()
                 .items_center()
                 .justify_center()
-                .w_full()
-                .h_full()
-                .debug_selector(move || icon_selector.clone())
-                .child(content),
+                .w(px(FILE_TREE_STATUS_ICON_SIZE))
+                .h(px(FILE_TREE_STATUS_ICON_SIZE))
+                .flex_none()
+                .border_1()
+                .rounded(px(2.))
+                .border_color(change_kind_border(kind))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w_full()
+                        .h_full()
+                        .debug_selector(move || icon_selector.clone())
+                        .child(content),
+                ),
         )
 }
 
