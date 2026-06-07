@@ -963,8 +963,8 @@ impl App {
     fn render_repo_open(&self, repo: &repo::OpenRepository, cx: &mut Context<Self>) -> AnyElement {
         match &self.review_screen {
             ReviewScreen::Graph => self.render_graph_screen(repo, cx).into_any_element(),
-            ReviewScreen::Changeset { sha, changeset } => self
-                .render_changeset_screen(repo, sha, changeset, cx)
+            ReviewScreen::Changeset { changeset, .. } => self
+                .render_changeset_screen(repo, changeset, cx)
                 .into_any_element(),
         }
     }
@@ -974,64 +974,10 @@ impl App {
         repo: &repo::OpenRepository,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let path_text = repo.path.display().to_string();
-        let head_line = match &repo.head {
-            Some(head) => format!("{} · {}", head.short_sha, head.summary),
-            None => "No commits yet.".to_string(),
-        };
         let can_open_changeset = matches!(
             self.selection,
             Selection::Single { .. } | Selection::Range { .. }
         );
-
-        let title_row = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .w_full()
-            .child(
-                div()
-                    .text_color(rgb(0xe6e6e6))
-                    .text_size(px(16.))
-                    .font_family("monospace")
-                    .child(path_text),
-            )
-            .when(can_open_changeset, |row| {
-                row.child(
-                    div()
-                        .px_3()
-                        .py_1()
-                        .border_1()
-                        .border_color(rgb(0x3b82f6))
-                        .bg(rgb(0x1d283a))
-                        .text_color(rgb(0xdbeafe))
-                        .text_size(px(12.))
-                        .cursor_pointer()
-                        .id("open-changeset")
-                        .debug_selector(|| "open-changeset".to_string())
-                        .on_click(cx.listener(|app, _event, window, cx| {
-                            app.open_changeset(window, cx);
-                        }))
-                        .child("Open changeset"),
-                )
-            });
-
-        let header = div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .gap_1()
-            .px_4()
-            .py_3()
-            .border_b_1()
-            .border_color(rgb(0x2a2a2a))
-            .child(title_row)
-            .child(
-                div()
-                    .text_color(rgb(0x999999))
-                    .text_size(px(13.))
-                    .child(head_line),
-            );
 
         let history = if repo.commits.is_empty() {
             div()
@@ -1104,71 +1050,48 @@ impl App {
         };
 
         div()
+            .relative()
             .flex()
             .flex_col()
             .w_full()
             .h_full()
             .bg(rgb(0x171717))
-            .child(header)
             .child(history)
+            // The open-changeset control floats over the top-right of the graph,
+            // outside the scroll area, so it stays pinned while the history
+            // scrolls. The repo/HEAD context that used to sit beside it is
+            // moving into the window bar.
+            .when(can_open_changeset, |screen| {
+                screen.child(
+                    div()
+                        .absolute()
+                        .top(px(2.))
+                        .right(px(2.))
+                        .occlude()
+                        .px_3()
+                        .py_1()
+                        .border_1()
+                        .border_color(rgb(0x3b82f6))
+                        .bg(rgb(0x1d283a))
+                        .text_color(rgb(0xdbeafe))
+                        .text_size(px(12.))
+                        .cursor_pointer()
+                        .id("open-changeset")
+                        .debug_selector(|| "open-changeset".to_string())
+                        .on_click(cx.listener(|app, _event, window, cx| {
+                            app.open_changeset(window, cx);
+                        }))
+                        .child("Open changeset"),
+                )
+            })
     }
 
     fn render_changeset_screen(
         &self,
         repo: &repo::OpenRepository,
-        sha: &str,
         changeset: &repo::ChangeSet,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let path_text = repo.path.display().to_string();
-        let short_sha: String = sha.chars().take(7).collect();
-
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .w_full()
-            .px_4()
-            .py_3()
-            .border_b_1()
-            .border_color(rgb(0x2a2a2a))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_color(rgb(0xe6e6e6))
-                            .text_size(px(16.))
-                            .font_family("monospace")
-                            .child(path_text),
-                    )
-                    .child(
-                        div()
-                            .text_color(rgb(0x999999))
-                            .text_size(px(13.))
-                            .child(format!("Changeset for {short_sha}")),
-                    ),
-            )
-            .child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .border_1()
-                    .border_color(rgb(0x4a4a4a))
-                    .bg(rgb(0x242424))
-                    .text_color(rgb(0xe6e6e6))
-                    .text_size(px(12.))
-                    .cursor_pointer()
-                    .id("close-changeset")
-                    .debug_selector(|| "close-changeset".to_string())
-                    .on_click(cx.listener(|app, _event, _window, cx| {
-                        app.close_changeset(cx);
-                    }))
-                    .child("Close"),
-            );
-
         let body: AnyElement = match self.file_list_entries(repo, changeset) {
             Ok(entries) => {
                 let selected_path = self
@@ -1205,7 +1128,6 @@ impl App {
             .w_full()
             .h_full()
             .bg(rgb(0x171717))
-            .child(header)
             .child(body)
     }
 
@@ -7812,11 +7734,9 @@ mod tests {
             .debug_bounds("changed-file-row-0")
             .expect("changed file row debug bounds");
 
-        let close_bounds = visual
-            .debug_bounds("close-changeset")
-            .expect("close changeset debug bounds");
-
-        visual.simulate_click(close_bounds.center(), Modifiers::none());
+        // The close affordance now lives only on the CloseChangeset action; the
+        // header button was removed pending its move into the window bar.
+        cx.dispatch_action(*window, CloseChangeset);
 
         window
             .read_with(cx, |app, _cx| {
