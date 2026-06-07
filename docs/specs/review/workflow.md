@@ -95,6 +95,41 @@ With a valid selection in place, the user opens the changeset to begin reviewing
 
 - Opening a changeset whose net effect is no change still transitions to review mode; the change set view shows the empty-state message described in the next section.
 
+## Seeing diff context in the window bar
+
+While a changeset is open, the window bar shows the open diff's context next to the
+repository name, in the form `{repository} / {commit identifier}`. For a single-commit
+changeset the commit identifier is the commit's short identifier; for a range it is the
+newest commit's short identifier followed by the number of commits in the range. The
+identifier is an affordance: activating it opens a popover describing the open changeset and
+offering a control to close it. Graph mode shows only the repository name, with no context
+identifier.
+
+**Triggering conditions**
+
+- The user activates the context identifier in the window bar while a changeset is open.
+- The user activates the close control inside the popover, or dismisses the popover by
+  activating outside it.
+
+**Observable outcomes**
+
+- In changeset mode the window bar shows the repository name and the changeset's commit
+  identifier; in graph mode it shows only the repository name.
+- Activating the identifier opens a popover that shows, for a range, the oldest and newest
+  short identifiers and the commit count, and for a single commit, the commit summary.
+- The popover shows the number of changed files and the total added and removed line counts
+  for the changeset.
+- The popover offers a control that closes the changeset, returning the window to graph mode
+  with the prior selection preserved.
+- Dismissing the popover by activating outside it leaves the changeset open.
+
+**Edge cases**
+
+- A changeset whose net effect is no change shows zero changed files and `+0 / −0` lines in
+  the popover; the close control still returns to graph mode.
+- A single-commit changeset whose commit is not in the loaded history window falls back to
+  showing the commit's short identifier in place of a summary.
+
 ## Reviewing the change set
 
 With a changeset open, the user sees the rollup change set: a file tree containing every file whose content differs between the state immediately before the oldest selected commit and the state at the newest selected commit. The tree shows each file's path and an indicator of how it changed (added, modified, deleted, renamed). Selecting a file in the tree opens that file's diff (described below).
