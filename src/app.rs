@@ -1215,6 +1215,17 @@ impl App {
     }
 
     fn file_tree_rows(&self, entries: Vec<FileListEntry>) -> Vec<FileTreeRow> {
+        // In "all files" mode the tree includes folders that hold no changes,
+        // which buries the diff in noise. Collapse those by default while
+        // keeping the folders that lead to a changed file expanded so the user
+        // can still see the diff at a glance. Manual toggles override this.
+        let collapse_unchanged_by_default = matches!(self.file_list_mode, FileListMode::All);
+        let changed_ancestor_paths = if collapse_unchanged_by_default {
+            changed_file_ancestor_paths(&entries)
+        } else {
+            BTreeSet::new()
+        };
+
         let mut root = FileTreeBranch::default();
 
         for entry in entries {
@@ -1222,7 +1233,15 @@ impl App {
         }
 
         let mut rows = Vec::new();
-        append_file_tree_rows(&root, 0, "", &self.collapsed_file_tree_paths, &mut rows);
+        append_file_tree_rows(
+            &root,
+            0,
+            "",
+            &self.collapsed_file_tree_paths,
+            collapse_unchanged_by_default,
+            &changed_ancestor_paths,
+            &mut rows,
+        );
         rows
     }
 
@@ -4117,11 +4136,45 @@ fn insert_file_tree_entry(root: &mut FileTreeBranch, entry: FileListEntry) {
     });
 }
 
+/// Collect every folder path that is an ancestor of a changed file. These are
+/// the folders that lead to the diff, so they stay expanded by default even in
+/// "all files" mode.
+fn changed_file_ancestor_paths(entries: &[FileListEntry]) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+
+    for entry in entries {
+        if !matches!(entry, FileListEntry::Changed(_)) {
+            continue;
+        }
+
+        let mut parts = entry
+            .path()
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        parts.pop();
+
+        let mut prefix = String::new();
+        for part in parts {
+            if prefix.is_empty() {
+                prefix = part.to_string();
+            } else {
+                prefix = format!("{prefix}/{part}");
+            }
+            paths.insert(prefix.clone());
+        }
+    }
+
+    paths
+}
+
 fn append_file_tree_rows(
     branch: &FileTreeBranch,
     depth: usize,
     prefix: &str,
     collapsed_paths: &BTreeSet<String>,
+    collapse_unchanged_by_default: bool,
+    changed_ancestor_paths: &BTreeSet<String>,
     rows: &mut Vec<FileTreeRow>,
 ) {
     for (name, child) in &branch.folders {
@@ -4130,7 +4183,12 @@ fn append_file_tree_rows(
         } else {
             format!("{prefix}/{name}")
         };
-        let collapsed = collapsed_paths.contains(&path);
+        // A folder is collapsed by default when it leads to no changed files in
+        // "all files" mode. `collapsed_paths` records the user's manual toggles
+        // and flips the folder away from its default state.
+        let collapsed_by_default =
+            collapse_unchanged_by_default && !changed_ancestor_paths.contains(&path);
+        let collapsed = collapsed_by_default ^ collapsed_paths.contains(&path);
 
         rows.push(FileTreeRow::Folder {
             name: name.clone(),
@@ -4140,7 +4198,15 @@ fn append_file_tree_rows(
         });
 
         if !collapsed {
-            append_file_tree_rows(child, depth + 1, &path, collapsed_paths, rows);
+            append_file_tree_rows(
+                child,
+                depth + 1,
+                &path,
+                collapsed_paths,
+                collapse_unchanged_by_default,
+                changed_ancestor_paths,
+                rows,
+            );
         }
     }
 
@@ -4240,9 +4306,10 @@ mod tests {
         commit_graph_spanning_connector_requires_center_fill, commit_row_separator_width,
         debug_ref_label_fragment, load_recent_repositories, save_recent_repositories,
         side_by_side_diff_rows, single_side_diff_rows, App, CloseChangeset, DiffLineStatus,
-        FileListMode, FileTreeRow, Mode, OpenChangeset, OpenFailed, RecentRepository, ReviewScreen,
-        Selection, FILE_TREE_FOLDER_ICON_SIZE, FILE_TREE_FONT_FAMILY, FILE_TREE_INDENT_WIDTH,
-        FILE_TREE_ROW_HEIGHT, FILE_TREE_STATUS_ICON_SIZE, FILE_TREE_TEXT_SIZE,
+        FileListEntry, FileListMode, FileTreeRow, Mode, OpenChangeset, OpenFailed,
+        RecentRepository, ReviewScreen, Selection, FILE_TREE_FOLDER_ICON_SIZE,
+        FILE_TREE_FONT_FAMILY, FILE_TREE_INDENT_WIDTH, FILE_TREE_ROW_HEIGHT,
+        FILE_TREE_STATUS_ICON_SIZE, FILE_TREE_TEXT_SIZE,
     };
     use crate::graph::{self, GraphConnectorKind};
     use crate::repo::{ChangeKind, DiffSide, INITIAL_COMMIT_LIMIT};
@@ -7274,6 +7341,92 @@ mod tests {
         visual
             .debug_bounds("unchanged-file-row-2")
             .expect("unchanged file child after expanding folder");
+    }
+
+    fn changed_file_entry(path: &str) -> FileListEntry {
+        FileListEntry::Changed(crate::repo::ChangedFile {
+            path: path.to_string(),
+            old_path: None,
+            kind: ChangeKind::Modified,
+            is_binary: false,
+            line_stats: crate::repo::LineStats::default(),
+        })
+    }
+
+    fn unchanged_file_entry(path: &str) -> FileListEntry {
+        FileListEntry::Unchanged(crate::repo::RepositoryFile {
+            path: path.to_string(),
+        })
+    }
+
+    fn folder_collapsed(rows: &[FileTreeRow], folder_path: &str) -> bool {
+        rows.iter()
+            .find_map(|row| match row {
+                FileTreeRow::Folder {
+                    path, collapsed, ..
+                } if path == folder_path => Some(*collapsed),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing folder row for {folder_path}"))
+    }
+
+    #[gpui::test]
+    async fn all_files_mode_collapses_folders_without_changes_by_default(cx: &mut TestAppContext) {
+        let window = cx.add_window(App::new);
+
+        let rows = window
+            .update(cx, |app, _window, _cx| {
+                app.file_list_mode = FileListMode::All;
+                app.file_tree_rows(vec![
+                    changed_file_entry("src/app/changed.rs"),
+                    unchanged_file_entry("src/app/sibling/context.rs"),
+                    unchanged_file_entry("docs/readme.md"),
+                ])
+            })
+            .expect("compute all-files tree rows");
+
+        assert!(
+            !folder_collapsed(&rows, "src"),
+            "folders on a changed path stay expanded"
+        );
+        assert!(
+            !folder_collapsed(&rows, "src/app"),
+            "folders on a changed path stay expanded at every depth"
+        );
+        assert!(
+            folder_collapsed(&rows, "src/app/sibling"),
+            "sibling folder without changes is collapsed by default"
+        );
+        assert!(
+            folder_collapsed(&rows, "docs"),
+            "unrelated folder without changes is collapsed by default"
+        );
+        assert!(
+            rows.iter().any(|row| row.path() == "src/app/changed.rs"),
+            "changed file stays visible"
+        );
+        assert!(
+            !rows.iter().any(|row| row.path() == "docs/readme.md"),
+            "collapsed folder hides its files"
+        );
+    }
+
+    #[gpui::test]
+    async fn changed_mode_keeps_all_folders_expanded_by_default(cx: &mut TestAppContext) {
+        let window = cx.add_window(App::new);
+
+        let rows = window
+            .update(cx, |app, _window, _cx| {
+                app.file_list_mode = FileListMode::Changed;
+                app.file_tree_rows(vec![changed_file_entry("src/app/changed.rs")])
+            })
+            .expect("compute changed tree rows");
+
+        assert!(
+            !folder_collapsed(&rows, "src"),
+            "changed mode leaves folders expanded by default"
+        );
+        assert!(!folder_collapsed(&rows, "src/app"));
     }
 
     #[gpui::test]

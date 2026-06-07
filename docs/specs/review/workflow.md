@@ -128,13 +128,14 @@ The user can toggle a view that shows every file in the repository at the newest
 
 **Observable outcomes**
 
-- The file tree expands to show every file at the newest selected commit.
+- The file tree shows every file at the newest selected commit.
+- Folders that do not lead to a changed file are collapsed by default, so the change set stays visible without scrolling past unrelated files. Folders on the path to a changed file remain expanded.
 - Files in the change set retain their change indicator; unchanged files render without one.
 - Selecting an unchanged file opens it as a read-only view of its contents at the newest selected commit.
 
 **Edge cases**
 
-- The toggle preserves the user's current expanded-folder state in the tree where possible.
+- The user can manually expand a collapsed folder or collapse an expanded one; manual toggles override the default and persist while the changeset stays open, including across switches between the change-set and all-files views.
 
 ## Inspecting a file's diff
 
