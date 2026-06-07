@@ -19,6 +19,7 @@ use gpui::{
 };
 use gpui_component::notification::{Notification, NotificationList};
 use gpui_component::resizable::{h_resizable, resizable_panel, ResizableState};
+use gpui_component::Icon;
 use similar::{DiffTag, TextDiff};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -26,6 +27,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::icons::LucideIcon;
 use crate::{graph, repo};
 
 actions!(
@@ -4029,42 +4031,18 @@ fn render_change_status_icon(
     icon_selector: String,
 ) -> gpui::Div {
     let color = change_kind_text(kind);
-    let content: AnyElement = match kind {
-        repo::ChangeKind::Added => div()
-            .relative()
-            .w(px(6.))
-            .h(px(6.))
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top(px(2.))
-                    .w(px(6.))
-                    .h(px(2.))
-                    .rounded(px(1.))
-                    .bg(color),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(2.))
-                    .top_0()
-                    .w(px(2.))
-                    .h(px(6.))
-                    .rounded(px(1.))
-                    .bg(color),
-            )
+    let glyph: AnyElement = match kind {
+        repo::ChangeKind::Added => Icon::new(LucideIcon::SquarePlus)
+            .text_color(color)
+            .size(px(FILE_TREE_STATUS_ICON_SIZE))
             .into_any_element(),
-        repo::ChangeKind::Deleted => div()
-            .w(px(6.))
-            .h(px(2.))
-            .rounded(px(1.))
-            .bg(color)
+        repo::ChangeKind::Deleted => Icon::new(LucideIcon::SquareMinus)
+            .text_color(color)
+            .size(px(FILE_TREE_STATUS_ICON_SIZE))
             .into_any_element(),
-        repo::ChangeKind::Modified => div()
-            .size(px(4.))
-            .rounded_full()
-            .bg(color)
+        repo::ChangeKind::Modified => Icon::new(LucideIcon::SquareDot)
+            .text_color(color)
+            .size(px(FILE_TREE_STATUS_ICON_SIZE))
             .into_any_element(),
         repo::ChangeKind::Renamed => div()
             .text_size(px(FILE_TREE_BADGE_TEXT_SIZE))
@@ -4074,6 +4052,23 @@ fn render_change_status_icon(
             .into_any_element(),
     };
 
+    let mut marker = div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(FILE_TREE_STATUS_ICON_SIZE))
+        .h(px(FILE_TREE_STATUS_ICON_SIZE))
+        .flex_none()
+        .debug_selector(move || icon_selector.clone());
+    // The Lucide square-* glyphs draw their own outline, so only the rename
+    // marker still needs a hand-drawn bordered box around its letter.
+    if matches!(kind, repo::ChangeKind::Renamed) {
+        marker = marker
+            .border_1()
+            .rounded(px(2.))
+            .border_color(change_kind_border(kind));
+    }
+
     div()
         .flex()
         .items_center()
@@ -4082,28 +4077,7 @@ fn render_change_status_icon(
         .h(px(FILE_TREE_FOLDER_ICON_SIZE))
         .flex_none()
         .debug_selector(move || selector.clone())
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(FILE_TREE_STATUS_ICON_SIZE))
-                .h(px(FILE_TREE_STATUS_ICON_SIZE))
-                .flex_none()
-                .border_1()
-                .rounded(px(2.))
-                .border_color(change_kind_border(kind))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .w_full()
-                        .h_full()
-                        .debug_selector(move || icon_selector.clone())
-                        .child(content),
-                ),
-        )
+        .child(marker.child(glyph))
 }
 
 fn render_file_diff_stat(selector: String, stats: repo::LineStats) -> gpui::Div {
@@ -7199,8 +7173,14 @@ mod tests {
         let status_icon_bounds = visual
             .debug_bounds("changed-file-status-icon-src-notes.txt")
             .expect("changed file status icon debug bounds");
-        assert_eq!(status_icon_bounds.size.width, px(12.));
-        assert_eq!(status_icon_bounds.size.height, px(12.));
+        assert_eq!(
+            status_icon_bounds.size.width,
+            px(FILE_TREE_STATUS_ICON_SIZE)
+        );
+        assert_eq!(
+            status_icon_bounds.size.height,
+            px(FILE_TREE_STATUS_ICON_SIZE)
+        );
         visual
             .debug_bounds("changed-file-diff-stat-src-notes.txt")
             .expect("changed file diff stat debug bounds");
