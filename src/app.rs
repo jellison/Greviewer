@@ -4147,6 +4147,7 @@ impl Render for App {
             }))
             .child(self.render_title_bar(cx))
             .child(div().flex().flex_1().min_h(px(0.)).w_full().child(body))
+            .children(self.render_context_popover(cx))
             .child(self.notifications.clone())
     }
 }

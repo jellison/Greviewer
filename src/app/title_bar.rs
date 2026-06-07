@@ -4,10 +4,10 @@
 //! docs/superpowers/specs/2026-06-07-titlebar-context-switcher-design.md.
 
 use gpui::{
-    div, px, rgb, Context, InteractiveElement, IntoElement, ParentElement,
+    div, px, rgb, AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
     StatefulInteractiveElement as _, Styled,
 };
-use gpui_component::TitleBar;
+use gpui_component::{TitleBar, TITLE_BAR_HEIGHT};
 
 use super::{App, Mode, ReviewScreen, Selection};
 use crate::repo::{ChangeSet, CommitInfo};
@@ -133,6 +133,130 @@ impl App {
 
         TitleBar::new().child(content)
     }
+
+    /// The diff "switcher" popover, shown when the context pill is active.
+    /// Returns `None` unless a changeset is open and the popover is toggled on.
+    /// Rendered as a full-window overlay: a transparent backdrop that dismisses
+    /// on outside click, plus the anchored card.
+    pub(crate) fn render_context_popover(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.context_popover_open {
+            return None;
+        }
+        let Mode::RepoOpen { repo } = &self.mode else {
+            return None;
+        };
+        let ReviewScreen::Changeset { changeset, .. } = &self.review_screen else {
+            return None;
+        };
+
+        let title = popover_header_title(&self.selection, changeset, &repo.commits);
+        let endpoints = range_endpoints(&self.selection);
+        let (added, removed) = changeset_line_totals(changeset);
+        let file_count = changeset.files.len();
+
+        let mut header = div().flex().flex_col().gap_1().p_3().child(
+            div()
+                .text_size(px(13.))
+                .text_color(rgb(0xededed))
+                .child(title),
+        );
+        if let Some((oldest, newest)) = endpoints {
+            header = header.child(
+                div()
+                    .font_family("monospace")
+                    .text_size(px(12.))
+                    .text_color(rgb(0x8a8a93))
+                    .child(format!("{oldest} \u{2026} {newest}")),
+            );
+        }
+
+        let stat_row = |label: &str, value: AnyElement| {
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .py_2()
+                .text_size(px(12.))
+                .child(div().text_color(rgb(0x8a8a93)).child(label.to_string()))
+                .child(value)
+        };
+
+        let files_row = stat_row(
+            "Files changed",
+            div()
+                .text_color(rgb(0xc7c7cf))
+                .child(file_count.to_string())
+                .into_any_element(),
+        );
+        let lines_row = stat_row(
+            "Lines",
+            div()
+                .flex()
+                .gap_2()
+                .child(div().text_color(rgb(0x7ee787)).child(format!("+{added}")))
+                .child(
+                    div()
+                        .text_color(rgb(0xf08a8a))
+                        .child(format!("\u{2212}{removed}")),
+                )
+                .into_any_element(),
+        );
+
+        let close = div()
+            .id("title-bar-context-close")
+            .debug_selector(|| "title-bar-context-close".to_string())
+            .m_2()
+            .flex()
+            .items_center()
+            .justify_center()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x5a2a2a))
+            .bg(rgb(0x2a1818))
+            .text_size(px(12.))
+            .text_color(rgb(0xf3b4b4))
+            .cursor_pointer()
+            .on_click(cx.listener(|app, _event, _window, cx| {
+                app.close_changeset(cx);
+            }))
+            .child("Close changeset");
+
+        let card = div()
+            .absolute()
+            .top(TITLE_BAR_HEIGHT)
+            .left(px(80.))
+            .occlude()
+            .w(px(380.))
+            .bg(rgb(0x141417))
+            .border_1()
+            .border_color(rgb(0x34343a))
+            .rounded_lg()
+            .debug_selector(|| "title-bar-context-popover".to_string())
+            .child(header)
+            .child(files_row)
+            .child(lines_row)
+            .child(close);
+
+        let backdrop = div()
+            .id("title-bar-context-backdrop")
+            .absolute()
+            .inset_0()
+            .on_click(cx.listener(|app, _event, _window, cx| {
+                app.context_popover_open = false;
+                cx.notify();
+            }));
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .child(backdrop)
+                .child(card)
+                .into_any_element(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -141,7 +265,7 @@ mod tests {
     use crate::app::{App, Mode, ReviewScreen};
     use crate::repo::OpenRepository;
     use crate::repo::{ChangeKind, ChangeSet, ChangedFile, CommitInfo, LineStats};
-    use gpui::{TestAppContext, VisualTestContext, WindowHandle};
+    use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowHandle};
     use std::path::PathBuf;
 
     const PILL: &str = "title-bar-context";
@@ -332,5 +456,64 @@ mod tests {
         cx.run_until_parked();
         let mut visual = VisualTestContext::from_window(*window, cx);
         assert!(visual.debug_bounds(PILL).is_some());
+    }
+
+    const POPOVER: &str = "title-bar-context-popover";
+    const CLOSE: &str = "title-bar-context-close";
+
+    fn open_changeset_window(cx: &mut TestAppContext) -> WindowHandle<App> {
+        let window = app_window(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                let changeset = changeset_with("abcdef1234567890", vec![file_with(3, 1)]);
+                app.mode = Mode::RepoOpen {
+                    repo: repo_named("Demo", vec![commit_with("abcdef1234567890", "feat: thing")]),
+                };
+                app.review_screen = ReviewScreen::Changeset {
+                    sha: "abcdef1234567890".to_string(),
+                    changeset,
+                };
+                app.selection = Selection::Single {
+                    sha: "abcdef1234567890".to_string(),
+                };
+                cx.notify();
+            })
+            .expect("set changeset state");
+        window
+    }
+
+    #[gpui::test]
+    async fn clicking_pill_opens_the_popover(cx: &mut TestAppContext) {
+        let window = open_changeset_window(cx);
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let pill = visual.debug_bounds(PILL).expect("pill bounds");
+        visual.simulate_click(pill.center(), Modifiers::none());
+
+        assert!(visual.debug_bounds(POPOVER).is_some());
+        window
+            .read_with(cx, |app, _cx| assert!(app.context_popover_open))
+            .expect("read open state");
+    }
+
+    #[gpui::test]
+    async fn close_button_closes_the_changeset(cx: &mut TestAppContext) {
+        let window = open_changeset_window(cx);
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let pill = visual.debug_bounds(PILL).expect("pill bounds");
+        visual.simulate_click(pill.center(), Modifiers::none());
+
+        let close = visual.debug_bounds(CLOSE).expect("close button bounds");
+        visual.simulate_click(close.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert!(!app.context_popover_open);
+                assert!(matches!(app.review_screen, ReviewScreen::Graph));
+            })
+            .expect("read closed state");
     }
 }
