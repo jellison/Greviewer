@@ -3,7 +3,13 @@
 //! docs/specs/review/workflow.md and
 //! docs/superpowers/specs/2026-06-07-titlebar-context-switcher-design.md.
 
-use super::Selection;
+use gpui::{
+    div, px, rgb, Context, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement as _, Styled,
+};
+use gpui_component::TitleBar;
+
+use super::{App, Mode, ReviewScreen, Selection};
 use crate::repo::{ChangeSet, CommitInfo};
 
 /// First seven characters of a full commit sha, matching the short form the
@@ -61,15 +67,98 @@ fn popover_header_title(
 
 /// Total added and removed lines across every file in the changeset.
 fn changeset_line_totals(changeset: &ChangeSet) -> (usize, usize) {
-    changeset.files.iter().fold((0, 0), |(added, removed), file| {
-        (added + file.line_stats.added, removed + file.line_stats.removed)
-    })
+    changeset
+        .files
+        .iter()
+        .fold((0, 0), |(added, removed), file| {
+            (
+                added + file.line_stats.added,
+                removed + file.line_stats.removed,
+            )
+        })
+}
+
+impl App {
+    /// The window-chrome title bar. Always shows the repo name when a
+    /// repository is open; in changeset mode it also shows the clickable
+    /// context pill that opens the diff popover.
+    pub(crate) fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let content = match &self.mode {
+            Mode::RepoOpen { repo } => {
+                let repo_name = super::repository_title(&repo.path);
+                let mut row = div().flex().items_center().child(
+                    div()
+                        .font_family("monospace")
+                        .text_size(px(13.))
+                        .text_color(rgb(0xe6e6e6))
+                        .child(repo_name),
+                );
+
+                if let ReviewScreen::Changeset { changeset, .. } = &self.review_screen {
+                    let label = context_pill_label(&self.selection, changeset);
+                    row = row
+                        .child(
+                            div()
+                                .mx_2()
+                                .text_size(px(13.))
+                                .text_color(rgb(0x5a5a5a))
+                                .child("/"),
+                        )
+                        .child(
+                            div()
+                                .id("title-bar-context")
+                                .debug_selector(|| "title-bar-context".to_string())
+                                .px_2()
+                                .py(px(2.))
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x34507a))
+                                .bg(rgb(0x1d283a))
+                                .font_family("monospace")
+                                .text_size(px(13.))
+                                .text_color(rgb(0xdbeafe))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|app, _event, _window, cx| {
+                                    app.context_popover_open = !app.context_popover_open;
+                                    cx.notify();
+                                }))
+                                .child(label),
+                        );
+                }
+
+                row
+            }
+            Mode::NoRepo => div(),
+        };
+
+        TitleBar::new().child(content)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repo::{ChangeKind, ChangedFile, ChangeSet, CommitInfo, LineStats};
+    use crate::app::{App, Mode, ReviewScreen};
+    use crate::repo::OpenRepository;
+    use crate::repo::{ChangeKind, ChangeSet, ChangedFile, CommitInfo, LineStats};
+    use gpui::{TestAppContext, VisualTestContext, WindowHandle};
+    use std::path::PathBuf;
+
+    const PILL: &str = "title-bar-context";
+
+    fn app_window(cx: &mut TestAppContext) -> WindowHandle<App> {
+        cx.update(gpui_component::init);
+        cx.add_window(App::new)
+    }
+
+    fn repo_named(name: &str, commits: Vec<CommitInfo>) -> OpenRepository {
+        OpenRepository {
+            path: PathBuf::from(format!("/tmp/{name}")),
+            head: None,
+            commits,
+            has_more_commits: false,
+        }
+    }
 
     fn changeset_with(commit_sha: &str, files: Vec<ChangedFile>) -> ChangeSet {
         ChangeSet {
@@ -125,7 +214,10 @@ mod tests {
                 "0000000000000000".to_string(),
             ],
         };
-        assert_eq!(context_pill_label(&selection, &changeset), "abcdef1 · 3 commits");
+        assert_eq!(
+            context_pill_label(&selection, &changeset),
+            "abcdef1 · 3 commits"
+        );
     }
 
     #[test]
@@ -194,10 +286,51 @@ mod tests {
 
     #[test]
     fn line_totals_sum_every_file() {
-        let changeset = changeset_with(
-            "abcdef1234567890",
-            vec![file_with(10, 2), file_with(5, 95)],
-        );
+        let changeset =
+            changeset_with("abcdef1234567890", vec![file_with(10, 2), file_with(5, 95)]);
         assert_eq!(changeset_line_totals(&changeset), (15, 97));
+    }
+
+    #[gpui::test]
+    async fn pill_is_hidden_in_graph_mode(cx: &mut TestAppContext) {
+        let window = app_window(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                app.mode = Mode::RepoOpen {
+                    repo: repo_named("Demo", vec![]),
+                };
+                app.review_screen = ReviewScreen::Graph;
+                cx.notify();
+            })
+            .expect("set graph state");
+
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds(PILL).is_none());
+    }
+
+    #[gpui::test]
+    async fn pill_is_shown_in_changeset_mode(cx: &mut TestAppContext) {
+        let window = app_window(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                let changeset = changeset_with("abcdef1234567890", vec![file_with(3, 1)]);
+                app.mode = Mode::RepoOpen {
+                    repo: repo_named("Demo", vec![commit_with("abcdef1234567890", "feat: thing")]),
+                };
+                app.review_screen = ReviewScreen::Changeset {
+                    sha: "abcdef1234567890".to_string(),
+                    changeset,
+                };
+                app.selection = Selection::Single {
+                    sha: "abcdef1234567890".to_string(),
+                };
+                cx.notify();
+            })
+            .expect("set changeset state");
+
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds(PILL).is_some());
     }
 }

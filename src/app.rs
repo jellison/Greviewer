@@ -4128,6 +4128,8 @@ impl Render for App {
 
         div()
             .relative()
+            .flex()
+            .flex_col()
             .w_full()
             .h_full()
             .track_focus(&self.focus_handle)
@@ -4143,7 +4145,8 @@ impl Render for App {
             .on_action(cx.listener(|app, _: &QuitApplication, _window, cx| {
                 app.quit_application(cx);
             }))
-            .child(body)
+            .child(self.render_title_bar(cx))
+            .child(div().flex().flex_1().min_h(px(0.)).w_full().child(body))
             .child(self.notifications.clone())
     }
 }
@@ -5085,6 +5088,7 @@ mod tests {
 
     #[gpui::test]
     async fn persisted_recent_repositories_load_on_startup(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
         let dir = tempfile::tempdir().expect("create tempdir");
         let store_path = dir.path().join("recent-repositories");
         let recent_repositories = vec![
@@ -5107,6 +5111,7 @@ mod tests {
 
     #[gpui::test]
     async fn opening_repository_persists_recent_repositories_to_disk(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
         let (dir, _) = init_repo_with_one_commit();
         let path = dir.path().canonicalize().expect("canonical repo path");
         let state_dir = tempfile::tempdir().expect("create tempdir");
@@ -5129,6 +5134,7 @@ mod tests {
 
     #[gpui::test]
     async fn clicking_recent_repository_opens_it(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
         let (dir, _) = init_repo_with_one_commit();
         let path = dir.path().canonicalize().expect("canonical repo path");
         let window = cx.add_window(|window, cx| {

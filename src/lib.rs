@@ -1,9 +1,7 @@
 //! Greviewer library entry point.
 
-use gpui::{
-    px, size, App, AppContext, Application, Bounds, SharedString, TitlebarOptions, WindowBounds,
-    WindowOptions,
-};
+use gpui::{px, size, App, AppContext, Application, Bounds, WindowBounds, WindowOptions};
+use gpui_component::TitleBar;
 
 use crate::assets::Assets;
 
@@ -26,10 +24,7 @@ pub fn run() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(SharedString::from("")),
-                    ..Default::default()
-                }),
+                titlebar: Some(TitleBar::title_bar_options()),
                 ..Default::default()
             },
             |window, cx| cx.new(|cx| app::App::new(window, cx)),
