@@ -15,3 +15,6 @@
 # Local environment / runtime config
 *.local
 *.local.*
+
+# Superpowers visual-companion scratch
+.superpowers/
