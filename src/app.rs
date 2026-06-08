@@ -405,15 +405,28 @@ impl App {
             window.focus(&app.focus_handle);
         });
 
+        let mut recent_repositories = recent_repositories;
         let mut mode = Mode::NoRepo;
         if recent_repositories
             .first()
             .is_some_and(|first| first.available)
         {
+            // The guard above guarantees a first entry, so indexing is sound.
             let path = recent_repositories[0].path.clone();
-            if let Ok(repo) = repo::open_at(&path) {
-                window.set_window_title(&repository_title(&repo.path));
-                mode = Mode::RepoOpen { repo };
+            match repo::open_at(&path) {
+                Ok(repo) => {
+                    window.set_window_title(&repository_title(&repo.path));
+                    mode = Mode::RepoOpen { repo };
+                }
+                // Construction-time fallback: no `&mut self` and no notification
+                // list yet, so unlike `open_recent_repository` we mark the entry
+                // unavailable and fall back to the recent screen silently.
+                Err(_) => {
+                    recent_repositories[0].available = false;
+                    if let Some(store_path) = recent_repository_store_path.as_deref() {
+                        let _ = save_recent_repositories(store_path, &recent_repositories);
+                    }
+                }
             }
         }
 
@@ -5111,7 +5124,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let store_path = dir.path().join("recent-repositories");
         let recent_repositories = vec![
-            RecentRepository::available(dir.path().join("repo-one")),
+            RecentRepository::unavailable(dir.path().join("repo-one")),
             RecentRepository::unavailable(dir.path().join("repo-two")),
         ];
         save_recent_repositories(&store_path, &recent_repositories)
@@ -5152,6 +5165,46 @@ mod tests {
                 Mode::NoRepo => panic!("expected RepoOpen on startup, got NoRepo"),
             })
             .expect("read startup-opened repository");
+    }
+
+    #[gpui::test]
+    async fn startup_marks_unopenable_last_repository_unavailable(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let missing_path = dir.path().join("missing-repo");
+        let store_path = dir.path().join("recent-repositories");
+        save_recent_repositories(
+            &store_path,
+            &[RecentRepository::available(missing_path.clone())],
+        )
+        .expect("seed recent repository store");
+
+        let window = cx.add_window(|window, cx| {
+            App::new_with_recent_repository_store_path(window, cx, store_path.clone())
+        });
+
+        window
+            .read_with(cx, |app, cx| {
+                assert!(
+                    matches!(app.mode, Mode::NoRepo),
+                    "expected NoRepo when the last repository cannot be opened",
+                );
+                assert_eq!(
+                    app.recent_repositories,
+                    vec![RecentRepository::unavailable(missing_path.clone())],
+                );
+                assert_eq!(
+                    app.notification_count(cx),
+                    0,
+                    "startup fallback must not raise an error notification",
+                );
+            })
+            .expect("read startup fallback state");
+
+        assert_eq!(
+            load_recent_repositories(&store_path).expect("load recent repository store"),
+            vec![RecentRepository::unavailable(missing_path)],
+        );
     }
 
     #[gpui::test]
@@ -5221,12 +5274,18 @@ mod tests {
         cx.update(gpui_component::init);
 
         let dir = tempfile::tempdir().expect("create tempdir");
+        let unavailable_path = dir.path().join("already-unavailable");
         let missing_path = dir.path().join("missing-repo");
+        // Put an unavailable entry first so startup auto-open does not fire,
+        // leaving the recent list visible and the available row clickable.
         let window = cx.add_window(|window, cx| {
             App::new_with_recent_repositories(
                 window,
                 cx,
-                vec![RecentRepository::available(missing_path.clone())],
+                vec![
+                    RecentRepository::unavailable(unavailable_path.clone()),
+                    RecentRepository::available(missing_path.clone()),
+                ],
             )
         });
 
@@ -5234,7 +5293,7 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let row_bounds = visual
-            .debug_bounds("recent-repository-row-0")
+            .debug_bounds("recent-repository-row-1")
             .expect("recent repository row debug bounds");
         visual.simulate_click(row_bounds.center(), Modifiers::none());
 
@@ -5243,7 +5302,10 @@ mod tests {
                 assert!(matches!(app.mode, Mode::NoRepo));
                 assert_eq!(
                     app.recent_repositories,
-                    vec![RecentRepository::unavailable(missing_path.clone())],
+                    vec![
+                        RecentRepository::unavailable(unavailable_path.clone()),
+                        RecentRepository::unavailable(missing_path.clone()),
+                    ],
                 );
                 assert_eq!(app.notification_count(cx), 1);
             })
@@ -5251,7 +5313,7 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         visual
-            .debug_bounds("unavailable-recent-repository-row-0")
+            .debug_bounds("unavailable-recent-repository-row-1")
             .expect("unavailable recent repository row debug bounds");
     }
 
@@ -5292,9 +5354,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let missing_path = dir.path().join("missing-repo");
         let store_path = dir.path().join("recent-repositories");
+        // Seed as unavailable so the remove button is visible immediately
+        // without relying on a click-to-fail path (which is tested separately).
         save_recent_repositories(
             &store_path,
-            &[RecentRepository::available(missing_path.clone())],
+            &[RecentRepository::unavailable(missing_path.clone())],
         )
         .expect("seed recent repository store");
         let window = cx.add_window(|window, cx| {
@@ -5304,12 +5368,6 @@ mod tests {
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);
-        let row_bounds = visual
-            .debug_bounds("recent-repository-row-0")
-            .expect("recent repository row debug bounds");
-        visual.simulate_click(row_bounds.center(), Modifiers::none());
-
-        let mut visual = VisualTestContext::from_window(*window, cx);
         let remove_bounds = visual
             .debug_bounds("unavailable-recent-repository-remove-0")
             .expect("unavailable recent repository remove debug bounds");
@@ -5317,9 +5375,8 @@ mod tests {
         cx.run_until_parked();
 
         window
-            .read_with(cx, |app, cx| {
+            .read_with(cx, |app, _cx| {
                 assert!(app.recent_repositories.is_empty());
-                assert_eq!(app.notification_count(cx), 1);
             })
             .expect("read removed recent repository");
         assert_eq!(
