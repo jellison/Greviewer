@@ -4,10 +4,11 @@ This contract defines the review experience: opening a Git repository, navigatin
 
 ## Opening a repository
 
-The user opens a local Git repository through a folder picker. The application reads the repository's history and presents the commit graph for that repository. Recently opened repositories persist between application launches and are surfaced on launch so the user can return to a repository without re-picking it. Only one repository is open per window in v1.
+The user opens a local Git repository through a folder picker. The application reads the repository's history and presents the commit graph for that repository. Recently opened repositories persist between application launches. On launch the application automatically reopens the most-recently-opened repository so the user returns straight to where they left off; the list of recent repositories is surfaced for re-picking only when no repository can be reopened. Only one repository is open per window in v1.
 
 **Triggering conditions**
 
+- The application launches with a most-recently-opened repository that can still be opened.
 - The user picks a folder via the open-repository affordance on launch or from within an open window.
 - The user activates a recently opened repository entry on launch.
 
@@ -16,12 +17,14 @@ The user opens a local Git repository through a folder picker. The application r
 - The window displays the commit graph of the chosen repository.
 - The window bar identifies the open repository by name.
 - The chosen repository is added to (or moved to the top of) the recently opened list, and that ordering is retained for future launches.
+- On launch, when a most-recently-opened repository can be opened, the window comes up showing that repository's commit graph without any further action.
 
 **Edge cases**
 
 - A chosen folder that is not a Git repository surfaces a clear error and the previous window state is preserved, including the window bar's repository name. If no repository was open, the window bar shows no repository name.
 - A repository with zero commits opens to an empty graph with a message explaining there is nothing to review.
 - A recently opened repository whose folder has been moved or deleted is shown as unavailable; activating it surfaces a clear error and offers to remove it from the list.
+- On launch, a most-recently-opened repository whose folder has been moved or deleted does not interrupt startup: the application drops silently to the recent-repositories list with no error, and the entry is shown as unavailable. When the most recent entry is already marked unavailable, the application does not attempt to reopen it and starts on the recent-repositories list.
 
 ## Switching repositories from the window bar
 
