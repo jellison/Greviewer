@@ -5375,8 +5375,13 @@ mod tests {
         cx.run_until_parked();
 
         window
-            .read_with(cx, |app, _cx| {
+            .read_with(cx, |app, cx| {
                 assert!(app.recent_repositories.is_empty());
+                assert_eq!(
+                    app.notification_count(cx),
+                    0,
+                    "removing an unavailable entry must not raise a notification",
+                );
             })
             .expect("read removed recent repository");
         assert_eq!(
