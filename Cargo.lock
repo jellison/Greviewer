@@ -2476,6 +2476,8 @@ dependencies = [
  "gpui",
  "gpui-component",
  "include_dir",
+ "serde",
+ "serde_json",
  "similar",
  "tempfile",
 ]

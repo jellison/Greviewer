@@ -25,11 +25,11 @@ use gpui_component::Icon;
 use similar::{DiffTag, TextDiff};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs, io,
     path::{Path, PathBuf},
 };
 
 use crate::icons::LucideIcon;
+use crate::settings::{self, RecentRepository, Settings, MAX_RECENT_REPOSITORIES};
 use crate::{graph, repo};
 
 actions!(
@@ -42,7 +42,6 @@ actions!(
     ]
 );
 
-const MAX_RECENT_REPOSITORIES: usize = 10;
 const FILE_TREE_FONT_FAMILY: &str = "BerkeleyMono Nerd Font";
 const FILE_TREE_INDENT_WIDTH: f32 = 16.;
 const FILE_TREE_ROW_HEIGHT: f32 = 24.;
@@ -64,11 +63,11 @@ pub struct App {
     pub review_screen: ReviewScreen,
     pub selected_changed_file_path: Option<String>,
     pub file_list_mode: FileListMode,
-    pub recent_repositories: Vec<RecentRepository>,
+    pub settings: Settings,
     collapsed_file_tree_paths: BTreeSet<String>,
     notifications: Entity<NotificationList>,
     path_picker: Box<dyn PathPicker>,
-    recent_repository_store_path: Option<PathBuf>,
+    settings_store_path: Option<PathBuf>,
     file_diff_scroll: FileDiffScroll,
     commit_history_scroll: ScrollHandle,
     changeset_resizable: Entity<ResizableState>,
@@ -143,121 +142,6 @@ pub enum FileListMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecentRepository {
-    pub path: PathBuf,
-    pub available: bool,
-}
-
-impl RecentRepository {
-    pub fn available(path: PathBuf) -> Self {
-        Self {
-            path,
-            available: true,
-        }
-    }
-
-    pub fn unavailable(path: PathBuf) -> Self {
-        Self {
-            path,
-            available: false,
-        }
-    }
-}
-
-fn load_recent_repositories(path: &Path) -> io::Result<Vec<RecentRepository>> {
-    let content = fs::read_to_string(path)?;
-
-    Ok(content
-        .lines()
-        .filter_map(parse_recent_repository_line)
-        .take(MAX_RECENT_REPOSITORIES)
-        .collect())
-}
-
-fn save_recent_repositories(
-    path: &Path,
-    recent_repositories: &[RecentRepository],
-) -> io::Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-
-    let mut content = String::new();
-    for recent in recent_repositories.iter().take(MAX_RECENT_REPOSITORIES) {
-        let availability = if recent.available { "1" } else { "0" };
-        content.push_str(availability);
-        content.push('\t');
-        content.push_str(&encode_recent_repository_path(&recent.path));
-        content.push('\n');
-    }
-
-    fs::write(path, content)
-}
-
-fn parse_recent_repository_line(line: &str) -> Option<RecentRepository> {
-    let (availability, encoded_path) = line.split_once('\t')?;
-    if encoded_path.is_empty() {
-        return None;
-    }
-
-    let path = decode_recent_repository_path(encoded_path);
-    match availability {
-        "1" => Some(RecentRepository::available(path)),
-        "0" => Some(RecentRepository::unavailable(path)),
-        _ => None,
-    }
-}
-
-fn encode_recent_repository_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('%', "%25")
-        .replace('\t', "%09")
-        .replace('\n', "%0A")
-        .replace('\r', "%0D")
-}
-
-fn decode_recent_repository_path(path: &str) -> PathBuf {
-    PathBuf::from(
-        path.replace("%0D", "\r")
-            .replace("%0A", "\n")
-            .replace("%09", "\t")
-            .replace("%25", "%"),
-    )
-}
-
-fn load_recent_repositories_or_default(path: Option<&Path>) -> Vec<RecentRepository> {
-    path.and_then(|path| load_recent_repositories(path).ok())
-        .unwrap_or_default()
-}
-
-#[cfg(test)]
-fn default_recent_repository_store_path() -> Option<PathBuf> {
-    None
-}
-
-#[cfg(all(not(test), target_os = "macos"))]
-fn default_recent_repository_store_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("Greviewer")
-            .join("recent-repositories")
-    })
-}
-
-#[cfg(all(not(test), not(target_os = "macos")))]
-fn default_recent_repository_store_path() -> Option<PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .map(|config_home| config_home.join("greviewer").join("recent-repositories"))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum FileListEntry {
     Changed(repo::ChangedFile),
     Unchanged(repo::RepositoryFile),
@@ -327,16 +211,18 @@ impl EventEmitter<QuitRequested> for App {}
 
 impl App {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let recent_repository_store_path = default_recent_repository_store_path();
-        let recent_repositories =
-            load_recent_repositories_or_default(recent_repository_store_path.as_deref());
+        let settings_store_path = settings::default_store_path();
+        let settings = settings_store_path
+            .as_deref()
+            .map(settings::load)
+            .unwrap_or_default();
 
-        Self::new_with_picker_recent_and_store_path(
+        Self::new_with_picker_settings_and_store_path(
             window,
             cx,
             Box::new(GpuiPathPicker),
-            recent_repositories,
-            recent_repository_store_path,
+            settings,
+            settings_store_path,
         )
     }
 
@@ -345,7 +231,7 @@ impl App {
         cx: &mut Context<Self>,
         path_picker: Box<dyn PathPicker>,
     ) -> Self {
-        Self::new_with_picker_and_recent(window, cx, path_picker, Vec::new())
+        Self::new_with_picker_and_settings(window, cx, path_picker, Settings::default())
     }
 
     pub fn new_with_recent_repositories(
@@ -353,48 +239,44 @@ impl App {
         cx: &mut Context<Self>,
         recent_repositories: Vec<RecentRepository>,
     ) -> Self {
-        Self::new_with_picker_and_recent(window, cx, Box::new(GpuiPathPicker), recent_repositories)
+        let settings = Settings {
+            recent_repositories,
+        };
+        Self::new_with_picker_and_settings(window, cx, Box::new(GpuiPathPicker), settings)
     }
 
     #[cfg(test)]
-    fn new_with_recent_repository_store_path(
+    fn new_with_settings_store_path(
         window: &mut Window,
         cx: &mut Context<Self>,
-        recent_repository_store_path: PathBuf,
+        settings_store_path: PathBuf,
     ) -> Self {
-        let recent_repositories =
-            load_recent_repositories_or_default(Some(&recent_repository_store_path));
+        let settings = settings::load(&settings_store_path);
 
-        Self::new_with_picker_recent_and_store_path(
+        Self::new_with_picker_settings_and_store_path(
             window,
             cx,
             Box::new(GpuiPathPicker),
-            recent_repositories,
-            Some(recent_repository_store_path),
+            settings,
+            Some(settings_store_path),
         )
     }
 
-    fn new_with_picker_and_recent(
+    fn new_with_picker_and_settings(
         window: &mut Window,
         cx: &mut Context<Self>,
         path_picker: Box<dyn PathPicker>,
-        recent_repositories: Vec<RecentRepository>,
+        settings: Settings,
     ) -> Self {
-        Self::new_with_picker_recent_and_store_path(
-            window,
-            cx,
-            path_picker,
-            recent_repositories,
-            None,
-        )
+        Self::new_with_picker_settings_and_store_path(window, cx, path_picker, settings, None)
     }
 
-    fn new_with_picker_recent_and_store_path(
+    fn new_with_picker_settings_and_store_path(
         window: &mut Window,
         cx: &mut Context<Self>,
         path_picker: Box<dyn PathPicker>,
-        recent_repositories: Vec<RecentRepository>,
-        recent_repository_store_path: Option<PathBuf>,
+        settings: Settings,
+        settings_store_path: Option<PathBuf>,
     ) -> Self {
         let notifications = cx.new(|cx| NotificationList::new(window, cx));
         let changeset_resizable = cx.new(|_| ResizableState::default());
@@ -405,14 +287,15 @@ impl App {
             window.focus(&app.focus_handle);
         });
 
-        let mut recent_repositories = recent_repositories;
+        let mut settings = settings;
         let mut mode = Mode::NoRepo;
-        if recent_repositories
+        if settings
+            .recent_repositories
             .first()
             .is_some_and(|first| first.available)
         {
             // The guard above guarantees a first entry, so indexing is sound.
-            let path = recent_repositories[0].path.clone();
+            let path = settings.recent_repositories[0].path.clone();
             match repo::open_at(&path) {
                 Ok(repo) => {
                     window.set_window_title(&repository_title(&repo.path));
@@ -422,9 +305,9 @@ impl App {
                 // list yet, so unlike `open_recent_repository` we mark the entry
                 // unavailable and fall back to the recent screen silently.
                 Err(_) => {
-                    recent_repositories[0].available = false;
-                    if let Some(store_path) = recent_repository_store_path.as_deref() {
-                        let _ = save_recent_repositories(store_path, &recent_repositories);
+                    settings.recent_repositories[0].available = false;
+                    if let Some(store_path) = settings_store_path.as_deref() {
+                        let _ = settings::save(store_path, &settings);
                     }
                 }
             }
@@ -436,11 +319,11 @@ impl App {
             review_screen: ReviewScreen::Graph,
             selected_changed_file_path: None,
             file_list_mode: FileListMode::Changed,
-            recent_repositories,
+            settings,
             collapsed_file_tree_paths: BTreeSet::new(),
             notifications,
             path_picker,
-            recent_repository_store_path,
+            settings_store_path,
             file_diff_scroll: FileDiffScroll::new(),
             commit_history_scroll: ScrollHandle::new(),
             changeset_resizable,
@@ -514,7 +397,7 @@ impl App {
             Ok(repo) => self.apply_open_repository(repo, window, cx),
             Err(err) => {
                 self.mark_recent_repository_unavailable(&path);
-                self.persist_recent_repositories();
+                self.persist_settings();
                 self.push_open_failed(err.to_string(), window, cx);
             }
         }
@@ -536,7 +419,7 @@ impl App {
         self.file_list_mode = FileListMode::Changed;
         self.collapsed_file_tree_paths.clear();
         self.record_recent_repository(recent_path);
-        self.persist_recent_repositories();
+        self.persist_settings();
         self.file_diff_scroll.reset();
         self.commit_history_scroll.set_offset(point(px(0.), px(0.)));
         self.context_popover_open = false;
@@ -545,15 +428,15 @@ impl App {
     }
 
     fn record_recent_repository(&mut self, path: PathBuf) {
-        self.recent_repositories
-            .retain(|recent| recent.path != path);
-        self.recent_repositories
-            .insert(0, RecentRepository::available(path));
-        self.recent_repositories.truncate(MAX_RECENT_REPOSITORIES);
+        let recents = &mut self.settings.recent_repositories;
+        recents.retain(|recent| recent.path != path);
+        recents.insert(0, RecentRepository::available(path));
+        recents.truncate(MAX_RECENT_REPOSITORIES);
     }
 
     fn mark_recent_repository_unavailable(&mut self, path: &PathBuf) {
         if let Some(recent) = self
+            .settings
             .recent_repositories
             .iter_mut()
             .find(|recent| recent.path == *path)
@@ -563,15 +446,16 @@ impl App {
     }
 
     fn remove_recent_repository(&mut self, path: &Path, cx: &mut Context<Self>) {
-        self.recent_repositories
+        self.settings
+            .recent_repositories
             .retain(|recent| recent.path.as_path() != path);
-        self.persist_recent_repositories();
+        self.persist_settings();
         cx.notify();
     }
 
-    fn persist_recent_repositories(&self) {
-        if let Some(path) = &self.recent_repository_store_path {
-            let _ = save_recent_repositories(path, &self.recent_repositories);
+    fn persist_settings(&self) {
+        if let Some(path) = &self.settings_store_path {
+            let _ = settings::save(path, &self.settings);
         }
     }
 
@@ -854,7 +738,7 @@ impl App {
     }
 
     fn render_no_repo(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let recent_repositories = if self.recent_repositories.is_empty() {
+        let recent_repositories = if self.settings.recent_repositories.is_empty() {
             None
         } else {
             Some(
@@ -878,7 +762,8 @@ impl App {
                             .child("Recent repositories"),
                     )
                     .children(
-                        self.recent_repositories
+                        self.settings
+                            .recent_repositories
                             .iter()
                             .enumerate()
                             .map(|(index, recent)| {
@@ -4406,15 +4291,15 @@ mod tests {
         commit_graph_connector_color_lane, commit_graph_connector_for_lane,
         commit_graph_line_width, commit_graph_merge_in_commit_line_y,
         commit_graph_spanning_connector_requires_center_fill, commit_row_separator_width,
-        debug_ref_label_fragment, load_recent_repositories, save_recent_repositories,
-        side_by_side_diff_rows, single_side_diff_rows, App, CloseChangeset, DiffLineStatus,
-        FileListEntry, FileListMode, FileTreeRow, Mode, OpenChangeset, OpenFailed,
-        RecentRepository, ReviewScreen, Selection, FILE_TREE_FOLDER_ICON_SIZE,
+        debug_ref_label_fragment, side_by_side_diff_rows, single_side_diff_rows, App,
+        CloseChangeset, DiffLineStatus, FileListEntry, FileListMode, FileTreeRow, Mode,
+        OpenChangeset, OpenFailed, ReviewScreen, Selection, FILE_TREE_FOLDER_ICON_SIZE,
         FILE_TREE_FONT_FAMILY, FILE_TREE_INDENT_WIDTH, FILE_TREE_ROW_HEIGHT,
         FILE_TREE_STATUS_ICON_SIZE, FILE_TREE_TEXT_SIZE,
     };
     use crate::graph::{self, GraphConnectorKind};
     use crate::repo::{ChangeKind, DiffSide, INITIAL_COMMIT_LIMIT};
+    use crate::settings::{self, RecentRepository, Settings};
     use git2::{IndexAddOption, Repository, Signature};
     use gpui::{font, px, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
     use std::{fs, path::PathBuf};
@@ -4425,6 +4310,26 @@ mod tests {
     fn add_app_window(cx: &mut TestAppContext) -> WindowHandle<App> {
         cx.update(gpui_component::init);
         cx.add_window(App::new)
+    }
+
+    /// Write a settings file at `path` whose only populated field is the recent
+    /// repository list. Mirrors how the storage tests seed state on disk.
+    fn seed_recent_repositories(
+        path: &std::path::Path,
+        recent_repositories: Vec<RecentRepository>,
+    ) {
+        settings::save(
+            path,
+            &Settings {
+                recent_repositories,
+            },
+        )
+        .expect("seed settings store");
+    }
+
+    /// Read back just the recent repository list from the settings file.
+    fn load_recent_repositories(path: &std::path::Path) -> Vec<RecentRepository> {
+        settings::load(path).recent_repositories
     }
 
     fn init_repo_with_one_commit() -> (tempfile::TempDir, String) {
@@ -4891,24 +4796,6 @@ mod tests {
         assert_eq!(rows[2].new.text, "beta");
     }
 
-    #[test]
-    fn recent_repository_store_round_trips_paths_and_availability() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let store_path = dir.path().join("state").join("recent-repositories");
-        let recent_repositories = vec![
-            RecentRepository::available(dir.path().join("repo-one")),
-            RecentRepository::unavailable(dir.path().join("repo%\t\n\r-two")),
-        ];
-
-        save_recent_repositories(&store_path, &recent_repositories)
-            .expect("save recent repositories");
-
-        assert_eq!(
-            load_recent_repositories(&store_path).expect("load recent repositories"),
-            recent_repositories,
-        );
-    }
-
     #[gpui::test]
     async fn renders_placeholder(cx: &mut TestAppContext) {
         let _window = add_app_window(cx);
@@ -5099,7 +4986,7 @@ mod tests {
                 app.open_repository_at(first_path.clone(), window, cx);
                 app.open_repository_at(second_path.clone(), window, cx);
                 assert_eq!(
-                    app.recent_repositories,
+                    app.settings.recent_repositories,
                     vec![
                         RecentRepository::available(second_path.clone()),
                         RecentRepository::available(first_path.clone()),
@@ -5108,7 +4995,7 @@ mod tests {
 
                 app.open_repository_at(first_path.clone(), window, cx);
                 assert_eq!(
-                    app.recent_repositories,
+                    app.settings.recent_repositories,
                     vec![
                         RecentRepository::available(first_path),
                         RecentRepository::available(second_path),
@@ -5122,21 +5009,20 @@ mod tests {
     async fn persisted_recent_repositories_load_on_startup(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().expect("create tempdir");
-        let store_path = dir.path().join("recent-repositories");
+        let store_path = dir.path().join("settings.json");
         let recent_repositories = vec![
             RecentRepository::unavailable(dir.path().join("repo-one")),
             RecentRepository::unavailable(dir.path().join("repo-two")),
         ];
-        save_recent_repositories(&store_path, &recent_repositories)
-            .expect("seed recent repository store");
+        seed_recent_repositories(&store_path, recent_repositories.clone());
 
         let window = cx.add_window(|window, cx| {
-            App::new_with_recent_repository_store_path(window, cx, store_path.clone())
+            App::new_with_settings_store_path(window, cx, store_path.clone())
         });
 
         window
             .read_with(cx, |app, _cx| {
-                assert_eq!(app.recent_repositories, recent_repositories);
+                assert_eq!(app.settings.recent_repositories, recent_repositories);
             })
             .expect("read loaded recent repositories");
     }
@@ -5147,12 +5033,11 @@ mod tests {
         let (dir, _) = init_repo_with_one_commit();
         let path = dir.path().canonicalize().expect("canonical repo path");
         let state_dir = tempfile::tempdir().expect("create tempdir");
-        let store_path = state_dir.path().join("recent-repositories");
-        save_recent_repositories(&store_path, &[RecentRepository::available(path.clone())])
-            .expect("seed recent repository store");
+        let store_path = state_dir.path().join("settings.json");
+        seed_recent_repositories(&store_path, vec![RecentRepository::available(path.clone())]);
 
         let window = cx.add_window(|window, cx| {
-            App::new_with_recent_repository_store_path(window, cx, store_path.clone())
+            App::new_with_settings_store_path(window, cx, store_path.clone())
         });
 
         window
@@ -5172,15 +5057,14 @@ mod tests {
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().expect("create tempdir");
         let missing_path = dir.path().join("missing-repo");
-        let store_path = dir.path().join("recent-repositories");
-        save_recent_repositories(
+        let store_path = dir.path().join("settings.json");
+        seed_recent_repositories(
             &store_path,
-            &[RecentRepository::available(missing_path.clone())],
-        )
-        .expect("seed recent repository store");
+            vec![RecentRepository::available(missing_path.clone())],
+        );
 
         let window = cx.add_window(|window, cx| {
-            App::new_with_recent_repository_store_path(window, cx, store_path.clone())
+            App::new_with_settings_store_path(window, cx, store_path.clone())
         });
 
         window
@@ -5190,7 +5074,7 @@ mod tests {
                     "expected NoRepo when the last repository cannot be opened",
                 );
                 assert_eq!(
-                    app.recent_repositories,
+                    app.settings.recent_repositories,
                     vec![RecentRepository::unavailable(missing_path.clone())],
                 );
                 assert_eq!(
@@ -5202,7 +5086,7 @@ mod tests {
             .expect("read startup fallback state");
 
         assert_eq!(
-            load_recent_repositories(&store_path).expect("load recent repository store"),
+            load_recent_repositories(&store_path),
             vec![RecentRepository::unavailable(missing_path)],
         );
     }
@@ -5213,9 +5097,9 @@ mod tests {
         let (dir, _) = init_repo_with_one_commit();
         let path = dir.path().canonicalize().expect("canonical repo path");
         let state_dir = tempfile::tempdir().expect("create tempdir");
-        let store_path = state_dir.path().join("recent-repositories");
+        let store_path = state_dir.path().join("settings.json");
         let window = cx.add_window(|window, cx| {
-            App::new_with_recent_repository_store_path(window, cx, store_path.clone())
+            App::new_with_settings_store_path(window, cx, store_path.clone())
         });
 
         window
@@ -5225,7 +5109,7 @@ mod tests {
             .expect("open repository");
 
         assert_eq!(
-            load_recent_repositories(&store_path).expect("load recent repository store"),
+            load_recent_repositories(&store_path),
             vec![RecentRepository::available(path)],
         );
     }
@@ -5301,7 +5185,7 @@ mod tests {
             .read_with(cx, |app, cx| {
                 assert!(matches!(app.mode, Mode::NoRepo));
                 assert_eq!(
-                    app.recent_repositories,
+                    app.settings.recent_repositories,
                     vec![
                         RecentRepository::unavailable(unavailable_path.clone()),
                         RecentRepository::unavailable(missing_path.clone()),
@@ -5325,19 +5209,18 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("create tempdir");
         let missing_path = dir.path().join("missing-repo");
-        let store_path = dir.path().join("recent-repositories");
+        let store_path = dir.path().join("settings.json");
         // Unavailable sentinel first so construction-time auto-open is skipped;
         // the activation call below is what marks missing_path unavailable.
-        save_recent_repositories(
+        seed_recent_repositories(
             &store_path,
-            &[
+            vec![
                 RecentRepository::unavailable(dir.path().join("sentinel-repo")),
                 RecentRepository::available(missing_path.clone()),
             ],
-        )
-        .expect("seed recent repository store");
+        );
         let window = cx.add_window(|window, cx| {
-            App::new_with_recent_repository_store_path(window, cx, store_path.clone())
+            App::new_with_settings_store_path(window, cx, store_path.clone())
         });
 
         window
@@ -5347,7 +5230,7 @@ mod tests {
             .expect("activate missing recent repository");
 
         assert_eq!(
-            load_recent_repositories(&store_path).expect("load recent repository store"),
+            load_recent_repositories(&store_path),
             vec![
                 RecentRepository::unavailable(dir.path().join("sentinel-repo")),
                 RecentRepository::unavailable(missing_path),
@@ -5361,16 +5244,15 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("create tempdir");
         let missing_path = dir.path().join("missing-repo");
-        let store_path = dir.path().join("recent-repositories");
+        let store_path = dir.path().join("settings.json");
         // Seed as unavailable so the remove button is visible immediately
         // without relying on a click-to-fail path (which is tested separately).
-        save_recent_repositories(
+        seed_recent_repositories(
             &store_path,
-            &[RecentRepository::unavailable(missing_path.clone())],
-        )
-        .expect("seed recent repository store");
+            vec![RecentRepository::unavailable(missing_path.clone())],
+        );
         let window = cx.add_window(|window, cx| {
-            App::new_with_recent_repository_store_path(window, cx, store_path.clone())
+            App::new_with_settings_store_path(window, cx, store_path.clone())
         });
 
         cx.run_until_parked();
@@ -5384,7 +5266,7 @@ mod tests {
 
         window
             .read_with(cx, |app, cx| {
-                assert!(app.recent_repositories.is_empty());
+                assert!(app.settings.recent_repositories.is_empty());
                 assert_eq!(
                     app.notification_count(cx),
                     0,
@@ -5393,7 +5275,7 @@ mod tests {
             })
             .expect("read removed recent repository");
         assert_eq!(
-            load_recent_repositories(&store_path).expect("load recent repository store"),
+            load_recent_repositories(&store_path),
             Vec::<RecentRepository>::new(),
         );
     }
