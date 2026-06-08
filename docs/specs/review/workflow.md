@@ -119,16 +119,23 @@ identifier.
   short identifiers and the commit count, and for a single commit, the commit summary.
 - The popover shows the number of changed files and the total added and removed line counts
   for the changeset.
+- The popover shows a breakdown of the changed files by how they changed (added, modified,
+  deleted, renamed), listing only the kinds that are present.
+- For a range, the popover lists the commits in the changeset, newest first, each with its
+  short identifier and summary; the list scrolls when it exceeds the popover's height. A
+  single-commit changeset omits the list because its summary already appears in the header.
 - The popover offers a control that closes the changeset, returning the window to graph mode
   with the prior selection preserved.
 - Dismissing the popover by activating outside it leaves the changeset open.
 
 **Edge cases**
 
-- A changeset whose net effect is no change shows zero changed files and `+0 / −0` lines in
-  the popover; the close control still returns to graph mode.
+- A changeset whose net effect is no change shows zero changed files, `+0 / −0` lines, and no
+  kind breakdown in the popover; the close control still returns to graph mode.
 - A single-commit changeset whose commit is not in the loaded history window falls back to
   showing the commit's short identifier in place of a summary.
+- A range commit that is not yet in the loaded history window appears in the commit list with
+  its short identifier and no summary.
 
 ## Reviewing the change set
 
