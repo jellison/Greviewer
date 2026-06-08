@@ -405,8 +405,20 @@ impl App {
             window.focus(&app.focus_handle);
         });
 
+        let mut mode = Mode::NoRepo;
+        if recent_repositories
+            .first()
+            .is_some_and(|first| first.available)
+        {
+            let path = recent_repositories[0].path.clone();
+            if let Ok(repo) = repo::open_at(&path) {
+                window.set_window_title(&repository_title(&repo.path));
+                mode = Mode::RepoOpen { repo };
+            }
+        }
+
         Self {
-            mode: Mode::NoRepo,
+            mode,
             selection: Selection::None,
             review_screen: ReviewScreen::Graph,
             selected_changed_file_path: None,
@@ -5117,6 +5129,32 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn startup_reopens_last_available_repository(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (dir, _) = init_repo_with_one_commit();
+        let path = dir.path().canonicalize().expect("canonical repo path");
+        let state_dir = tempfile::tempdir().expect("create tempdir");
+        let store_path = state_dir.path().join("recent-repositories");
+        save_recent_repositories(&store_path, &[RecentRepository::available(path.clone())])
+            .expect("seed recent repository store");
+
+        let window = cx.add_window(|window, cx| {
+            App::new_with_recent_repository_store_path(window, cx, store_path.clone())
+        });
+
+        window
+            .read_with(cx, |app, _cx| match &app.mode {
+                Mode::RepoOpen { repo } => {
+                    assert_eq!(repo.path, path);
+                    let head = repo.head.as_ref().expect("head present");
+                    assert_eq!(head.summary, "Add hello.txt");
+                }
+                Mode::NoRepo => panic!("expected RepoOpen on startup, got NoRepo"),
+            })
+            .expect("read startup-opened repository");
+    }
+
+    #[gpui::test]
     async fn opening_repository_persists_recent_repositories_to_disk(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         let (dir, _) = init_repo_with_one_commit();
@@ -5144,11 +5182,18 @@ mod tests {
         cx.update(gpui_component::init);
         let (dir, _) = init_repo_with_one_commit();
         let path = dir.path().canonicalize().expect("canonical repo path");
+        let missing_dir = tempfile::tempdir().expect("create tempdir");
+        let missing_path = missing_dir.path().join("missing-repo");
+        // Put an unavailable entry first so startup auto-open does not fire,
+        // leaving the recent list visible and the available row clickable.
         let window = cx.add_window(|window, cx| {
             App::new_with_recent_repositories(
                 window,
                 cx,
-                vec![RecentRepository::available(path.clone())],
+                vec![
+                    RecentRepository::unavailable(missing_path),
+                    RecentRepository::available(path.clone()),
+                ],
             )
         });
 
@@ -5156,7 +5201,7 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let row_bounds = visual
-            .debug_bounds("recent-repository-row-0")
+            .debug_bounds("recent-repository-row-1")
             .expect("recent repository row debug bounds");
         visual.simulate_click(row_bounds.center(), Modifiers::none());
 
