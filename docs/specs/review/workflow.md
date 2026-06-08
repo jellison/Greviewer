@@ -23,6 +23,45 @@ The user opens a local Git repository through a folder picker. The application r
 - A repository with zero commits opens to an empty graph with a message explaining there is nothing to review.
 - A recently opened repository whose folder has been moved or deleted is shown as unavailable; activating it surfaces a clear error and offers to remove it from the list.
 
+## Switching repositories from the window bar
+
+With a repository open, the repository name in the window bar is an affordance: activating it
+opens a switcher listing the Git repositories that sit alongside the open one in its parent
+folder. The open repository is shown in the list and marked as the current one; selecting any
+other repository opens it in place, exactly as if it had been opened from the folder picker.
+The switcher always offers an "open repository" control that falls back to the folder picker
+so any repository remains reachable. The switcher is available in both graph and changeset
+mode, since the repository name is always shown.
+
+**Triggering conditions**
+
+- The user activates the repository name in the window bar.
+- The user selects another repository in the switcher.
+- The user activates the switcher's open-repository control.
+- The user dismisses the switcher by activating outside it.
+
+**Observable outcomes**
+
+- Activating the repository name opens a switcher listing the sibling repositories in the
+  parent folder, ordered by folder name, with the open repository marked as current.
+- Selecting another repository opens it: the window shows that repository's commit graph, the
+  prior selection and changeset are cleared, and the repository is moved to the top of the
+  recently opened list.
+- The open-repository control launches the folder picker.
+- Dismissing the switcher by activating outside it leaves the open repository unchanged.
+- Opening the switcher dismisses the diff-context popover, and vice versa; the two are never
+  shown at once.
+
+**Edge cases**
+
+- A parent folder that contains no other Git repositories shows an explanatory message in
+  place of the list; the open-repository control still works.
+- A repository whose folder is at the filesystem root, or whose parent cannot be read, shows
+  the same empty message.
+- Selecting a sibling whose folder has been moved or deleted since the switcher opened
+  surfaces a clear error through the normal open-failure flow and leaves the previous
+  repository open.
+
 ## Quitting the application
 
 The user can quit Greviewer with the standard quit keyboard shortcut.

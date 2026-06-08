@@ -6,7 +6,7 @@
 
 use std::{
     collections::BTreeMap,
-    fmt, io,
+    fmt, fs, io,
     path::{Path, PathBuf},
     str,
 };
@@ -190,6 +190,35 @@ pub fn open_at(path: &Path) -> Result<OpenRepository, OpenError> {
         commits: page.commits,
         has_more_commits: page.has_more,
     })
+}
+
+/// The git repositories sitting alongside `current` in its parent folder,
+/// including `current` itself. Scans the parent's direct children (non-recursive)
+/// and keeps directories whose `.git` entry exists, which covers normal clones
+/// and worktrees. Returned paths are canonicalized and sorted case-insensitively
+/// by folder name. A `current` with no parent, or an unreadable parent, yields an
+/// empty list.
+pub fn sibling_repositories(current: &Path) -> Vec<PathBuf> {
+    let Some(parent) = current.parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+
+    let mut repositories: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join(".git").exists())
+        .filter_map(|path| path.canonicalize().ok())
+        .collect();
+
+    repositories.sort_by_key(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    });
+    repositories
 }
 
 pub fn load_commits_after(path: &Path, after_sha: &str) -> Result<CommitPage, OpenError> {
@@ -1480,5 +1509,37 @@ mod tests {
             matches!(err, OpenError::NotARepository | OpenError::Io(_)),
             "expected NotARepository or Io, got {err:?}"
         );
+    }
+
+    #[test]
+    fn sibling_repositories_lists_sibling_git_repos_sorted_including_current() {
+        let parent = tempfile::tempdir().expect("create parent tempdir");
+
+        for name in ["Gamma", "alpha", "beta"] {
+            Repository::init(parent.path().join(name)).expect("init sibling repo");
+        }
+        fs::create_dir(parent.path().join("plain")).expect("create plain dir");
+
+        let current = parent.path().join("beta");
+        let siblings = sibling_repositories(&current);
+
+        let expect = |name: &str| {
+            parent
+                .path()
+                .join(name)
+                .canonicalize()
+                .expect("canonicalize expected sibling")
+        };
+        // Sorted case-insensitively by folder name; the current repo is included
+        // and the non-repo "plain" directory is excluded.
+        assert_eq!(
+            siblings,
+            vec![expect("alpha"), expect("beta"), expect("Gamma")]
+        );
+    }
+
+    #[test]
+    fn sibling_repositories_is_empty_for_a_path_without_a_parent() {
+        assert!(sibling_repositories(Path::new("/")).is_empty());
     }
 }

@@ -129,9 +129,17 @@ impl App {
                 let repo_name = super::repository_title(&repo.path);
                 let mut row = div().flex().items_center().child(
                     div()
+                        .id("title-bar-repo")
+                        .debug_selector(|| "title-bar-repo".to_string())
                         .font_family("monospace")
                         .text_size(px(13.))
                         .text_color(rgb(0xe6e6e6))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|app, _event, _window, cx| {
+                            app.repo_switcher_open = !app.repo_switcher_open;
+                            app.context_popover_open = false;
+                            cx.notify();
+                        }))
                         .child(repo_name),
                 );
 
@@ -155,6 +163,7 @@ impl App {
                                 .cursor_pointer()
                                 .on_click(cx.listener(|app, _event, _window, cx| {
                                     app.context_popover_open = !app.context_popover_open;
+                                    app.repo_switcher_open = false;
                                     cx.notify();
                                 }))
                                 .child(label),
@@ -361,6 +370,142 @@ impl App {
                 .into_any_element(),
         )
     }
+
+    /// The repo switcher popover, shown when the repo name is active. Lists the
+    /// git repositories sitting alongside the open one in its parent folder
+    /// (the current repo marked), with an `Open repository…` escape hatch to the
+    /// folder picker. Returns `None` unless a repository is open and the switcher
+    /// is toggled on. Like the context popover, it is a full-window overlay: a
+    /// transparent backdrop that dismisses on outside click, plus the card.
+    pub(crate) fn render_repo_switcher(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.repo_switcher_open {
+            return None;
+        }
+        let Mode::RepoOpen { repo } = &self.mode else {
+            return None;
+        };
+
+        let current = repo.path.clone();
+        let parent_label = current
+            .parent()
+            .map(|parent| parent.display().to_string())
+            .unwrap_or_default();
+        let siblings = crate::repo::sibling_repositories(&current);
+        let other_count = siblings.iter().filter(|path| **path != current).count();
+
+        let header = div()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(rgb(0x26262c))
+            .font_family("monospace")
+            .text_size(px(12.))
+            .text_color(rgb(0x8a8a93))
+            .child(parent_label);
+
+        let body = if other_count == 0 {
+            div()
+                .id("title-bar-repo-switcher-empty")
+                .debug_selector(|| "title-bar-repo-switcher-empty".to_string())
+                .px_3()
+                .py_2()
+                .text_size(px(12.))
+                .text_color(rgb(0x8a8a93))
+                .child("No other repositories in this folder.")
+                .into_any_element()
+        } else {
+            let mut list = div().flex().flex_col();
+            for (index, path) in siblings.iter().enumerate() {
+                let is_current = *path == current;
+                let name = super::repository_title(path);
+                let mut row = div()
+                    .id(("title-bar-repo-sibling", index))
+                    .debug_selector(move || format!("title-bar-repo-sibling-{index}"))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .text_size(px(12.))
+                    .child(
+                        div()
+                            .font_family("monospace")
+                            .text_color(rgb(0xc7c7cf))
+                            .child(name),
+                    );
+
+                if is_current {
+                    row = row.child(
+                        div()
+                            .debug_selector(|| "title-bar-repo-current".to_string())
+                            .text_size(px(11.))
+                            .text_color(rgb(0x8a8a93))
+                            .child("current"),
+                    );
+                } else {
+                    let open_path = path.clone();
+                    row = row.cursor_pointer().on_click(cx.listener(
+                        move |app, _event, window, cx| {
+                            app.open_repository_at(open_path.clone(), window, cx);
+                        },
+                    ));
+                }
+
+                list = list.child(row);
+            }
+            list.into_any_element()
+        };
+
+        let open = div()
+            .id("title-bar-repo-open")
+            .debug_selector(|| "title-bar-repo-open".to_string())
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(rgb(0x26262c))
+            .text_size(px(12.))
+            .text_color(rgb(0xdbeafe))
+            .cursor_pointer()
+            .on_click(cx.listener(|app, _event, window, cx| {
+                app.repo_switcher_open = false;
+                app.prompt_and_open_repository(window, cx);
+            }))
+            .child("Open repository\u{2026}");
+
+        let card = div()
+            .absolute()
+            .top(TITLE_BAR_HEIGHT)
+            .left(px(8.))
+            .occlude()
+            .w(px(320.))
+            .bg(rgb(0x141417))
+            .border_1()
+            .border_color(rgb(0x34343a))
+            .rounded_lg()
+            .debug_selector(|| "title-bar-repo-switcher".to_string())
+            .child(header)
+            .child(body)
+            .child(open);
+
+        let backdrop = div()
+            .id("title-bar-repo-switcher-backdrop")
+            .absolute()
+            .inset_0()
+            .on_click(cx.listener(|app, _event, _window, cx| {
+                app.repo_switcher_open = false;
+                cx.notify();
+            }));
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .child(backdrop)
+                .child(card)
+                .into_any_element(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -370,7 +515,7 @@ mod tests {
     use crate::repo::OpenRepository;
     use crate::repo::{ChangeKind, ChangeSet, ChangedFile, CommitInfo, LineStats};
     use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowHandle};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     const PILL: &str = "title-bar-context";
 
@@ -759,5 +904,183 @@ mod tests {
         assert!(visual.debug_bounds("title-bar-context-popover").is_some());
         assert!(visual.debug_bounds("title-bar-context-commit-0").is_some());
         assert!(visual.debug_bounds("title-bar-context-commit-1").is_some());
+    }
+
+    const REPO_NAME: &str = "title-bar-repo";
+    const SWITCHER: &str = "title-bar-repo-switcher";
+
+    /// Create a parent directory containing one git repository per name and
+    /// return the parent (kept alive) plus the canonicalized repo paths.
+    fn parent_with_repos(names: &[&str]) -> (tempfile::TempDir, Vec<PathBuf>) {
+        let parent = tempfile::tempdir().expect("create parent tempdir");
+        let paths = names
+            .iter()
+            .map(|name| {
+                let path = parent.path().join(name);
+                git2::Repository::init(&path).expect("init sibling repo");
+                path.canonicalize().expect("canonicalize repo path")
+            })
+            .collect();
+        (parent, paths)
+    }
+
+    /// Open `path` (a real on-disk repository) in a fresh app window.
+    fn window_with_repo_open(cx: &mut TestAppContext, path: &Path) -> WindowHandle<App> {
+        let window = app_window(cx);
+        let repo = crate::repo::open_at(path).expect("open repo");
+        window
+            .update(cx, |app, _window, cx| {
+                app.mode = Mode::RepoOpen { repo };
+                app.review_screen = ReviewScreen::Graph;
+                cx.notify();
+            })
+            .expect("set repo-open state");
+        window
+    }
+
+    #[gpui::test]
+    async fn repo_name_is_present_in_graph_mode(cx: &mut TestAppContext) {
+        let window = app_window(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                app.mode = Mode::RepoOpen {
+                    repo: repo_named("Demo", vec![]),
+                };
+                app.review_screen = ReviewScreen::Graph;
+                cx.notify();
+            })
+            .expect("set graph state");
+
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds(REPO_NAME).is_some());
+    }
+
+    #[gpui::test]
+    async fn clicking_repo_name_opens_the_switcher(cx: &mut TestAppContext) {
+        let (_parent, paths) = parent_with_repos(&["solo"]);
+        let window = window_with_repo_open(cx, &paths[0]);
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let name = visual.debug_bounds(REPO_NAME).expect("repo name bounds");
+        visual.simulate_click(name.center(), Modifiers::none());
+
+        assert!(visual.debug_bounds(SWITCHER).is_some());
+        window
+            .read_with(cx, |app, _cx| assert!(app.repo_switcher_open))
+            .expect("read switcher open state");
+    }
+
+    #[gpui::test]
+    async fn switcher_lists_siblings_and_marks_the_current_repo(cx: &mut TestAppContext) {
+        let (_parent, paths) = parent_with_repos(&["alpha", "beta"]);
+        // Open beta; alpha is its sibling.
+        let beta = paths.into_iter().find(|p| p.ends_with("beta")).unwrap();
+        let window = window_with_repo_open(cx, &beta);
+        window
+            .update(cx, |app, _window, cx| {
+                app.repo_switcher_open = true;
+                cx.notify();
+            })
+            .expect("open switcher");
+
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds(SWITCHER).is_some());
+        // Two siblings (alpha, beta) sorted → rows 0 and 1.
+        assert!(visual.debug_bounds("title-bar-repo-sibling-0").is_some());
+        assert!(visual.debug_bounds("title-bar-repo-sibling-1").is_some());
+        // The current repo (beta) carries a marker.
+        assert!(visual.debug_bounds("title-bar-repo-current").is_some());
+    }
+
+    #[gpui::test]
+    async fn clicking_a_sibling_switches_the_repo(cx: &mut TestAppContext) {
+        let (_parent, paths) = parent_with_repos(&["alpha", "beta"]);
+        let alpha = paths.iter().find(|p| p.ends_with("alpha")).unwrap().clone();
+        let beta = paths.iter().find(|p| p.ends_with("beta")).unwrap().clone();
+        let window = window_with_repo_open(cx, &beta);
+        window
+            .update(cx, |app, _window, cx| {
+                app.repo_switcher_open = true;
+                cx.notify();
+            })
+            .expect("open switcher");
+        cx.run_until_parked();
+
+        // alpha sorts first → row 0.
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row = visual
+            .debug_bounds("title-bar-repo-sibling-0")
+            .expect("alpha row bounds");
+        visual.simulate_click(row.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _cx| match &app.mode {
+                Mode::RepoOpen { repo } => assert_eq!(repo.path, alpha),
+                Mode::NoRepo => panic!("expected a repo to be open"),
+            })
+            .expect("read switched repo");
+    }
+
+    #[gpui::test]
+    async fn switcher_shows_empty_state_when_no_other_repos(cx: &mut TestAppContext) {
+        let (_parent, paths) = parent_with_repos(&["solo"]);
+        let window = window_with_repo_open(cx, &paths[0]);
+        window
+            .update(cx, |app, _window, cx| {
+                app.repo_switcher_open = true;
+                cx.notify();
+            })
+            .expect("open switcher");
+
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual
+            .debug_bounds("title-bar-repo-switcher-empty")
+            .is_some());
+        assert!(visual.debug_bounds("title-bar-repo-sibling-1").is_none());
+    }
+
+    #[gpui::test]
+    async fn switcher_has_an_open_repository_footer(cx: &mut TestAppContext) {
+        let (_parent, paths) = parent_with_repos(&["solo"]);
+        let window = window_with_repo_open(cx, &paths[0]);
+        window
+            .update(cx, |app, _window, cx| {
+                app.repo_switcher_open = true;
+                cx.notify();
+            })
+            .expect("open switcher");
+
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds("title-bar-repo-open").is_some());
+    }
+
+    #[gpui::test]
+    async fn opening_the_switcher_closes_the_context_popover(cx: &mut TestAppContext) {
+        let (_parent, paths) = parent_with_repos(&["solo"]);
+        let window = window_with_repo_open(cx, &paths[0]);
+        window
+            .update(cx, |app, _window, cx| {
+                app.context_popover_open = true;
+                cx.notify();
+            })
+            .expect("open context popover");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let name = visual.debug_bounds(REPO_NAME).expect("repo name bounds");
+        visual.simulate_click(name.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert!(app.repo_switcher_open);
+                assert!(!app.context_popover_open);
+            })
+            .expect("read popover states");
     }
 }

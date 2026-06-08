@@ -75,6 +75,8 @@ pub struct App {
     focus_handle: FocusHandle,
     /// Whether the title-bar context popover (the diff "switcher") is open.
     context_popover_open: bool,
+    /// Whether the title-bar repo switcher (sibling-repository list) is open.
+    repo_switcher_open: bool,
 }
 
 struct FileDiffScroll {
@@ -419,6 +421,7 @@ impl App {
             changeset_resizable,
             focus_handle,
             context_popover_open: false,
+            repo_switcher_open: false,
         }
     }
 
@@ -511,6 +514,8 @@ impl App {
         self.persist_recent_repositories();
         self.file_diff_scroll.reset();
         self.commit_history_scroll.set_offset(point(px(0.), px(0.)));
+        self.context_popover_open = false;
+        self.repo_switcher_open = false;
         cx.notify();
     }
 
@@ -4148,6 +4153,7 @@ impl Render for App {
             .child(self.render_title_bar(cx))
             .child(div().flex().flex_1().min_h(px(0.)).w_full().child(body))
             .children(self.render_context_popover(cx))
+            .children(self.render_repo_switcher(cx))
             .child(self.notifications.clone())
     }
 }
