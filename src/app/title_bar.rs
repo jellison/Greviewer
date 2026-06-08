@@ -10,7 +10,7 @@ use gpui::{
 use gpui_component::{TitleBar, TITLE_BAR_HEIGHT};
 
 use super::{App, Mode, ReviewScreen, Selection};
-use crate::repo::{ChangeSet, CommitInfo};
+use crate::repo::{ChangeKind, ChangeSet, CommitInfo};
 
 /// First seven characters of a full commit sha, matching the short form the
 /// graph and the removed diff header used.
@@ -65,6 +65,47 @@ fn popover_header_title(
     }
 }
 
+/// Per-kind file counts in the changeset, as (added, modified, deleted, renamed).
+fn changeset_kind_counts(changeset: &ChangeSet) -> (usize, usize, usize, usize) {
+    let mut counts = (0, 0, 0, 0);
+    for file in &changeset.files {
+        match file.kind {
+            ChangeKind::Added => counts.0 += 1,
+            ChangeKind::Modified => counts.1 += 1,
+            ChangeKind::Deleted => counts.2 += 1,
+            ChangeKind::Renamed => counts.3 += 1,
+        }
+    }
+    counts
+}
+
+/// Short sha + summary for each commit in the changeset, newest first. The
+/// summary is empty when the commit is not in the loaded history window.
+fn popover_commit_rows(
+    selection: &Selection,
+    changeset: &ChangeSet,
+    commits: &[CommitInfo],
+) -> Vec<(String, String)> {
+    let shas: Vec<String> = match selection {
+        Selection::Range { shas, .. } if shas.len() > 1 => shas.clone(),
+        Selection::Single { sha } => vec![sha.clone()],
+        // Unreachable from render_context_popover (a changeset always implies a
+        // Single or Range selection); handled defensively. The single-element
+        // result is suppressed by the `> 1` gate at the call site.
+        _ => vec![changeset.commit_sha.clone()],
+    };
+    shas.into_iter()
+        .map(|sha| {
+            let summary = commits
+                .iter()
+                .find(|commit| commit.sha == sha)
+                .map(|commit| commit.summary.clone())
+                .unwrap_or_default();
+            (short_sha(&sha), summary)
+        })
+        .collect()
+}
+
 /// Total added and removed lines across every file in the changeset.
 fn changeset_line_totals(changeset: &ChangeSet) -> (usize, usize) {
     changeset
@@ -108,12 +149,6 @@ impl App {
                             div()
                                 .id("title-bar-context")
                                 .debug_selector(|| "title-bar-context".to_string())
-                                .px_2()
-                                .py(px(2.))
-                                .rounded_md()
-                                .border_1()
-                                .border_color(rgb(0x34507a))
-                                .bg(rgb(0x1d283a))
                                 .font_family("monospace")
                                 .text_size(px(13.))
                                 .text_color(rgb(0xdbeafe))
@@ -153,6 +188,22 @@ impl App {
         let endpoints = range_endpoints(&self.selection);
         let (added, removed) = changeset_line_totals(changeset);
         let file_count = changeset.files.len();
+        let (added_files, modified_files, deleted_files, renamed_files) =
+            changeset_kind_counts(changeset);
+        let mut kind_parts: Vec<String> = Vec::new();
+        if added_files > 0 {
+            kind_parts.push(format!("{added_files} added"));
+        }
+        if modified_files > 0 {
+            kind_parts.push(format!("{modified_files} modified"));
+        }
+        if deleted_files > 0 {
+            kind_parts.push(format!("{deleted_files} deleted"));
+        }
+        if renamed_files > 0 {
+            kind_parts.push(format!("{renamed_files} renamed"));
+        }
+        let commit_rows = popover_commit_rows(&self.selection, changeset, &repo.commits);
 
         let mut header = div().flex().flex_col().gap_1().p_3().child(
             div()
@@ -223,6 +274,57 @@ impl App {
             }))
             .child("Close changeset");
 
+        let kind_row = (!kind_parts.is_empty()).then(|| {
+            div()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(rgb(0x26262c))
+                .text_size(px(12.))
+                .text_color(rgb(0x8a8a93))
+                .child(kind_parts.join(" \u{00b7} "))
+        });
+
+        // For a range, list the commits (newest first) with their summaries so
+        // reviewers see real context, not bare hashes. A single commit's summary
+        // is already the header title, so its one-row list is omitted.
+        let commit_list = (commit_rows.len() > 1).then(|| {
+            let mut list = div()
+                .id("title-bar-context-commits")
+                .flex()
+                .flex_col()
+                .max_h(px(168.))
+                .overflow_y_scroll()
+                .border_t_1()
+                .border_color(rgb(0x26262c));
+            for (index, (sha, summary)) in commit_rows.iter().enumerate() {
+                list = list.child(
+                    div()
+                        .id(("title-bar-context-commit", index))
+                        .debug_selector(move || format!("title-bar-context-commit-{index}"))
+                        .flex()
+                        .gap_2()
+                        .px_3()
+                        .py_1()
+                        .text_size(px(12.))
+                        .child(
+                            div()
+                                .font_family("monospace")
+                                .text_color(rgb(0x7aa2f7))
+                                .child(sha.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_color(rgb(0xc7c7cf))
+                                .child(summary.clone()),
+                        ),
+                );
+            }
+            list
+        });
+
         let card = div()
             .absolute()
             .top(TITLE_BAR_HEIGHT)
@@ -237,6 +339,8 @@ impl App {
             .child(header)
             .child(files_row)
             .child(lines_row)
+            .children(kind_row)
+            .children(commit_list)
             .child(close);
 
         let backdrop = div()
@@ -515,5 +619,145 @@ mod tests {
                 assert!(matches!(app.review_screen, ReviewScreen::Graph));
             })
             .expect("read closed state");
+    }
+
+    #[test]
+    fn kind_counts_tally_each_change_kind() {
+        let mut changeset = changeset_with("abcdef1234567890", vec![]);
+        changeset.files = vec![
+            ChangedFile {
+                path: "a.rs".to_string(),
+                old_path: None,
+                kind: ChangeKind::Added,
+                is_binary: false,
+                line_stats: LineStats {
+                    added: 1,
+                    removed: 0,
+                },
+            },
+            ChangedFile {
+                path: "b.rs".to_string(),
+                old_path: None,
+                kind: ChangeKind::Modified,
+                is_binary: false,
+                line_stats: LineStats {
+                    added: 1,
+                    removed: 1,
+                },
+            },
+            ChangedFile {
+                path: "c.rs".to_string(),
+                old_path: None,
+                kind: ChangeKind::Modified,
+                is_binary: false,
+                line_stats: LineStats {
+                    added: 0,
+                    removed: 2,
+                },
+            },
+            ChangedFile {
+                path: "d.rs".to_string(),
+                old_path: None,
+                kind: ChangeKind::Deleted,
+                is_binary: false,
+                line_stats: LineStats {
+                    added: 0,
+                    removed: 5,
+                },
+            },
+            ChangedFile {
+                path: "e.rs".to_string(),
+                old_path: Some("old_e.rs".to_string()),
+                kind: ChangeKind::Renamed,
+                is_binary: false,
+                line_stats: LineStats {
+                    added: 0,
+                    removed: 0,
+                },
+            },
+        ];
+        assert_eq!(changeset_kind_counts(&changeset), (1, 2, 1, 1));
+    }
+
+    #[test]
+    fn commit_rows_preserve_selection_order_with_summaries() {
+        let changeset = changeset_with("aaaaaaa1111111", vec![]);
+        let selection = Selection::Range {
+            start_sha: "ccccccc3333333".to_string(),
+            end_sha: "aaaaaaa1111111".to_string(),
+            shas: vec![
+                "aaaaaaa1111111".to_string(),
+                "bbbbbbb2222222".to_string(),
+                "ccccccc3333333".to_string(),
+            ],
+        };
+        let commits = vec![
+            commit_with("aaaaaaa1111111", "feat: newest"),
+            commit_with("bbbbbbb2222222", "fix: middle"),
+            commit_with("ccccccc3333333", "chore: oldest"),
+        ];
+        assert_eq!(
+            popover_commit_rows(&selection, &changeset, &commits),
+            vec![
+                ("aaaaaaa".to_string(), "feat: newest".to_string()),
+                ("bbbbbbb".to_string(), "fix: middle".to_string()),
+                ("ccccccc".to_string(), "chore: oldest".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn commit_rows_use_empty_summary_when_commit_not_loaded() {
+        let changeset = changeset_with("aaaaaaa1111111", vec![]);
+        let selection = Selection::Range {
+            start_sha: "bbbbbbb2222222".to_string(),
+            end_sha: "aaaaaaa1111111".to_string(),
+            shas: vec!["aaaaaaa1111111".to_string(), "bbbbbbb2222222".to_string()],
+        };
+        // Only the newest commit is loaded.
+        let commits = vec![commit_with("aaaaaaa1111111", "feat: newest")];
+        assert_eq!(
+            popover_commit_rows(&selection, &changeset, &commits),
+            vec![
+                ("aaaaaaa".to_string(), "feat: newest".to_string()),
+                ("bbbbbbb".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn popover_lists_range_commits(cx: &mut TestAppContext) {
+        let window = app_window(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                let changeset = changeset_with("aaaaaaa1111111", vec![file_with(3, 1)]);
+                app.mode = Mode::RepoOpen {
+                    repo: repo_named(
+                        "Demo",
+                        vec![
+                            commit_with("aaaaaaa1111111", "feat: newest"),
+                            commit_with("bbbbbbb2222222", "fix: oldest"),
+                        ],
+                    ),
+                };
+                app.review_screen = ReviewScreen::Changeset {
+                    sha: "aaaaaaa1111111".to_string(),
+                    changeset,
+                };
+                app.selection = Selection::Range {
+                    start_sha: "bbbbbbb2222222".to_string(),
+                    end_sha: "aaaaaaa1111111".to_string(),
+                    shas: vec!["aaaaaaa1111111".to_string(), "bbbbbbb2222222".to_string()],
+                };
+                app.context_popover_open = true;
+                cx.notify();
+            })
+            .expect("set range changeset state");
+
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds("title-bar-context-popover").is_some());
+        assert!(visual.debug_bounds("title-bar-context-commit-0").is_some());
+        assert!(visual.debug_bounds("title-bar-context-commit-1").is_some());
     }
 }
