@@ -5326,9 +5326,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let missing_path = dir.path().join("missing-repo");
         let store_path = dir.path().join("recent-repositories");
+        // Unavailable sentinel first so construction-time auto-open is skipped;
+        // the activation call below is what marks missing_path unavailable.
         save_recent_repositories(
             &store_path,
-            &[RecentRepository::available(missing_path.clone())],
+            &[
+                RecentRepository::unavailable(dir.path().join("sentinel-repo")),
+                RecentRepository::available(missing_path.clone()),
+            ],
         )
         .expect("seed recent repository store");
         let window = cx.add_window(|window, cx| {
@@ -5343,7 +5348,10 @@ mod tests {
 
         assert_eq!(
             load_recent_repositories(&store_path).expect("load recent repository store"),
-            vec![RecentRepository::unavailable(missing_path)],
+            vec![
+                RecentRepository::unavailable(dir.path().join("sentinel-repo")),
+                RecentRepository::unavailable(missing_path),
+            ],
         );
     }
 
