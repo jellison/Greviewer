@@ -19,9 +19,19 @@ async fn boots_to_the_placeholder(cx: &mut TestAppContext) {
         gpui_component::init(cx);
     });
 
-    let _window = cx.add_window(App::new);
-    // The contract: the boot path constructs the App entity without panicking.
-    // Repository-opening behavior is covered by the dispatch smoke test below.
+    let picker = QueuedPathPicker::new([]);
+    let window = cx.add_window(|window, cx| App::new_with_picker(window, cx, Box::new(picker)));
+
+    // The contract: the boot path constructs the App entity in the placeholder
+    // (no-repository) state without reading or mutating the real recent-repos store.
+    window
+        .read_with(cx, |app, _cx| {
+            assert!(
+                matches!(app.mode, Mode::NoRepo),
+                "expected the boot path to land on the placeholder",
+            );
+        })
+        .expect("read booted window");
 }
 
 #[gpui::test]
