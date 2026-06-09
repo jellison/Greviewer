@@ -20,7 +20,7 @@ use gpui::{
 };
 use gpui_component::notification::{Notification, NotificationList};
 use gpui_component::resizable::{h_resizable, resizable_panel, ResizableState};
-use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarShow};
+use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::Icon;
 use similar::{DiffTag, TextDiff};
@@ -72,6 +72,9 @@ pub struct App {
     file_diff_scroll: FileDiffScroll,
     commit_history_scroll: ScrollHandle,
     file_tree_scroll: ScrollHandle,
+    /// Horizontal scroll handle for the path pane only; the stat gutter stays
+    /// fixed while this scrolls.
+    file_tree_hscroll: ScrollHandle,
     /// True while the cursor is anywhere over the file-tree panel; gates the
     /// hover-revealed scrollbar overlay.
     file_tree_hovered: bool,
@@ -332,6 +335,7 @@ impl App {
             file_diff_scroll: FileDiffScroll::new(),
             commit_history_scroll: ScrollHandle::new(),
             file_tree_scroll: ScrollHandle::new(),
+            file_tree_hscroll: ScrollHandle::new(),
             file_tree_hovered: false,
             changeset_resizable,
             focus_handle,
@@ -430,6 +434,7 @@ impl App {
         self.file_diff_scroll.reset();
         self.commit_history_scroll.set_offset(point(px(0.), px(0.)));
         self.file_tree_scroll.set_offset(point(px(0.), px(0.)));
+        self.file_tree_hscroll.set_offset(point(px(0.), px(0.)));
         self.file_tree_hovered = false;
         self.context_popover_open = false;
         self.repo_switcher_open = false;
@@ -571,6 +576,7 @@ impl App {
                     self.selected_changed_file_path = None;
                 }
                 self.file_tree_scroll.set_offset(point(px(0.), px(0.)));
+                self.file_tree_hscroll.set_offset(point(px(0.), px(0.)));
                 self.file_tree_hovered = false;
                 let sha = changeset.commit_sha.clone();
                 self.review_screen = ReviewScreen::Changeset { sha, changeset };
@@ -1114,29 +1120,64 @@ impl App {
                 .child("This changeset has no net file changes.")
                 .into_any_element()
         } else {
+            let path_cells = rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| self.render_file_tree_row(index, row, cx))
+                .collect::<Vec<_>>();
+            let gutter_cells = rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| self.render_file_tree_gutter_cell(index, row, cx))
+                .collect::<Vec<_>>();
+
             div()
                 .flex()
                 .flex_col()
-                // items_start() prevents the cross-axis stretch that would pin the
-                // inner wrapper to the viewport width, defeating horizontal scrolling.
-                .items_start()
                 .flex_1()
                 .min_h_0()
                 .id("changed-files-scroll")
                 .debug_selector(|| "changed-files-scroll".to_string())
-                .overflow_scroll()
+                .overflow_y_scroll()
                 .track_scroll(&self.file_tree_scroll)
                 .child(
-                    // Inner flex_none wrapper sizes to the widest row's natural
-                    // width instead of being stretched to the viewport, which is
-                    // what enables horizontal scrolling. Every row uses w_full() to
-                    // fill this wrapper so all rows share a uniform background width.
-                    div().flex().flex_col().flex_none().children(
-                        rows.iter()
-                            .enumerate()
-                            .map(|(index, row)| self.render_file_tree_row(index, row, cx))
-                            .collect::<Vec<_>>(),
-                    ),
+                    // Two columns share this one vertical scroll, so they scroll
+                    // vertically together. min_w_full pins the gutter to the
+                    // viewport's right edge.
+                    div()
+                        .flex()
+                        .flex_row()
+                        .min_w_full()
+                        .child(
+                            // Path pane: only this column scrolls horizontally.
+                            // items_start() prevents cross-axis stretch, allowing
+                            // the flex_none inner wrapper to exceed the viewport width.
+                            div()
+                                .id("changed-files-path-pane")
+                                .debug_selector(|| "changed-files-path-pane".to_string())
+                                .flex()
+                                .flex_col()
+                                .items_start()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_x_scroll()
+                                .track_scroll(&self.file_tree_hscroll)
+                                .child(
+                                    // flex_none inner column sizes to the widest
+                                    // path; rows use w_full so backgrounds are uniform.
+                                    div().flex().flex_col().flex_none().children(path_cells),
+                                ),
+                        )
+                        .child(
+                            // Frozen stat gutter.
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_none()
+                                .border_l_1()
+                                .border_color(rgb(0x242424))
+                                .children(gutter_cells),
+                        ),
                 )
                 .into_any_element()
         };
@@ -1169,14 +1210,11 @@ impl App {
                         .bottom_0()
                         .debug_selector(|| "file-tree-scrollbar".to_string())
                         .child(
-                            Scrollbar::new(&self.file_tree_scroll)
-                                .axis(ScrollbarAxis::Both)
-                                // Always: render both tracks whenever the
-                                // hover gate has placed this overlay. The
-                                // component's Hover mode keys off the scroll
-                                // area's own hover, not the whole panel's, so
-                                // we gate visibility ourselves via the `.when`
-                                // above and let the component always paint.
+                            Scrollbar::vertical(&self.file_tree_scroll)
+                                .scrollbar_show(ScrollbarShow::Always),
+                        )
+                        .child(
+                            Scrollbar::horizontal(&self.file_tree_hscroll)
                                 .scrollbar_show(ScrollbarShow::Always),
                         ),
                 )
@@ -1325,6 +1363,50 @@ impl App {
         }
     }
 
+    fn render_file_tree_gutter_cell(
+        &self,
+        index: usize,
+        row: &FileTreeRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Every gutter cell is one row tall so it stays aligned with its path row.
+        let base = |selected: bool| {
+            div()
+                .flex()
+                .items_center()
+                .min_h(px(FILE_TREE_ROW_HEIGHT))
+                .px_2()
+                .bg(if selected {
+                    rgb(0x223248)
+                } else {
+                    rgb(0x171717)
+                })
+        };
+
+        match row {
+            FileTreeRow::File {
+                entry: FileListEntry::Changed(file),
+                ..
+            } => {
+                let selected = self.is_file_path_selected(row.path());
+                let path = file.path.clone();
+                let path_fragment = debug_path_fragment(&file.path);
+                let diff_stat_selector = format!("changed-file-diff-stat-{path_fragment}");
+                let gutter_selector = format!("changed-file-gutter-{index}");
+                base(selected)
+                    .cursor_pointer()
+                    .id(("changed-file-gutter", index))
+                    .debug_selector(move || gutter_selector.clone())
+                    .on_click(cx.listener(move |app, _event, _window, cx| {
+                        app.select_changed_file(path.clone(), cx);
+                    }))
+                    .child(render_file_diff_stat(diff_stat_selector, file.line_stats))
+                    .into_any_element()
+            }
+            _ => base(false).w(px(68.)).into_any_element(),
+        }
+    }
+
     fn render_file_tree_folder_row(
         &self,
         index: usize,
@@ -1395,7 +1477,6 @@ impl App {
         let binary_selector = format!("changed-file-binary-indicator-{path_fragment}");
         let rename_source_selector = format!("changed-file-rename-source-{path_fragment}");
         let status_icon_selector = format!("changed-file-status-icon-{path_fragment}");
-        let diff_stat_selector = format!("changed-file-diff-stat-{path_fragment}");
         let file_name_selector = format!("changed-file-name-{path_fragment}");
         let deleted_strike_selector = format!("changed-file-deleted-strike-{path_fragment}");
 
@@ -1458,7 +1539,6 @@ impl App {
                         )
                     }),
             )
-            .child(render_file_diff_stat(diff_stat_selector, file.line_stats))
     }
 
     fn render_unchanged_file_row(
@@ -7009,17 +7089,19 @@ mod tests {
             .expect("changed-files-scroll must be rendered in changeset view");
         cx.run_until_parked();
 
-        let max_offset = window
+        let v_max = window
             .read_with(cx, |app, _cx| app.file_tree_scroll.max_offset())
-            .expect("read file tree max offset");
-
+            .expect("v max");
+        let h_max = window
+            .read_with(cx, |app, _cx| app.file_tree_hscroll.max_offset())
+            .expect("h max");
         assert!(
-            max_offset.height > px(0.),
-            "nested changeset should overflow the file tree vertically; max: {max_offset:?}"
+            v_max.height > px(0.),
+            "should overflow vertically; v_max {v_max:?}"
         );
         assert!(
-            max_offset.width > px(0.),
-            "long nested paths should overflow the file tree horizontally; max: {max_offset:?}"
+            h_max.width > px(0.),
+            "should overflow horizontally; h_max {h_max:?}"
         );
     }
 
@@ -7031,44 +7113,72 @@ mod tests {
 
         // The folder row "deeply" (index 0) has short content. The fixture's
         // deep_dir has 7 components, so folder rows occupy indices 0-6; the first
-        // changed-file row is at index 7. With w_full() on every row and a
-        // flex_none inner wrapper, both rows must expand to the widest row's width
-        // — which exceeds the 360 px viewport. We verify rows extend beyond the
-        // viewport width, proving they fill the scrolled content width rather than
-        // clipping to the viewport. (debug_bounds returns layout bounds, not
-        // viewport-clipped bounds, so a value > 360 px is genuine.)
-        let folder_bounds = visual
-            .debug_bounds("file-tree-folder-deeply")
-            .expect("top-level folder row must be rendered");
-        // NOTE: "changed-file-row-7" is index 7 because deep_dir
+        // changed-file row is at index 7. Rows now live in the path pane only;
+        // they must be equal width and wider than the path pane's own width
+        // (proving they fill the full scrolled content width, not the viewport).
+        let pane = visual
+            .debug_bounds("changed-files-path-pane")
+            .expect("path pane bounds");
+        // NOTE: "file-tree-folder-deeply" is the top-level folder at index 0.
+        // "changed-file-row-7" is index 7 because deep_dir
         // ("deeply/nested/directory/structure/that/keeps/going") has exactly 7
         // path components, placing folder rows at indices 0–6 and the first file
         // row at index 7. If deep_dir in init_repo_with_deeply_nested_long_paths
         // is ever changed to a path with a different component count, this index
         // must be updated to match.
+        let folder_bounds = visual
+            .debug_bounds("file-tree-folder-deeply")
+            .expect("top-level folder row must be rendered");
         let file_bounds = visual
             .debug_bounds("changed-file-row-7")
             .expect("first changed-file row (index 7, after 7 folder levels) must be rendered");
 
         assert!(
-            folder_bounds.size.width > px(360.),
-            "folder row (short content) should expand to scrolled content width, not clip to \
-             viewport; got {:?}",
+            (folder_bounds.size.width - file_bounds.size.width).abs() < px(1.),
+            "rows must be uniform width: {:?} vs {:?}",
             folder_bounds.size.width,
+            file_bounds.size.width
         );
         assert!(
-            file_bounds.size.width > px(360.),
-            "changed-file row (long content) should extend beyond viewport; got {:?}",
-            file_bounds.size.width,
+            folder_bounds.size.width > pane.size.width,
+            "rows should fill the full scrolled width, not just the pane"
         );
-        // Both rows must be the same width: the short folder row is pulled up to
-        // the wrapper's full width by w_full(), matching the long file row.
+    }
+
+    #[gpui::test]
+    async fn diff_stats_stay_frozen_during_horizontal_scroll(cx: &mut TestAppContext) {
+        use gpui::{point, px};
+
+        let (window, mut visual) = open_deeply_nested_changeset_at_360x200(cx);
+
+        let before = visual
+            .debug_bounds("changed-file-gutter-7")
+            .expect("stat gutter cell bounds before scroll");
+
+        window
+            .update(cx, |app, _window, _cx| {
+                app.file_tree_hscroll.set_offset(point(px(-200.), px(0.)));
+            })
+            .expect("scroll path pane horizontally");
+        cx.run_until_parked();
+
+        let after = visual
+            .debug_bounds("changed-file-gutter-7")
+            .expect("stat gutter cell bounds after scroll");
+
         assert!(
-            (folder_bounds.size.width - file_bounds.size.width).abs() <= px(1.),
-            "folder and changed-file rows must have equal width (uniform backgrounds); \
-             folder={:?}, file={:?}",
-            folder_bounds.size.width,
-            file_bounds.size.width,
+            (before.origin.x - after.origin.x).abs() < px(1.),
+            "diff-stat gutter should not move horizontally; before {:?} after {:?}",
+            before.origin.x,
+            after.origin.x
+        );
+
+        let max = window
+            .read_with(cx, |app, _cx| app.file_tree_hscroll.max_offset())
+            .expect("read hscroll max");
+        assert!(
+            max.width > px(0.),
+            "path pane should overflow horizontally; max {max:?}"
         );
     }
 
