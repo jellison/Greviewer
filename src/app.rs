@@ -1422,38 +1422,32 @@ impl App {
             .child(
                 div()
                     .flex()
-                    .flex_col()
+                    .items_center()
                     .flex_1()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(render_file_tree_file_name(
-                                file_name_selector,
-                                display_name,
-                                file.kind == repo::ChangeKind::Deleted,
-                                deleted_strike_selector,
-                            ))
-                            .when(file.is_binary, |row| {
-                                row.child(
-                                    div()
-                                        .px_1()
-                                        .py_0p5()
-                                        .border_1()
-                                        .border_color(rgb(0x525252))
-                                        .bg(rgb(0x242424))
-                                        .text_color(rgb(0xbdbdbd))
-                                        .text_size(px(FILE_TREE_BADGE_TEXT_SIZE))
-                                        .font_family(FILE_TREE_FONT_FAMILY)
-                                        .debug_selector(move || binary_selector.clone())
-                                        .child("Binary"),
-                                )
-                            }),
-                    )
-                    .when_some(file.old_path.clone(), |column, old_path| {
-                        column.child(
+                    .gap_2()
+                    .child(render_file_tree_file_name(
+                        file_name_selector,
+                        display_name,
+                        file.kind == repo::ChangeKind::Deleted,
+                        deleted_strike_selector,
+                    ))
+                    .when(file.is_binary, |row| {
+                        row.child(
+                            div()
+                                .px_1()
+                                .py_0p5()
+                                .border_1()
+                                .border_color(rgb(0x525252))
+                                .bg(rgb(0x242424))
+                                .text_color(rgb(0xbdbdbd))
+                                .text_size(px(FILE_TREE_BADGE_TEXT_SIZE))
+                                .font_family(FILE_TREE_FONT_FAMILY)
+                                .debug_selector(move || binary_selector.clone())
+                                .child("Binary"),
+                        )
+                    })
+                    .when_some(file.old_path.clone(), |row, old_path| {
+                        row.child(
                             div()
                                 .text_color(rgb(0x8a8a8a))
                                 .text_size(px(FILE_TREE_SECONDARY_TEXT_SIZE))
@@ -8198,6 +8192,42 @@ mod tests {
         visual
             .debug_bounds("file-diff-row-added")
             .expect("new renamed content diff row debug bounds");
+    }
+
+    #[gpui::test]
+    async fn renamed_file_row_is_single_line(cx: &mut TestAppContext) {
+        use gpui::px;
+
+        let (dir, oid_hex) = init_repo_with_renamed_file();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open renamed changeset");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+
+        // The rename source is still rendered (now inline on the name line).
+        visual
+            .debug_bounds("changed-file-rename-source-new.txt")
+            .expect("inline rename source bounds");
+
+        // A single-line row is about FILE_TREE_ROW_HEIGHT tall; a two-line row is
+        // visibly taller. Allow a small tolerance for padding/border.
+        let row = visual
+            .debug_bounds("changed-file-row-0")
+            .expect("renamed file row bounds");
+        assert!(
+            row.size.height <= px(FILE_TREE_ROW_HEIGHT + 6.),
+            "renamed file row should be single-line; height was {:?}",
+            row.size.height
+        );
     }
 
     #[gpui::test]
