@@ -194,6 +194,8 @@ With a changeset open, the user sees the rollup change set: a file tree containi
 - Each changed file entry shows a compact change marker: plus for added, dot for modified, horizontal bar for deleted, and rename marker for renamed.
 - Deleted file entries render their filename struck through.
 - Changed entries show added and removed line counts so the user can estimate review size before opening a file.
+- When the tree's contents exceed the visible area, the user can scroll it both vertically and horizontally; long or deeply nested paths are shown in full and reached by scrolling rather than being abbreviated.
+- A scrollbar appears while the user's pointer is over the tree and lets the user drag to scroll; it stays out of the way otherwise. An axis with nothing off-screen shows no scrollbar.
 - Selecting a file opens it for inspection.
 
 **Edge cases**
