@@ -1298,6 +1298,7 @@ impl App {
         div()
             .flex()
             .items_center()
+            .w_full()
             .min_h(px(FILE_TREE_ROW_HEIGHT))
             .gap_2()
             .px_2()
@@ -1316,6 +1317,7 @@ impl App {
             ))
             .child(
                 div()
+                    .flex_1()
                     .text_color(rgb(0x8aa6bd))
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
@@ -1357,6 +1359,7 @@ impl App {
         div()
             .flex()
             .items_center()
+            .w_full()
             .min_h(px(FILE_TREE_ROW_HEIGHT))
             .gap_2()
             .px_2()
@@ -1377,6 +1380,7 @@ impl App {
                 div()
                     .flex()
                     .flex_col()
+                    .flex_1()
                     .gap_1()
                     .child(
                         div()
@@ -1444,6 +1448,7 @@ impl App {
         div()
             .flex()
             .items_center()
+            .w_full()
             .min_h(px(FILE_TREE_ROW_HEIGHT))
             .gap_2()
             .px_2()
@@ -1464,6 +1469,7 @@ impl App {
             ))
             .child(
                 div()
+                    .flex_1()
                     .text_color(rgb(0xb8c0c7))
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
@@ -6959,6 +6965,69 @@ mod tests {
         assert!(
             max_offset.width > px(0.),
             "long nested paths should overflow the file tree horizontally; max: {max_offset:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn file_tree_rows_are_uniform_width(cx: &mut TestAppContext) {
+        use gpui::{px, size};
+
+        let (dir, sha) = init_repo_with_deeply_nested_long_paths();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(sha.clone(), cx);
+            })
+            .expect("open repo and select commit");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let open_bounds = visual
+            .debug_bounds("open-changeset")
+            .expect("open-changeset button must be visible after selecting a commit");
+        visual.simulate_click(open_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        visual.simulate_resize(size(px(360.), px(200.)));
+        cx.run_until_parked();
+
+        // The folder row "deeply" (index 0) has short content. The fixture's
+        // deep_dir has 7 components, so folder rows occupy indices 0-6; the first
+        // changed-file row is at index 7. With w_full() on every row and a
+        // flex_none inner wrapper, both rows must expand to the widest row's width
+        // — which exceeds the 360 px viewport. We verify rows extend beyond the
+        // viewport width, proving they fill the scrolled content width rather than
+        // clipping to the viewport. (debug_bounds returns layout bounds, not
+        // viewport-clipped bounds, so a value > 360 px is genuine.)
+        let folder_bounds = visual
+            .debug_bounds("file-tree-folder-deeply")
+            .expect("top-level folder row must be rendered");
+        let file_bounds = visual
+            .debug_bounds("changed-file-row-7")
+            .expect("first changed-file row (index 7, after 7 folder levels) must be rendered");
+
+        assert!(
+            folder_bounds.size.width > px(360.),
+            "folder row (short content) should expand to scrolled content width, not clip to \
+             viewport; got {:?}",
+            folder_bounds.size.width,
+        );
+        assert!(
+            file_bounds.size.width > px(360.),
+            "changed-file row (long content) should extend beyond viewport; got {:?}",
+            file_bounds.size.width,
+        );
+        // Both rows must be the same width: the short folder row is pulled up to
+        // the wrapper's full width by w_full(), matching the long file row.
+        assert!(
+            (folder_bounds.size.width - file_bounds.size.width).abs() <= px(1.),
+            "folder and changed-file rows must have equal width (uniform backgrounds); \
+             folder={:?}, file={:?}",
+            folder_bounds.size.width,
+            file_bounds.size.width,
         );
     }
 
