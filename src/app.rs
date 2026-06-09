@@ -57,6 +57,8 @@ const FILE_TREE_INDENT_GUIDE_WIDTH: f32 = 1.;
 const FILE_TREE_GUIDE_TO_ITEM_GAP: f32 = 4.;
 const FILE_TREE_CONTROL_BUTTON_SIZE: f32 = 22.;
 const FILE_TREE_CONTROL_ICON_SIZE: f32 = 15.;
+const FILE_TREE_DIFF_STAT_WIDTH: f32 = 68.;
+const FILE_TREE_STAT_GUTTER_WIDTH: f32 = 84.; // diff-stat width + horizontal cell padding
 
 pub struct App {
     pub mode: Mode,
@@ -1169,11 +1171,13 @@ impl App {
                                 ),
                         )
                         .child(
-                            // Frozen stat gutter.
+                            // Frozen stat gutter: explicit width so w_full cells have
+                            // a defined column width to fill.
                             div()
                                 .flex()
                                 .flex_col()
                                 .flex_none()
+                                .w(px(FILE_TREE_STAT_GUTTER_WIDTH))
                                 .border_l_1()
                                 .border_color(rgb(0x242424))
                                 .children(gutter_cells),
@@ -1210,12 +1214,30 @@ impl App {
                         .bottom_0()
                         .debug_selector(|| "file-tree-scrollbar".to_string())
                         .child(
-                            Scrollbar::vertical(&self.file_tree_scroll)
-                                .scrollbar_show(ScrollbarShow::Always),
+                            // Vertical bar spans the full panel height at the right edge.
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .child(
+                                    Scrollbar::vertical(&self.file_tree_scroll)
+                                        .scrollbar_show(ScrollbarShow::Always),
+                                ),
                         )
                         .child(
-                            Scrollbar::horizontal(&self.file_tree_hscroll)
-                                .scrollbar_show(ScrollbarShow::Always),
+                            // Horizontal bar spans only the path pane, not the frozen gutter.
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .bottom_0()
+                                .right(px(FILE_TREE_STAT_GUTTER_WIDTH))
+                                .child(
+                                    Scrollbar::horizontal(&self.file_tree_hscroll)
+                                        .scrollbar_show(ScrollbarShow::Always),
+                                ),
                         ),
                 )
             })
@@ -1370,10 +1392,14 @@ impl App {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // Every gutter cell is one row tall so it stays aligned with its path row.
+        // w_full + justify_end fills the fixed-width column so all row backgrounds
+        // (including selection blue) are exactly the same width.
         let base = |selected: bool| {
             div()
                 .flex()
                 .items_center()
+                .justify_end()
+                .w_full()
                 .min_h(px(FILE_TREE_ROW_HEIGHT))
                 .px_2()
                 .bg(if selected {
@@ -1403,7 +1429,7 @@ impl App {
                     .child(render_file_diff_stat(diff_stat_selector, file.line_stats))
                     .into_any_element()
             }
-            _ => base(false).w(px(68.)).into_any_element(),
+            _ => base(false).into_any_element(),
         }
     }
 
@@ -4137,7 +4163,7 @@ fn render_file_diff_stat(selector: String, stats: repo::LineStats) -> gpui::Div 
         .items_center()
         .justify_end()
         .gap_2()
-        .w(px(68.))
+        .w(px(FILE_TREE_DIFF_STAT_WIDTH))
         .flex_none()
         .font_family(FILE_TREE_FONT_FAMILY)
         .text_size(px(FILE_TREE_DIFF_STAT_TEXT_SIZE))
@@ -8378,6 +8404,60 @@ mod tests {
                 assert_eq!(
                     app.selected_changed_file_path,
                     Some("hello.txt".to_string()),
+                );
+            })
+            .expect("read selected changed file");
+    }
+
+    #[gpui::test]
+    async fn clicking_gutter_cell_selects_file(cx: &mut TestAppContext) {
+        // Use a two-file commit so that gutter row 1 is not obscured by the
+        // floating file-tree controls (which occlude the top-right area at row 0).
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+        fs::write(dir.path().join("alpha.txt"), "a\n").expect("write alpha");
+        fs::write(dir.path().join("beta.txt"), "b\n").expect("write beta");
+        let root_oid = commit_all(&repo, "Add two files", &[]);
+        drop(repo);
+        let oid_hex = root_oid.to_string();
+        let path = dir.path().to_path_buf();
+
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+            })
+            .expect("open repo and select commit");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let open_bounds = visual
+            .debug_bounds("open-changeset")
+            .expect("open changeset debug bounds");
+        visual.simulate_click(open_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        // Row 1 is clear of the floating controls that occlude the top-right corner.
+        let gutter_bounds = visual
+            .debug_bounds("changed-file-gutter-1")
+            .expect("gutter cell 1 debug bounds");
+        visual.simulate_click(gutter_bounds.center(), Modifiers::none());
+
+        visual
+            .debug_bounds("selected-changed-file-row-1")
+            .expect("selected changed file row 1 debug bounds");
+        visual
+            .debug_bounds("file-detail-shell")
+            .expect("file detail shell debug bounds");
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert!(
+                    app.selected_changed_file_path.is_some(),
+                    "a file should be selected after clicking gutter row 1"
                 );
             })
             .expect("read selected changed file");
