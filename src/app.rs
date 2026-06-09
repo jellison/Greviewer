@@ -1178,8 +1178,6 @@ impl App {
                                 .flex_col()
                                 .flex_none()
                                 .w(px(FILE_TREE_STAT_GUTTER_WIDTH))
-                                .border_l_1()
-                                .border_color(rgb(0x242424))
                                 .children(gutter_cells),
                         ),
                 )
