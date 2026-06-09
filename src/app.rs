@@ -70,6 +70,7 @@ pub struct App {
     settings_store_path: Option<PathBuf>,
     file_diff_scroll: FileDiffScroll,
     commit_history_scroll: ScrollHandle,
+    file_tree_scroll: ScrollHandle,
     changeset_resizable: Entity<ResizableState>,
     focus_handle: FocusHandle,
     /// Whether the title-bar context popover (the diff "switcher") is open.
@@ -326,6 +327,7 @@ impl App {
             settings_store_path,
             file_diff_scroll: FileDiffScroll::new(),
             commit_history_scroll: ScrollHandle::new(),
+            file_tree_scroll: ScrollHandle::new(),
             changeset_resizable,
             focus_handle,
             context_popover_open: false,
@@ -422,6 +424,7 @@ impl App {
         self.persist_settings();
         self.file_diff_scroll.reset();
         self.commit_history_scroll.set_offset(point(px(0.), px(0.)));
+        self.file_tree_scroll.set_offset(point(px(0.), px(0.)));
         self.context_popover_open = false;
         self.repo_switcher_open = false;
         cx.notify();
@@ -1106,16 +1109,20 @@ impl App {
             div()
                 .flex()
                 .flex_col()
+                .items_start()
                 .flex_1()
                 .min_h_0()
                 .id("changed-files-scroll")
                 .debug_selector(|| "changed-files-scroll".to_string())
-                .overflow_y_scroll()
-                .children(
-                    rows.iter()
-                        .enumerate()
-                        .map(|(index, row)| self.render_file_tree_row(index, row, cx))
-                        .collect::<Vec<_>>(),
+                .overflow_scroll()
+                .track_scroll(&self.file_tree_scroll)
+                .child(
+                    div().flex().flex_col().flex_none().children(
+                        rows.iter()
+                            .enumerate()
+                            .map(|(index, row)| self.render_file_tree_row(index, row, cx))
+                            .collect::<Vec<_>>(),
+                    ),
                 )
                 .into_any_element()
         };
@@ -1291,7 +1298,6 @@ impl App {
         div()
             .flex()
             .items_center()
-            .w_full()
             .min_h(px(FILE_TREE_ROW_HEIGHT))
             .gap_2()
             .px_2()
@@ -1310,13 +1316,11 @@ impl App {
             ))
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
                     .text_color(rgb(0x8aa6bd))
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
                     .font_family(FILE_TREE_FONT_FAMILY)
-                    .truncate()
+                    .whitespace_nowrap()
                     .child(name.to_string()),
             )
     }
@@ -1353,7 +1357,6 @@ impl App {
         div()
             .flex()
             .items_center()
-            .w_full()
             .min_h(px(FILE_TREE_ROW_HEIGHT))
             .gap_2()
             .px_2()
@@ -1374,8 +1377,6 @@ impl App {
                 div()
                     .flex()
                     .flex_col()
-                    .flex_1()
-                    .min_w_0()
                     .gap_1()
                     .child(
                         div()
@@ -1443,7 +1444,6 @@ impl App {
         div()
             .flex()
             .items_center()
-            .w_full()
             .min_h(px(FILE_TREE_ROW_HEIGHT))
             .gap_2()
             .px_2()
@@ -1464,13 +1464,11 @@ impl App {
             ))
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
                     .text_color(rgb(0xb8c0c7))
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
                     .font_family(FILE_TREE_FONT_FAMILY)
-                    .truncate()
+                    .whitespace_nowrap()
                     .child(display_name.to_string()),
             )
     }
@@ -3934,12 +3932,11 @@ fn render_file_tree_file_name(
         .relative()
         .flex()
         .items_center()
-        .min_w_0()
         .text_color(rgb(0xe6eef0))
         .text_size(px(FILE_TREE_TEXT_SIZE))
         .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
         .font_family(FILE_TREE_FONT_FAMILY)
-        .truncate()
+        .whitespace_nowrap()
         .debug_selector(move || selector.clone())
         .child(display_name.to_string())
         .when(deleted, |label| {
@@ -4428,6 +4425,34 @@ mod tests {
 
         drop(repo);
 
+        (dir, update_oid.to_string())
+    }
+
+    fn init_repo_with_deeply_nested_long_paths() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        let deep_dir = "deeply/nested/directory/structure/that/keeps/going";
+        let long_names = [
+            "a_very_long_changed_file_name_for_horizontal_overflow_one.txt",
+            "a_very_long_changed_file_name_for_horizontal_overflow_two.txt",
+            "a_very_long_changed_file_name_for_horizontal_overflow_three.txt",
+            "a_very_long_changed_file_name_for_horizontal_overflow_four.txt",
+            "a_very_long_changed_file_name_for_horizontal_overflow_five.txt",
+            "a_very_long_changed_file_name_for_horizontal_overflow_six.txt",
+        ];
+        fs::create_dir_all(dir.path().join(deep_dir)).expect("create nested dirs");
+        for name in long_names {
+            fs::write(dir.path().join(deep_dir).join(name), "before\n").expect("write file");
+        }
+        let root_oid = commit_all(&repo, "Initial", &[]);
+
+        for name in long_names {
+            fs::write(dir.path().join(deep_dir).join(name), "after\n").expect("update file");
+        }
+        let update_oid = commit_all(&repo, "Update files", &[root_oid]);
+
+        drop(repo);
         (dir, update_oid.to_string())
     }
 
@@ -6887,6 +6912,54 @@ mod tests {
         visual
             .debug_bounds(oldest_row_selector)
             .expect("oldest loaded commit row debug bounds");
+    }
+
+    #[gpui::test]
+    async fn file_tree_scrolls_both_axes(cx: &mut TestAppContext) {
+        use gpui::{px, size};
+
+        let (dir, sha) = init_repo_with_deeply_nested_long_paths();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(sha.clone(), cx);
+            })
+            .expect("open repo and select commit");
+        cx.run_until_parked();
+
+        // Open the changeset view (transitions review_screen to Changeset mode,
+        // which renders the file tree with changed-files-scroll).
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let open_bounds = visual
+            .debug_bounds("open-changeset")
+            .expect("open-changeset button must be visible after selecting a commit");
+        visual.simulate_click(open_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        visual.simulate_resize(size(px(360.), px(200.)));
+        cx.run_until_parked();
+
+        // Query bounds to ensure a layout pass has occurred, then read scroll state.
+        visual
+            .debug_bounds("changed-files-scroll")
+            .expect("changed-files-scroll must be rendered in changeset view");
+        cx.run_until_parked();
+
+        let max_offset = window
+            .read_with(cx, |app, _cx| app.file_tree_scroll.max_offset())
+            .expect("read file tree max offset");
+
+        assert!(
+            max_offset.height > px(0.),
+            "nested changeset should overflow the file tree vertically; max: {max_offset:?}"
+        );
+        assert!(
+            max_offset.width > px(0.),
+            "long nested paths should overflow the file tree horizontally; max: {max_offset:?}"
+        );
     }
 
     #[gpui::test]
