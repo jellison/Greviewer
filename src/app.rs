@@ -1169,6 +1169,12 @@ impl App {
                         .child(
                             Scrollbar::new(&self.file_tree_scroll)
                                 .axis(ScrollbarAxis::Both)
+                                // Always: render both tracks whenever the
+                                // hover gate has placed this overlay. The
+                                // component's Hover mode keys off the scroll
+                                // area's own hover, not the whole panel's, so
+                                // we gate visibility ourselves via the `.when`
+                                // above and let the component always paint.
                                 .scrollbar_show(ScrollbarShow::Always),
                         ),
                 )
@@ -7072,8 +7078,7 @@ mod tests {
 
     #[gpui::test]
     async fn file_tree_scrollbar_reveals_on_panel_hover(cx: &mut TestAppContext) {
-        use gpui::{px, Modifiers};
-        let _ = px(0.); // ensure px is used (silences any unused-import lint)
+        use gpui::{point, px, Modifiers};
 
         // Reuse the Task 1 setup helper (deeply-nested changeset, 360×200 window).
         let (_window, mut visual) = open_deeply_nested_changeset_at_360x200(cx);
@@ -7094,6 +7099,15 @@ mod tests {
         assert!(
             visual.debug_bounds("file-tree-scrollbar").is_some(),
             "scrollbar overlay should appear while the cursor is over the panel"
+        );
+
+        // Move the cursor outside the panel; the overlay should disappear.
+        visual.simulate_mouse_move(point(px(-10.), px(-10.)), None, Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            visual.debug_bounds("file-tree-scrollbar").is_none(),
+            "scrollbar overlay should disappear when the cursor leaves the panel"
         );
     }
 
