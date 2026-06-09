@@ -4,8 +4,8 @@
 //! docs/superpowers/specs/2026-06-07-titlebar-context-switcher-design.md.
 
 use gpui::{
-    div, px, rgb, AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement as _, Styled,
+    div, px, rgb, AnyElement, Context, Div, InteractiveElement, IntoElement, ParentElement,
+    Stateful, StatefulInteractiveElement as _, Styled,
 };
 use gpui_component::{TitleBar, TITLE_BAR_HEIGHT};
 
@@ -119,6 +119,30 @@ fn changeset_line_totals(changeset: &ChangeSet) -> (usize, usize) {
         })
 }
 
+/// Shared chrome for the two window-chrome switchers (repo and diff context).
+/// At rest the switcher is plain text; on hover a subtle neutral pill appears,
+/// and while its popover is `open` a stronger fill marks it as pressed. The
+/// caller adds its own `on_click` handler and child label.
+fn switcher_pill(id: &'static str, text_color: u32, open: bool) -> Stateful<Div> {
+    let hover_bg = rgb(0x2a2a2a);
+    let active_bg = rgb(0x3a3a3a);
+    let pill = div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .font_family("monospace")
+        .text_size(px(13.))
+        .text_color(rgb(text_color))
+        .px_2()
+        .py_0p5()
+        .rounded_md()
+        .cursor_pointer();
+    if open {
+        pill.bg(active_bg).hover(move |s| s.bg(active_bg))
+    } else {
+        pill.hover(move |s| s.bg(hover_bg))
+    }
+}
+
 impl App {
     /// The window-chrome title bar. Always shows the repo name when a
     /// repository is open; in changeset mode it also shows the clickable
@@ -128,13 +152,7 @@ impl App {
             Mode::RepoOpen { repo } => {
                 let repo_name = super::repository_title(&repo.path);
                 let mut row = div().flex().items_center().child(
-                    div()
-                        .id("title-bar-repo")
-                        .debug_selector(|| "title-bar-repo".to_string())
-                        .font_family("monospace")
-                        .text_size(px(13.))
-                        .text_color(rgb(0xe6e6e6))
-                        .cursor_pointer()
+                    switcher_pill("title-bar-repo", 0xe6e6e6, self.repo_switcher_open)
                         .on_click(cx.listener(|app, _event, _window, cx| {
                             app.repo_switcher_open = !app.repo_switcher_open;
                             app.context_popover_open = false;
@@ -154,13 +172,7 @@ impl App {
                                 .child("/"),
                         )
                         .child(
-                            div()
-                                .id("title-bar-context")
-                                .debug_selector(|| "title-bar-context".to_string())
-                                .font_family("monospace")
-                                .text_size(px(13.))
-                                .text_color(rgb(0xdbeafe))
-                                .cursor_pointer()
+                            switcher_pill("title-bar-context", 0xdbeafe, self.context_popover_open)
                                 .on_click(cx.listener(|app, _event, _window, cx| {
                                     app.context_popover_open = !app.context_popover_open;
                                     app.repo_switcher_open = false;
