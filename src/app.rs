@@ -430,6 +430,7 @@ impl App {
         self.file_diff_scroll.reset();
         self.commit_history_scroll.set_offset(point(px(0.), px(0.)));
         self.file_tree_scroll.set_offset(point(px(0.), px(0.)));
+        self.file_tree_hovered = false;
         self.context_popover_open = false;
         self.repo_switcher_open = false;
         cx.notify();
@@ -570,6 +571,7 @@ impl App {
                     self.selected_changed_file_path = None;
                 }
                 self.file_tree_scroll.set_offset(point(px(0.), px(0.)));
+                self.file_tree_hovered = false;
                 let sha = changeset.commit_sha.clone();
                 self.review_screen = ReviewScreen::Changeset { sha, changeset };
                 self.context_popover_open = false;
@@ -1456,7 +1458,7 @@ impl App {
                                 .text_color(rgb(0x8a8a8a))
                                 .text_size(px(FILE_TREE_SECONDARY_TEXT_SIZE))
                                 .font_family(FILE_TREE_FONT_FAMILY)
-                                .truncate()
+                                .whitespace_nowrap()
                                 .debug_selector(move || rename_source_selector.clone())
                                 .child(format!("from {old_path}")),
                         )
