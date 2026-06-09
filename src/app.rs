@@ -20,6 +20,7 @@ use gpui::{
 };
 use gpui_component::notification::{Notification, NotificationList};
 use gpui_component::resizable::{h_resizable, resizable_panel, ResizableState};
+use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarShow};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::Icon;
 use similar::{DiffTag, TextDiff};
@@ -71,6 +72,9 @@ pub struct App {
     file_diff_scroll: FileDiffScroll,
     commit_history_scroll: ScrollHandle,
     file_tree_scroll: ScrollHandle,
+    /// True while the cursor is anywhere over the file-tree panel; gates the
+    /// hover-revealed scrollbar overlay.
+    file_tree_hovered: bool,
     changeset_resizable: Entity<ResizableState>,
     focus_handle: FocusHandle,
     /// Whether the title-bar context popover (the diff "switcher") is open.
@@ -328,6 +332,7 @@ impl App {
             file_diff_scroll: FileDiffScroll::new(),
             commit_history_scroll: ScrollHandle::new(),
             file_tree_scroll: ScrollHandle::new(),
+            file_tree_hovered: false,
             changeset_resizable,
             focus_handle,
             context_popover_open: false,
@@ -1142,9 +1147,32 @@ impl App {
             .h_full()
             .min_h_0()
             .id("changed-files")
+            .debug_selector(|| "changed-files".to_string())
             .border_1()
             .border_color(rgb(0x242424))
+            .on_hover(cx.listener(|app, hovered: &bool, _window, cx| {
+                if app.file_tree_hovered != *hovered {
+                    app.file_tree_hovered = *hovered;
+                    cx.notify();
+                }
+            }))
             .child(list_content)
+            .when(self.file_tree_hovered, |container| {
+                container.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .debug_selector(|| "file-tree-scrollbar".to_string())
+                        .child(
+                            Scrollbar::new(&self.file_tree_scroll)
+                                .axis(ScrollbarAxis::Both)
+                                .scrollbar_show(ScrollbarShow::Always),
+                        ),
+                )
+            })
             .child(self.render_file_tree_controls(folder_defaults, cx))
     }
 
@@ -7039,6 +7067,33 @@ mod tests {
              folder={:?}, file={:?}",
             folder_bounds.size.width,
             file_bounds.size.width,
+        );
+    }
+
+    #[gpui::test]
+    async fn file_tree_scrollbar_reveals_on_panel_hover(cx: &mut TestAppContext) {
+        use gpui::{px, Modifiers};
+        let _ = px(0.); // ensure px is used (silences any unused-import lint)
+
+        // Reuse the Task 1 setup helper (deeply-nested changeset, 360×200 window).
+        let (_window, mut visual) = open_deeply_nested_changeset_at_360x200(cx);
+
+        // Not hovered: no scrollbar overlay is rendered.
+        assert!(
+            visual.debug_bounds("file-tree-scrollbar").is_none(),
+            "scrollbar overlay should be hidden until the panel is hovered"
+        );
+
+        // Move the cursor into the file-tree panel.
+        let panel = visual
+            .debug_bounds("changed-files")
+            .expect("file tree panel bounds");
+        visual.simulate_mouse_move(panel.center(), None, Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            visual.debug_bounds("file-tree-scrollbar").is_some(),
+            "scrollbar overlay should appear while the cursor is over the panel"
         );
     }
 
