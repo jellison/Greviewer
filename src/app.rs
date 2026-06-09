@@ -1454,7 +1454,7 @@ impl App {
                                 .font_family(FILE_TREE_FONT_FAMILY)
                                 .whitespace_nowrap()
                                 .debug_selector(move || rename_source_selector.clone())
-                                .child(format!("from {old_path}")),
+                                .child(format!("(from {old_path})")),
                         )
                     }),
             )
