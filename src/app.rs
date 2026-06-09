@@ -564,6 +564,7 @@ impl App {
                 {
                     self.selected_changed_file_path = None;
                 }
+                self.file_tree_scroll.set_offset(point(px(0.), px(0.)));
                 let sha = changeset.commit_sha.clone();
                 self.review_screen = ReviewScreen::Changeset { sha, changeset };
                 self.context_popover_open = false;
@@ -1109,6 +1110,8 @@ impl App {
             div()
                 .flex()
                 .flex_col()
+                // items_start() prevents the cross-axis stretch that would pin the
+                // inner wrapper to the viewport width, defeating horizontal scrolling.
                 .items_start()
                 .flex_1()
                 .min_h_0()
@@ -1117,6 +1120,10 @@ impl App {
                 .overflow_scroll()
                 .track_scroll(&self.file_tree_scroll)
                 .child(
+                    // Inner flex_none wrapper sizes to the widest row's natural
+                    // width instead of being stretched to the viewport, which is
+                    // what enables horizontal scrolling. Every row uses w_full() to
+                    // fill this wrapper so all rows share a uniform background width.
                     div().flex().flex_col().flex_none().children(
                         rows.iter()
                             .enumerate()
@@ -6920,8 +6927,17 @@ mod tests {
             .expect("oldest loaded commit row debug bounds");
     }
 
-    #[gpui::test]
-    async fn file_tree_scrolls_both_axes(cx: &mut TestAppContext) {
+    /// Open a deeply-nested-long-paths repo, select its single commit, open the
+    /// changeset view, and resize the window to 360×200. Returns the window
+    /// handle (for `read_with` access to app state) and the visual context (for
+    /// `debug_bounds` / simulate calls).
+    ///
+    /// Both `file_tree_scrolls_both_axes` and `file_tree_rows_are_uniform_width`
+    /// share this setup; extract here to keep each test focused on its own
+    /// assertions.
+    fn open_deeply_nested_changeset_at_360x200(
+        cx: &mut TestAppContext,
+    ) -> (WindowHandle<App>, VisualTestContext) {
         use gpui::{px, size};
 
         let (dir, sha) = init_repo_with_deeply_nested_long_paths();
@@ -6948,6 +6964,15 @@ mod tests {
         visual.simulate_resize(size(px(360.), px(200.)));
         cx.run_until_parked();
 
+        (window, visual)
+    }
+
+    #[gpui::test]
+    async fn file_tree_scrolls_both_axes(cx: &mut TestAppContext) {
+        use gpui::px;
+
+        let (window, mut visual) = open_deeply_nested_changeset_at_360x200(cx);
+
         // Query bounds to ensure a layout pass has occurred, then read scroll state.
         visual
             .debug_bounds("changed-files-scroll")
@@ -6970,29 +6995,9 @@ mod tests {
 
     #[gpui::test]
     async fn file_tree_rows_are_uniform_width(cx: &mut TestAppContext) {
-        use gpui::{px, size};
+        use gpui::px;
 
-        let (dir, sha) = init_repo_with_deeply_nested_long_paths();
-        let path = dir.path().to_path_buf();
-        let window = add_app_window(cx);
-
-        window
-            .update(cx, |app, window, cx| {
-                app.open_repository_at(path, window, cx);
-                app.select_single_commit(sha.clone(), cx);
-            })
-            .expect("open repo and select commit");
-        cx.run_until_parked();
-
-        let mut visual = VisualTestContext::from_window(*window, cx);
-        let open_bounds = visual
-            .debug_bounds("open-changeset")
-            .expect("open-changeset button must be visible after selecting a commit");
-        visual.simulate_click(open_bounds.center(), Modifiers::none());
-        cx.run_until_parked();
-
-        visual.simulate_resize(size(px(360.), px(200.)));
-        cx.run_until_parked();
+        let (_window, mut visual) = open_deeply_nested_changeset_at_360x200(cx);
 
         // The folder row "deeply" (index 0) has short content. The fixture's
         // deep_dir has 7 components, so folder rows occupy indices 0-6; the first
@@ -7005,6 +7010,12 @@ mod tests {
         let folder_bounds = visual
             .debug_bounds("file-tree-folder-deeply")
             .expect("top-level folder row must be rendered");
+        // NOTE: "changed-file-row-7" is index 7 because deep_dir
+        // ("deeply/nested/directory/structure/that/keeps/going") has exactly 7
+        // path components, placing folder rows at indices 0–6 and the first file
+        // row at index 7. If deep_dir in init_repo_with_deeply_nested_long_paths
+        // is ever changed to a path with a different component count, this index
+        // must be updated to match.
         let file_bounds = visual
             .debug_bounds("changed-file-row-7")
             .expect("first changed-file row (index 7, after 7 folder levels) must be rendered");
