@@ -19,6 +19,16 @@ pub struct OpenRepository {
     pub head: Option<HeadInfo>,
     pub commits: Vec<CommitInfo>,
     pub has_more_commits: bool,
+    pub local_branches: Vec<LocalBranch>,
+}
+
+/// A local branch snapshot taken at open time. `is_head` is true only for
+/// the checked-out branch; a detached HEAD marks no branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBranch {
+    pub name: String,
+    pub tip_sha: String,
+    pub is_head: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +185,7 @@ pub fn open_at(path: &Path) -> Result<OpenRepository, OpenError> {
     let head = head_commit.as_ref().map(head_info_from_commit);
     let checked_out_branch_oid = read_checked_out_branch_oid(&repo)?;
     let branch_names_by_oid = read_local_branch_names_by_oid(&repo)?;
+    let local_branches = read_local_branches(&repo)?;
     let page = read_commit_page(
         &repo,
         head_oid,
@@ -189,6 +200,7 @@ pub fn open_at(path: &Path) -> Result<OpenRepository, OpenError> {
         head,
         commits: page.commits,
         has_more_commits: page.has_more,
+        local_branches,
     })
 }
 
@@ -746,6 +758,32 @@ fn read_local_branch_names_by_oid(
     Ok(branch_names_by_oid)
 }
 
+fn read_local_branches(repo: &git2::Repository) -> Result<Vec<LocalBranch>, OpenError> {
+    let mut local_branches = Vec::new();
+    let branches = repo
+        .branches(Some(git2::BranchType::Local))
+        .map_err(OpenError::Git)?;
+
+    for branch in branches {
+        let (branch, _branch_type) = branch.map_err(OpenError::Git)?;
+        let Some(target_oid) = branch.get().target() else {
+            continue;
+        };
+        let Some(name) = branch.name().map_err(OpenError::Git)? else {
+            continue;
+        };
+
+        local_branches.push(LocalBranch {
+            name: name.to_string(),
+            tip_sha: target_oid.to_string(),
+            is_head: branch.is_head(),
+        });
+    }
+
+    local_branches.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(local_branches)
+}
+
 fn head_info_from_commit(commit: &git2::Commit<'_>) -> HeadInfo {
     HeadInfo {
         short_sha: short_sha(commit.id()),
@@ -1024,6 +1062,74 @@ mod tests {
             "unmerged branch commits interleave newest-first",
         );
         assert!(snapshot.commits[1].is_head, "HEAD stays on the main tip");
+    }
+
+    #[test]
+    fn open_at_returns_local_branches_sorted_with_head_marked() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        let root = commit_tree_to_ref(&repo, Some("HEAD"), "Root", 100, &[]);
+        let main_tip = commit_tree_to_ref(&repo, Some("HEAD"), "Main tip", 200, &[root]);
+        let feature_tip = commit_tree_to_ref(
+            &repo,
+            Some("refs/heads/feature"),
+            "Feature tip",
+            300,
+            &[root],
+        );
+        drop(repo);
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+
+        let summary = snapshot
+            .local_branches
+            .iter()
+            .map(|branch| {
+                (
+                    branch.name.as_str(),
+                    branch.tip_sha.as_str(),
+                    branch.is_head,
+                )
+            })
+            .collect::<Vec<_>>();
+        let feature_sha = feature_tip.to_string();
+        let main_sha = main_tip.to_string();
+        assert_eq!(
+            summary,
+            vec![
+                ("feature", feature_sha.as_str(), false),
+                ("master", main_sha.as_str(), true),
+            ],
+            "local branches sort by name and mark the checked-out branch",
+        );
+    }
+
+    #[test]
+    fn open_at_marks_no_branch_as_head_when_detached() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        let root = commit_tree_to_ref(&repo, Some("HEAD"), "Root", 100, &[]);
+        let tip = commit_tree_to_ref(&repo, Some("HEAD"), "Tip", 200, &[root]);
+        repo.set_head_detached(tip).expect("detach HEAD");
+        drop(repo);
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+
+        assert!(
+            snapshot.local_branches.iter().all(|branch| !branch.is_head),
+            "detached HEAD marks no branch",
+        );
+    }
+
+    #[test]
+    fn open_at_returns_empty_local_branches_for_an_unborn_repo() {
+        let dir = init_unborn_repo();
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+
+        assert!(snapshot.local_branches.is_empty());
     }
 
     #[test]

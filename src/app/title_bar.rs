@@ -542,6 +542,7 @@ mod tests {
             head: None,
             commits,
             has_more_commits: false,
+            local_branches: Vec::new(),
         }
     }
 

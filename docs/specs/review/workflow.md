@@ -106,6 +106,31 @@ The user sees a graphical history of the repository's commits with branch lanes 
   other local branches.
 - Detached-HEAD repositories render normally with no checked-out branch marker.
 
+## Navigating branches from the sidebar
+
+Graph mode includes a sidebar beside the graph listing the repository's local branches by name, in alphabetical order. The sidebar mirrors the graph's scope: local branches only, with remote-tracking branches and tags excluded. The checked-out branch carries a visual marker. Activating a branch focuses it in the graph: the branch's tip commit becomes the selected commit and the graph scrolls so that commit is visible. The divider between the sidebar and the graph is draggable to resize the sidebar. The sidebar exists only in graph mode; review mode shows the file tree in its place.
+
+**Triggering conditions**
+
+- A repository is open and the window is in graph mode.
+- The user activates a branch entry in the sidebar.
+- The user drags the divider between the sidebar and the graph.
+
+**Observable outcomes**
+
+- The sidebar lists every local branch by name, alphabetically, with the checked-out branch visually marked.
+- Activating a branch selects its tip commit and scrolls the graph so the commit is visible.
+- A branch entry whose tip commit is the current selection is visually distinct, using the same selected treatment as the commit row.
+- Dragging the divider resizes the sidebar.
+
+**Edge cases**
+
+- A repository with no local branches shows an explanatory message in place of the list.
+- Detached-HEAD repositories list branches normally with no checked-out marker.
+- Activating a branch whose tip commit has not yet been loaded into the visible history loads older history until the tip appears, then selects and reveals it.
+- Activating a branch whose tip is already the selected commit keeps that selection; it does not clear it.
+- When the branch list exceeds the sidebar's height, it scrolls; a scrollbar appears while the pointer is over the sidebar and stays out of the way otherwise.
+
 ## Selecting commits to review
 
 The user stages a review by selecting either a single commit or a contiguous sequential range from the graph. Selection is tentative: no review activity begins until the user explicitly opens the changeset (described below). Clicking a commit selects it. Shift-clicking a second commit extends the selection to a range, provided the two commits lie on a single ancestry path (one is an ancestor of the other). The selection is the inclusive set of commits between the two endpoints along that path. Clicking the selected commit again clears the selection.
@@ -205,7 +230,7 @@ With a changeset open, the user sees the rollup change set: a file tree containi
 - When the tree's contents exceed the visible area, the user can scroll it both vertically and horizontally; long or deeply nested paths are shown in full and reached by scrolling rather than being abbreviated.
 - Only the file's path scrolls horizontally; each entry's change details (its added and removed line counts) stay pinned in view at the trailing edge so the user can always read them, even while scrolling a long path. Vertical scrolling moves a row's path and its change details together.
 - A scrollbar appears while the user's pointer is over the tree and lets the user drag to scroll; it stays out of the way otherwise. An axis with nothing off-screen shows no scrollbar.
-- Selecting a file opens it for inspection.
+- Selecting a file opens it for inspection in a tab above the diff area (see "Holding files open in tabs").
 
 **Edge cases**
 
@@ -236,6 +261,33 @@ The show-all-files toggle reveals every file in the repository at the newest sel
 
 - The user can manually expand a collapsed folder or collapse an expanded one; manual toggles override the default and persist while the changeset stays open, including across switches between the change-set and all-files views.
 - Collapse-all and expand-all establish a new baseline; subsequent manual folder toggles adjust from there.
+
+## Holding files open in tabs
+
+Opened files live in a row of tabs above the diff area. A single click on a file opens it in the preview tab — a holding slot that subsequent single clicks reuse, so casual browsing never piles up tabs. At most one preview tab exists at a time, and its title renders in italics to signal that the next single click will replace it. Opening a file deliberately — double-clicking it in the tree, or double-clicking the preview tab itself — pins the tab; a pinned tab keeps its file until the user closes it.
+
+**Triggering conditions**
+
+- The user single-clicks or double-clicks a file row while a changeset is open, or clicks, double-clicks, or middle-clicks a tab.
+
+**Observable outcomes**
+
+- Single-clicking a file shows its diff in the preview tab, creating that tab when none exists and otherwise replacing its content in place; the tab keeps its position in the row.
+- Double-clicking a file pins its tab. Double-clicking the preview tab pins it without changing its content.
+- Opening a file that is already open activates the existing tab; a file is never open in two tabs at once, and opening a pinned file never demotes it to preview.
+- A tab's title is the file's name, tinted with the file's change-kind color; files opened from the all-files view that are not part of the change set use the default text color. When two open tabs share a file name, each also shows its parent folder name.
+- Exactly one tab is active; it is visually distinct from the other tabs (raised background and an accent line, with inactive tabs dimmed), and the diff area always shows the active tab's file. Clicking a tab activates it.
+- Every tab offers a close control, revealed on hover and always present on the active tab; middle-clicking a tab also closes it. Closing the active tab activates its right neighbor, or its left neighbor at the end of the row.
+- When more tabs are open than fit the width, the tab row scrolls horizontally and activating a tab brings it into view.
+- Closing every tab returns the diff area to the select-a-file placeholder.
+- Leaving the changeset — closing it or opening a different one — closes all tabs.
+- The file tree's highlighted row follows the user's clicks in the tree; activating a different tab does not move the tree highlight.
+
+**Edge cases**
+
+- Closing the preview tab removes it; the next single click opens a fresh preview tab at the end of the row.
+- Re-opening the changeset after leaving it starts with no tabs open, even if files were open when it was left.
+- Switching between the change-set and all-files views does not close tabs; a tab for a file outside the change set keeps showing its read-only content in either view. Only leaving the changeset closes tabs.
 
 ## Inspecting a file's diff
 

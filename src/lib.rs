@@ -11,6 +11,7 @@ pub mod graph;
 pub mod icons;
 pub mod repo;
 pub mod settings;
+pub mod workspace;
 
 pub fn run() {
     Application::new().with_assets(Assets).run(|cx: &mut App| {

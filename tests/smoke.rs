@@ -2,16 +2,41 @@
 //!
 //! Asserts that booting the root view through the gpui test harness yields the
 //! placeholder state. Grows with each feature slice that adds to the golden path
-//! of `docs/specs/review/workflow.md`.
+//! of `docs/specs/review/workflow.md`: open repo → graph → changeset → click a
+//! file → diff renders in a preview tab → double-click pins the tab.
 
 pub mod common;
 
 use common::QueuedPathPicker;
-use gpui::{Modifiers, TestAppContext, VisualTestContext};
+use gpui::{
+    Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, TestAppContext,
+    VisualTestContext,
+};
 use greviewer::app::{
     bind_app_keys, App, Mode, PathPickerOutcome, ReviewScreen, Selection, OPEN_REPOSITORY_KEYSTROKE,
 };
 use greviewer::repo::ChangeKind;
+
+/// Dispatch a platform-faithful double-click at `position`: a count-1
+/// down/up pair followed by a count-2 down/up pair. The public
+/// `simulate_click` helper hardcodes `click_count: 1`.
+fn simulate_double_click(visual: &mut VisualTestContext, position: Point<Pixels>) {
+    for click_count in [1, 2] {
+        visual.simulate_event(MouseDownEvent {
+            position,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count,
+            first_mouse: false,
+        });
+        visual.simulate_event(MouseUpEvent {
+            position,
+            button: MouseButton::Left,
+            modifiers: Modifiers::none(),
+            click_count,
+        });
+    }
+}
 
 #[gpui::test]
 async fn boots_to_the_placeholder(cx: &mut TestAppContext) {
@@ -98,6 +123,9 @@ async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
     visual
         .debug_bounds("file-diff-row-added")
         .expect("added line row debug bounds");
+    visual
+        .debug_bounds("workspace-tab-0")
+        .expect("opening a file shows its tab in the tab bar");
 
     window
         .read_with(cx, |app, _cx| match &app.review_screen {
@@ -106,11 +134,29 @@ async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
                 assert_eq!(changeset.files[0].path, "hello.txt");
                 assert_eq!(changeset.files[0].kind, ChangeKind::Modified);
                 assert_eq!(
-                    app.selected_changed_file_path,
+                    app.workspace
+                        .active_item()
+                        .map(|item| item.path().to_string()),
                     Some("hello.txt".to_string()),
+                );
+                assert!(
+                    app.workspace.is_preview(0),
+                    "single-click opens a preview tab"
                 );
             }
             ReviewScreen::Graph => panic!("expected changeset review screen"),
         })
         .expect("read changeset state");
+
+    let row_bounds = visual
+        .debug_bounds("selected-changed-file-row-0")
+        .expect("selected changed file row debug bounds");
+    simulate_double_click(&mut visual, row_bounds.center());
+
+    window
+        .read_with(cx, |app, _cx| {
+            assert_eq!(app.workspace.tabs().len(), 1);
+            assert!(!app.workspace.is_preview(0), "double-click pins the tab");
+        })
+        .expect("read pinned state");
 }

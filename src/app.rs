@@ -31,6 +31,7 @@ use std::{
 
 use crate::icons::LucideIcon;
 use crate::settings::{self, RecentRepository, Settings, MAX_RECENT_REPOSITORIES};
+use crate::workspace::FileDiffItem;
 use crate::{graph, repo};
 
 actions!(
@@ -43,7 +44,7 @@ actions!(
     ]
 );
 
-const FILE_TREE_FONT_FAMILY: &str = "BerkeleyMono Nerd Font";
+pub(crate) const FILE_TREE_FONT_FAMILY: &str = "BerkeleyMono Nerd Font";
 const FILE_TREE_INDENT_WIDTH: f32 = 16.;
 const FILE_TREE_ROW_HEIGHT: f32 = 24.;
 const FILE_TREE_TEXT_SIZE: f32 = 14.;
@@ -59,12 +60,19 @@ const FILE_TREE_CONTROL_BUTTON_SIZE: f32 = 22.;
 const FILE_TREE_CONTROL_ICON_SIZE: f32 = 15.;
 const FILE_TREE_DIFF_STAT_WIDTH: f32 = 68.;
 const FILE_TREE_STAT_GUTTER_WIDTH: f32 = 84.; // diff-stat width + horizontal cell padding
+const BRANCH_SIDEBAR_DEFAULT_WIDTH: f32 = 240.;
 
 pub struct App {
     pub mode: Mode,
     pub selection: Selection,
     pub review_screen: ReviewScreen,
-    pub selected_changed_file_path: Option<String>,
+    /// Open diff tabs. Source of truth for what the detail area shows.
+    pub workspace: crate::workspace::Workspace,
+    /// Last file row the user clicked. Drives the tree highlight only; tab
+    /// activation deliberately does not move it (spec: tree is click-driven).
+    pub file_tree_highlight_path: Option<String>,
+    /// Horizontal scroll for the tab strip.
+    tab_bar_scroll: ScrollHandle,
     pub file_list_mode: FileListMode,
     pub settings: Settings,
     collapsed_file_tree_paths: BTreeSet<String>,
@@ -81,6 +89,11 @@ pub struct App {
     /// hover-revealed scrollbar overlay.
     file_tree_hovered: bool,
     changeset_resizable: Entity<ResizableState>,
+    graph_resizable: Entity<ResizableState>,
+    branch_sidebar_scroll: ScrollHandle,
+    /// True while the cursor is anywhere over the branch sidebar; gates its
+    /// hover-revealed scrollbar overlay.
+    branch_sidebar_hovered: bool,
     focus_handle: FocusHandle,
     /// Whether the title-bar context popover (the diff "switcher") is open.
     context_popover_open: bool,
@@ -290,6 +303,7 @@ impl App {
     ) -> Self {
         let notifications = cx.new(|cx| NotificationList::new(window, cx));
         let changeset_resizable = cx.new(|_| ResizableState::default());
+        let graph_resizable = cx.new(|_| ResizableState::default());
         let focus_handle = cx.focus_handle();
 
         window.focus(&focus_handle);
@@ -327,7 +341,9 @@ impl App {
             mode,
             selection: Selection::None,
             review_screen: ReviewScreen::Graph,
-            selected_changed_file_path: None,
+            workspace: crate::workspace::Workspace::new(),
+            file_tree_highlight_path: None,
+            tab_bar_scroll: ScrollHandle::new(),
             file_list_mode: FileListMode::Changed,
             settings,
             collapsed_file_tree_paths: BTreeSet::new(),
@@ -340,6 +356,9 @@ impl App {
             file_tree_hscroll: ScrollHandle::new(),
             file_tree_hovered: false,
             changeset_resizable,
+            graph_resizable,
+            branch_sidebar_scroll: ScrollHandle::new(),
+            branch_sidebar_hovered: false,
             focus_handle,
             context_popover_open: false,
             repo_switcher_open: false,
@@ -428,15 +447,19 @@ impl App {
         self.mode = Mode::RepoOpen { repo };
         self.selection = Selection::None;
         self.review_screen = ReviewScreen::Graph;
-        self.selected_changed_file_path = None;
+        self.workspace.clear();
+        self.file_tree_highlight_path = None;
         self.file_list_mode = FileListMode::Changed;
         self.collapsed_file_tree_paths.clear();
         self.record_recent_repository(recent_path);
         self.persist_settings();
         self.file_diff_scroll.reset();
+        self.tab_bar_scroll.set_offset(point(px(0.), px(0.)));
         self.commit_history_scroll.set_offset(point(px(0.), px(0.)));
         self.file_tree_scroll.set_offset(point(px(0.), px(0.)));
         self.file_tree_hscroll.set_offset(point(px(0.), px(0.)));
+        self.branch_sidebar_scroll.set_offset(point(px(0.), px(0.)));
+        self.branch_sidebar_hovered = false;
         self.file_tree_hovered = false;
         self.context_popover_open = false;
         self.repo_switcher_open = false;
@@ -475,12 +498,72 @@ impl App {
         }
     }
 
-    fn select_single_commit(&mut self, sha: String, cx: &mut Context<Self>) {
+    pub(crate) fn select_single_commit(&mut self, sha: String, cx: &mut Context<Self>) {
         self.selection = match &self.selection {
             Selection::Single { sha: selected_sha } if selected_sha == &sha => Selection::None,
             _ => Selection::Single { sha },
         };
         cx.notify();
+    }
+
+    /// Select a branch's tip commit and bring its row into view, paging in
+    /// older history first when the tip has not been loaded yet. The revwalk
+    /// behind `load_older_commits` pushes every local branch tip, so paging
+    /// always reaches the commit unless loading itself fails.
+    fn focus_branch(&mut self, tip_sha: String, window: &mut Window, cx: &mut Context<Self>) {
+        let (commit_index, commit_count) = loop {
+            let (tip_index, can_load_more, loaded_count) = match &self.mode {
+                Mode::RepoOpen { repo } => (
+                    repo.commits.iter().position(|commit| commit.sha == tip_sha),
+                    repo.has_more_commits,
+                    repo.commits.len(),
+                ),
+                Mode::NoRepo => return,
+            };
+            if let Some(index) = tip_index {
+                break (index, loaded_count);
+            }
+            if !can_load_more {
+                return;
+            }
+
+            self.load_older_commits(window, cx);
+
+            let loaded_count_after = match &self.mode {
+                Mode::RepoOpen { repo } => repo.commits.len(),
+                Mode::NoRepo => return,
+            };
+            if loaded_count_after == loaded_count {
+                // Paging failed; the error is already on the notification
+                // list, so stop rather than loop forever.
+                return;
+            }
+        };
+
+        self.selection = Selection::Single { sha: tip_sha };
+        self.scroll_commit_row_into_view(commit_index, commit_count);
+        cx.notify();
+    }
+
+    /// Center the commit row at `index` in the history viewport, clamped to
+    /// the scrollable range. Content height comes from the commit count
+    /// rather than the scroll handle's max offset, which is stale when this
+    /// runs in the same frame that paged in more commits.
+    fn scroll_commit_row_into_view(&self, index: usize, commit_count: usize) {
+        let viewport_height = self.commit_history_scroll.bounds().size.height;
+        let row_top = px(index as f32 * COMMIT_ROW_HEIGHT);
+        if viewport_height <= px(0.) {
+            // Not laid out yet; pin the row to the top rather than centering
+            // against a zero-height viewport.
+            self.commit_history_scroll
+                .set_offset(point(px(0.), -row_top));
+            return;
+        }
+        let centered_top = row_top - (viewport_height - px(COMMIT_ROW_HEIGHT)) / 2.;
+        let content_height = px(commit_count as f32 * COMMIT_ROW_HEIGHT);
+        let max_offset = (content_height - viewport_height).max(px(0.));
+        let target = (-centered_top).clamp(-max_offset, px(0.));
+        self.commit_history_scroll.set_offset(point(px(0.), target));
     }
 
     fn select_commit(
@@ -570,13 +653,10 @@ impl App {
 
         match changeset {
             Ok(changeset) => {
-                if !self
-                    .selected_changed_file_path
-                    .as_ref()
-                    .is_some_and(|path| changeset.files.iter().any(|file| &file.path == path))
-                {
-                    self.selected_changed_file_path = None;
-                }
+                self.workspace.clear();
+                self.file_tree_highlight_path = None;
+                self.file_diff_scroll.reset();
+                self.tab_bar_scroll.set_offset(point(px(0.), px(0.)));
                 self.file_tree_scroll.set_offset(point(px(0.), px(0.)));
                 self.file_tree_hscroll.set_offset(point(px(0.), px(0.)));
                 self.file_tree_hovered = false;
@@ -592,6 +672,10 @@ impl App {
     fn close_changeset(&mut self, cx: &mut Context<Self>) {
         self.review_screen = ReviewScreen::Graph;
         self.context_popover_open = false;
+        self.workspace.clear();
+        self.file_tree_highlight_path = None;
+        self.file_diff_scroll.reset();
+        self.tab_bar_scroll.set_offset(point(px(0.), px(0.)));
         cx.notify();
     }
 
@@ -600,9 +684,54 @@ impl App {
         cx.quit();
     }
 
-    fn select_changed_file(&mut self, path: String, cx: &mut Context<Self>) {
-        self.file_diff_scroll.reset();
-        self.selected_changed_file_path = Some(path);
+    fn open_file_preview(&mut self, path: String, cx: &mut Context<Self>) {
+        self.file_tree_highlight_path = Some(path.clone());
+        if self
+            .workspace
+            .open_preview(Box::new(FileDiffItem::new(path)))
+        {
+            self.file_diff_scroll.reset();
+        }
+        if let Some(index) = self.workspace.active_index() {
+            self.tab_bar_scroll.scroll_to_item(index);
+        }
+        cx.notify();
+    }
+
+    fn open_file_pinned(&mut self, path: String, cx: &mut Context<Self>) {
+        self.file_tree_highlight_path = Some(path.clone());
+        if self
+            .workspace
+            .open_pinned(Box::new(FileDiffItem::new(path)))
+        {
+            self.file_diff_scroll.reset();
+        }
+        if let Some(index) = self.workspace.active_index() {
+            self.tab_bar_scroll.scroll_to_item(index);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn activate_workspace_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.workspace.activate_tab(index) {
+            self.file_diff_scroll.reset();
+        }
+        self.tab_bar_scroll.scroll_to_item(index);
+        cx.notify();
+    }
+
+    pub(crate) fn promote_workspace_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.workspace.promote_tab(index);
+        cx.notify();
+    }
+
+    pub(crate) fn close_workspace_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.workspace.close_tab(index) {
+            self.file_diff_scroll.reset();
+            if let Some(index) = self.workspace.active_index() {
+                self.tab_bar_scroll.scroll_to_item(index);
+            }
+        }
         cx.notify();
     }
 
@@ -732,8 +861,10 @@ impl App {
         }
     }
 
-    fn is_file_path_selected(&self, path: &str) -> bool {
-        self.selected_changed_file_path.as_deref() == Some(path)
+    /// Whether the tree row at `path` carries the click-driven highlight. The
+    /// workspace's active tab deliberately does not feed this.
+    fn is_file_path_highlighted(&self, path: &str) -> bool {
+        self.file_tree_highlight_path.as_deref() == Some(path)
     }
 
     #[cfg(test)]
@@ -994,7 +1125,7 @@ impl App {
                 )
         };
 
-        div()
+        let history_panel = div()
             .relative()
             .flex()
             .flex_col()
@@ -1028,6 +1159,165 @@ impl App {
                         }))
                         .child("Open changeset"),
                 )
+            });
+
+        div()
+            .flex()
+            .w_full()
+            .h_full()
+            .min_h_0()
+            .bg(rgb(0x171717))
+            .child(
+                h_resizable("graph-split")
+                    .with_state(&self.graph_resizable)
+                    .child(
+                        resizable_panel()
+                            .size(px(BRANCH_SIDEBAR_DEFAULT_WIDTH))
+                            .child(self.render_branch_sidebar(repo, cx)),
+                    )
+                    .child(resizable_panel().child(history_panel)),
+            )
+    }
+
+    fn render_branch_sidebar(
+        &self,
+        repo: &repo::OpenRepository,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let list_content: AnyElement = if repo.local_branches.is_empty() {
+            div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .id("branch-sidebar-empty")
+                .debug_selector(|| "branch-sidebar-empty".to_string())
+                .text_color(rgb(0x999999))
+                .text_size(px(14.))
+                .child("No branches")
+                .into_any_element()
+        } else {
+            let rows = repo
+                .local_branches
+                .iter()
+                .enumerate()
+                .map(|(index, branch)| self.render_branch_row(index, branch, cx))
+                .collect::<Vec<_>>();
+
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .id("branch-sidebar-scroll")
+                .debug_selector(|| "branch-sidebar-scroll".to_string())
+                .overflow_y_scroll()
+                .track_scroll(&self.branch_sidebar_scroll)
+                .child(div().flex().flex_col().w_full().children(rows))
+                .into_any_element()
+        };
+
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .w_full()
+            .h_full()
+            .min_h_0()
+            .id("branch-sidebar")
+            .debug_selector(|| "branch-sidebar".to_string())
+            .border_1()
+            .border_color(rgb(0x242424))
+            .font_family(FILE_TREE_FONT_FAMILY)
+            .on_hover(cx.listener(|app, hovered: &bool, _window, cx| {
+                if app.branch_sidebar_hovered != *hovered {
+                    app.branch_sidebar_hovered = *hovered;
+                    cx.notify();
+                }
+            }))
+            .child(list_content)
+            .when(self.branch_sidebar_hovered, |container| {
+                container.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .debug_selector(|| "branch-sidebar-scrollbar".to_string())
+                        .child(
+                            Scrollbar::vertical(&self.branch_sidebar_scroll)
+                                .scrollbar_show(ScrollbarShow::Always),
+                        ),
+                )
+            })
+    }
+
+    fn render_branch_row(
+        &self,
+        index: usize,
+        branch: &repo::LocalBranch,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = matches!(
+            &self.selection,
+            Selection::Single { sha } if sha == &branch.tip_sha
+        );
+        let row_bg = if selected {
+            rgb(0x223248)
+        } else {
+            rgb(0x171717)
+        };
+        let name_fragment = debug_ref_label_fragment(&branch.name);
+        let row_selector = if selected {
+            format!("selected-branch-row-{name_fragment}")
+        } else {
+            format!("branch-row-{name_fragment}")
+        };
+        let marker_selector = format!("branch-head-marker-{name_fragment}");
+        let tip_sha = branch.tip_sha.clone();
+
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(FILE_TREE_ROW_HEIGHT))
+            .gap_2()
+            .px_3()
+            .bg(row_bg)
+            .cursor_pointer()
+            .id(("branch-row", index))
+            .debug_selector(move || row_selector.clone())
+            .when(!selected, |row| row.hover(|style| style.bg(rgb(0x1f2733))))
+            .on_click(cx.listener(move |app, _event: &ClickEvent, window, cx| {
+                app.focus_branch(tip_sha.clone(), window, cx);
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_color(if branch.is_head {
+                        rgb(0xa3e635)
+                    } else {
+                        rgb(0xe6e6e6)
+                    })
+                    .text_size(px(FILE_TREE_TEXT_SIZE))
+                    .truncate()
+                    .child(branch.name.clone()),
+            )
+            .when(branch.is_head, |row| {
+                row.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_shrink_0()
+                        .debug_selector(move || marker_selector.clone())
+                        .child(
+                            Icon::new(LucideIcon::Check)
+                                .text_color(rgb(0xa3e635))
+                                .size(px(FILE_TREE_STATUS_ICON_SIZE)),
+                        ),
+                )
             })
     }
 
@@ -1039,10 +1329,10 @@ impl App {
     ) -> gpui::Div {
         let body: AnyElement = match self.file_list_entries(repo, changeset) {
             Ok(entries) => {
-                let selected_path = self
-                    .selected_changed_file_path
-                    .as_deref()
-                    .filter(|path| entries.iter().any(|entry| entry.path() == *path));
+                let active_path = self
+                    .workspace
+                    .active_item()
+                    .map(|item| item.path().to_string());
 
                 div()
                     .flex()
@@ -1056,11 +1346,27 @@ impl App {
                                     .size(px(340.))
                                     .child(self.render_file_list(entries, cx)),
                             )
-                            .child(resizable_panel().child(self.render_file_detail(
-                                repo,
-                                changeset,
-                                selected_path,
-                            ))),
+                            .child(
+                                resizable_panel().child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .h_full()
+                                        .child(crate::workspace::tab_bar::render_tab_bar(
+                                            &self.workspace,
+                                            changeset,
+                                            &self.tab_bar_scroll,
+                                            cx,
+                                        ))
+                                        .child(self.render_file_detail(
+                                            repo,
+                                            changeset,
+                                            active_path.as_deref(),
+                                        )),
+                                ),
+                            ),
                     )
                     .into_any_element()
             }
@@ -1375,7 +1681,7 @@ impl App {
                 .render_file_tree_folder_row(index, name, path, *depth, *collapsed, cx)
                 .into_any_element(),
             FileTreeRow::File { name, entry, depth } => {
-                let selected = self.is_file_path_selected(row.path());
+                let selected = self.is_file_path_highlighted(row.path());
                 match entry {
                     FileListEntry::Changed(file) => self
                         .render_changed_file_row(index, file, selected, *depth, name, cx)
@@ -1417,7 +1723,7 @@ impl App {
                 entry: FileListEntry::Changed(file),
                 ..
             } => {
-                let selected = self.is_file_path_selected(row.path());
+                let selected = self.is_file_path_highlighted(row.path());
                 let path = file.path.clone();
                 let path_fragment = debug_path_fragment(&file.path);
                 let diff_stat_selector = format!("changed-file-diff-stat-{path_fragment}");
@@ -1426,8 +1732,12 @@ impl App {
                     .cursor_pointer()
                     .id(("changed-file-gutter", index))
                     .debug_selector(move || gutter_selector.clone())
-                    .on_click(cx.listener(move |app, _event, _window, cx| {
-                        app.select_changed_file(path.clone(), cx);
+                    .on_click(cx.listener(move |app, event: &ClickEvent, _window, cx| {
+                        if event.click_count() >= 2 {
+                            app.open_file_pinned(path.clone(), cx);
+                        } else {
+                            app.open_file_preview(path.clone(), cx);
+                        }
                     }))
                     .child(render_file_diff_stat(diff_stat_selector, file.line_stats))
                     .into_any_element()
@@ -1520,8 +1830,12 @@ impl App {
             .cursor_pointer()
             .id(("changed-file-row", index))
             .debug_selector(move || debug_selector.clone())
-            .on_click(cx.listener(move |app, _event, _window, cx| {
-                app.select_changed_file(path.clone(), cx);
+            .on_click(cx.listener(move |app, event: &ClickEvent, _window, cx| {
+                if event.click_count() >= 2 {
+                    app.open_file_pinned(path.clone(), cx);
+                } else {
+                    app.open_file_preview(path.clone(), cx);
+                }
             }))
             .child(render_file_tree_indent_guides(depth, &path_fragment))
             .child(render_change_status_icon(
@@ -1602,8 +1916,12 @@ impl App {
             .cursor_pointer()
             .id(("unchanged-file-row", index))
             .debug_selector(move || debug_selector.clone())
-            .on_click(cx.listener(move |app, _event, _window, cx| {
-                app.select_changed_file(path.clone(), cx);
+            .on_click(cx.listener(move |app, event: &ClickEvent, _window, cx| {
+                if event.click_count() >= 2 {
+                    app.open_file_pinned(path.clone(), cx);
+                } else {
+                    app.open_file_preview(path.clone(), cx);
+                }
             }))
             .child(render_file_tree_indent_guides(
                 depth,
@@ -1645,6 +1963,7 @@ impl App {
                 .flex_1()
                 .h_full()
                 .id("file-detail-empty")
+                .debug_selector(|| "file-detail-empty".to_string())
                 .items_center()
                 .justify_center()
                 .text_color(rgb(0x999999))
@@ -3900,7 +4219,7 @@ fn change_kind_border(kind: repo::ChangeKind) -> gpui::Rgba {
     }
 }
 
-fn change_kind_text(kind: repo::ChangeKind) -> gpui::Rgba {
+pub(crate) fn change_kind_text(kind: repo::ChangeKind) -> gpui::Rgba {
     match kind {
         repo::ChangeKind::Added => rgb(0xb8f77a),
         repo::ChangeKind::Modified => rgb(0x7da4ff),
@@ -4531,6 +4850,27 @@ mod tests {
         (dir, update_oid.to_string())
     }
 
+    /// Two commits on master (HEAD at the tip) plus a `feature` branch pointing
+    /// at the root commit. Returns (dir, master_tip_sha, root_sha).
+    fn init_repo_with_feature_branch() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("hello.txt"), "hello\n").expect("write file");
+        let root_oid = commit_all(&repo, "Root", &[]);
+
+        fs::write(dir.path().join("hello.txt"), "main\n").expect("update file");
+        let main_tip = commit_all(&repo, "Main tip", &[root_oid]);
+
+        let root_commit = repo.find_commit(root_oid).expect("find root commit");
+        repo.branch("feature", &root_commit, false)
+            .expect("create feature branch");
+
+        drop(root_commit);
+        drop(repo);
+        (dir, main_tip.to_string(), root_oid.to_string())
+    }
+
     fn init_repo_with_detached_head() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("create tempdir");
         let repo = Repository::init(dir.path()).expect("init repo");
@@ -4544,6 +4884,25 @@ mod tests {
 
         drop(repo);
 
+        (dir, tip_oid.to_string())
+    }
+
+    /// One commit with HEAD detached and the initial branch deleted, so the
+    /// repository has zero local branches.
+    fn init_repo_with_detached_head_no_branches() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("solo.txt"), "solo\n").expect("write file");
+        let tip_oid = commit_all(&repo, "Solo", &[]);
+        repo.set_head_detached(tip_oid).expect("detach HEAD");
+        let mut branch = repo
+            .find_branch("master", git2::BranchType::Local)
+            .expect("find master");
+        branch.delete().expect("delete master");
+
+        drop(branch);
+        drop(repo);
         (dir, tip_oid.to_string())
     }
 
@@ -4758,6 +5117,7 @@ mod tests {
                 head,
                 commits,
                 has_more_commits: false,
+                local_branches: Vec::new(),
             },
         };
     }
@@ -5140,6 +5500,177 @@ mod tests {
             visual.debug_bounds("open-changeset").is_none(),
             "unborn repos should not offer opening a changeset"
         );
+    }
+
+    #[gpui::test]
+    async fn graph_mode_lists_local_branches_with_head_marked(cx: &mut TestAppContext) {
+        let (dir, _main_tip, _root) = init_repo_with_feature_branch();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("branch-row-feature")
+            .expect("feature branch row renders");
+        visual
+            .debug_bounds("branch-row-master")
+            .expect("master branch row renders");
+        visual
+            .debug_bounds("branch-head-marker-master")
+            .expect("checked-out branch carries the HEAD marker");
+        assert!(
+            visual.debug_bounds("branch-head-marker-feature").is_none(),
+            "non-checked-out branch has no HEAD marker",
+        );
+    }
+
+    #[gpui::test]
+    async fn changeset_mode_renders_no_branch_sidebar(cx: &mut TestAppContext) {
+        let (dir, main_tip, _root) = init_repo_with_feature_branch();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(main_tip, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open changeset");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(
+            visual.debug_bounds("branch-sidebar").is_none(),
+            "changeset mode has no branch sidebar",
+        );
+        visual
+            .debug_bounds("changed-files")
+            .expect("changeset file tree still renders");
+    }
+
+    #[gpui::test]
+    async fn clicking_a_branch_selects_and_reveals_its_tip_commit(cx: &mut TestAppContext) {
+        let (dir, _main_tip, _root) = init_repo_with_feature_branch();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let feature_row = visual
+            .debug_bounds("branch-row-feature")
+            .expect("feature branch row renders");
+        visual.simulate_click(feature_row.center(), Modifiers::none());
+
+        // The feature branch points at the root commit, which renders at index 1
+        // (newest-first: master tip, then root).
+        visual
+            .debug_bounds("selected-commit-row-1")
+            .expect("feature tip commit becomes the selected row");
+        visual
+            .debug_bounds("selected-branch-row-feature")
+            .expect("the branch row reflects the selection");
+    }
+
+    #[gpui::test]
+    async fn clicking_a_branch_pages_in_history_until_its_tip_is_loaded(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("history.txt"), "base\n").expect("write file");
+        let base_oid = commit_all(&repo, "Base", &[]);
+        let base_commit = repo.find_commit(base_oid).expect("find base commit");
+        repo.branch("old-base", &base_commit, false)
+            .expect("create old-base branch");
+        drop(base_commit);
+
+        let mut parent = base_oid;
+        for index in 0..(INITIAL_COMMIT_LIMIT + 1) {
+            fs::write(dir.path().join("history.txt"), format!("commit {index}\n"))
+                .expect("write history file");
+            parent = commit_all(&repo, &format!("Commit {index}"), &[parent]);
+        }
+        drop(repo);
+
+        let base_sha = base_oid.to_string();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+
+        cx.run_until_parked();
+
+        // The branch tip is beyond the initial page, yet the sidebar lists it.
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let branch_row = visual
+            .debug_bounds("branch-row-old-base")
+            .expect("old-base branch row renders even though its tip is unloaded");
+        visual.simulate_click(branch_row.center(), Modifiers::none());
+
+        window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("repository stays open");
+                };
+                assert!(
+                    repo.commits.iter().any(|commit| commit.sha == base_sha),
+                    "clicking the branch paged its tip commit into the history",
+                );
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: base_sha.clone()
+                    },
+                    "the branch tip commit is selected",
+                );
+                let offset = app.commit_history_scroll.offset();
+                assert!(
+                    offset.y < px(-1000.),
+                    "focusing a deep branch tip scrolled the history substantially, got {:?}",
+                    offset.y
+                );
+            })
+            .expect("inspect state");
+    }
+
+    #[gpui::test]
+    async fn branch_sidebar_shows_placeholder_when_repo_has_no_branches(cx: &mut TestAppContext) {
+        let (dir, _tip) = init_repo_with_detached_head_no_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("branch-sidebar-empty")
+            .expect("empty branch sidebar shows the placeholder");
     }
 
     #[gpui::test]
@@ -6829,6 +7360,7 @@ mod tests {
                             is_head: true,
                         }],
                         has_more_commits: false,
+                        local_branches: Vec::new(),
                     },
                 };
                 cx.notify();
@@ -7022,6 +7554,7 @@ mod tests {
                             is_head: false,
                         }],
                         has_more_commits: false,
+                        local_branches: Vec::new(),
                     },
                 };
                 cx.notify();
@@ -7529,7 +8062,13 @@ mod tests {
         window
             .read_with(cx, |app, _cx| {
                 assert_eq!(
-                    app.selected_changed_file_path,
+                    app.workspace
+                        .active_item()
+                        .map(|item| item.path().to_string()),
+                    Some("context.txt".to_string()),
+                );
+                assert_eq!(
+                    app.file_tree_highlight_path,
                     Some("context.txt".to_string()),
                 );
             })
@@ -8054,7 +8593,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn selecting_changed_file_records_path(cx: &mut TestAppContext) {
+    async fn opening_file_preview_records_tab_and_highlight(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
@@ -8064,18 +8603,21 @@ mod tests {
                 app.open_repository_at(path, window, cx);
                 app.select_single_commit(oid_hex, cx);
                 app.open_changeset(window, cx);
-                app.select_changed_file("hello.txt".to_string(), cx);
+                app.open_file_preview("hello.txt".to_string(), cx);
 
                 assert_eq!(
-                    app.selected_changed_file_path,
+                    app.workspace
+                        .active_item()
+                        .map(|item| item.path().to_string()),
                     Some("hello.txt".to_string()),
                 );
+                assert_eq!(app.file_tree_highlight_path, Some("hello.txt".to_string()));
             })
-            .expect("select changed file");
+            .expect("open file preview");
     }
 
     #[gpui::test]
-    async fn reopening_changeset_preserves_valid_changed_file_selection(cx: &mut TestAppContext) {
+    async fn reopening_a_changeset_starts_with_no_tabs(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
@@ -8085,20 +8627,18 @@ mod tests {
                 app.open_repository_at(path, window, cx);
                 app.select_single_commit(oid_hex, cx);
                 app.open_changeset(window, cx);
-                app.select_changed_file("hello.txt".to_string(), cx);
+                app.open_file_preview("hello.txt".to_string(), cx);
                 app.close_changeset(cx);
                 app.open_changeset(window, cx);
 
-                assert_eq!(
-                    app.selected_changed_file_path,
-                    Some("hello.txt".to_string()),
-                );
+                assert!(app.workspace.tabs().is_empty());
+                assert_eq!(app.file_tree_highlight_path, None);
             })
             .expect("reopen changeset");
     }
 
     #[gpui::test]
-    async fn opening_changeset_clears_stale_changed_file_selection(cx: &mut TestAppContext) {
+    async fn opening_changeset_clears_tabs_and_highlight(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
@@ -8106,11 +8646,12 @@ mod tests {
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
-                app.selected_changed_file_path = Some("missing.txt".to_string());
+                app.open_file_preview("missing.txt".to_string(), cx);
                 app.select_single_commit(oid_hex, cx);
                 app.open_changeset(window, cx);
 
-                assert_eq!(app.selected_changed_file_path, None);
+                assert!(app.workspace.tabs().is_empty());
+                assert_eq!(app.file_tree_highlight_path, None);
             })
             .expect("open changeset");
     }
@@ -8462,9 +9003,12 @@ mod tests {
         window
             .read_with(cx, |app, _cx| {
                 assert_eq!(
-                    app.selected_changed_file_path,
+                    app.workspace
+                        .active_item()
+                        .map(|item| item.path().to_string()),
                     Some("hello.txt".to_string()),
                 );
+                assert_eq!(app.file_tree_highlight_path, Some("hello.txt".to_string()));
             })
             .expect("read selected changed file");
     }
@@ -8516,8 +9060,12 @@ mod tests {
         window
             .read_with(cx, |app, _cx| {
                 assert!(
-                    app.selected_changed_file_path.is_some(),
-                    "a file should be selected after clicking gutter row 1"
+                    app.workspace.active_item().is_some(),
+                    "a file should be open after clicking gutter row 1"
+                );
+                assert!(
+                    app.file_tree_highlight_path.is_some(),
+                    "a file should be highlighted after clicking gutter row 1"
                 );
             })
             .expect("read selected changed file");
@@ -8735,7 +9283,7 @@ mod tests {
                 app.open_repository_at(path, window, cx);
                 app.select_single_commit(oid_hex, cx);
                 app.open_changeset(window, cx);
-                app.select_changed_file("long.txt".to_string(), cx);
+                app.open_file_preview("long.txt".to_string(), cx);
             })
             .expect("open long diff");
 
@@ -8786,7 +9334,7 @@ mod tests {
                 app.open_repository_at(path, window, cx);
                 app.select_single_commit(oid_hex, cx);
                 app.open_changeset(window, cx);
-                app.select_changed_file("long.txt".to_string(), cx);
+                app.open_file_preview("long.txt".to_string(), cx);
             })
             .expect("open long diff");
 
@@ -8845,7 +9393,7 @@ mod tests {
                 app.open_repository_at(path, window, cx);
                 app.select_single_commit(oid_hex, cx);
                 app.open_changeset(window, cx);
-                app.select_changed_file("long.txt".to_string(), cx);
+                app.open_file_preview("long.txt".to_string(), cx);
             })
             .expect("open long diff");
 

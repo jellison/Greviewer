@@ -8,6 +8,8 @@ use gpui_component::IconNamed;
 /// variant here, map it in `path`, and add it to `ALL`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LucideIcon {
+    /// `check.svg`
+    Check,
     /// `chevrons-down-up.svg`
     ChevronsDownUp,
     /// `chevrons-up-down.svg`
@@ -20,30 +22,36 @@ pub enum LucideIcon {
     SquareMinus,
     /// `square-plus.svg`
     SquarePlus,
+    /// `x.svg`
+    X,
 }
 
 impl LucideIcon {
     /// Every variant, used by tests to assert each has a vendored asset.
     /// Keep in sync with the enum variants when adding or removing an icon.
     pub const ALL: &[LucideIcon] = &[
+        LucideIcon::Check,
         LucideIcon::ChevronsDownUp,
         LucideIcon::ChevronsUpDown,
         LucideIcon::ListTree,
         LucideIcon::SquareDot,
         LucideIcon::SquareMinus,
         LucideIcon::SquarePlus,
+        LucideIcon::X,
     ];
 }
 
 impl IconNamed for LucideIcon {
     fn path(self) -> SharedString {
         match self {
+            LucideIcon::Check => "icons/check.svg",
             LucideIcon::ChevronsDownUp => "icons/chevrons-down-up.svg",
             LucideIcon::ChevronsUpDown => "icons/chevrons-up-down.svg",
             LucideIcon::ListTree => "icons/list-tree.svg",
             LucideIcon::SquareDot => "icons/square-dot.svg",
             LucideIcon::SquareMinus => "icons/square-minus.svg",
             LucideIcon::SquarePlus => "icons/square-plus.svg",
+            LucideIcon::X => "icons/x.svg",
         }
         .into()
     }
