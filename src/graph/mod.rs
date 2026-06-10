@@ -165,6 +165,30 @@ fn top_first_parent_history(commits: &[GraphCommit], head_sha: Option<&str>) -> 
         history.push(sha);
     }
 
+    // Extend the trunk upward through first-parent descendants so a
+    // fast-forwardable branch tip continues lane 0 instead of opening a side
+    // lane above HEAD. When several children compete for the same trunk top,
+    // the newest chain extends the trunk and the rest stay side branches.
+    while let Some(trunk_top) = history.first() {
+        let mut extension: Option<&GraphCommit> = None;
+        for commit in commits {
+            if commit.parent_shas.first() != Some(trunk_top) || contains_sha(&history, &commit.sha)
+            {
+                continue;
+            }
+            if extension
+                .is_none_or(|candidate| commit.authored_timestamp > candidate.authored_timestamp)
+            {
+                extension = Some(commit);
+            }
+        }
+
+        let Some(extension) = extension else {
+            break;
+        };
+        history.insert(0, extension.sha.clone());
+    }
+
     history
 }
 
@@ -770,6 +794,41 @@ mod tests {
     }
 
     #[test]
+    fn descendant_branch_tip_extends_lane_zero() {
+        // The unmerged tip is a pure first-parent descendant of HEAD (a
+        // fast-forward), so it continues the trunk in lane 0 instead of
+        // branching out to a side lane.
+        let rows = layout_graph_anchored(
+            &[
+                commit("descendant-tip", &["descendant-mid"]),
+                commit("descendant-mid", &["head-tip"]),
+                commit("head-tip", &["root"]),
+                commit("root", &[]),
+            ],
+            Some("head-tip"),
+        );
+
+        assert_eq!(rows[0].sha, "descendant-tip");
+        assert_eq!(rows[0].lane, 0);
+        assert_eq!(rows[0].lane_count, 1);
+        assert_eq!(rows[1].sha, "descendant-mid");
+        assert_eq!(rows[1].lane, 0);
+        assert_eq!(rows[1].lane_count, 1);
+        assert_eq!(
+            rows[1].connectors,
+            vec![GraphConnector {
+                from_lane: 0,
+                to_lane: 0,
+                kind: GraphConnectorKind::Straight,
+            }]
+        );
+        assert_eq!(rows[2].sha, "head-tip");
+        assert_eq!(rows[2].lane, 0);
+        assert_eq!(rows[3].sha, "root");
+        assert_eq!(rows[3].lane, 0);
+    }
+
+    #[test]
     fn layout_graph_falls_back_to_first_commit_when_head_absent() {
         let anchored = layout_graph_anchored(
             &[commit("tip", &["root"]), commit("root", &[])],
@@ -876,25 +935,41 @@ mod tests {
     }
 
     #[test]
-    fn unmerged_branch_forking_off_the_head_tip_ends_on_the_head_row() {
+    fn competing_descendant_tip_stays_in_a_side_lane_ending_on_the_head_row() {
+        // Two branch tips sit above HEAD. The newer one extends the trunk in
+        // lane 0; the older one keeps a side lane whose edge ends on the HEAD
+        // row.
         let rows = layout_graph_anchored(
             &[
-                commit("feature", &["head-tip"]),
-                commit("head-tip", &["root"]),
-                commit("root", &[]),
+                commit_at("newer-tip", 30, &["head-tip"]),
+                commit_at("older-tip", 20, &["head-tip"]),
+                commit_at("head-tip", 10, &["root"]),
+                commit_at("root", 0, &[]),
             ],
             Some("head-tip"),
         );
 
-        assert_eq!(rows[0].lane, 1);
-        assert_eq!(rows[1].sha, "head-tip");
-        assert_eq!(rows[1].lane, 0);
+        assert_eq!(rows[0].sha, "newer-tip");
+        assert_eq!(rows[0].lane, 0);
+        assert_eq!(rows[1].sha, "older-tip");
+        assert_eq!(rows[1].lane, 1);
         assert!(rows[1].connectors.contains(&GraphConnector {
             from_lane: 1,
             to_lane: 0,
             kind: GraphConnectorKind::MergeIn,
         }));
         assert_eq!(rows[1].outgoing_lanes, vec![0]);
+        assert_eq!(rows[2].sha, "head-tip");
+        assert_eq!(rows[2].lane, 0);
+        assert_eq!(rows[2].lane_count, 1);
+        assert_eq!(
+            rows[2].connectors,
+            vec![GraphConnector {
+                from_lane: 0,
+                to_lane: 0,
+                kind: GraphConnectorKind::Straight,
+            }]
+        );
     }
 
     #[test]
