@@ -11,7 +11,7 @@ Reviewing a changeset today means clicking one file at a time. The detail pane s
 - Single-clicking a file in the file tree opens its diff in a preview tab; double-clicking opens it pinned. This matches Zed's and VS Code's preview-tab convention.
 - Tabs can be closed, reordered, moved between panes, and dragged to create splits.
 - The visual design of the tab bar follows Zed's tab bar as closely as our feature set allows.
-- Workspace content (open tabs) is scoped to the current changeset and cleared when leaving it. Structural layout (split arrangement) persists per repository.
+- Workspace content (open tabs) is scoped to the current changeset and cleared when leaving it. Structural layout (split arrangement) is also per-changeset; every changeset opens with a single pane. *(Revised 2026-06-10: per-repository layout persistence was implemented, then dropped.)*
 - **License (ADR-0001):** Zed's `workspace`, `editor`, and `ui` crates are GPL-3.0. We model behavior and appearance only. No code in this feature may be copied from or derived from Zed source; Zed is read for idioms and observed for UX, nothing more.
 - **Layout (ADR-0002):** the feature lives in a by-feature module `src/workspace/` inside the single binary crate.
 - **Testing (ADR-0003):** the module ships unit tests for all state transitions and `#[gpui::test]` view tests for the rendered tab bar, panes, and drag interactions.
@@ -24,7 +24,7 @@ Three architectures were weighed. Keeping tab state as flat fields on `App` (a `
 
 The workspace occupies the changeset review screen's detail area, to the right of the file tree. The file tree remains a sidebar outside the workspace. The graph screen is unchanged, and the title bar's changeset pills continue to switch review contexts above the workspace level.
 
-Entering a changeset starts with the persisted pane layout and no open tabs. Leaving the changeset (returning to the graph or opening a different changeset) closes all tabs. `App.selected_changed_file_path` is removed; the workspace is the sole source of truth for what the detail area shows.
+Entering a changeset starts with a single pane and no open tabs. Leaving the changeset (returning to the graph or opening a different changeset) discards tabs and splits alike. `App.selected_changed_file_path` is removed; the workspace is the sole source of truth for what the detail area shows.
 
 ## Tab Semantics
 
@@ -46,7 +46,7 @@ The workspace layout is a tree whose internal nodes are axes (horizontal or vert
 
 Exactly one pane is active. Tree clicks open files in the active pane, and its tabs render at full visual strength while inactive panes render dimmed, following Zed. Clicking anywhere within a pane — tab bar or content — activates it.
 
-Each pane's tab bar carries split-right and split-down controls at its right corner. Splitting inserts a new empty pane (showing the placeholder) adjacent to the source pane and makes it active. Closing a pane's last tab does not close the pane; the pane shows the placeholder. A pane closes only via the explicit close-pane action or by having its last tab dragged out, at which point the layout tree collapses the empty slot and returns its space to siblings.
+Each pane's tab bar carries split-right and split-down controls at its right corner; the tab bar (controls included) renders only while the pane holds at least one tab, so an empty pane shows just the placeholder. Splitting inserts a new pane adjacent to the source pane, makes it active, and seeds it with a copy of the source pane's active item, preserving the item's preview/pinned status (a pane showing nothing splits into an empty pane). A pane closes via the explicit close-pane action, by having its last tab dragged out, or by its last tab being closed — except the last remaining pane, which stays and shows the placeholder. In every closing case the layout tree collapses the empty slot and returns its space to siblings. *(Revised 2026-06-10: the original design always showed the tab bar, created splits empty, and kept a pane open with a placeholder after its last tab closed; all three were changed to match Zed.)*
 
 Keyboard bindings, registered through the existing menu module: `Cmd+W` closes the active tab, `Ctrl+Tab` and `Ctrl+Shift+Tab` cycle tabs within the active pane, `Cmd+K` followed by an arrow key splits in that direction, and `Cmd+K W` closes the active pane.
 
@@ -60,7 +60,7 @@ Dragging a tab over the left, right, top, or bottom edge zone of a pane's conten
 
 ## Layout Persistence
 
-The settings store persists, per repository, the pane-tree shape — split axes, ratios, and which pane was active. Tabs, items, and preview state are never persisted; they are per-changeset by definition. Entering any changeset review in a repository restores that repository's pane arrangement with all panes empty. If a saved layout fails to deserialize, the workspace falls back silently to a single pane and overwrites the stored layout on next save.
+*(Dropped 2026-06-10.)* The original design persisted the pane-tree shape per repository in the settings store; it was implemented as slice 4 and then removed by product decision: a remembered multi-pane arrangement greeting every changeset proved surprising. The layout is now per-changeset — opening a changeset always starts with a single pane, and splits are discarded on leaving it. Nothing about the workspace is persisted. The slice-4 implementation (a validated `SavedPaneGroup` snapshot keyed by repository path) lives in git history should per-repository persistence return.
 
 ## Visual Design
 

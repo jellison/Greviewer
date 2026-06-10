@@ -2,12 +2,23 @@
 
 use gpui::{Action, App as GpuiApp, KeyBinding, Menu, MenuItem, SharedString};
 
-use super::{OpenRepository, QuitApplication};
+use super::{
+    ActivateNextTab, ActivatePreviousTab, CloseActivePane, CloseActiveTab, OpenRepository,
+    QuitApplication, SplitPaneDown, SplitPaneLeft, SplitPaneRight, SplitPaneUp,
+};
 
 pub const GREVIEWER_MENU_LABEL: &str = "Greviewer";
 pub const OPEN_REPOSITORY_MENU_LABEL: &str = "Open Repository\u{2026}";
 pub const OPEN_REPOSITORY_KEYSTROKE: &str = "cmd-o";
 pub const QUIT_APPLICATION_KEYSTROKE: &str = "cmd-q";
+pub const CLOSE_ACTIVE_TAB_KEYSTROKE: &str = "cmd-w";
+pub const ACTIVATE_NEXT_TAB_KEYSTROKE: &str = "ctrl-tab";
+pub const ACTIVATE_PREVIOUS_TAB_KEYSTROKE: &str = "ctrl-shift-tab";
+pub const SPLIT_PANE_LEFT_KEYSTROKE: &str = "cmd-k left";
+pub const SPLIT_PANE_RIGHT_KEYSTROKE: &str = "cmd-k right";
+pub const SPLIT_PANE_UP_KEYSTROKE: &str = "cmd-k up";
+pub const SPLIT_PANE_DOWN_KEYSTROKE: &str = "cmd-k down";
+pub const CLOSE_ACTIVE_PANE_KEYSTROKE: &str = "cmd-k w";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuSnapshot {
@@ -52,6 +63,14 @@ pub fn bind_app_keys(cx: &mut GpuiApp) {
     cx.bind_keys([
         open_repository_key_binding(),
         quit_application_key_binding(),
+        KeyBinding::new(CLOSE_ACTIVE_TAB_KEYSTROKE, CloseActiveTab, None),
+        KeyBinding::new(ACTIVATE_NEXT_TAB_KEYSTROKE, ActivateNextTab, None),
+        KeyBinding::new(ACTIVATE_PREVIOUS_TAB_KEYSTROKE, ActivatePreviousTab, None),
+        KeyBinding::new(SPLIT_PANE_LEFT_KEYSTROKE, SplitPaneLeft, None),
+        KeyBinding::new(SPLIT_PANE_RIGHT_KEYSTROKE, SplitPaneRight, None),
+        KeyBinding::new(SPLIT_PANE_UP_KEYSTROKE, SplitPaneUp, None),
+        KeyBinding::new(SPLIT_PANE_DOWN_KEYSTROKE, SplitPaneDown, None),
+        KeyBinding::new(CLOSE_ACTIVE_PANE_KEYSTROKE, CloseActivePane, None),
     ]);
 }
 

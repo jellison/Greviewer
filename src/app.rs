@@ -25,7 +25,8 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::Icon;
 use similar::{DiffTag, TextDiff};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -40,7 +41,15 @@ actions!(
         OpenRepository,
         OpenChangeset,
         CloseChangeset,
-        QuitApplication
+        QuitApplication,
+        CloseActiveTab,
+        ActivateNextTab,
+        ActivatePreviousTab,
+        SplitPaneLeft,
+        SplitPaneRight,
+        SplitPaneUp,
+        SplitPaneDown,
+        CloseActivePane
     ]
 );
 
@@ -71,15 +80,19 @@ pub struct App {
     /// Last file row the user clicked. Drives the tree highlight only; tab
     /// activation deliberately does not move it (spec: tree is click-driven).
     pub file_tree_highlight_path: Option<String>,
-    /// Horizontal scroll for the tab strip.
-    tab_bar_scroll: ScrollHandle,
+    /// Scroll handles per pane (tab strip + diff sides), created on demand.
+    /// RefCell because render paths take `&self`; ScrollHandle clones share
+    /// their underlying state, so handing out clones is safe.
+    pane_scrolls: RefCell<HashMap<crate::workspace::PaneId, PaneScrollState>>,
+    /// While a tab drag hovers a pane's edge zone, the pane and the split
+    /// direction its half-highlight previews. None when no edge is hovered.
+    pub(crate) tab_drop_zone: Option<(crate::workspace::PaneId, crate::workspace::SplitDirection)>,
     pub file_list_mode: FileListMode,
     pub settings: Settings,
     collapsed_file_tree_paths: BTreeSet<String>,
     notifications: Entity<NotificationList>,
     path_picker: Box<dyn PathPicker>,
     settings_store_path: Option<PathBuf>,
-    file_diff_scroll: FileDiffScroll,
     commit_history_scroll: ScrollHandle,
     file_tree_scroll: ScrollHandle,
     /// Horizontal scroll handle for the path pane only; the stat gutter stays
@@ -101,10 +114,27 @@ pub struct App {
     repo_switcher_open: bool,
 }
 
-struct FileDiffScroll {
+#[derive(Clone)]
+pub(crate) struct FileDiffScroll {
     old: ScrollHandle,
     new: ScrollHandle,
     side_by_side: ScrollHandle,
+}
+
+/// One pane's scroll handles: the tab strip plus the diff content sides.
+#[derive(Clone)]
+pub(crate) struct PaneScrollState {
+    pub(crate) tab_bar: ScrollHandle,
+    pub(crate) diff: FileDiffScroll,
+}
+
+impl PaneScrollState {
+    fn new() -> Self {
+        Self {
+            tab_bar: ScrollHandle::new(),
+            diff: FileDiffScroll::new(),
+        }
+    }
 }
 
 impl FileDiffScroll {
@@ -343,14 +373,14 @@ impl App {
             review_screen: ReviewScreen::Graph,
             workspace: crate::workspace::Workspace::new(),
             file_tree_highlight_path: None,
-            tab_bar_scroll: ScrollHandle::new(),
+            pane_scrolls: RefCell::new(HashMap::new()),
+            tab_drop_zone: None,
             file_list_mode: FileListMode::Changed,
             settings,
             collapsed_file_tree_paths: BTreeSet::new(),
             notifications,
             path_picker,
             settings_store_path,
-            file_diff_scroll: FileDiffScroll::new(),
             commit_history_scroll: ScrollHandle::new(),
             file_tree_scroll: ScrollHandle::new(),
             file_tree_hscroll: ScrollHandle::new(),
@@ -447,14 +477,13 @@ impl App {
         self.mode = Mode::RepoOpen { repo };
         self.selection = Selection::None;
         self.review_screen = ReviewScreen::Graph;
-        self.workspace.clear();
+        self.workspace = crate::workspace::Workspace::new();
+        self.pane_scrolls.borrow_mut().clear();
         self.file_tree_highlight_path = None;
         self.file_list_mode = FileListMode::Changed;
         self.collapsed_file_tree_paths.clear();
         self.record_recent_repository(recent_path);
         self.persist_settings();
-        self.file_diff_scroll.reset();
-        self.tab_bar_scroll.set_offset(point(px(0.), px(0.)));
         self.commit_history_scroll.set_offset(point(px(0.), px(0.)));
         self.file_tree_scroll.set_offset(point(px(0.), px(0.)));
         self.file_tree_hscroll.set_offset(point(px(0.), px(0.)));
@@ -653,10 +682,11 @@ impl App {
 
         match changeset {
             Ok(changeset) => {
-                self.workspace.clear();
+                // Each changeset starts with the default single-pane layout;
+                // splits last only while the changeset stays open.
+                self.workspace = crate::workspace::Workspace::new();
+                self.pane_scrolls.borrow_mut().clear();
                 self.file_tree_highlight_path = None;
-                self.file_diff_scroll.reset();
-                self.tab_bar_scroll.set_offset(point(px(0.), px(0.)));
                 self.file_tree_scroll.set_offset(point(px(0.), px(0.)));
                 self.file_tree_hscroll.set_offset(point(px(0.), px(0.)));
                 self.file_tree_hovered = false;
@@ -674,8 +704,7 @@ impl App {
         self.context_popover_open = false;
         self.workspace.clear();
         self.file_tree_highlight_path = None;
-        self.file_diff_scroll.reset();
-        self.tab_bar_scroll.set_offset(point(px(0.), px(0.)));
+        self.reset_pane_scrolls();
         cx.notify();
     }
 
@@ -684,55 +713,256 @@ impl App {
         cx.quit();
     }
 
+    /// The scroll handles for `pane`, created on first use. The returned
+    /// clone shares its underlying state with every other clone for the pane.
+    pub(crate) fn pane_scroll(&self, pane: crate::workspace::PaneId) -> PaneScrollState {
+        self.pane_scrolls
+            .borrow_mut()
+            .entry(pane)
+            .or_insert_with(PaneScrollState::new)
+            .clone()
+    }
+
+    fn reset_pane_scrolls(&self) {
+        for state in self.pane_scrolls.borrow().values() {
+            state.diff.reset();
+            state.tab_bar.set_offset(point(px(0.), px(0.)));
+        }
+    }
+
+    /// Drop scroll state for panes the workspace no longer has. Called after
+    /// operations that can collapse a pane as a side effect (moving or
+    /// splitting out a pane's last tab).
+    fn prune_pane_scrolls(&self) {
+        let live = self.workspace.pane_ids();
+        self.pane_scrolls
+            .borrow_mut()
+            .retain(|pane, _| live.contains(pane));
+    }
+
     fn open_file_preview(&mut self, path: String, cx: &mut Context<Self>) {
-        self.file_tree_highlight_path = Some(path.clone());
-        if self
-            .workspace
-            .open_preview(Box::new(FileDiffItem::new(path)))
-        {
-            self.file_diff_scroll.reset();
-        }
-        if let Some(index) = self.workspace.active_index() {
-            self.tab_bar_scroll.scroll_to_item(index);
-        }
-        cx.notify();
+        self.open_file(path, false, cx);
     }
 
     fn open_file_pinned(&mut self, path: String, cx: &mut Context<Self>) {
+        self.open_file(path, true, cx);
+    }
+
+    fn open_file(&mut self, path: String, pinned: bool, cx: &mut Context<Self>) {
         self.file_tree_highlight_path = Some(path.clone());
-        if self
-            .workspace
-            .open_pinned(Box::new(FileDiffItem::new(path)))
-        {
-            self.file_diff_scroll.reset();
+        let pane = self.workspace.active_pane();
+        let item = Box::new(FileDiffItem::new(path));
+        let content_changed = if pinned {
+            self.workspace.open_pinned(item)
+        } else {
+            self.workspace.open_preview(item)
+        };
+        if content_changed {
+            self.pane_scroll(pane).diff.reset();
         }
-        if let Some(index) = self.workspace.active_index() {
-            self.tab_bar_scroll.scroll_to_item(index);
+        if let Some(index) = self.workspace.active_index(pane) {
+            self.pane_scroll(pane).tab_bar.scroll_to_item(index);
         }
         cx.notify();
     }
 
-    pub(crate) fn activate_workspace_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.workspace.activate_tab(index) {
-            self.file_diff_scroll.reset();
+    pub(crate) fn activate_workspace_tab(
+        &mut self,
+        pane: crate::workspace::PaneId,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.activate_tab(pane, index) {
+            self.pane_scroll(pane).diff.reset();
         }
-        self.tab_bar_scroll.scroll_to_item(index);
+        self.pane_scroll(pane).tab_bar.scroll_to_item(index);
         cx.notify();
     }
 
-    pub(crate) fn promote_workspace_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.workspace.promote_tab(index);
+    pub(crate) fn promote_workspace_tab(
+        &mut self,
+        pane: crate::workspace::PaneId,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace.promote_tab(pane, index);
         cx.notify();
     }
 
-    pub(crate) fn close_workspace_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.workspace.close_tab(index) {
-            self.file_diff_scroll.reset();
-            if let Some(index) = self.workspace.active_index() {
-                self.tab_bar_scroll.scroll_to_item(index);
+    pub(crate) fn close_workspace_tab(
+        &mut self,
+        pane: crate::workspace::PaneId,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.close_tab(pane, index) {
+            if self.workspace.pane_ids().contains(&pane) {
+                self.pane_scroll(pane).diff.reset();
+                if let Some(index) = self.workspace.active_index(pane) {
+                    self.pane_scroll(pane).tab_bar.scroll_to_item(index);
+                }
+            } else {
+                // Closing the pane's last tab collapsed the pane itself.
+                self.prune_pane_scrolls();
             }
         }
         cx.notify();
+    }
+
+    /// Whether the review screen currently shows a changeset; the workspace
+    /// keyboard actions are no-ops anywhere else.
+    fn changeset_open(&self) -> bool {
+        matches!(self.mode, Mode::RepoOpen { .. })
+            && matches!(self.review_screen, ReviewScreen::Changeset { .. })
+    }
+
+    fn close_active_workspace_tab(&mut self, cx: &mut Context<Self>) {
+        if !self.changeset_open() {
+            return;
+        }
+        let pane = self.workspace.active_pane();
+        if let Some(index) = self.workspace.active_index(pane) {
+            self.close_workspace_tab(pane, index, cx);
+        }
+    }
+
+    fn cycle_workspace_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if !self.changeset_open() {
+            return;
+        }
+        let changed = if forward {
+            self.workspace.activate_next_tab()
+        } else {
+            self.workspace.activate_previous_tab()
+        };
+        if changed {
+            let pane = self.workspace.active_pane();
+            self.pane_scroll(pane).diff.reset();
+            if let Some(index) = self.workspace.active_index(pane) {
+                self.pane_scroll(pane).tab_bar.scroll_to_item(index);
+            }
+            cx.notify();
+        }
+    }
+
+    fn split_active_workspace_pane(
+        &mut self,
+        direction: crate::workspace::SplitDirection,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.changeset_open() {
+            return;
+        }
+        let pane = self.workspace.active_pane();
+        self.split_workspace_pane(pane, direction, cx);
+    }
+
+    fn close_active_workspace_pane(&mut self, cx: &mut Context<Self>) {
+        if !self.changeset_open() {
+            return;
+        }
+        let pane = self.workspace.active_pane();
+        self.close_workspace_pane(pane, cx);
+    }
+
+    pub(crate) fn activate_workspace_pane(
+        &mut self,
+        pane: crate::workspace::PaneId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.activate_pane(pane) {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn split_workspace_pane(
+        &mut self,
+        pane: crate::workspace::PaneId,
+        direction: crate::workspace::SplitDirection,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .workspace
+            .split_with_active_item(pane, direction)
+            .is_some()
+        {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn close_workspace_pane(
+        &mut self,
+        pane: crate::workspace::PaneId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.close_pane(pane) {
+            self.pane_scrolls.borrow_mut().remove(&pane);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn set_tab_drop_zone(
+        &mut self,
+        zone: Option<(crate::workspace::PaneId, crate::workspace::SplitDirection)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tab_drop_zone != zone {
+            self.tab_drop_zone = zone;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn move_workspace_tab(
+        &mut self,
+        from_pane: crate::workspace::PaneId,
+        from_index: usize,
+        to_pane: crate::workspace::PaneId,
+        to_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.tab_drop_zone = None;
+        if self
+            .workspace
+            .move_tab(from_pane, from_index, to_pane, to_index)
+        {
+            self.pane_scroll(to_pane).diff.reset();
+            if let Some(index) = self.workspace.active_index(to_pane) {
+                self.pane_scroll(to_pane).tab_bar.scroll_to_item(index);
+            }
+            self.prune_pane_scrolls();
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn split_workspace_pane_with_tab(
+        &mut self,
+        target_pane: crate::workspace::PaneId,
+        direction: crate::workspace::SplitDirection,
+        from_pane: crate::workspace::PaneId,
+        from_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.tab_drop_zone = None;
+        if let Some(new_pane) =
+            self.workspace
+                .split_with_tab(target_pane, direction, from_pane, from_index)
+        {
+            self.pane_scroll(new_pane).diff.reset();
+            self.prune_pane_scrolls();
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn resize_workspace_divider(
+        &mut self,
+        axis_id: usize,
+        divider: usize,
+        fraction: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.resize(axis_id, divider, fraction) {
+            cx.notify();
+        }
     }
 
     fn set_file_list_mode(&mut self, mode: FileListMode, cx: &mut Context<Self>) {
@@ -874,17 +1104,26 @@ impl App {
 
     #[cfg(test)]
     fn file_diff_old_scroll_offset(&self) -> gpui::Point<gpui::Pixels> {
-        self.file_diff_scroll.side_by_side.offset()
+        self.pane_scroll(self.workspace.active_pane())
+            .diff
+            .side_by_side
+            .offset()
     }
 
     #[cfg(test)]
     fn file_diff_new_scroll_offset(&self) -> gpui::Point<gpui::Pixels> {
-        self.file_diff_scroll.side_by_side.offset()
+        self.pane_scroll(self.workspace.active_pane())
+            .diff
+            .side_by_side
+            .offset()
     }
 
     #[cfg(test)]
     fn file_diff_new_scroll_max_offset(&self) -> gpui::Size<gpui::Pixels> {
-        self.file_diff_scroll.side_by_side.max_offset()
+        self.pane_scroll(self.workspace.active_pane())
+            .diff
+            .side_by_side
+            .max_offset()
     }
 
     fn render_no_repo(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -1328,48 +1567,29 @@ impl App {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let body: AnyElement = match self.file_list_entries(repo, changeset) {
-            Ok(entries) => {
-                let active_path = self
-                    .workspace
-                    .active_item()
-                    .map(|item| item.path().to_string());
-
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
-                        h_resizable("changeset-split")
-                            .with_state(&self.changeset_resizable)
-                            .child(
-                                resizable_panel()
-                                    .size(px(340.))
-                                    .child(self.render_file_list(entries, cx)),
-                            )
-                            .child(
-                                resizable_panel().child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .h_full()
-                                        .child(crate::workspace::tab_bar::render_tab_bar(
-                                            &self.workspace,
-                                            changeset,
-                                            &self.tab_bar_scroll,
-                                            cx,
-                                        ))
-                                        .child(self.render_file_detail(
-                                            repo,
-                                            changeset,
-                                            active_path.as_deref(),
-                                        )),
-                                ),
+            Ok(entries) => div()
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    h_resizable("changeset-split")
+                        .with_state(&self.changeset_resizable)
+                        .child(
+                            resizable_panel()
+                                .size(px(340.))
+                                .child(self.render_file_list(entries, cx)),
+                        )
+                        .child(resizable_panel().child(
+                            crate::workspace::pane_grid::render_pane_group(
+                                self,
+                                self.workspace.layout(),
+                                repo,
+                                changeset,
+                                cx,
                             ),
-                    )
-                    .into_any_element()
-            }
+                        )),
+                )
+                .into_any_element(),
             Err(err) => render_file_diff_error(err.to_string()),
         };
 
@@ -1943,19 +2163,20 @@ impl App {
             )
     }
 
-    fn render_file_detail(
+    pub(crate) fn render_file_detail(
         &self,
         repo: &repo::OpenRepository,
         changeset: &repo::ChangeSet,
         selected_path: Option<&str>,
+        scroll: &FileDiffScroll,
     ) -> AnyElement {
         match selected_path {
             Some(path) => {
                 if let Some(file) = changeset.files.iter().find(|file| file.path == path) {
-                    return self.render_changed_file_detail(repo, changeset, file);
+                    return self.render_changed_file_detail(repo, changeset, file, scroll);
                 }
 
-                self.render_read_only_file_detail(repo, changeset, path)
+                self.render_read_only_file_detail(repo, changeset, path, scroll)
             }
             None => div()
                 .flex()
@@ -1978,6 +2199,7 @@ impl App {
         repo: &repo::OpenRepository,
         changeset: &repo::ChangeSet,
         file: &repo::ChangedFile,
+        scroll: &FileDiffScroll,
     ) -> AnyElement {
         let title = file.path.clone();
         let kind = change_kind_label(file.kind);
@@ -1991,7 +2213,7 @@ impl App {
             changeset.base_sha.as_deref(),
             file,
         ) {
-            Ok(diff) => render_file_diff_content(diff.content, &self.file_diff_scroll),
+            Ok(diff) => render_file_diff_content(diff.content, scroll),
             Err(err) => render_file_diff_error(err.to_string()),
         };
 
@@ -2051,9 +2273,10 @@ impl App {
         repo: &repo::OpenRepository,
         changeset: &repo::ChangeSet,
         path: &str,
+        scroll: &FileDiffScroll,
     ) -> AnyElement {
         let content = match repo::file_content_at_commit(&repo.path, &changeset.commit_sha, path) {
-            Ok(content) => render_file_content(content.content, &self.file_diff_scroll),
+            Ok(content) => render_file_content(content.content, scroll),
             Err(err) => render_file_diff_error(err.to_string()),
         };
 
@@ -4528,6 +4751,30 @@ impl Render for App {
             .on_action(cx.listener(|app, _: &QuitApplication, _window, cx| {
                 app.quit_application(cx);
             }))
+            .on_action(cx.listener(|app, _: &CloseActiveTab, _window, cx| {
+                app.close_active_workspace_tab(cx);
+            }))
+            .on_action(cx.listener(|app, _: &ActivateNextTab, _window, cx| {
+                app.cycle_workspace_tab(true, cx);
+            }))
+            .on_action(cx.listener(|app, _: &ActivatePreviousTab, _window, cx| {
+                app.cycle_workspace_tab(false, cx);
+            }))
+            .on_action(cx.listener(|app, _: &SplitPaneLeft, _window, cx| {
+                app.split_active_workspace_pane(crate::workspace::SplitDirection::Left, cx);
+            }))
+            .on_action(cx.listener(|app, _: &SplitPaneRight, _window, cx| {
+                app.split_active_workspace_pane(crate::workspace::SplitDirection::Right, cx);
+            }))
+            .on_action(cx.listener(|app, _: &SplitPaneUp, _window, cx| {
+                app.split_active_workspace_pane(crate::workspace::SplitDirection::Up, cx);
+            }))
+            .on_action(cx.listener(|app, _: &SplitPaneDown, _window, cx| {
+                app.split_active_workspace_pane(crate::workspace::SplitDirection::Down, cx);
+            }))
+            .on_action(cx.listener(|app, _: &CloseActivePane, _window, cx| {
+                app.close_active_workspace_pane(cx);
+            }))
             .child(self.render_title_bar(cx))
             .child(div().flex().flex_1().min_h(px(0.)).w_full().child(body))
             .children(self.render_context_popover(cx))
@@ -5907,6 +6154,35 @@ mod tests {
         visual
             .debug_bounds("unavailable-recent-repository-row-1")
             .expect("unavailable recent repository row debug bounds");
+    }
+
+    #[gpui::test]
+    async fn moving_out_a_panes_last_tab_prunes_its_scroll_state(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (repo_dir, _) = init_repo_with_one_commit();
+        let repo_path = repo_dir.path().canonicalize().expect("canonical repo path");
+        let window = add_app_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(repo_path, window, cx);
+                // Pane 0 holds one tab; pane 1 is the empty split target.
+                app.open_file_pinned("hello.txt".to_string(), cx);
+                let pane = app.workspace.active_pane();
+                app.split_workspace_pane(pane, crate::workspace::SplitDirection::Right, cx);
+                // Touch both panes' scroll state so both have map entries.
+                app.pane_scroll(0);
+                app.pane_scroll(1);
+                // Moving pane 0's only tab collapses pane 0; its scroll
+                // state must not linger in the map.
+                app.move_workspace_tab(0, 0, 1, 0, cx);
+                assert_eq!(app.workspace.pane_ids(), [1]);
+                assert!(
+                    !app.pane_scrolls.borrow().contains_key(&0),
+                    "collapsed pane's scroll state is pruned"
+                );
+                assert!(app.pane_scrolls.borrow().contains_key(&1));
+            })
+            .expect("exercise scroll pruning");
     }
 
     #[gpui::test]
@@ -8063,7 +8339,7 @@ mod tests {
             .read_with(cx, |app, _cx| {
                 assert_eq!(
                     app.workspace
-                        .active_item()
+                        .active_item(0)
                         .map(|item| item.path().to_string()),
                     Some("context.txt".to_string()),
                 );
@@ -8607,13 +8883,42 @@ mod tests {
 
                 assert_eq!(
                     app.workspace
-                        .active_item()
+                        .active_item(0)
                         .map(|item| item.path().to_string()),
                     Some("hello.txt".to_string()),
                 );
                 assert_eq!(app.file_tree_highlight_path, Some("hello.txt".to_string()));
             })
             .expect("open file preview");
+    }
+
+    #[gpui::test]
+    async fn opening_a_changeset_resets_the_pane_layout(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.open_file_pinned("hello.txt".to_string(), cx);
+                let pane = app.workspace.active_pane();
+                app.split_workspace_pane(pane, crate::workspace::SplitDirection::Right, cx);
+                assert_eq!(app.workspace.pane_ids().len(), 2);
+
+                app.close_changeset(cx);
+                app.open_changeset(window, cx);
+
+                assert_eq!(
+                    app.workspace.pane_ids(),
+                    [0],
+                    "each changeset starts with the default single-pane layout"
+                );
+                assert!(app.workspace.tabs(0).is_empty());
+            })
+            .expect("reopen changeset with reset layout");
     }
 
     #[gpui::test]
@@ -8631,7 +8936,7 @@ mod tests {
                 app.close_changeset(cx);
                 app.open_changeset(window, cx);
 
-                assert!(app.workspace.tabs().is_empty());
+                assert!(app.workspace.tabs(0).is_empty());
                 assert_eq!(app.file_tree_highlight_path, None);
             })
             .expect("reopen changeset");
@@ -8650,7 +8955,7 @@ mod tests {
                 app.select_single_commit(oid_hex, cx);
                 app.open_changeset(window, cx);
 
-                assert!(app.workspace.tabs().is_empty());
+                assert!(app.workspace.tabs(0).is_empty());
                 assert_eq!(app.file_tree_highlight_path, None);
             })
             .expect("open changeset");
@@ -9004,7 +9309,7 @@ mod tests {
             .read_with(cx, |app, _cx| {
                 assert_eq!(
                     app.workspace
-                        .active_item()
+                        .active_item(0)
                         .map(|item| item.path().to_string()),
                     Some("hello.txt".to_string()),
                 );
@@ -9060,7 +9365,7 @@ mod tests {
         window
             .read_with(cx, |app, _cx| {
                 assert!(
-                    app.workspace.active_item().is_some(),
+                    app.workspace.active_item(0).is_some(),
                     "a file should be open after clicking gutter row 1"
                 );
                 assert!(

@@ -1,18 +1,20 @@
-//! Zed-styled tab bar for the workspace pane.
+//! Zed-styled tab bar for one workspace pane.
 //!
 //! One compact strip above the diff: hairline-separated tabs, active tab on
 //! the editor background with a top accent line, preview titles in italics,
-//! hover-revealed close buttons. Behavior contract lives in
+//! hover-revealed close buttons, split controls in the right corner. The bar
+//! of an inactive pane renders dimmed. Behavior contract lives in
 //! `docs/specs/review/workflow.md`.
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, rgb, AnyElement, ClickEvent, Context, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, ScrollHandle, StatefulInteractiveElement, Styled,
+    div, px, rgb, AnyElement, AppContext, ClickEvent, Context, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled,
 };
 use gpui_component::Icon;
 
-use super::Workspace;
+use super::{PaneId, SplitDirection, Workspace};
 use crate::app::{change_kind_text, App, FILE_TREE_FONT_FAMILY};
 use crate::icons::LucideIcon;
 use crate::repo;
@@ -29,6 +31,41 @@ const TAB_DEFAULT_TEXT: u32 = 0xe6eef0;
 const TAB_CLOSE_HIT_SIZE: f32 = 16.;
 const TAB_CLOSE_ICON_SIZE: f32 = 12.;
 const TAB_INACTIVE_OPACITY: f32 = 0.75;
+const TAB_BAR_INACTIVE_PANE_OPACITY: f32 = 0.6;
+const SPLIT_CONTROL_SIZE: f32 = 24.;
+const SPLIT_CONTROL_ICON_SIZE: f32 = 14.;
+
+/// A tab being dragged: its source pane and strip index.
+#[derive(Clone)]
+pub(crate) struct DraggedTab {
+    pub pane: PaneId,
+    pub index: usize,
+    pub title: String,
+}
+
+/// Cursor-following preview while a tab is dragged.
+pub(crate) struct TabDragPreview {
+    title: String,
+}
+
+impl gpui::Render for TabDragPreview {
+    fn render(&mut self, _window: &mut gpui::Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .h(px(TAB_BAR_HEIGHT - 6.))
+            .px_3()
+            .bg(rgb(TAB_ACTIVE_BG))
+            .border_1()
+            .border_color(rgb(TAB_ACCENT))
+            .rounded(px(3.))
+            .text_size(px(TAB_TEXT_SIZE))
+            .font_family(FILE_TREE_FONT_FAMILY)
+            .text_color(rgb(TAB_DEFAULT_TEXT))
+            .opacity(0.9)
+            .child(self.title.clone())
+    }
+}
 
 /// The innermost directory name, shown to disambiguate duplicate file names.
 fn parent_directory_hint(path: &str) -> Option<String> {
@@ -38,40 +75,47 @@ fn parent_directory_hint(path: &str) -> Option<String> {
 
 pub fn render_tab_bar(
     workspace: &Workspace,
+    pane: PaneId,
     changeset: &repo::ChangeSet,
     scroll: &ScrollHandle,
     cx: &mut Context<App>,
 ) -> AnyElement {
-    if workspace.tabs().is_empty() {
-        // Zero-sized marker so view tests can positively assert the bar
-        // rendered its empty branch: gpui's `debug_bounds` map is never
-        // cleared between frames, so asserting the absence of a previously
-        // painted tab selector is impossible.
+    // The tab row exists only while the pane holds tabs (Zed's model): an
+    // empty pane shows just the placeholder, and dropping a tab anywhere in
+    // it moves the tab there (handled by the pane content's drop target).
+    // The zero-sized marker lets view tests positively assert the empty
+    // branch rendered: gpui's `debug_bounds` map is never cleared between
+    // frames, so asserting the absence of a previously painted tab selector
+    // is impossible.
+    if workspace.tabs(pane).is_empty() {
         return div()
-            .debug_selector(|| "workspace-tab-bar-empty".into())
+            .debug_selector(move || format!("workspace-tab-bar-empty-{pane}"))
             .into_any_element();
     }
 
-    let mut bar = div()
-        .id("workspace-tab-bar")
-        .debug_selector(|| "workspace-tab-bar".into())
+    let pane_active = workspace.active_pane() == pane;
+
+    let mut strip = div()
+        .id(SharedString::from(format!("workspace-tab-strip-{pane}")))
         .flex()
         .items_center()
-        .w_full()
-        .h(px(TAB_BAR_HEIGHT))
-        .flex_none()
-        .bg(rgb(TAB_BAR_BG))
-        .border_b_1()
-        .border_color(rgb(TAB_BORDER))
+        .flex_1()
+        .min_w_0()
+        .h_full()
         .overflow_x_scroll()
-        .track_scroll(scroll);
+        .track_scroll(scroll)
+        .drag_over::<DraggedTab>(|style, _drag, _window, _cx| style.bg(rgb(0x1d2733)))
+        .on_drop(cx.listener(move |app, drag: &DraggedTab, _window, cx| {
+            let end = app.workspace.tabs(pane).len();
+            app.move_workspace_tab(drag.pane, drag.index, pane, end, cx);
+        }));
 
-    for (index, item) in workspace.tabs().iter().enumerate() {
-        let active = workspace.active_index() == Some(index);
-        let preview = workspace.is_preview(index);
+    for (index, item) in workspace.tabs(pane).iter().enumerate() {
+        let active = workspace.active_index(pane) == Some(index);
+        let preview = workspace.is_preview(pane, index);
         let title = item.tab_title().to_string();
         let duplicate_title = workspace
-            .tabs()
+            .tabs(pane)
             .iter()
             .enumerate()
             .any(|(other, tab)| other != index && tab.tab_title() == title);
@@ -84,12 +128,12 @@ pub fn render_tab_bar(
             .find(|file| file.path == item.path())
             .map(|file| change_kind_text(file.kind))
             .unwrap_or(rgb(TAB_DEFAULT_TEXT));
-        let tab_selector = format!("workspace-tab-{index}");
-        let close_selector = format!("workspace-tab-close-{index}");
-        let group_name = format!("workspace-tab-{index}");
+        let tab_selector = format!("workspace-tab-{pane}-{index}");
+        let close_selector = format!("workspace-tab-close-{pane}-{index}");
+        let group_name = format!("workspace-tab-{pane}-{index}");
 
         let close_button = div()
-            .id(("workspace-tab-close", index))
+            .id(SharedString::from(close_selector.clone()))
             .debug_selector(move || close_selector.clone())
             .flex()
             .items_center()
@@ -105,7 +149,7 @@ pub fn render_tab_bar(
             .hover(|button| button.bg(rgb(TAB_BORDER)))
             .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
                 cx.stop_propagation();
-                app.close_workspace_tab(index, cx);
+                app.close_workspace_tab(pane, index, cx);
             }))
             .child(
                 Icon::new(LucideIcon::X)
@@ -114,7 +158,7 @@ pub fn render_tab_bar(
             );
 
         let tab = div()
-            .id(("workspace-tab", index))
+            .id(SharedString::from(tab_selector.clone()))
             .debug_selector(move || tab_selector.clone())
             .group(group_name)
             .relative()
@@ -141,17 +185,41 @@ pub fn render_tab_bar(
             .when(!active, |tab| tab.opacity(TAB_INACTIVE_OPACITY))
             .on_click(cx.listener(move |app, event: &ClickEvent, _window, cx| {
                 if event.click_count() >= 2 {
-                    app.promote_workspace_tab(index, cx);
+                    app.promote_workspace_tab(pane, index, cx);
                 } else {
-                    app.activate_workspace_tab(index, cx);
+                    app.activate_workspace_tab(pane, index, cx);
                 }
             }))
             .on_mouse_down(
                 MouseButton::Middle,
                 cx.listener(move |app, _event: &MouseDownEvent, _window, cx| {
-                    app.close_workspace_tab(index, cx);
+                    app.close_workspace_tab(pane, index, cx);
                 }),
             )
+            .on_drag(
+                DraggedTab {
+                    pane,
+                    index,
+                    title: title.clone(),
+                },
+                {
+                    let entity = cx.entity();
+                    move |drag, _offset, _window, cx| {
+                        let title = drag.title.clone();
+                        // A fresh drag must not inherit a stale edge-zone
+                        // highlight from the previous drag.
+                        entity.update(cx, |app, _cx| app.tab_drop_zone = None);
+                        cx.new(|_| TabDragPreview { title })
+                    }
+                },
+            )
+            .drag_over::<DraggedTab>(|style, _drag, _window, _cx| {
+                style.border_l_2().border_color(rgb(TAB_ACCENT))
+            })
+            .on_drop(cx.listener(move |app, drag: &DraggedTab, _window, cx| {
+                cx.stop_propagation();
+                app.move_workspace_tab(drag.pane, drag.index, pane, index, cx);
+            }))
             .child(
                 div()
                     .text_size(px(TAB_TEXT_SIZE))
@@ -173,117 +241,85 @@ pub fn render_tab_bar(
             })
             .child(close_button);
 
-        bar = bar.child(tab);
+        strip = strip.child(tab);
     }
 
-    bar.into_any_element()
+    div()
+        .id(SharedString::from(format!("workspace-tab-bar-{pane}")))
+        .debug_selector(move || format!("workspace-tab-bar-{pane}"))
+        .flex()
+        .items_center()
+        .w_full()
+        .h(px(TAB_BAR_HEIGHT))
+        .flex_none()
+        .bg(rgb(TAB_BAR_BG))
+        .border_b_1()
+        .border_color(rgb(TAB_BORDER))
+        .when(!pane_active, |bar| {
+            bar.opacity(TAB_BAR_INACTIVE_PANE_OPACITY)
+        })
+        .child(strip)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .flex_none()
+                .gap_1()
+                .px_2()
+                .h_full()
+                .child(split_control(
+                    pane,
+                    LucideIcon::Columns2,
+                    format!("workspace-split-right-{pane}"),
+                    SplitDirection::Right,
+                    cx,
+                ))
+                .child(split_control(
+                    pane,
+                    LucideIcon::Rows2,
+                    format!("workspace-split-down-{pane}"),
+                    SplitDirection::Down,
+                    cx,
+                )),
+        )
+        .into_any_element()
+}
+
+/// One corner control that splits `pane` in `direction` when clicked.
+fn split_control(
+    pane: PaneId,
+    icon: LucideIcon,
+    selector: String,
+    direction: SplitDirection,
+    cx: &mut Context<App>,
+) -> impl IntoElement {
+    div()
+        .id(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(SPLIT_CONTROL_SIZE))
+        .h(px(SPLIT_CONTROL_SIZE))
+        .rounded(px(2.))
+        .cursor_pointer()
+        .hover(|button| button.bg(rgb(TAB_BORDER)))
+        .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
+            app.split_workspace_pane(pane, direction, cx);
+        }))
+        .child(
+            Icon::new(icon)
+                .size(px(SPLIT_CONTROL_ICON_SIZE))
+                .text_color(rgb(TAB_MUTED_TEXT)),
+        )
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::app::App;
-    use crate::workspace::test_util::simulate_double_click;
-    use git2::{IndexAddOption, Oid, Repository, Signature};
-    use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext, WindowHandle};
-    use std::fs;
-
-    fn add_app_window(cx: &mut TestAppContext) -> WindowHandle<App> {
-        cx.update(gpui_component::init);
-        cx.add_window(App::new)
-    }
-
-    fn commit_all(repo: &Repository, message: &str, parent_shas: &[String]) -> String {
-        let mut index = repo.index().expect("open index");
-        index
-            .add_all(["*"], IndexAddOption::DEFAULT, None)
-            .expect("stage files");
-        index.write().expect("write index");
-        let tree_oid = index.write_tree().expect("write tree");
-        let tree = repo.find_tree(tree_oid).expect("find tree");
-        let sig =
-            Signature::now("Greviewer Tests", "tests@greviewer.invalid").expect("create signature");
-        let parents: Vec<git2::Commit> = parent_shas
-            .iter()
-            .map(|sha| {
-                repo.find_commit(Oid::from_str(sha).expect("parse oid"))
-                    .expect("find parent")
-            })
-            .collect();
-        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-        let oid = repo
-            .commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)
-            .expect("create commit");
-        oid.to_string()
-    }
-
-    /// Two-commit repo whose head commit changes `alpha.txt` and `nested/beta.txt`.
-    fn init_repo_with_two_changed_files() -> (tempfile::TempDir, String) {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let repo = Repository::init(dir.path()).expect("init repo");
-        fs::create_dir_all(dir.path().join("nested")).expect("create nested dir");
-        fs::write(dir.path().join("alpha.txt"), "alpha v1\n").expect("write alpha");
-        fs::write(dir.path().join("nested/beta.txt"), "beta v1\n").expect("write beta");
-        let first = commit_all(&repo, "Add files", &[]);
-        fs::write(dir.path().join("alpha.txt"), "alpha v2\n").expect("update alpha");
-        fs::write(dir.path().join("nested/beta.txt"), "beta v2\n").expect("update beta");
-        let head = commit_all(&repo, "Update files", std::slice::from_ref(&first));
-        drop(repo);
-        (dir, head)
-    }
-
-    /// Open the fixture repo, select the head commit, and click into the
-    /// changeset review screen.
-    fn open_changeset(
-        cx: &mut TestAppContext,
-    ) -> (tempfile::TempDir, WindowHandle<App>, VisualTestContext) {
-        let (dir, head) = init_repo_with_two_changed_files();
-        let path = dir.path().to_path_buf();
-        let window = add_app_window(cx);
-        window
-            .update(cx, |app, window, cx| {
-                app.open_repository_at(path, window, cx);
-                app.select_single_commit(head, cx);
-            })
-            .expect("open repo and select commit");
-        cx.run_until_parked();
-
-        let mut visual = VisualTestContext::from_window(*window, cx);
-        let open_bounds = visual
-            .debug_bounds("open-changeset")
-            .expect("open changeset debug bounds");
-        visual.simulate_click(open_bounds.center(), Modifiers::none());
-        cx.run_until_parked();
-        (dir, window, visual)
-    }
-
-    /// Click the tree row for the given file index, tolerating the
-    /// highlight-driven selector rename after a prior click.
-    ///
-    /// The file tree renders folder rows before file rows, so with the
-    /// `nested/` fixture directory the tree rows are: 0 = `nested` folder,
-    /// 1 = `nested/beta.txt`, 2 = `alpha.txt`. File index 0 maps to
-    /// `alpha.txt` (tree row 2) and file index 1 to `nested/beta.txt`
-    /// (tree row 1).
-    fn click_file_row(visual: &mut VisualTestContext, index: usize) {
-        let bounds = match index {
-            0 => visual
-                .debug_bounds("changed-file-row-2")
-                .or_else(|| visual.debug_bounds("selected-changed-file-row-2")),
-            1 => visual
-                .debug_bounds("changed-file-row-1")
-                .or_else(|| visual.debug_bounds("selected-changed-file-row-1")),
-            _ => panic!("unsupported row index"),
-        }
-        .expect("file row debug bounds");
-        visual.simulate_click(bounds.center(), Modifiers::none());
-    }
-
-    /// Bounds of the `alpha.txt` tree row (tree row 2; see `click_file_row`).
-    fn alpha_row_bounds(visual: &mut VisualTestContext) -> gpui::Bounds<gpui::Pixels> {
-        visual
-            .debug_bounds("changed-file-row-2")
-            .expect("file row debug bounds")
-    }
+    use crate::workspace::test_util::{
+        alpha_row_bounds, click_file_row, open_changeset, simulate_double_click,
+    };
+    use gpui::{Modifiers, MouseButton, TestAppContext};
 
     #[gpui::test]
     async fn single_clicks_share_one_preview_tab(cx: &mut TestAppContext) {
@@ -291,22 +327,22 @@ mod tests {
 
         click_file_row(&mut visual, 0);
         visual
-            .debug_bounds("workspace-tab-0")
+            .debug_bounds("workspace-tab-0-0")
             .expect("first tab renders");
         click_file_row(&mut visual, 1);
         cx.run_until_parked();
 
         assert!(
-            visual.debug_bounds("workspace-tab-1").is_none(),
+            visual.debug_bounds("workspace-tab-0-1").is_none(),
             "second single-click must reuse the preview tab, not add a tab"
         );
         window
             .read_with(cx, |app, _cx| {
-                assert_eq!(app.workspace.tabs().len(), 1);
-                assert!(app.workspace.is_preview(0));
+                assert_eq!(app.workspace.tabs(0).len(), 1);
+                assert!(app.workspace.is_preview(0, 0));
                 assert_eq!(
                     app.workspace
-                        .active_item()
+                        .active_item(0)
                         .map(|item| item.path().to_string()),
                     Some("nested/beta.txt".to_string()),
                 );
@@ -325,9 +361,16 @@ mod tests {
 
         window
             .read_with(cx, |app, _cx| {
-                assert_eq!(app.workspace.tabs().len(), 2, "pinned tab plus new preview");
-                assert!(!app.workspace.is_preview(0), "double-clicked tab is pinned");
-                assert!(app.workspace.is_preview(1));
+                assert_eq!(
+                    app.workspace.tabs(0).len(),
+                    2,
+                    "pinned tab plus new preview"
+                );
+                assert!(
+                    !app.workspace.is_preview(0, 0),
+                    "double-clicked tab is pinned"
+                );
+                assert!(app.workspace.is_preview(0, 1));
             })
             .expect("read workspace state");
     }
@@ -342,11 +385,11 @@ mod tests {
         cx.run_until_parked();
 
         // Click the first (pinned) tab: it activates; tree highlight stays put.
-        let tab0 = visual.debug_bounds("workspace-tab-0").expect("tab 0");
+        let tab0 = visual.debug_bounds("workspace-tab-0-0").expect("tab 0");
         visual.simulate_click(tab0.center(), Modifiers::none());
         window
             .read_with(cx, |app, _cx| {
-                assert_eq!(app.workspace.active_index(), Some(0));
+                assert_eq!(app.workspace.active_index(0), Some(0));
                 assert_eq!(
                     app.file_tree_highlight_path,
                     Some("nested/beta.txt".to_string()),
@@ -356,12 +399,12 @@ mod tests {
             .expect("read activation state");
 
         // Double-click the preview tab: it pins in place.
-        let tab1 = visual.debug_bounds("workspace-tab-1").expect("tab 1");
+        let tab1 = visual.debug_bounds("workspace-tab-0-1").expect("tab 1");
         simulate_double_click(&mut visual, tab1.center());
         window
             .read_with(cx, |app, _cx| {
                 assert!(
-                    !app.workspace.is_preview(1),
+                    !app.workspace.is_preview(0, 1),
                     "double-clicked tab is promoted"
                 );
             })
@@ -379,15 +422,15 @@ mod tests {
 
         // Close the active (preview) tab via its close button.
         let close1 = visual
-            .debug_bounds("workspace-tab-close-1")
+            .debug_bounds("workspace-tab-close-0-1")
             .expect("close button on active tab");
         visual.simulate_click(close1.center(), Modifiers::none());
         window
             .read_with(cx, |app, _cx| {
-                assert_eq!(app.workspace.tabs().len(), 1);
+                assert_eq!(app.workspace.tabs(0).len(), 1);
                 assert_eq!(
                     app.workspace
-                        .active_item()
+                        .active_item(0)
                         .map(|item| item.path().to_string()),
                     Some("alpha.txt".to_string()),
                     "left neighbor becomes active"
@@ -396,7 +439,7 @@ mod tests {
             .expect("read state after close-button close");
 
         // Middle-click closes the remaining tab; the placeholder returns.
-        let tab0 = visual.debug_bounds("workspace-tab-0").expect("tab 0");
+        let tab0 = visual.debug_bounds("workspace-tab-0-0").expect("tab 0");
         visual.simulate_mouse_down(tab0.center(), MouseButton::Middle, Modifiers::none());
         visual.simulate_mouse_up(tab0.center(), MouseButton::Middle, Modifiers::none());
         cx.run_until_parked();
@@ -405,13 +448,13 @@ mod tests {
         // closed tab's selector lingers in the map; the empty-bar marker is
         // the positive signal that the latest frame rendered no tabs.
         visual
-            .debug_bounds("workspace-tab-bar-empty")
+            .debug_bounds("workspace-tab-bar-empty-0")
             .expect("tab bar renders its empty branch");
         visual
             .debug_bounds("file-detail-empty")
             .expect("placeholder returns when every tab is closed");
         window
-            .read_with(cx, |app, _cx| assert!(app.workspace.tabs().is_empty()))
+            .read_with(cx, |app, _cx| assert!(app.workspace.tabs(0).is_empty()))
             .expect("read emptied workspace");
     }
 }

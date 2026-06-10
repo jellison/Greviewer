@@ -264,7 +264,7 @@ The show-all-files toggle reveals every file in the repository at the newest sel
 
 ## Holding files open in tabs
 
-Opened files live in a row of tabs above the diff area. A single click on a file opens it in the preview tab — a holding slot that subsequent single clicks reuse, so casual browsing never piles up tabs. At most one preview tab exists at a time, and its title renders in italics to signal that the next single click will replace it. Opening a file deliberately — double-clicking it in the tree, or double-clicking the preview tab itself — pins the tab; a pinned tab keeps its file until the user closes it.
+Opened files live in a row of tabs above each pane's diff area. A single click on a file opens it in the active pane's preview tab — a holding slot that subsequent single clicks reuse, so casual browsing never piles up tabs. At most one preview tab exists per pane, and its title renders in italics to signal that the next single click will replace it. Opening a file deliberately — double-clicking it in the tree, or double-clicking the preview tab itself — pins the tab; a pinned tab keeps its file until the user closes it.
 
 **Triggering conditions**
 
@@ -272,15 +272,15 @@ Opened files live in a row of tabs above the diff area. A single click on a file
 
 **Observable outcomes**
 
-- Single-clicking a file shows its diff in the preview tab, creating that tab when none exists and otherwise replacing its content in place; the tab keeps its position in the row.
+- Single-clicking a file shows its diff in the active pane's preview tab, creating that tab when none exists and otherwise replacing its content in place; the tab keeps its position in the row.
 - Double-clicking a file pins its tab. Double-clicking the preview tab pins it without changing its content.
-- Opening a file that is already open activates the existing tab; a file is never open in two tabs at once, and opening a pinned file never demotes it to preview.
+- Opening a file that is already open in the pane activates the existing tab; a file is never open twice in one pane, and opening a pinned file never demotes it to preview.
 - A tab's title is the file's name, tinted with the file's change-kind color; files opened from the all-files view that are not part of the change set use the default text color. When two open tabs share a file name, each also shows its parent folder name.
-- Exactly one tab is active; it is visually distinct from the other tabs (raised background and an accent line, with inactive tabs dimmed), and the diff area always shows the active tab's file. Clicking a tab activates it.
+- Exactly one tab is active per pane; it is visually distinct from the other tabs (raised background and an accent line, with inactive tabs dimmed), and the pane always shows its active tab's file. Clicking a tab activates it.
 - Every tab offers a close control, revealed on hover and always present on the active tab; middle-clicking a tab also closes it. Closing the active tab activates its right neighbor, or its left neighbor at the end of the row.
 - When more tabs are open than fit the width, the tab row scrolls horizontally and activating a tab brings it into view.
-- Closing every tab returns the diff area to the select-a-file placeholder.
-- Leaving the changeset — closing it or opening a different one — closes all tabs.
+- Closing a pane's last tab closes the pane itself when other panes remain (see "Splitting the diff area into panes"). In the only remaining pane, closing the last tab returns it to the select-a-file placeholder, and the tab row disappears along with its last tab.
+- Leaving the changeset — closing it or opening a different one — closes all tabs in every pane.
 - The file tree's highlighted row follows the user's clicks in the tree; activating a different tab does not move the tree highlight.
 
 **Edge cases**
@@ -288,6 +288,56 @@ Opened files live in a row of tabs above the diff area. A single click on a file
 - Closing the preview tab removes it; the next single click opens a fresh preview tab at the end of the row.
 - Re-opening the changeset after leaving it starts with no tabs open, even if files were open when it was left.
 - Switching between the change-set and all-files views does not close tabs; a tab for a file outside the change set keeps showing its read-only content in either view. Only leaving the changeset closes tabs.
+
+## Splitting the diff area into panes
+
+The diff area can hold several panes at once, arranged by vertical and horizontal splits, so two files — or two parts of one review — sit side by side. Each pane has its own tab row and its own diff. Exactly one pane is active at a time: it is where file-tree clicks open tabs, and its tab row renders at full strength while the other panes' rows are dimmed.
+
+**Triggering conditions**
+
+- The user clicks a split control in a pane's tab row, presses Cmd+K followed by an arrow key, clicks inside a pane, drags a divider, or closes a pane with Cmd+K W.
+
+**Observable outcomes**
+
+- A pane shows its tab row only while it holds at least one tab; the row carries split-right and split-down controls at its right edge. A pane with no tabs shows only the select-a-file placeholder, so splitting an empty pane is a keyboard-only action.
+- Splitting inserts a new pane next to the source pane — after it for right and down, before it for left and up. The new pane becomes active, takes half the source pane's space, and opens holding the same file the source pane was showing, with the same preview or pinned state; splitting a pane that shows nothing yields an empty pane with the placeholder. Splitting along an existing row or column of panes adds a sibling rather than nesting.
+- Clicking anywhere within a pane — its tab row or its content — makes it the active pane.
+- Single- and double-clicks in the file tree open files in the active pane only. A file may be open in several panes at once, but never twice in the same pane.
+- Cmd+W closes the active pane's active tab. Ctrl+Tab and Ctrl+Shift+Tab cycle through the active pane's tabs, wrapping at the ends. Cmd+K then an arrow key splits the active pane in that direction. Cmd+K W closes the active pane.
+- Dividers between panes can be dragged to trade space between the neighbors they separate; a pane never shrinks below a tenth of its row or column.
+- Closing a pane's last tab — by close control, middle-click, or Cmd+W — closes the pane itself, exactly as if it had been closed explicitly. The last remaining pane is the exception: it stays and shows the placeholder.
+- Closing a pane removes it and returns its space to its siblings; the pane taking the closed slot's place becomes active, and closing an inactive pane leaves the active pane untouched.
+- The last remaining pane cannot be closed.
+- The split arrangement lives and dies with the changeset: opening a changeset always starts with a single pane, and splits made while reviewing are discarded on leaving it.
+
+**Edge cases**
+
+- The workspace keyboard shortcuts do nothing while no changeset is open.
+- Closing a pane that leaves a single child of a split collapses that level of the layout entirely.
+
+## Rearranging tabs by dragging
+
+Tabs answer to the mouse: a reviewer can drag one along its own row to reorder, drop it on another pane's tab row to move it, or drop it on the edge of a pane's content to carve out a new split — the same gestures Zed and VS Code train.
+
+**Triggering conditions**
+
+- The user drags a tab and drops it on a tab row, on another tab, or on the edge zone of a pane's content area.
+
+**Observable outcomes**
+
+- While a tab is dragged, a floating preview of the tab follows the cursor.
+- Dropping a tab on another tab inserts it at that position; dropping it on empty tab-row space appends it at the end. An insertion indicator marks the target while hovering. Reordering within a pane keeps the tab's preview or pinned status.
+- Dropping a tab on a different pane's tab row moves it there. The moved tab arrives pinned — even if it was the preview tab — and becomes the active tab of the now-active target pane.
+- If the target pane already holds a tab for the same file, the drop merges: the existing tab activates and the dragged tab closes rather than duplicating.
+- Dragging a tab over the left, right, top, or bottom band of a pane's content area highlights the corresponding half of the pane; dropping there splits that pane in that direction, and the dragged tab becomes the new pane's only, pinned tab.
+- A pane with no tabs has no tab row and no edge zones; dropping a tab anywhere in it moves the tab there.
+- Dragging the last tab out of a pane closes that pane; the layout collapses and returns its space to siblings.
+
+**Edge cases**
+
+- Dropping a tab back where it started changes nothing.
+- Dragging a pane's only tab to that same pane's edge zone moves the tab into the new half; no empty pane is left behind.
+- Releasing a drag outside any drop target leaves every tab where it was.
 
 ## Inspecting a file's diff
 

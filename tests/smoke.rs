@@ -124,7 +124,7 @@ async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
         .debug_bounds("file-diff-row-added")
         .expect("added line row debug bounds");
     visual
-        .debug_bounds("workspace-tab-0")
+        .debug_bounds("workspace-tab-0-0")
         .expect("opening a file shows its tab in the tab bar");
 
     window
@@ -135,12 +135,12 @@ async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
                 assert_eq!(changeset.files[0].kind, ChangeKind::Modified);
                 assert_eq!(
                     app.workspace
-                        .active_item()
+                        .active_item(0)
                         .map(|item| item.path().to_string()),
                     Some("hello.txt".to_string()),
                 );
                 assert!(
-                    app.workspace.is_preview(0),
+                    app.workspace.is_preview(0, 0),
                     "single-click opens a preview tab"
                 );
             }
@@ -155,8 +155,38 @@ async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
 
     window
         .read_with(cx, |app, _cx| {
-            assert_eq!(app.workspace.tabs().len(), 1);
-            assert!(!app.workspace.is_preview(0), "double-click pins the tab");
+            assert_eq!(app.workspace.tabs(0).len(), 1);
+            assert!(!app.workspace.is_preview(0, 0), "double-click pins the tab");
         })
         .expect("read pinned state");
+
+    // Split once: a new empty pane opens to the right and becomes active, and
+    // the next tree click opens the file there.
+    let split_bounds = visual
+        .debug_bounds("workspace-split-right-0")
+        .expect("split-right control debug bounds");
+    visual.simulate_click(split_bounds.center(), Modifiers::none());
+    cx.run_until_parked();
+
+    let row_bounds = visual
+        .debug_bounds("selected-changed-file-row-0")
+        .expect("selected changed file row debug bounds");
+    visual.simulate_click(row_bounds.center(), Modifiers::none());
+    cx.run_until_parked();
+
+    visual
+        .debug_bounds("workspace-tab-1-0")
+        .expect("file opens in the new pane's tab bar");
+    window
+        .read_with(cx, |app, _cx| {
+            assert_eq!(app.workspace.pane_ids(), [0, 1]);
+            assert_eq!(app.workspace.active_pane(), 1);
+            assert_eq!(
+                app.workspace
+                    .active_item(1)
+                    .map(|item| item.path().to_string()),
+                Some("hello.txt".to_string()),
+            );
+        })
+        .expect("read split state");
 }
