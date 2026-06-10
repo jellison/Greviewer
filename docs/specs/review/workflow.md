@@ -79,7 +79,7 @@ The user can quit Greviewer with the standard quit keyboard shortcut.
 
 ## Viewing the commit graph
 
-The user sees a graphical history of the repository's commits with branch lanes and merge connectors. Branch and merge lines use smooth rounded bends where they turn between lanes, including the final turn into a branch commit. Each commit is presented as a single-row entry whose reading order is graph, short identifier, summary line, author, authored date, and any local branch names that point at it. The graph is scrollable; older commits load progressively as the user scrolls. The currently checked-out tip is visually marked, but selection is independent of checkout state — reviewing never moves HEAD.
+The user sees a graphical history of the repository's commits with branch lanes and merge connectors. The history covers the checked-out commit and every local branch, so work on branches that have not been merged is visible alongside the checked-out history; remote-tracking branches and tags do not contribute commits. Commits from all branches interleave in a single graph ordered newest-first, with no visual distinction between commits that are and are not part of the checked-out history. Branch and merge lines use smooth rounded bends where they turn between lanes, including the final turn into a branch commit. Each commit is presented as a single-row entry whose reading order is graph, short identifier, summary line, author, authored date, and any local branch names that point at it. The graph is scrollable; older commits load progressively as the user scrolls. The currently checked-out tip is visually marked, but selection is independent of checkout state — reviewing never moves HEAD.
 
 **Triggering conditions**
 
@@ -88,6 +88,8 @@ The user sees a graphical history of the repository's commits with branch lanes 
 **Observable outcomes**
 
 - Commits appear in graphical order with branch lanes and merge connectors.
+- Commits reachable only from unmerged local branches appear interleaved with the
+  checked-out history; each such branch renders as its own lane that ends at its tip.
 - Each visible commit shows its short identifier, summary line, author, and authored date.
 - Local branch names are shown on the commits they point to.
 - The currently checked-out tip carries a visual marker.
@@ -95,7 +97,13 @@ The user sees a graphical history of the repository's commits with branch lanes 
 **Edge cases**
 
 - Very large histories load progressively rather than blocking the UI.
-- Histories with several active branches remain legible: the visible first-parent history of the top commit anchors the left-most lane, active branch lanes keep a stable horizontal position until they end, branch lanes render as continuous vertical lines through and between rows without row separators or rounded branch/merge joins interrupting them, horizontal branch and merge runs appear at row boundaries so commits remain centered within their branch lanes, multiple visible edges may target the same future parent commit without deleting one another, sibling side branches with the same trunk parent keep strictly earlier authored commits on inner side lanes, keep later siblings on their outward lanes until they rejoin the shared parent, share the same trunk branch-off with horizontal extensions to outer lanes, new branch lanes use the nearest available lane to the right and do not reuse occupied lanes, multi-lane connectors stay continuous and horizontally aligned across intermediate lanes even when those lanes are occupied by other active branches, and branch labels do not obscure the graph.
+- Histories with several active branches remain legible: the visible first-parent history of the checked-out commit anchors the left-most lane, active branch lanes keep a stable horizontal position until they end, branch lanes render as continuous vertical lines through and between rows without row separators or rounded branch/merge joins interrupting them, horizontal branch and merge runs appear at row boundaries so commits remain centered within their branch lanes, multiple visible edges may target the same future parent commit without deleting one another, sibling side branches with the same trunk parent keep strictly earlier authored commits on inner side lanes, keep later siblings on their outward lanes until they rejoin the shared parent, share the same trunk branch-off with horizontal extensions to outer lanes, new branch lanes use the nearest available lane to the right and do not reuse occupied lanes, multi-lane connectors stay continuous and horizontally aligned across intermediate lanes even when those lanes are occupied by other active branches, and branch labels do not obscure the graph.
+- An unmerged branch's lane runs from its tip down to the commit where it diverged from
+  visible history and ends there; when the tip is newer than the checked-out commit, the
+  left-most lane is simply empty above the checked-out commit's row.
+- A branch that shares no history with the others ends without joining any other lane.
+- A repository whose checked-out branch has no commits yet still shows the history of its
+  other local branches.
 - Detached-HEAD repositories render normally with no checked-out branch marker.
 
 ## Selecting commits to review

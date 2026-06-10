@@ -659,7 +659,7 @@ fn read_commit_page(
     after_oid: Option<git2::Oid>,
     limit: usize,
 ) -> Result<CommitPage, OpenError> {
-    if head_oid.is_none() {
+    if head_oid.is_none() && branch_names_by_oid.is_empty() {
         return Ok(CommitPage {
             commits: Vec::new(),
             has_more: false,
@@ -670,7 +670,12 @@ fn read_commit_page(
     revwalk
         .set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)
         .map_err(OpenError::Git)?;
-    revwalk.push_head().map_err(OpenError::Git)?;
+    for branch_oid in branch_names_by_oid.keys() {
+        revwalk.push(*branch_oid).map_err(OpenError::Git)?;
+    }
+    if head_oid.is_some() {
+        revwalk.push_head().map_err(OpenError::Git)?;
+    }
 
     let mut commits = Vec::new();
     let mut after_seen = after_oid.is_none();
@@ -701,7 +706,7 @@ fn read_commit_page(
 
     if !after_seen {
         return Err(OpenError::Git(git2::Error::from_str(
-            "Commit cursor was not found in HEAD history",
+            "Commit cursor was not found in commit history",
         )));
     }
 
@@ -947,6 +952,190 @@ mod tests {
             .expect("create commit");
 
         oid.to_string()
+    }
+
+    /// Commits the current index tree to `reference` (or to no ref when
+    /// `None`) with an explicit authored time, so tests control history
+    /// interleaving deterministically.
+    fn commit_tree_to_ref(
+        repo: &Repository,
+        reference: Option<&str>,
+        message: &str,
+        authored_seconds: i64,
+        parent_oids: &[git2::Oid],
+    ) -> git2::Oid {
+        let mut index = repo.index().expect("open index");
+        let tree_oid = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+
+        let signature = Signature::new(
+            "Greviewer Tests",
+            "tests@greviewer.invalid",
+            &git2::Time::new(authored_seconds, 0),
+        )
+        .expect("create signature");
+        let parents = parent_oids
+            .iter()
+            .map(|oid| repo.find_commit(*oid).expect("find parent"))
+            .collect::<Vec<_>>();
+        let parent_refs = parents.iter().collect::<Vec<_>>();
+
+        repo.commit(
+            reference,
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parent_refs,
+        )
+        .expect("create commit")
+    }
+
+    #[test]
+    fn open_at_includes_commits_from_unmerged_local_branches() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        let root = commit_tree_to_ref(&repo, Some("HEAD"), "Root", 100, &[]);
+        let main_tip = commit_tree_to_ref(&repo, Some("HEAD"), "Main tip", 200, &[root]);
+        let feature_tip = commit_tree_to_ref(
+            &repo,
+            Some("refs/heads/feature"),
+            "Feature tip",
+            300,
+            &[root],
+        );
+        drop(repo);
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+
+        let shas = snapshot
+            .commits
+            .iter()
+            .map(|commit| commit.sha.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shas,
+            vec![
+                feature_tip.to_string(),
+                main_tip.to_string(),
+                root.to_string(),
+            ],
+            "unmerged branch commits interleave newest-first",
+        );
+        assert!(snapshot.commits[1].is_head, "HEAD stays on the main tip");
+    }
+
+    #[test]
+    fn open_at_excludes_remote_tracking_refs_and_tags() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        let root = commit_tree_to_ref(&repo, Some("HEAD"), "Root", 100, &[]);
+        let remote_only = commit_tree_to_ref(&repo, None, "Remote only", 200, &[root]);
+        let tag_only = commit_tree_to_ref(&repo, None, "Tag only", 300, &[root]);
+        repo.reference(
+            "refs/remotes/origin/topic",
+            remote_only,
+            true,
+            "create remote-tracking ref",
+        )
+        .expect("create remote-tracking ref");
+        repo.reference("refs/tags/v1", tag_only, true, "create tag")
+            .expect("create tag");
+        drop(repo);
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+
+        let shas = snapshot
+            .commits
+            .iter()
+            .map(|commit| commit.sha.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shas,
+            vec![root.to_string()],
+            "remote-tracking and tag commits stay out of the graph",
+        );
+    }
+
+    #[test]
+    fn open_at_includes_orphan_branch_commits() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        let root = commit_tree_to_ref(&repo, Some("HEAD"), "Root", 100, &[]);
+        let orphan = commit_tree_to_ref(&repo, Some("refs/heads/orphan"), "Orphan", 200, &[]);
+        drop(repo);
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+
+        let shas = snapshot
+            .commits
+            .iter()
+            .map(|commit| commit.sha.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(shas, vec![orphan.to_string(), root.to_string()]);
+    }
+
+    #[test]
+    fn open_at_with_unborn_head_still_lists_branch_commits() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        let other = commit_tree_to_ref(&repo, Some("refs/heads/other"), "Other", 100, &[]);
+        drop(repo);
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+
+        assert!(snapshot.head.is_none(), "HEAD is still unborn");
+        let shas = snapshot
+            .commits
+            .iter()
+            .map(|commit| commit.sha.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(shas, vec![other.to_string()]);
+    }
+
+    #[test]
+    fn load_commits_after_pages_deterministically_across_multiple_tips() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        let root = commit_tree_to_ref(&repo, Some("HEAD"), "Root", 10, &[]);
+        let main_a = commit_tree_to_ref(&repo, Some("HEAD"), "Main a", 20, &[root]);
+        let feature_a =
+            commit_tree_to_ref(&repo, Some("refs/heads/feature"), "Feature a", 25, &[root]);
+        let main_b = commit_tree_to_ref(&repo, Some("HEAD"), "Main b", 30, &[main_a]);
+        let _feature_b = commit_tree_to_ref(
+            &repo,
+            Some("refs/heads/feature"),
+            "Feature b",
+            35,
+            &[feature_a],
+        );
+        let _main_c = commit_tree_to_ref(&repo, Some("HEAD"), "Main c", 40, &[main_b]);
+        drop(repo);
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+        assert_eq!(snapshot.commits.len(), 6, "all branch commits load");
+
+        for (index, commit) in snapshot.commits.iter().enumerate() {
+            let page = load_commits_after(dir.path(), &commit.sha).expect("load page");
+            let page_shas = page
+                .commits
+                .iter()
+                .map(|commit| commit.sha.clone())
+                .collect::<Vec<_>>();
+            let expected = snapshot.commits[index + 1..]
+                .iter()
+                .map(|commit| commit.sha.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                page_shas, expected,
+                "resuming after any cursor continues the same walk",
+            );
+        }
     }
 
     #[test]

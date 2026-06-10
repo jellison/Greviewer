@@ -38,7 +38,14 @@ pub struct GraphRow {
 }
 
 pub fn layout_graph(commits: &[GraphCommit]) -> Vec<GraphRow> {
-    let top_first_parent_history = top_first_parent_history(commits);
+    layout_graph_anchored(commits, None)
+}
+
+/// Lays out the graph, anchoring lane 0 to `head_sha`'s first-parent history.
+/// Falls back to the first commit when `head_sha` is `None` or absent from the
+/// commit set.
+pub fn layout_graph_anchored(commits: &[GraphCommit], head_sha: Option<&str>) -> Vec<GraphRow> {
+    let top_first_parent_history = top_first_parent_history(commits, head_sha);
     let side_branch_lanes = side_branch_lanes(commits, &top_first_parent_history);
     let mut active_shas = Vec::<Option<String>>::new();
     let mut active_colors = Vec::<Option<usize>>::new();
@@ -51,6 +58,7 @@ pub fn layout_graph(commits: &[GraphCommit]) -> Vec<GraphRow> {
         let lane = commit_lane(
             commit,
             is_top_first_parent,
+            &side_branch_lanes,
             &mut active_shas,
             &mut active_colors,
             &mut next_color,
@@ -134,9 +142,12 @@ pub fn layout_graph(commits: &[GraphCommit]) -> Vec<GraphRow> {
     rows
 }
 
-fn top_first_parent_history(commits: &[GraphCommit]) -> Vec<String> {
+fn top_first_parent_history(commits: &[GraphCommit], head_sha: Option<&str>) -> Vec<String> {
     let mut history = Vec::new();
-    let mut next_sha = commits.first().map(|commit| commit.sha.clone());
+    let mut next_sha = head_sha
+        .filter(|sha| commits.iter().any(|commit| commit.sha == *sha))
+        .map(|sha| sha.to_string())
+        .or_else(|| commits.first().map(|commit| commit.sha.clone()));
 
     while let Some(sha) = next_sha {
         if contains_sha(&history, &sha) {
@@ -212,6 +223,7 @@ fn side_branch_lanes(
 fn commit_lane(
     commit: &GraphCommit,
     is_top_first_parent: bool,
+    side_branch_lanes: &BTreeMap<String, usize>,
     active_shas: &mut Vec<Option<String>>,
     active_colors: &mut Vec<Option<usize>>,
     next_color: &mut usize,
@@ -231,7 +243,8 @@ fn commit_lane(
         return lane;
     }
 
-    let lane = first_available_lane_at_or_after(&occupied_lanes(active_shas), 1);
+    let lane_floor = side_branch_lanes.get(&commit.sha).copied().unwrap_or(1);
+    let lane = first_available_lane_at_or_after(&occupied_lanes(active_shas), lane_floor.max(1));
     set_new_lane(
         active_shas,
         active_colors,
@@ -668,7 +681,10 @@ fn trim_empty_lanes(active_shas: &mut Vec<Option<String>>, active_colors: &mut V
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{layout_graph, parent_lanes, GraphCommit, GraphConnector, GraphConnectorKind};
+    use super::{
+        layout_graph, layout_graph_anchored, parent_lanes, GraphCommit, GraphConnector,
+        GraphConnectorKind,
+    };
 
     fn commit(sha: &str, parent_shas: &[&str]) -> GraphCommit {
         commit_at(sha, 0, parent_shas)
@@ -723,6 +739,162 @@ mod tests {
         assert_eq!(rows[2].parent_lanes, Vec::<usize>::new());
         assert_eq!(rows[2].connector_lanes, Vec::<usize>::new());
         assert_eq!(rows[2].lane_colors, vec![Some(0)]);
+    }
+
+    #[test]
+    fn head_anchors_lane_zero_when_another_branch_tip_is_newer() {
+        // Rows are newest-first. The unmerged feature tip is newest, so it sits
+        // at row 0, but HEAD (main-tip) must still own lane 0.
+        let rows = layout_graph_anchored(
+            &[
+                commit("feature-tip", &["base"]),
+                commit("main-tip", &["main-mid"]),
+                commit("main-mid", &["base"]),
+                commit("base", &[]),
+            ],
+            Some("main-tip"),
+        );
+
+        // Feature tip is a side lane and dead-ends at the top (nothing above it).
+        assert_eq!(rows[0].sha, "feature-tip");
+        assert_eq!(rows[0].lane, 1);
+        assert_eq!(rows[0].incoming_lanes, Vec::<usize>::new());
+
+        // HEAD's first-parent history owns lane 0 the whole way down.
+        assert_eq!(rows[1].sha, "main-tip");
+        assert_eq!(rows[1].lane, 0);
+        assert_eq!(rows[2].sha, "main-mid");
+        assert_eq!(rows[2].lane, 0);
+        assert_eq!(rows[3].sha, "base");
+        assert_eq!(rows[3].lane, 0);
+    }
+
+    #[test]
+    fn layout_graph_falls_back_to_first_commit_when_head_absent() {
+        let anchored = layout_graph_anchored(
+            &[commit("tip", &["root"]), commit("root", &[])],
+            Some("does-not-exist"),
+        );
+        let default = layout_graph(&[commit("tip", &["root"]), commit("root", &[])]);
+
+        assert_eq!(anchored, default);
+        assert_eq!(anchored[0].lane, 0);
+    }
+
+    #[test]
+    fn unmerged_branch_lane_merges_into_its_fork_point() {
+        let rows = layout_graph_anchored(
+            &[
+                commit("feature-tip", &["fork"]),
+                commit("head-tip", &["fork"]),
+                commit("fork", &["root"]),
+                commit("root", &[]),
+            ],
+            Some("head-tip"),
+        );
+
+        // Lane 0 stays empty above the HEAD row.
+        assert_eq!(rows[0].lane, 1);
+        assert_eq!(rows[0].active_lanes, vec![1]);
+        assert_eq!(rows[0].lane_colors[0], None);
+
+        // The branch lane runs down to the fork commit and ends there.
+        assert_eq!(rows[2].sha, "fork");
+        assert_eq!(rows[2].lane, 0);
+        assert_eq!(rows[2].incoming_lanes, vec![0, 1]);
+        assert!(rows[2].connectors.contains(&GraphConnector {
+            from_lane: 1,
+            to_lane: 0,
+            kind: GraphConnectorKind::MergeIn,
+        }));
+        assert_eq!(rows[2].outgoing_lanes, vec![0]);
+    }
+
+    #[test]
+    fn two_unmerged_branches_sharing_a_fork_point_each_end_there() {
+        let rows = layout_graph_anchored(
+            &[
+                commit_at("feature-b", 40, &["fork"]),
+                commit_at("feature-a", 30, &["fork"]),
+                commit_at("head-tip", 20, &["fork"]),
+                commit_at("fork", 10, &[]),
+            ],
+            Some("head-tip"),
+        );
+
+        // The later tip sits in its outward sibling lane, directly above its
+        // edge to the fork.
+        assert_eq!(rows[0].sha, "feature-b");
+        assert_eq!(rows[0].lane, 2);
+        assert_eq!(rows[0].parent_lanes, vec![2]);
+
+        // The earlier tip joins the existing edge to the shared fork instead of
+        // drawing a duplicate parallel edge.
+        assert_eq!(rows[1].sha, "feature-a");
+        assert_eq!(rows[1].lane, 1);
+        assert_eq!(rows[1].parent_lanes, vec![2]);
+        assert!(rows[1].connectors.contains(&GraphConnector {
+            from_lane: 1,
+            to_lane: 2,
+            kind: GraphConnectorKind::BranchOut,
+        }));
+        assert_eq!(rows[2].lane, 0);
+
+        // The shared branch edge ends at the fork commit.
+        assert_eq!(rows[3].sha, "fork");
+        assert_eq!(rows[3].lane, 0);
+        assert_eq!(rows[3].incoming_lanes, vec![0, 2]);
+        assert!(rows[3].connectors.contains(&GraphConnector {
+            from_lane: 2,
+            to_lane: 0,
+            kind: GraphConnectorKind::MergeIn,
+        }));
+        assert_eq!(rows[3].outgoing_lanes, Vec::<usize>::new());
+    }
+
+    #[test]
+    fn orphan_branch_lane_terminates_without_connectors() {
+        let rows = layout_graph_anchored(
+            &[
+                commit("orphan-tip", &["orphan-root"]),
+                commit("head-tip", &["root"]),
+                commit("orphan-root", &[]),
+                commit("root", &[]),
+            ],
+            Some("head-tip"),
+        );
+
+        assert_eq!(rows[0].lane, 1);
+        assert_eq!(rows[1].lane, 0);
+
+        // The orphan root has no visible parent: its lane just stops.
+        assert_eq!(rows[2].sha, "orphan-root");
+        assert_eq!(rows[2].lane, 1);
+        assert_eq!(rows[2].parent_lanes, Vec::<usize>::new());
+        assert_eq!(rows[2].connectors, Vec::<GraphConnector>::new());
+        assert_eq!(rows[2].outgoing_lanes, vec![0]);
+    }
+
+    #[test]
+    fn unmerged_branch_forking_off_the_head_tip_ends_on_the_head_row() {
+        let rows = layout_graph_anchored(
+            &[
+                commit("feature", &["head-tip"]),
+                commit("head-tip", &["root"]),
+                commit("root", &[]),
+            ],
+            Some("head-tip"),
+        );
+
+        assert_eq!(rows[0].lane, 1);
+        assert_eq!(rows[1].sha, "head-tip");
+        assert_eq!(rows[1].lane, 0);
+        assert!(rows[1].connectors.contains(&GraphConnector {
+            from_lane: 1,
+            to_lane: 0,
+            kind: GraphConnectorKind::MergeIn,
+        }));
+        assert_eq!(rows[1].outgoing_lanes, vec![0]);
     }
 
     #[test]

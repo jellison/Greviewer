@@ -940,7 +940,12 @@ impl App {
                     parent_shas: commit.parent_shas.clone(),
                 })
                 .collect::<Vec<_>>();
-            let graph_rows = graph::layout_graph(&graph_commits);
+            let head_sha = repo
+                .commits
+                .iter()
+                .find(|commit| commit.is_head)
+                .map(|commit| commit.sha.as_str());
+            let graph_rows = graph::layout_graph_anchored(&graph_commits, head_sha);
             let max_graph_lanes = graph_rows
                 .iter()
                 .map(|row| row.lane_count)
@@ -6588,6 +6593,63 @@ mod tests {
             side_bottom.origin.y <= side_middle.origin.y + side_middle.size.height,
             "side lane middle segment should not leave a gap before the bottom segment",
         );
+    }
+
+    #[gpui::test]
+    async fn commit_graph_renders_unmerged_branch_tip_above_head(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, _window, cx| {
+                let mut head_commit = commit_info_for_graph_at("head-tip", 20, &["fork"]);
+                head_commit.is_head = true;
+                seed_repo_open_mode_with_commits(
+                    app,
+                    dir.path().to_path_buf(),
+                    vec![
+                        commit_info_for_graph_at("feature-tip", 30, &["fork"]),
+                        head_commit,
+                        commit_info_for_graph_at("fork", 10, &[]),
+                    ],
+                );
+                cx.notify();
+            })
+            .expect("seed open repository");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let feature_dot = visual
+            .debug_bounds("commit-graph-dot-0")
+            .expect("unmerged branch tip renders a commit dot");
+        let head_dot = visual
+            .debug_bounds("commit-graph-dot-1")
+            .expect("HEAD commit renders a commit dot");
+        let fork_dot = visual
+            .debug_bounds("commit-graph-dot-2")
+            .expect("fork commit renders a commit dot");
+
+        assert!(
+            feature_dot.origin.x > head_dot.origin.x,
+            "the unmerged branch tip should sit in a side lane right of HEAD's trunk lane",
+        );
+        assert_eq!(
+            head_dot.origin.x, fork_dot.origin.x,
+            "HEAD's first-parent history should keep the trunk lane",
+        );
+        assert!(
+            visual
+                .debug_bounds("commit-graph-vertical-0-0-top")
+                .is_none()
+                && visual
+                    .debug_bounds("commit-graph-middle-vertical-0-0")
+                    .is_none(),
+            "the trunk lane should stay empty above the HEAD row",
+        );
+        visual
+            .debug_bounds("commit-graph-vertical-2-1-top")
+            .expect("the branch lane should run into its fork row");
     }
 
     #[gpui::test]
