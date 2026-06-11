@@ -16,6 +16,10 @@ pub enum LucideIcon {
     ChevronsUpDown,
     /// `columns-2.svg`
     Columns2,
+    /// `eye.svg`
+    Eye,
+    /// `eye-off.svg`
+    EyeOff,
     /// `list-tree.svg`
     ListTree,
     /// `rows-2.svg`
@@ -38,6 +42,8 @@ impl LucideIcon {
         LucideIcon::ChevronsDownUp,
         LucideIcon::ChevronsUpDown,
         LucideIcon::Columns2,
+        LucideIcon::Eye,
+        LucideIcon::EyeOff,
         LucideIcon::ListTree,
         LucideIcon::Rows2,
         LucideIcon::SquareDot,
@@ -54,6 +60,8 @@ impl IconNamed for LucideIcon {
             LucideIcon::ChevronsDownUp => "icons/chevrons-down-up.svg",
             LucideIcon::ChevronsUpDown => "icons/chevrons-up-down.svg",
             LucideIcon::Columns2 => "icons/columns-2.svg",
+            LucideIcon::Eye => "icons/eye.svg",
+            LucideIcon::EyeOff => "icons/eye-off.svg",
             LucideIcon::ListTree => "icons/list-tree.svg",
             LucideIcon::Rows2 => "icons/rows-2.svg",
             LucideIcon::SquareDot => "icons/square-dot.svg",

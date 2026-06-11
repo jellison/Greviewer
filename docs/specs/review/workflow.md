@@ -131,6 +131,34 @@ Graph mode includes a sidebar beside the graph listing the repository's local br
 - Activating a branch whose tip is already the selected commit keeps that selection; it does not clear it.
 - When the branch list exceeds the sidebar's height, it scrolls; a scrollbar appears while the pointer is over the sidebar and stays out of the way otherwise.
 
+## Hiding branches from the graph
+
+Every branch except the checked-out branch can be toggled off from the
+sidebar. A hidden branch's name no longer appears as a ref label in the
+graph, and commits reachable only from hidden branches are removed: the graph
+re-flows as if those commits did not exist. Commits a hidden branch shares
+with any visible branch (or with the checked-out branch) remain.
+
+The toggle control on a visible branch is revealed when the pointer is over
+its row; a hidden branch's control is always visible and its name renders
+muted. Activating a hidden branch's row does not focus it; the branch must be
+shown again first. The checked-out branch offers no toggle. If hiding a
+branch removes the selected commit — or any commit in a selected range — the
+selection clears. Visibility choices are not persisted: opening a repository
+shows every branch.
+
+**Observable outcomes**
+
+- A non-checked-out branch row reveals a visibility toggle on hover; the
+  checked-out branch row never shows one.
+- Toggling a branch off removes its ref labels and its exclusive commits from
+  the graph; toggling it back on restores them.
+- A hidden branch's row is muted, keeps its toggle visible, and does not
+  focus its tip when activated.
+- Hiding a branch that makes the current selection invisible clears the
+  selection.
+- Reopening a repository resets all branches to visible.
+
 ## Selecting commits to review
 
 The user stages a review by selecting either a single commit or a contiguous sequential range from the graph. Selection is tentative: no review activity begins until the user explicitly opens the changeset (described below). Clicking a commit selects it. Shift-clicking a second commit extends the selection to a range, provided the two commits lie on a single ancestry path (one is an ancestor of the other). The selection is the inclusive set of commits between the two endpoints along that path. Clicking the selected commit again clears the selection.

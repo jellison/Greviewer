@@ -26,7 +26,7 @@ use gpui_component::Icon;
 use similar::{DiffTag, TextDiff};
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -107,6 +107,13 @@ pub struct App {
     /// True while the cursor is anywhere over the branch sidebar; gates its
     /// hover-revealed scrollbar overlay.
     branch_sidebar_hovered: bool,
+    /// Branch names the user has toggled off in the sidebar. Session-only:
+    /// cleared whenever a repository is opened. The checked-out branch is
+    /// never in this set (its row renders no toggle).
+    hidden_branches: BTreeSet<String>,
+    /// Sidebar row index the cursor is currently over, if any. Gates the
+    /// hover-revealed visibility toggle on visible branches.
+    hovered_branch_row: Option<usize>,
     focus_handle: FocusHandle,
     /// Whether the title-bar context popover (the diff "switcher") is open.
     context_popover_open: bool,
@@ -389,6 +396,8 @@ impl App {
             graph_resizable,
             branch_sidebar_scroll: ScrollHandle::new(),
             branch_sidebar_hovered: false,
+            hidden_branches: BTreeSet::new(),
+            hovered_branch_row: None,
             focus_handle,
             context_popover_open: false,
             repo_switcher_open: false,
@@ -489,6 +498,8 @@ impl App {
         self.file_tree_hscroll.set_offset(point(px(0.), px(0.)));
         self.branch_sidebar_scroll.set_offset(point(px(0.), px(0.)));
         self.branch_sidebar_hovered = false;
+        self.hidden_branches.clear();
+        self.hovered_branch_row = None;
         self.file_tree_hovered = false;
         self.context_popover_open = false;
         self.repo_switcher_open = false;
@@ -535,22 +546,67 @@ impl App {
         cx.notify();
     }
 
+    /// Flip a branch's graph visibility. Hiding may make the selected
+    /// commit(s) invisible, in which case the selection is cleared. The HEAD
+    /// branch never reaches this path: its sidebar row renders no toggle.
+    pub(crate) fn toggle_branch_visibility(&mut self, name: String, cx: &mut Context<Self>) {
+        if self.hidden_branches.remove(&name) {
+            cx.notify();
+            return;
+        }
+        self.hidden_branches.insert(name);
+        self.clear_selection_if_hidden();
+        cx.notify();
+    }
+
+    /// Reset the selection when hiding a branch removed any selected commit
+    /// from the visible graph. No-ops outside `Mode::RepoOpen` or when the
+    /// selection is already visible.
+    fn clear_selection_if_hidden(&mut self) {
+        let Mode::RepoOpen { repo } = &self.mode else {
+            return;
+        };
+        let head_sha = repo
+            .commits
+            .iter()
+            .find(|commit| commit.is_head)
+            .map(|commit| commit.sha.as_str());
+        let visible = visible_commit_shas(
+            &repo.commits,
+            &repo.local_branches,
+            head_sha,
+            &self.hidden_branches,
+        );
+        let selection_hidden = match &self.selection {
+            Selection::None => false,
+            Selection::Single { sha } => !visible.contains(sha),
+            Selection::Range { shas, .. } => shas.iter().any(|sha| !visible.contains(sha)),
+        };
+        if selection_hidden {
+            self.selection = Selection::None;
+        }
+    }
+
     /// Select a branch's tip commit and bring its row into view, paging in
     /// older history first when the tip has not been loaded yet. The revwalk
     /// behind `load_older_commits` pushes every local branch tip, so paging
     /// always reaches the commit unless loading itself fails.
     fn focus_branch(&mut self, tip_sha: String, window: &mut Window, cx: &mut Context<Self>) {
         let (commit_index, commit_count) = loop {
-            let (tip_index, can_load_more, loaded_count) = match &self.mode {
-                Mode::RepoOpen { repo } => (
-                    repo.commits.iter().position(|commit| commit.sha == tip_sha),
-                    repo.has_more_commits,
-                    repo.commits.len(),
-                ),
+            let (tip_index, can_load_more, loaded_count, visible_count) = match &self.mode {
+                Mode::RepoOpen { repo } => {
+                    let visible = visible_commits(repo, &self.hidden_branches);
+                    (
+                        visible.iter().position(|commit| commit.sha == tip_sha),
+                        repo.has_more_commits,
+                        repo.commits.len(),
+                        visible.len(),
+                    )
+                }
                 Mode::NoRepo => return,
             };
             if let Some(index) = tip_index {
-                break (index, loaded_count);
+                break (index, visible_count);
             }
             if !can_load_more {
                 return;
@@ -1301,8 +1357,8 @@ impl App {
                 .text_size(px(14.))
                 .child("This repository has no commits to review.")
         } else {
-            let graph_commits = repo
-                .commits
+            let visible_commits = visible_commits(repo, &self.hidden_branches);
+            let graph_commits = visible_commits
                 .iter()
                 .map(|commit| graph::GraphCommit {
                     sha: commit.sha.clone(),
@@ -1310,8 +1366,7 @@ impl App {
                     parent_shas: commit.parent_shas.clone(),
                 })
                 .collect::<Vec<_>>();
-            let head_sha = repo
-                .commits
+            let head_sha = visible_commits
                 .iter()
                 .find(|commit| commit.is_head)
                 .map(|commit| commit.sha.as_str());
@@ -1322,8 +1377,7 @@ impl App {
                 .max()
                 .unwrap_or(1);
 
-            let commit_rows = repo
-                .commits
+            let commit_rows = visible_commits
                 .iter()
                 .zip(graph_rows.iter())
                 .enumerate()
@@ -1502,10 +1556,19 @@ impl App {
             &self.selection,
             Selection::Single { sha } if sha == &branch.tip_sha
         );
+        let hidden = self.hidden_branches.contains(&branch.name);
+        let show_toggle = !branch.is_head && (hidden || self.hovered_branch_row == Some(index));
         let row_bg = if selected {
             rgb(0x223248)
         } else {
             rgb(0x171717)
+        };
+        let name_color = if hidden {
+            rgb(0x999999)
+        } else if branch.is_head {
+            rgb(0xa3e635)
+        } else {
+            rgb(0xe6e6e6)
         };
         let name_fragment = debug_ref_label_fragment(&branch.name);
         let row_selector = if selected {
@@ -1514,7 +1577,9 @@ impl App {
             format!("branch-row-{name_fragment}")
         };
         let marker_selector = format!("branch-head-marker-{name_fragment}");
+        let toggle_selector = format!("branch-visibility-{name_fragment}");
         let tip_sha = branch.tip_sha.clone();
+        let toggle_branch_name = branch.name.clone();
 
         div()
             .flex()
@@ -1524,22 +1589,34 @@ impl App {
             .gap_2()
             .px_3()
             .bg(row_bg)
-            .cursor_pointer()
             .id(("branch-row", index))
             .debug_selector(move || row_selector.clone())
-            .when(!selected, |row| row.hover(|style| style.bg(rgb(0x1f2733))))
-            .on_click(cx.listener(move |app, _event: &ClickEvent, window, cx| {
-                app.focus_branch(tip_sha.clone(), window, cx);
+            .when(!selected && !hidden, |row| {
+                row.hover(|style| style.bg(rgb(0x1f2733)))
+            })
+            .on_hover(cx.listener(move |app, hovered: &bool, _window, cx| {
+                if *hovered {
+                    if app.hovered_branch_row != Some(index) {
+                        app.hovered_branch_row = Some(index);
+                        cx.notify();
+                    }
+                } else if app.hovered_branch_row == Some(index) {
+                    app.hovered_branch_row = None;
+                    cx.notify();
+                }
             }))
+            .when(!hidden, |row| {
+                row.cursor_pointer().on_click(cx.listener(
+                    move |app, _event: &ClickEvent, window, cx| {
+                        app.focus_branch(tip_sha.clone(), window, cx);
+                    },
+                ))
+            })
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_color(if branch.is_head {
-                        rgb(0xa3e635)
-                    } else {
-                        rgb(0xe6e6e6)
-                    })
+                    .text_color(name_color)
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .truncate()
                     .child(branch.name.clone()),
@@ -1555,6 +1632,30 @@ impl App {
                             Icon::new(LucideIcon::Check)
                                 .text_color(rgb(0xa3e635))
                                 .size(px(FILE_TREE_STATUS_ICON_SIZE)),
+                        ),
+                )
+            })
+            .when(show_toggle, |row| {
+                row.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .id(("branch-visibility", index))
+                        .debug_selector(move || toggle_selector.clone())
+                        .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            app.toggle_branch_visibility(toggle_branch_name.clone(), cx);
+                        }))
+                        .child(
+                            Icon::new(if hidden {
+                                LucideIcon::EyeOff
+                            } else {
+                                LucideIcon::Eye
+                            })
+                            .text_color(rgb(0x999999))
+                            .size(px(FILE_TREE_STATUS_ICON_SIZE)),
                         ),
                 )
             })
@@ -2383,7 +2484,11 @@ impl App {
                     .debug_selector(move || format!("commit-time-{index}"))
                     .child(commit.authored_date.clone()),
             )
-            .child(render_commit_ref_labels(index, commit))
+            .child(render_commit_ref_labels(
+                index,
+                commit,
+                &self.hidden_branches,
+            ))
     }
 }
 
@@ -2405,7 +2510,11 @@ fn commit_row_separator_color(selected: bool) -> gpui::Rgba {
     }
 }
 
-fn render_commit_ref_labels(row_index: usize, commit: &repo::CommitInfo) -> gpui::Div {
+fn render_commit_ref_labels(
+    row_index: usize,
+    commit: &repo::CommitInfo,
+    hidden_branches: &BTreeSet<String>,
+) -> gpui::Div {
     let mut labels = Vec::new();
     if commit.is_head {
         labels.push(CommitRefLabel {
@@ -2417,6 +2526,7 @@ fn render_commit_ref_labels(row_index: usize, commit: &repo::CommitInfo) -> gpui
         commit
             .branch_names
             .iter()
+            .filter(|name| !hidden_branches.contains(*name))
             .cloned()
             .map(|name| CommitRefLabel {
                 name,
@@ -2478,6 +2588,77 @@ fn render_commit_ref_label(row_index: usize, label: CommitRefLabel) -> gpui::Div
         .truncate()
         .debug_selector(move || selector.clone())
         .child(label.name)
+}
+
+/// The set of loaded commits reachable from HEAD or from any branch whose
+/// name is not in `hidden_branches`. Parents beyond the loaded page simply
+/// terminate the walk: a commit that is not loaded cannot be rendered anyway,
+/// and paging in more history re-runs this computation over the larger list.
+fn visible_commit_shas(
+    commits: &[repo::CommitInfo],
+    local_branches: &[repo::LocalBranch],
+    head_sha: Option<&str>,
+    hidden_branches: &BTreeSet<String>,
+) -> HashSet<String> {
+    let commits_by_sha: HashMap<&str, &repo::CommitInfo> = commits
+        .iter()
+        .map(|commit| (commit.sha.as_str(), commit))
+        .collect();
+
+    let mut worklist: Vec<&str> = Vec::new();
+    worklist.extend(head_sha);
+    worklist.extend(
+        local_branches
+            .iter()
+            .filter(|branch| !hidden_branches.contains(&branch.name))
+            .map(|branch| branch.tip_sha.as_str()),
+    );
+
+    let mut visible = HashSet::new();
+    while let Some(sha) = worklist.pop() {
+        let Some(commit) = commits_by_sha.get(sha) else {
+            continue;
+        };
+        if !visible.insert(commit.sha.clone()) {
+            continue;
+        }
+        worklist.extend(commit.parent_shas.iter().map(String::as_str));
+    }
+    visible
+}
+
+/// The loaded commits that survive branch-visibility filtering, in history
+/// order. Render and focus paths must both use this so row indices agree.
+///
+/// The empty-set fast-path is the identity over loaded commits. For real
+/// repositories that equals the reachability walk, because `repo::read_commit_page`
+/// seeds its revwalk only from local branch tips and HEAD — every loaded commit
+/// is reachable from at least one of those seeds. Synthetic test fixtures seed
+/// commits without `local_branches` and rely on the fast-path to render at
+/// all; if the revwalk ever loads unreachable commits, hide-then-show would
+/// no longer round-trip and this fast-path must be revisited.
+fn visible_commits<'a>(
+    repo: &'a repo::OpenRepository,
+    hidden_branches: &BTreeSet<String>,
+) -> Vec<&'a repo::CommitInfo> {
+    if hidden_branches.is_empty() {
+        return repo.commits.iter().collect();
+    }
+    let head_sha = repo
+        .commits
+        .iter()
+        .find(|commit| commit.is_head)
+        .map(|commit| commit.sha.as_str());
+    let visible = visible_commit_shas(
+        &repo.commits,
+        &repo.local_branches,
+        head_sha,
+        hidden_branches,
+    );
+    repo.commits
+        .iter()
+        .filter(|commit| visible.contains(&commit.sha))
+        .collect()
 }
 
 fn render_commit_graph_gutter(
@@ -5006,18 +5187,18 @@ mod tests {
         commit_graph_connector_color_lane, commit_graph_connector_for_lane,
         commit_graph_line_width, commit_graph_merge_in_commit_line_y,
         commit_graph_spanning_connector_requires_center_fill, commit_row_separator_width,
-        debug_ref_label_fragment, side_by_side_diff_rows, single_side_diff_rows, App,
-        CloseChangeset, DiffLineStatus, FileListEntry, FileListMode, FileTreeRow, Mode,
-        OpenChangeset, OpenFailed, ReviewScreen, Selection, FILE_TREE_FOLDER_ICON_SIZE,
-        FILE_TREE_FONT_FAMILY, FILE_TREE_INDENT_WIDTH, FILE_TREE_ROW_HEIGHT,
-        FILE_TREE_STATUS_ICON_SIZE, FILE_TREE_TEXT_SIZE,
+        debug_ref_label_fragment, side_by_side_diff_rows, single_side_diff_rows,
+        visible_commit_shas, App, CloseChangeset, DiffLineStatus, FileListEntry, FileListMode,
+        FileTreeRow, Mode, OpenChangeset, OpenFailed, ReviewScreen, Selection,
+        FILE_TREE_FOLDER_ICON_SIZE, FILE_TREE_FONT_FAMILY, FILE_TREE_INDENT_WIDTH,
+        FILE_TREE_ROW_HEIGHT, FILE_TREE_STATUS_ICON_SIZE, FILE_TREE_TEXT_SIZE,
     };
     use crate::graph::{self, GraphConnectorKind};
-    use crate::repo::{ChangeKind, DiffSide, INITIAL_COMMIT_LIMIT};
+    use crate::repo::{self, ChangeKind, DiffSide, INITIAL_COMMIT_LIMIT};
     use crate::settings::{self, RecentRepository, Settings};
     use git2::{IndexAddOption, Repository, Signature};
-    use gpui::{font, px, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
-    use std::{fs, path::PathBuf};
+    use gpui::{font, point, px, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
+    use std::{collections::BTreeSet, fs, path::PathBuf};
 
     /// Open a window holding a freshly constructed `App`, with the
     /// gpui-component theme installed. The theme global is required by themed
@@ -5082,6 +5263,130 @@ mod tests {
         }
     }
 
+    fn commit_info(sha: &str, parent_shas: &[&str]) -> repo::CommitInfo {
+        repo::CommitInfo {
+            sha: sha.to_string(),
+            short_sha: sha.chars().take(7).collect(),
+            summary: format!("commit {sha}"),
+            author: "Tester".to_string(),
+            authored_timestamp: 0,
+            authored_date: "2026-01-01".to_string(),
+            parent_shas: parent_shas.iter().map(|sha| sha.to_string()).collect(),
+            branch_names: Vec::new(),
+            parent_count: parent_shas.len(),
+            is_head: false,
+        }
+    }
+
+    fn local_branch(name: &str, tip_sha: &str) -> repo::LocalBranch {
+        repo::LocalBranch {
+            name: name.to_string(),
+            tip_sha: tip_sha.to_string(),
+            is_head: false,
+        }
+    }
+
+    fn hidden(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn hiding_a_branch_removes_its_exclusive_commits() {
+        // feature-tip -> root <- main-tip; hiding feature drops feature-tip only.
+        let commits = vec![
+            commit_info("feature-tip", &["root"]),
+            commit_info("main-tip", &["root"]),
+            commit_info("root", &[]),
+        ];
+        let branches = vec![
+            local_branch("feature", "feature-tip"),
+            local_branch("master", "main-tip"),
+        ];
+
+        let visible =
+            visible_commit_shas(&commits, &branches, Some("main-tip"), &hidden(&["feature"]));
+
+        assert!(!visible.contains("feature-tip"));
+        assert!(visible.contains("main-tip"));
+        assert!(visible.contains("root"));
+    }
+
+    #[test]
+    fn shared_ancestry_survives_hiding_a_branch() {
+        // feature points at root, which master also reaches: root stays.
+        let commits = vec![commit_info("main-tip", &["root"]), commit_info("root", &[])];
+        let branches = vec![
+            local_branch("feature", "root"),
+            local_branch("master", "main-tip"),
+        ];
+
+        let visible =
+            visible_commit_shas(&commits, &branches, Some("main-tip"), &hidden(&["feature"]));
+
+        assert!(visible.contains("root"));
+        assert!(visible.contains("main-tip"));
+    }
+
+    #[test]
+    fn head_chain_is_visible_even_with_no_visible_branches() {
+        let commits = vec![commit_info("head-tip", &["root"]), commit_info("root", &[])];
+        let branches = vec![local_branch("feature", "head-tip")];
+
+        let visible =
+            visible_commit_shas(&commits, &branches, Some("head-tip"), &hidden(&["feature"]));
+
+        assert!(visible.contains("head-tip"));
+        assert!(visible.contains("root"));
+    }
+
+    #[test]
+    fn missing_head_walks_from_branch_tips_only() {
+        let commits = vec![
+            commit_info("main-tip", &["root"]),
+            commit_info("root", &[]),
+            commit_info("orphan", &[]),
+        ];
+        let branches = vec![local_branch("master", "main-tip")];
+
+        let visible = visible_commit_shas(&commits, &branches, None, &BTreeSet::new());
+
+        assert!(visible.contains("main-tip"));
+        assert!(visible.contains("root"));
+        assert!(!visible.contains("orphan"));
+    }
+
+    #[test]
+    fn empty_hidden_set_keeps_every_loaded_commit() {
+        let commits = vec![
+            commit_info("feature-tip", &["root"]),
+            commit_info("main-tip", &["root"]),
+            commit_info("root", &[]),
+        ];
+        let branches = vec![
+            local_branch("feature", "feature-tip"),
+            local_branch("master", "main-tip"),
+        ];
+
+        let visible = visible_commit_shas(&commits, &branches, Some("main-tip"), &BTreeSet::new());
+
+        // Every commit here is reachable from a branch tip; the function
+        // returns reachable commits, not loaded commits, so the counts only
+        // match because this topology has no orphans.
+        assert_eq!(visible.len(), commits.len());
+    }
+
+    #[test]
+    fn parents_beyond_the_loaded_boundary_are_ignored() {
+        // root's parent is not loaded; the walk must terminate, not panic.
+        let commits = vec![commit_info("root", &["unloaded-parent"])];
+        let branches = vec![local_branch("master", "root")];
+
+        let visible = visible_commit_shas(&commits, &branches, Some("root"), &BTreeSet::new());
+
+        assert!(visible.contains("root"));
+        assert!(!visible.contains("unloaded-parent"));
+    }
+
     fn init_repo_with_two_commits() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("create tempdir");
         let repo = Repository::init(dir.path()).expect("init repo");
@@ -5116,6 +5421,34 @@ mod tests {
         drop(root_commit);
         drop(repo);
         (dir, main_tip.to_string(), root_oid.to_string())
+    }
+
+    /// Two commits on master plus a `feature` branch carrying one exclusive
+    /// commit branched from the root. Returns (dir, master_tip_sha,
+    /// feature_tip_sha). HEAD stays on master.
+    /// Timestamps are fixed so the loaded order is deterministic: main tip, feature tip, root.
+    fn init_repo_with_unmerged_branch_commit() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("hello.txt"), "hello\n").expect("write file");
+        let root_oid = commit_all_to_ref_at_time(&repo, Some("HEAD"), "Root", &[], 10);
+
+        fs::write(dir.path().join("feature.txt"), "feature\n").expect("write feature file");
+        let feature_tip = commit_all_to_ref_at_time(
+            &repo,
+            Some("refs/heads/feature"),
+            "Feature work",
+            &[root_oid],
+            20,
+        );
+
+        fs::remove_file(dir.path().join("feature.txt")).expect("remove feature file");
+        fs::write(dir.path().join("hello.txt"), "main\n").expect("update file");
+        let main_tip = commit_all_to_ref_at_time(&repo, Some("HEAD"), "Main tip", &[root_oid], 30);
+
+        drop(repo);
+        (dir, main_tip.to_string(), feature_tip.to_string())
     }
 
     fn init_repo_with_detached_head() -> (tempfile::TempDir, String) {
@@ -6290,6 +6623,180 @@ mod tests {
                 assert_eq!(app.selection, Selection::None);
             })
             .expect("update window");
+    }
+
+    #[gpui::test]
+    async fn hiding_a_branch_clears_a_selection_it_made_invisible(cx: &mut TestAppContext) {
+        let (dir, _main_tip, feature_tip) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(feature_tip.clone(), cx);
+                app.toggle_branch_visibility("feature".to_string(), cx);
+                assert_eq!(app.selection, Selection::None);
+            })
+            .expect("update window");
+    }
+
+    #[gpui::test]
+    async fn hiding_a_branch_keeps_a_still_visible_selection(cx: &mut TestAppContext) {
+        let (dir, main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(main_tip.clone(), cx);
+                app.toggle_branch_visibility("feature".to_string(), cx);
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: main_tip.clone()
+                    }
+                );
+            })
+            .expect("update window");
+    }
+
+    #[gpui::test]
+    async fn toggling_a_branch_twice_restores_visibility(cx: &mut TestAppContext) {
+        let (dir, _main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.toggle_branch_visibility("feature".to_string(), cx);
+                assert!(app.hidden_branches.contains("feature"));
+                app.toggle_branch_visibility("feature".to_string(), cx);
+                assert!(app.hidden_branches.is_empty());
+            })
+            .expect("update window");
+    }
+
+    #[gpui::test]
+    async fn opening_a_repository_resets_hidden_branches(cx: &mut TestAppContext) {
+        let (dir, _main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path.clone(), window, cx);
+                app.toggle_branch_visibility("feature".to_string(), cx);
+                assert!(!app.hidden_branches.is_empty());
+                app.open_repository_at(path, window, cx);
+                assert!(app.hidden_branches.is_empty());
+            })
+            .expect("update window");
+    }
+
+    #[gpui::test]
+    async fn hiding_a_branch_removes_its_exclusive_commits_and_label(cx: &mut TestAppContext) {
+        let (dir, _main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.toggle_branch_visibility("feature".to_string(), cx);
+            })
+            .expect("open repository and hide feature");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        // Three commits loaded, one (the feature-exclusive commit) hidden.
+        assert!(visual.debug_bounds("commit-row-1").is_some());
+        assert!(
+            visual.debug_bounds("commit-row-2").is_none(),
+            "the feature-exclusive commit must not render"
+        );
+        // The feature ref label is gone from every remaining row.
+        for row in 0..2usize {
+            let selector = test_debug_selector(format!("commit-ref-label-{row}-feature"));
+            assert!(
+                visual.debug_bounds(selector).is_none(),
+                "hidden branch label must not render on row {row}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn showing_a_branch_again_restores_its_commits_and_label(cx: &mut TestAppContext) {
+        let (dir, _main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.toggle_branch_visibility("feature".to_string(), cx);
+                app.toggle_branch_visibility("feature".to_string(), cx);
+            })
+            .expect("hide and re-show feature");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        // Hide-then-show must round-trip to the identical render: all three
+        // rows back, the feature label on exactly one of them.
+        for row in 0..3 {
+            assert!(
+                visual
+                    .debug_bounds(test_debug_selector(format!("commit-row-{row}")))
+                    .is_some()
+                    || visual
+                        .debug_bounds(test_debug_selector(format!("selected-commit-row-{row}")))
+                        .is_some(),
+                "row {row} must render after re-showing the branch"
+            );
+        }
+        let feature_label_rows = (0..3)
+            .filter(|row| {
+                visual
+                    .debug_bounds(test_debug_selector(format!(
+                        "commit-ref-label-{row}-feature"
+                    )))
+                    .is_some()
+            })
+            .count();
+        assert_eq!(
+            feature_label_rows, 1,
+            "the feature label renders on exactly one row"
+        );
+    }
+
+    #[gpui::test]
+    async fn focusing_a_branch_targets_its_visible_row_index(cx: &mut TestAppContext) {
+        // Hiding `feature` removes row 1, shifting root from index 2 to 1.
+        // Focusing master must select the row at its *visible* index.
+        let (dir, _main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.toggle_branch_visibility("feature".to_string(), cx);
+            })
+            .expect("open repository and hide feature");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let master_row = visual
+            .debug_bounds("branch-row-master")
+            .expect("master branch row renders");
+        visual.simulate_click(master_row.center(), Modifiers::none());
+
+        // With feature hidden the visible order is: master tip (0), root (1).
+        visual
+            .debug_bounds("selected-commit-row-0")
+            .expect("master tip is the selected visible row");
     }
 
     #[gpui::test]
@@ -9794,5 +10301,147 @@ mod tests {
             "notification body matches NotARepository, got {:?}",
             events[0],
         );
+    }
+
+    #[gpui::test]
+    async fn clicking_the_eye_icon_hides_the_branch(cx: &mut TestAppContext) {
+        let (dir, _main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                // The toggle is hover-revealed; tests drive the hover state
+                // directly. Branches sort alphabetically: feature is row 0.
+                app.hovered_branch_row = Some(0);
+                cx.notify();
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let toggle = visual
+            .debug_bounds("branch-visibility-feature")
+            .expect("hovered branch row reveals its visibility toggle");
+        visual.simulate_click(toggle.center(), Modifiers::none());
+
+        // Verify clicking the toggle called toggle_branch_visibility:
+        // (a) the branch is now in hidden_branches, and
+        // (b) the visible commit count dropped from 3 to 2.
+        window
+            .update(cx, |app, _window, _cx| {
+                assert!(
+                    app.hidden_branches.contains("feature"),
+                    "visibility toggle click must add branch to hidden_branches"
+                );
+                assert_eq!(
+                    app.selection,
+                    Selection::None,
+                    "visibility toggle click must not focus the branch"
+                );
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                let head_sha = repo
+                    .commits
+                    .iter()
+                    .find(|c| c.is_head)
+                    .map(|c| c.sha.as_str());
+                let visible = visible_commit_shas(
+                    &repo.commits,
+                    &repo.local_branches,
+                    head_sha,
+                    &app.hidden_branches,
+                );
+                assert_eq!(
+                    visible.len(),
+                    2,
+                    "feature-exclusive commit must be absent from visible set"
+                );
+            })
+            .expect("verify post-click state");
+    }
+
+    #[gpui::test]
+    async fn hidden_branch_shows_its_toggle_without_hover(cx: &mut TestAppContext) {
+        let (dir, _main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.toggle_branch_visibility("feature".to_string(), cx);
+            })
+            .expect("open repository and hide feature");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("branch-visibility-feature")
+            .expect("hidden branch keeps its toggle visible without hover");
+    }
+
+    #[gpui::test]
+    async fn head_branch_row_renders_no_visibility_toggle(cx: &mut TestAppContext) {
+        let (dir, _main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                // master is the HEAD branch; alphabetically it is row 1.
+                app.hovered_branch_row = Some(1);
+                cx.notify();
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(
+            visual.debug_bounds("branch-visibility-master").is_none(),
+            "the HEAD branch must not offer a visibility toggle"
+        );
+    }
+
+    #[gpui::test]
+    async fn clicking_a_hidden_branch_row_does_not_focus_it(cx: &mut TestAppContext) {
+        let (dir, _main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.toggle_branch_visibility("feature".to_string(), cx);
+            })
+            .expect("open repository and hide feature");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row = visual
+            .debug_bounds("branch-row-feature")
+            .expect("hidden branch row still renders");
+        let toggle = visual
+            .debug_bounds("branch-visibility-feature")
+            .expect("hidden branch renders its always-visible toggle");
+        assert!(
+            row.origin.x + px(8.) < toggle.origin.x,
+            "left-edge click point must fall outside the toggle icon"
+        );
+        // Click near the left edge so the click cannot land on the
+        // always-visible eye-off icon at the row's right edge.
+        visual.simulate_click(
+            point(row.origin.x + px(8.), row.center().y),
+            Modifiers::none(),
+        );
+
+        window
+            .update(cx, |app, _window, _cx| {
+                assert_eq!(app.selection, Selection::None);
+            })
+            .expect("read selection");
     }
 }
