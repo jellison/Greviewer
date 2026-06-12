@@ -10,6 +10,10 @@ use gpui_component::IconNamed;
 pub enum LucideIcon {
     /// `check.svg`
     Check,
+    /// `chevron-down.svg`
+    ChevronDown,
+    /// `chevron-right.svg`
+    ChevronRight,
     /// `chevrons-down-up.svg`
     ChevronsDownUp,
     /// `chevrons-up-down.svg`
@@ -39,6 +43,8 @@ impl LucideIcon {
     /// Keep in sync with the enum variants when adding or removing an icon.
     pub const ALL: &[LucideIcon] = &[
         LucideIcon::Check,
+        LucideIcon::ChevronDown,
+        LucideIcon::ChevronRight,
         LucideIcon::ChevronsDownUp,
         LucideIcon::ChevronsUpDown,
         LucideIcon::Columns2,
@@ -57,6 +63,8 @@ impl IconNamed for LucideIcon {
     fn path(self) -> SharedString {
         match self {
             LucideIcon::Check => "icons/check.svg",
+            LucideIcon::ChevronDown => "icons/chevron-down.svg",
+            LucideIcon::ChevronRight => "icons/chevron-right.svg",
             LucideIcon::ChevronsDownUp => "icons/chevrons-down-up.svg",
             LucideIcon::ChevronsUpDown => "icons/chevrons-up-down.svg",
             LucideIcon::Columns2 => "icons/columns-2.svg",

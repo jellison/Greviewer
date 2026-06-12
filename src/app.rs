@@ -111,6 +111,10 @@ pub struct App {
     /// cleared whenever a repository is opened. The checked-out branch is
     /// never in this set (its row renders no toggle).
     hidden_branches: BTreeSet<String>,
+    /// Sidebar folder paths the user has collapsed. Session-only: cleared
+    /// whenever a repository is opened. Folders default to expanded, so an
+    /// empty set means every folder shows its contents.
+    collapsed_branch_folders: BTreeSet<String>,
     /// Sidebar row index the cursor is currently over, if any. Gates the
     /// hover-revealed visibility toggle on visible branches.
     hovered_branch_row: Option<usize>,
@@ -250,6 +254,48 @@ struct FileTreeBranch {
 struct FileTreeLeaf {
     name: String,
     entry: FileListEntry,
+}
+
+/// A folder's aggregate graph-visibility, derived from its descendant
+/// branches' membership in `hidden_branches`. The HEAD branch cannot be
+/// hidden and never counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FolderVisibility {
+    /// No hideable descendant is hidden (or there are none).
+    Visible,
+    /// Every hideable descendant is hidden, and there is at least one.
+    Hidden,
+    /// Some hideable descendants are hidden, some visible.
+    Mixed,
+}
+
+/// Render model for the graph branch sidebar: branches grouped under
+/// collapsible folders derived from `/`-separated name segments. Branch rows
+/// carry the full `LocalBranch` — selection, hiding, and debug selectors all
+/// key on the full name; only `display_name` is shortened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BranchTreeRow {
+    Folder(BranchFolderRow),
+    Branch(BranchRow),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchFolderRow {
+    /// Final path segment, e.g. "alice" for `team/alice`.
+    name: String,
+    /// Full prefix path, e.g. "team/alice". Keys collapse state.
+    path: String,
+    depth: usize,
+    collapsed: bool,
+    visibility: FolderVisibility,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchRow {
+    branch: repo::LocalBranch,
+    /// Final name segment, e.g. "some-feature" for `features/some-feature`.
+    display_name: String,
+    depth: usize,
 }
 
 /// Emitted whenever `open_repository_at` fails. Carries the user-facing
@@ -397,6 +443,7 @@ impl App {
             branch_sidebar_scroll: ScrollHandle::new(),
             branch_sidebar_hovered: false,
             hidden_branches: BTreeSet::new(),
+            collapsed_branch_folders: BTreeSet::new(),
             hovered_branch_row: None,
             focus_handle,
             context_popover_open: false,
@@ -499,6 +546,7 @@ impl App {
         self.branch_sidebar_scroll.set_offset(point(px(0.), px(0.)));
         self.branch_sidebar_hovered = false;
         self.hidden_branches.clear();
+        self.collapsed_branch_folders.clear();
         self.hovered_branch_row = None;
         self.file_tree_hovered = false;
         self.context_popover_open = false;
@@ -556,6 +604,49 @@ impl App {
         }
         self.hidden_branches.insert(name);
         self.clear_selection_if_hidden();
+        cx.notify();
+    }
+
+    /// Collapse or expand a sidebar branch folder. Purely visual: removes the
+    /// folder's descendant rows from the sidebar without touching graph
+    /// visibility.
+    pub(crate) fn toggle_branch_folder(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.collapsed_branch_folders.insert(path.clone()) {
+            self.collapsed_branch_folders.remove(&path);
+        }
+        cx.notify();
+    }
+
+    /// Flip graph visibility for every branch under a sidebar folder as one
+    /// batched change: if any hideable descendant is visible, hide them all;
+    /// otherwise show them all. The HEAD branch cannot be hidden and is
+    /// skipped, so a folder containing it hides everything else inside.
+    pub(crate) fn toggle_folder_visibility(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Mode::RepoOpen { repo } = &self.mode else {
+            return;
+        };
+        let prefix = format!("{path}/");
+        let descendants = repo
+            .local_branches
+            .iter()
+            .filter(|branch| !branch.is_head && branch.name.starts_with(&prefix))
+            .map(|branch| branch.name.clone())
+            .collect::<Vec<_>>();
+        if descendants.is_empty() {
+            return;
+        }
+
+        let any_visible = descendants
+            .iter()
+            .any(|name| !self.hidden_branches.contains(name));
+        if any_visible {
+            self.hidden_branches.extend(descendants);
+            self.clear_selection_if_hidden();
+        } else {
+            for name in &descendants {
+                self.hidden_branches.remove(name);
+            }
+        }
         cx.notify();
     }
 
@@ -1490,11 +1581,22 @@ impl App {
                 .child("No branches")
                 .into_any_element()
         } else {
-            let rows = repo
-                .local_branches
+            let rows = build_branch_tree_rows(
+                &repo.local_branches,
+                &self.collapsed_branch_folders,
+                &self.hidden_branches,
+            );
+            let rows = rows
                 .iter()
                 .enumerate()
-                .map(|(index, branch)| self.render_branch_row(index, branch, cx))
+                .map(|(index, row)| match row {
+                    BranchTreeRow::Folder(folder) => self
+                        .render_branch_folder_row(index, folder, cx)
+                        .into_any_element(),
+                    BranchTreeRow::Branch(branch_row) => self
+                        .render_branch_row(index, branch_row, cx)
+                        .into_any_element(),
+                })
                 .collect::<Vec<_>>();
 
             div()
@@ -1549,9 +1651,10 @@ impl App {
     fn render_branch_row(
         &self,
         index: usize,
-        branch: &repo::LocalBranch,
+        row: &BranchRow,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let branch = &row.branch;
         let selected = matches!(
             &self.selection,
             Selection::Single { sha } if sha == &branch.tip_sha
@@ -1580,6 +1683,7 @@ impl App {
         let toggle_selector = format!("branch-visibility-{name_fragment}");
         let tip_sha = branch.tip_sha.clone();
         let toggle_branch_name = branch.name.clone();
+        let display_name = row.display_name.clone();
 
         div()
             .flex()
@@ -1612,6 +1716,15 @@ impl App {
                     },
                 ))
             })
+            .when(row.depth > 0, |el| {
+                // Plain spacer indent: the branch sidebar deliberately skips
+                // the file tree's indent guides.
+                el.child(
+                    div()
+                        .flex_none()
+                        .w(px(row.depth as f32 * FILE_TREE_INDENT_WIDTH)),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -1619,7 +1732,7 @@ impl App {
                     .text_color(name_color)
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .truncate()
-                    .child(branch.name.clone()),
+                    .child(display_name),
             )
             .when(branch.is_head, |row| {
                 row.child(
@@ -1653,6 +1766,102 @@ impl App {
                                 LucideIcon::EyeOff
                             } else {
                                 LucideIcon::Eye
+                            })
+                            .text_color(rgb(0x999999))
+                            .size(px(FILE_TREE_STATUS_ICON_SIZE)),
+                        ),
+                )
+            })
+    }
+
+    fn render_branch_folder_row(
+        &self,
+        index: usize,
+        folder: &BranchFolderRow,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let path_fragment = debug_ref_label_fragment(&folder.path);
+        let row_selector = format!("branch-folder-{path_fragment}");
+        let toggle_selector = format!("branch-folder-visibility-{path_fragment}");
+        let collapse_path = folder.path.clone();
+        let toggle_path = folder.path.clone();
+        let hidden = folder.visibility == FolderVisibility::Hidden;
+        let show_toggle = folder.visibility != FolderVisibility::Visible
+            || self.hovered_branch_row == Some(index);
+        let name_color = if hidden { rgb(0x999999) } else { rgb(0x8aa6bd) };
+        let depth = folder.depth;
+
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(FILE_TREE_ROW_HEIGHT))
+            .gap_2()
+            .px_3()
+            .bg(rgb(0x171717))
+            .cursor_pointer()
+            .id(("branch-folder", index))
+            .debug_selector(move || row_selector.clone())
+            .hover(|style| style.bg(rgb(0x1f2733)))
+            .on_hover(cx.listener(move |app, hovered: &bool, _window, cx| {
+                if *hovered {
+                    if app.hovered_branch_row != Some(index) {
+                        app.hovered_branch_row = Some(index);
+                        cx.notify();
+                    }
+                } else if app.hovered_branch_row == Some(index) {
+                    app.hovered_branch_row = None;
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
+                app.toggle_branch_folder(collapse_path.clone(), cx);
+            }))
+            .when(depth > 0, |row| {
+                // Plain spacer indent: the branch sidebar deliberately skips
+                // the file tree's indent guides.
+                row.child(
+                    div()
+                        .flex_none()
+                        .w(px(depth as f32 * FILE_TREE_INDENT_WIDTH)),
+                )
+            })
+            .child(
+                Icon::new(if folder.collapsed {
+                    LucideIcon::ChevronRight
+                } else {
+                    LucideIcon::ChevronDown
+                })
+                .text_color(name_color)
+                .size(px(FILE_TREE_STATUS_ICON_SIZE)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_color(name_color)
+                    .text_size(px(FILE_TREE_TEXT_SIZE))
+                    .truncate()
+                    .child(folder.name.clone()),
+            )
+            .when(show_toggle, |row| {
+                row.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .id(("branch-folder-visibility", index))
+                        .debug_selector(move || toggle_selector.clone())
+                        .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            app.toggle_folder_visibility(&toggle_path, cx);
+                        }))
+                        .child(
+                            Icon::new(if folder.visibility == FolderVisibility::Visible {
+                                LucideIcon::Eye
+                            } else {
+                                LucideIcon::EyeOff
                             })
                             .text_color(rgb(0x999999))
                             .size(px(FILE_TREE_STATUS_ICON_SIZE)),
@@ -5216,6 +5425,126 @@ fn append_file_tree_rows(
     }
 }
 
+/// Tree node used while grouping branches by slash-separated name segments.
+/// The BTreeMap keeps sibling folders alphabetical; branches within a node
+/// stay in input order, which is alphabetical because they share a prefix
+/// and `local_branches` arrives sorted by full name.
+#[derive(Debug, Default)]
+struct BranchTreeNode {
+    folders: BTreeMap<String, BranchTreeNode>,
+    branches: Vec<repo::LocalBranch>,
+}
+
+/// Group branches into folders by `/`-separated name segments and flatten
+/// the tree into depth-tagged sidebar rows. Folders list before branches at
+/// each level. A collapsed folder contributes its own row and skips every
+/// descendant. Git rejects ref names with empty segments, so segments are
+/// always non-empty.
+fn build_branch_tree_rows(
+    local_branches: &[repo::LocalBranch],
+    collapsed_folders: &BTreeSet<String>,
+    hidden_branches: &BTreeSet<String>,
+) -> Vec<BranchTreeRow> {
+    let mut root = BranchTreeNode::default();
+    for branch in local_branches {
+        let mut segments = branch.name.split('/').collect::<Vec<_>>();
+        segments.pop();
+        let mut node = &mut root;
+        for segment in segments {
+            node = node.folders.entry(segment.to_string()).or_default();
+        }
+        node.branches.push(branch.clone());
+    }
+
+    let mut rows = Vec::new();
+    append_branch_tree_rows(&root, 0, "", collapsed_folders, hidden_branches, &mut rows);
+    rows
+}
+
+fn append_branch_tree_rows(
+    node: &BranchTreeNode,
+    depth: usize,
+    prefix: &str,
+    collapsed_folders: &BTreeSet<String>,
+    hidden_branches: &BTreeSet<String>,
+    rows: &mut Vec<BranchTreeRow>,
+) {
+    for (name, child) in &node.folders {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let collapsed = collapsed_folders.contains(&path);
+        rows.push(BranchTreeRow::Folder(BranchFolderRow {
+            name: name.clone(),
+            path: path.clone(),
+            depth,
+            collapsed,
+            visibility: folder_visibility(child, hidden_branches),
+        }));
+        if !collapsed {
+            append_branch_tree_rows(
+                child,
+                depth + 1,
+                &path,
+                collapsed_folders,
+                hidden_branches,
+                rows,
+            );
+        }
+    }
+
+    for branch in &node.branches {
+        let display_name = branch
+            .name
+            .rsplit('/')
+            .next()
+            .unwrap_or(&branch.name)
+            .to_string();
+        rows.push(BranchTreeRow::Branch(BranchRow {
+            branch: branch.clone(),
+            display_name,
+            depth,
+        }));
+    }
+}
+
+fn folder_visibility(
+    node: &BranchTreeNode,
+    hidden_branches: &BTreeSet<String>,
+) -> FolderVisibility {
+    let mut any_hidden = false;
+    let mut any_visible = false;
+    collect_folder_visibility(node, hidden_branches, &mut any_hidden, &mut any_visible);
+    match (any_hidden, any_visible) {
+        (true, false) => FolderVisibility::Hidden,
+        (true, true) => FolderVisibility::Mixed,
+        _ => FolderVisibility::Visible,
+    }
+}
+
+fn collect_folder_visibility(
+    node: &BranchTreeNode,
+    hidden_branches: &BTreeSet<String>,
+    any_hidden: &mut bool,
+    any_visible: &mut bool,
+) {
+    for child in node.folders.values() {
+        collect_folder_visibility(child, hidden_branches, any_hidden, any_visible);
+    }
+    for branch in &node.branches {
+        if branch.is_head {
+            continue;
+        }
+        if hidden_branches.contains(&branch.name) {
+            *any_hidden = true;
+        } else {
+            *any_visible = true;
+        }
+    }
+}
+
 fn commit_ancestry_path(
     commits: &[repo::CommitInfo],
     first_sha: &str,
@@ -5298,14 +5627,15 @@ fn repository_title(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_graph_connector_color_lane, commit_graph_connector_for_lane,
+        build_branch_tree_rows, commit_graph_connector_color_lane, commit_graph_connector_for_lane,
         commit_graph_line_width, commit_graph_merge_in_commit_line_y,
         commit_graph_spanning_connector_requires_center_fill, commit_row_separator_width,
         debug_ref_label_fragment, side_by_side_diff_rows, single_side_diff_rows,
-        visible_commit_shas, App, CloseChangeset, DiffLineStatus, FileListEntry, FileListMode,
-        FileTreeRow, Mode, OpenChangeset, OpenFailed, ReviewScreen, Selection,
-        FILE_TREE_FOLDER_ICON_SIZE, FILE_TREE_FONT_FAMILY, FILE_TREE_INDENT_WIDTH,
-        FILE_TREE_ROW_HEIGHT, FILE_TREE_STATUS_ICON_SIZE, FILE_TREE_TEXT_SIZE,
+        visible_commit_shas, App, BranchFolderRow, BranchRow, BranchTreeRow, CloseChangeset,
+        DiffLineStatus, FileListEntry, FileListMode, FileTreeRow, FolderVisibility, Mode,
+        OpenChangeset, OpenFailed, ReviewScreen, Selection, FILE_TREE_FOLDER_ICON_SIZE,
+        FILE_TREE_FONT_FAMILY, FILE_TREE_INDENT_WIDTH, FILE_TREE_ROW_HEIGHT,
+        FILE_TREE_STATUS_ICON_SIZE, FILE_TREE_TEXT_SIZE,
     };
     use crate::graph::{self, GraphConnectorKind};
     use crate::repo::{self, ChangeKind, DiffSide, INITIAL_COMMIT_LIMIT};
@@ -5501,6 +5831,255 @@ mod tests {
         assert!(!visible.contains("unloaded-parent"));
     }
 
+    #[test]
+    fn flat_branch_names_produce_flat_rows() {
+        let branches = vec![local_branch("feature", "f"), local_branch("master", "m")];
+
+        let rows = build_branch_tree_rows(&branches, &BTreeSet::new(), &BTreeSet::new());
+
+        assert_eq!(
+            rows,
+            vec![
+                BranchTreeRow::Branch(BranchRow {
+                    branch: local_branch("feature", "f"),
+                    display_name: "feature".to_string(),
+                    depth: 0,
+                }),
+                BranchTreeRow::Branch(BranchRow {
+                    branch: local_branch("master", "m"),
+                    display_name: "master".to_string(),
+                    depth: 0,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn slash_named_branch_nests_under_a_folder_even_when_alone() {
+        let branches = vec![local_branch("features/some-feature", "tip")];
+
+        let rows = build_branch_tree_rows(&branches, &BTreeSet::new(), &BTreeSet::new());
+
+        assert_eq!(
+            rows,
+            vec![
+                BranchTreeRow::Folder(BranchFolderRow {
+                    name: "features".to_string(),
+                    path: "features".to_string(),
+                    depth: 0,
+                    collapsed: false,
+                    visibility: FolderVisibility::Visible,
+                }),
+                BranchTreeRow::Branch(BranchRow {
+                    branch: local_branch("features/some-feature", "tip"),
+                    display_name: "some-feature".to_string(),
+                    depth: 1,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_level_names_nest_one_folder_per_segment() {
+        let branches = vec![local_branch("team/alice/feature-x", "tip")];
+
+        let rows = build_branch_tree_rows(&branches, &BTreeSet::new(), &BTreeSet::new());
+
+        assert_eq!(
+            rows,
+            vec![
+                BranchTreeRow::Folder(BranchFolderRow {
+                    name: "team".to_string(),
+                    path: "team".to_string(),
+                    depth: 0,
+                    collapsed: false,
+                    visibility: FolderVisibility::Visible,
+                }),
+                BranchTreeRow::Folder(BranchFolderRow {
+                    name: "alice".to_string(),
+                    path: "team/alice".to_string(),
+                    depth: 1,
+                    collapsed: false,
+                    visibility: FolderVisibility::Visible,
+                }),
+                BranchTreeRow::Branch(BranchRow {
+                    branch: local_branch("team/alice/feature-x", "tip"),
+                    display_name: "feature-x".to_string(),
+                    depth: 2,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn folders_sort_before_branches_at_each_level() {
+        // Input order is alphabetical by full name, as the repo layer
+        // provides it: alpha, features/x, zeta.
+        let branches = vec![
+            local_branch("alpha", "a"),
+            local_branch("features/x", "x"),
+            local_branch("zeta", "z"),
+        ];
+
+        let rows = build_branch_tree_rows(&branches, &BTreeSet::new(), &BTreeSet::new());
+
+        let order = rows
+            .iter()
+            .map(|row| match row {
+                BranchTreeRow::Folder(folder) => format!("folder:{}", folder.path),
+                BranchTreeRow::Branch(branch_row) => {
+                    format!("branch:{}", branch_row.branch.name)
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            vec![
+                "folder:features",
+                "branch:features/x",
+                "branch:alpha",
+                "branch:zeta"
+            ]
+        );
+    }
+
+    #[test]
+    fn collapsed_folder_emits_no_descendant_rows() {
+        let branches = vec![
+            local_branch("features/inner/deep", "d"),
+            local_branch("features/x", "x"),
+            local_branch("master", "m"),
+        ];
+        let collapsed = ["features"]
+            .iter()
+            .map(|path| path.to_string())
+            .collect::<BTreeSet<_>>();
+
+        let rows = build_branch_tree_rows(&branches, &collapsed, &BTreeSet::new());
+
+        assert_eq!(
+            rows,
+            vec![
+                BranchTreeRow::Folder(BranchFolderRow {
+                    name: "features".to_string(),
+                    path: "features".to_string(),
+                    depth: 0,
+                    collapsed: true,
+                    visibility: FolderVisibility::Visible,
+                }),
+                BranchTreeRow::Branch(BranchRow {
+                    branch: local_branch("master", "m"),
+                    display_name: "master".to_string(),
+                    depth: 0,
+                }),
+            ]
+        );
+    }
+
+    fn head_branch(name: &str, tip_sha: &str) -> repo::LocalBranch {
+        repo::LocalBranch {
+            name: name.to_string(),
+            tip_sha: tip_sha.to_string(),
+            is_head: true,
+        }
+    }
+
+    /// Extract (path, visibility) for every folder row.
+    fn folder_visibilities(rows: &[BranchTreeRow]) -> Vec<(String, FolderVisibility)> {
+        rows.iter()
+            .filter_map(|row| match row {
+                BranchTreeRow::Folder(folder) => Some((folder.path.clone(), folder.visibility)),
+                BranchTreeRow::Branch(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn folder_visibility_derives_from_descendants() {
+        let branches = vec![
+            local_branch("features/a", "a"),
+            local_branch("features/b", "b"),
+        ];
+
+        let none_hidden = build_branch_tree_rows(&branches, &BTreeSet::new(), &hidden(&[]));
+        let some_hidden =
+            build_branch_tree_rows(&branches, &BTreeSet::new(), &hidden(&["features/a"]));
+        let all_hidden = build_branch_tree_rows(
+            &branches,
+            &BTreeSet::new(),
+            &hidden(&["features/a", "features/b"]),
+        );
+
+        assert_eq!(
+            folder_visibilities(&none_hidden),
+            vec![("features".to_string(), FolderVisibility::Visible)]
+        );
+        assert_eq!(
+            folder_visibilities(&some_hidden),
+            vec![("features".to_string(), FolderVisibility::Mixed)]
+        );
+        assert_eq!(
+            folder_visibilities(&all_hidden),
+            vec![("features".to_string(), FolderVisibility::Hidden)]
+        );
+    }
+
+    #[test]
+    fn folder_visibility_spans_nested_subfolders() {
+        // Hiding the only branch in a deep subfolder marks every ancestor
+        // folder Hidden, because each ancestor's full descendant set is hidden.
+        let branches = vec![local_branch("team/alice/feature-x", "tip")];
+
+        let rows = build_branch_tree_rows(
+            &branches,
+            &BTreeSet::new(),
+            &hidden(&["team/alice/feature-x"]),
+        );
+
+        assert_eq!(
+            folder_visibilities(&rows),
+            vec![
+                ("team".to_string(), FolderVisibility::Hidden),
+                ("team/alice".to_string(), FolderVisibility::Hidden),
+            ]
+        );
+    }
+
+    #[test]
+    fn folder_visibility_ignores_the_head_branch() {
+        let branches = vec![
+            head_branch("features/current", "c"),
+            local_branch("features/other", "o"),
+        ];
+
+        let nothing_hidden = build_branch_tree_rows(&branches, &BTreeSet::new(), &hidden(&[]));
+        let other_hidden =
+            build_branch_tree_rows(&branches, &BTreeSet::new(), &hidden(&["features/other"]));
+
+        // HEAD never counts: with the only hideable branch hidden, the folder
+        // reads fully hidden even though HEAD inside it stays visible.
+        assert_eq!(
+            folder_visibilities(&nothing_hidden),
+            vec![("features".to_string(), FolderVisibility::Visible)]
+        );
+        assert_eq!(
+            folder_visibilities(&other_hidden),
+            vec![("features".to_string(), FolderVisibility::Hidden)]
+        );
+    }
+
+    #[test]
+    fn folder_containing_only_the_head_branch_is_visible() {
+        let branches = vec![head_branch("features/current", "c")];
+
+        let rows = build_branch_tree_rows(&branches, &BTreeSet::new(), &hidden(&[]));
+
+        assert_eq!(
+            folder_visibilities(&rows),
+            vec![("features".to_string(), FolderVisibility::Visible)]
+        );
+    }
+
     fn init_repo_with_two_commits() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("create tempdir");
         let repo = Repository::init(dir.path()).expect("init repo");
@@ -5563,6 +6142,39 @@ mod tests {
 
         drop(repo);
         (dir, main_tip.to_string(), feature_tip.to_string())
+    }
+
+    /// Two commits on master (HEAD at the tip) plus `features/alpha` carrying
+    /// one exclusive commit and `features/beta` pointing at the root.
+    /// Exercises sidebar folder nesting. Timestamps are fixed so the loaded
+    /// order is deterministic. Returns (dir, master_tip_sha, alpha_tip_sha).
+    fn init_repo_with_slash_named_branches() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("hello.txt"), "hello\n").expect("write file");
+        let root_oid = commit_all_to_ref_at_time(&repo, Some("HEAD"), "Root", &[], 10);
+
+        fs::write(dir.path().join("alpha.txt"), "alpha\n").expect("write alpha file");
+        let alpha_tip = commit_all_to_ref_at_time(
+            &repo,
+            Some("refs/heads/features/alpha"),
+            "Alpha work",
+            &[root_oid],
+            20,
+        );
+
+        let root_commit = repo.find_commit(root_oid).expect("find root commit");
+        repo.branch("features/beta", &root_commit, false)
+            .expect("create features/beta");
+        drop(root_commit);
+
+        fs::remove_file(dir.path().join("alpha.txt")).expect("remove alpha file");
+        fs::write(dir.path().join("hello.txt"), "main\n").expect("update file");
+        let main_tip = commit_all_to_ref_at_time(&repo, Some("HEAD"), "Main tip", &[root_oid], 30);
+
+        drop(repo);
+        (dir, main_tip.to_string(), alpha_tip.to_string())
     }
 
     fn init_repo_with_detached_head() -> (tempfile::TempDir, String) {
@@ -10410,6 +11022,317 @@ mod tests {
             "notification body matches NotARepository, got {:?}",
             events[0],
         );
+    }
+
+    #[gpui::test]
+    async fn slash_named_branches_render_under_a_folder_row(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let folder = visual
+            .debug_bounds("branch-folder-features")
+            .expect("slash-named branches render a folder row");
+        let alpha = visual
+            .debug_bounds("branch-row-features-alpha")
+            .expect("nested branch row renders, keyed by full name");
+        let beta = visual
+            .debug_bounds("branch-row-features-beta")
+            .expect("sibling nested branch row renders");
+        let master = visual
+            .debug_bounds("branch-row-master")
+            .expect("flat branch row renders");
+        assert!(
+            folder.origin.y < alpha.origin.y
+                && alpha.origin.y < beta.origin.y
+                && beta.origin.y < master.origin.y,
+            "row order must be: folder, alpha, beta, master"
+        );
+    }
+
+    #[gpui::test]
+    async fn clicking_a_folder_row_collapses_and_expands_it(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let folder = visual
+            .debug_bounds("branch-folder-features")
+            .expect("folder row renders");
+        visual.simulate_click(folder.center(), Modifiers::none());
+
+        // Verify app state after the click.
+        window
+            .update(cx, |app, _window, _cx| {
+                assert!(
+                    app.hidden_branches.is_empty(),
+                    "collapsing is visual only; no branch becomes hidden"
+                );
+                assert!(
+                    app.collapsed_branch_folders.contains("features"),
+                    "features must be in collapsed_branch_folders after click"
+                );
+                // Verify that the tree builder produces the collapsed layout.
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                let rows = build_branch_tree_rows(
+                    &repo.local_branches,
+                    &app.collapsed_branch_folders,
+                    &app.hidden_branches,
+                );
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "collapsed folder must hide descendant rows; rows: {:?}",
+                    rows
+                );
+                assert!(
+                    matches!(&rows[0], BranchTreeRow::Folder(f) if f.collapsed),
+                    "first row is the collapsed folder"
+                );
+                assert!(
+                    matches!(&rows[1], BranchTreeRow::Branch(b) if b.branch.name == "master"),
+                    "second row is the master branch"
+                );
+            })
+            .expect("read state after collapse");
+
+        // Verify the folder row is still rendered (collapsed, not removed).
+        visual
+            .debug_bounds("branch-folder-features")
+            .expect("collapsed folder row still renders");
+
+        // Click again to expand.
+        let folder = visual
+            .debug_bounds("branch-folder-features")
+            .expect("collapsed folder row still renders for second click");
+        visual.simulate_click(folder.center(), Modifiers::none());
+
+        window
+            .update(cx, |app, _window, _cx| {
+                assert!(
+                    app.collapsed_branch_folders.is_empty(),
+                    "second click must expand the folder"
+                );
+            })
+            .expect("read state after expand");
+    }
+
+    #[gpui::test]
+    async fn reopening_a_repository_expands_all_folders(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path.clone(), window, cx);
+                app.toggle_branch_folder("features".to_string(), cx);
+                assert!(app.collapsed_branch_folders.contains("features"));
+
+                app.open_repository_at(path, window, cx);
+                assert!(
+                    app.collapsed_branch_folders.is_empty(),
+                    "reopening must reset collapse state"
+                );
+            })
+            .expect("open, collapse, reopen");
+    }
+
+    /// Like `init_repo_with_slash_named_branches`, but HEAD is moved onto
+    /// `features/alpha`, so a sidebar folder contains the checked-out branch.
+    fn init_repo_with_head_inside_folder() -> (tempfile::TempDir, String) {
+        let (dir, _master_tip, alpha_tip) = init_repo_with_slash_named_branches();
+        let repo = Repository::open(dir.path()).expect("open repo");
+        repo.set_head("refs/heads/features/alpha")
+            .expect("set HEAD");
+        drop(repo);
+        (dir, alpha_tip)
+    }
+
+    #[gpui::test]
+    async fn folder_visibility_toggle_hides_then_shows_all_descendants(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+
+                app.toggle_folder_visibility("features", cx);
+                assert!(app.hidden_branches.contains("features/alpha"));
+                assert!(app.hidden_branches.contains("features/beta"));
+
+                app.toggle_folder_visibility("features", cx);
+                assert!(
+                    app.hidden_branches.is_empty(),
+                    "toggling a fully hidden folder must show every descendant"
+                );
+            })
+            .expect("toggle folder visibility twice");
+    }
+
+    #[gpui::test]
+    async fn folder_visibility_toggle_hides_the_remainder_when_mixed(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.toggle_branch_visibility("features/alpha".to_string(), cx);
+
+                app.toggle_folder_visibility("features", cx);
+                assert!(
+                    app.hidden_branches.contains("features/alpha")
+                        && app.hidden_branches.contains("features/beta"),
+                    "a mixed folder toggle must hide the remaining visible branches"
+                );
+            })
+            .expect("toggle mixed folder");
+    }
+
+    #[gpui::test]
+    async fn folder_visibility_toggle_skips_the_head_branch(cx: &mut TestAppContext) {
+        let (dir, _alpha_tip) = init_repo_with_head_inside_folder();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+
+                app.toggle_folder_visibility("features", cx);
+                assert!(
+                    !app.hidden_branches.contains("features/alpha"),
+                    "the checked-out branch must never be hidden"
+                );
+                assert!(app.hidden_branches.contains("features/beta"));
+
+                app.toggle_folder_visibility("features", cx);
+                assert!(app.hidden_branches.is_empty());
+            })
+            .expect("toggle folder containing HEAD");
+    }
+
+    #[gpui::test]
+    async fn hiding_a_folder_clears_a_selection_inside_it(cx: &mut TestAppContext) {
+        let (dir, _master_tip, alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.selection = Selection::Single {
+                    sha: alpha_tip.clone(),
+                };
+
+                app.toggle_folder_visibility("features", cx);
+                assert_eq!(
+                    app.selection,
+                    Selection::None,
+                    "hiding the folder removed the selected commit, so the selection clears"
+                );
+            })
+            .expect("hide folder containing the selection");
+    }
+
+    #[gpui::test]
+    async fn clicking_a_folder_eye_hides_every_descendant_branch(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                // The toggle is hover-revealed; tests drive the hover state
+                // directly. The features folder is row 0.
+                app.hovered_branch_row = Some(0);
+                cx.notify();
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let toggle = visual
+            .debug_bounds("branch-folder-visibility-features")
+            .expect("hovered folder row reveals its visibility toggle");
+        visual.simulate_click(toggle.center(), Modifiers::none());
+
+        window
+            .update(cx, |app, _window, _cx| {
+                assert!(
+                    app.hidden_branches.contains("features/alpha")
+                        && app.hidden_branches.contains("features/beta"),
+                    "folder toggle click must hide every descendant branch"
+                );
+                assert!(
+                    app.collapsed_branch_folders.is_empty(),
+                    "the toggle click must not also collapse the folder"
+                );
+            })
+            .expect("verify post-click state");
+    }
+
+    #[gpui::test]
+    async fn fully_hidden_folder_keeps_its_toggle_without_hover(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.toggle_folder_visibility("features", cx);
+            })
+            .expect("open repository and hide the folder");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("branch-folder-visibility-features")
+            .expect("a fully hidden folder keeps its toggle visible without hover");
+    }
+
+    #[gpui::test]
+    async fn partially_hidden_folder_keeps_its_toggle_without_hover(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.toggle_branch_visibility("features/alpha".to_string(), cx);
+            })
+            .expect("open repository and hide one branch");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("branch-folder-visibility-features")
+            .expect("a mixed folder keeps its toggle visible without hover");
     }
 
     #[gpui::test]

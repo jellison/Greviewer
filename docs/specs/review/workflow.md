@@ -108,7 +108,7 @@ The user sees a graphical history of the repository's commits with branch lanes 
 
 ## Navigating branches from the sidebar
 
-Graph mode includes a sidebar beside the graph listing the repository's local branches by name, in alphabetical order. The sidebar mirrors the graph's scope: local branches only, with remote-tracking branches and tags excluded. The checked-out branch carries a visual marker. Activating a branch focuses it in the graph: the branch's tip commit becomes the selected commit and the graph scrolls so that commit is visible. The divider between the sidebar and the graph is draggable to resize the sidebar. The sidebar exists only in graph mode; review mode shows the file tree in its place.
+Graph mode includes a sidebar beside the graph listing the repository's local branches by name, in alphabetical order. Branch names containing `/` nest under collapsible folders (see "Nesting branches in sidebar folders" below). The sidebar mirrors the graph's scope: local branches only, with remote-tracking branches and tags excluded. The checked-out branch carries a visual marker. Activating a branch focuses it in the graph: the branch's tip commit becomes the selected commit and the graph scrolls so that commit is visible. The divider between the sidebar and the graph is draggable to resize the sidebar. The sidebar exists only in graph mode; review mode shows the file tree in its place.
 
 **Triggering conditions**
 
@@ -118,7 +118,7 @@ Graph mode includes a sidebar beside the graph listing the repository's local br
 
 **Observable outcomes**
 
-- The sidebar lists every local branch by name, alphabetically, with the checked-out branch visually marked.
+- The sidebar lists every local branch, alphabetically within its folder level, with the checked-out branch visually marked.
 - Activating a branch selects its tip commit and scrolls the graph so the commit is visible.
 - A branch entry whose tip commit is the current selection is visually distinct, using the same selected treatment as the commit row.
 - Dragging the divider resizes the sidebar.
@@ -130,6 +130,50 @@ Graph mode includes a sidebar beside the graph listing the repository's local br
 - Activating a branch whose tip commit has not yet been loaded into the visible history loads older history until the tip appears, then selects and reveals it.
 - Activating a branch whose tip is already the selected commit keeps that selection; it does not clear it.
 - When the branch list exceeds the sidebar's height, it scrolls; a scrollbar appears while the pointer is over the sidebar and stays out of the way otherwise.
+
+## Nesting branches in sidebar folders
+
+Branch names that contain `/` nest in the sidebar: every name segment except
+the last becomes a collapsible folder, so `features/some-feature` appears as
+a `some-feature` row inside a `features` folder, and `team/alice/feature-x`
+nests two folders deep. A folder exists even when it holds a single branch —
+grouping depends only on the branch's own name, so rows do not reorganize as
+siblings appear or disappear. Within a level, folders list before branches,
+each alphabetically. A nested branch row shows only its final name segment,
+indented under its folders; everywhere else — graph labels, hiding,
+focusing — the branch keeps its full name.
+
+Activating a folder row collapses or expands it. Collapsing is purely
+visual: descendant rows leave the sidebar, but graph visibility does not
+change, and branches hidden from the graph stay hidden while collapsed.
+Folders start expanded, and collapse state is not persisted: opening a
+repository expands every folder.
+
+Each folder row carries a visibility toggle with the same hover-reveal
+behavior as branch rows. Activating it hides every branch under the folder
+when at least one is visible, and shows them all otherwise. The checked-out
+branch cannot be hidden and is skipped: hiding a folder that contains it
+hides everything else inside, and the folder reads as fully hidden once all
+its other branches are. A fully hidden folder renders muted with its toggle
+always visible; a folder with a mix of hidden and visible branches keeps its
+normal color but also keeps its toggle visible.
+
+**Observable outcomes**
+
+- A branch named with `/` renders inside one folder per leading segment,
+  showing only its final segment, indented by depth.
+- A folder appears even for a single nested branch; multi-segment names nest
+  multi-level.
+- Folders precede branches at each level; both sort alphabetically.
+- Activating a folder row removes its descendant rows from the sidebar;
+  activating it again restores them. Graph contents are unchanged either way.
+- Activating a folder's visibility toggle hides all its branches from the
+  graph, skipping the checked-out branch, or shows them all when none are
+  visible. A selection that becomes invisible clears, as with single-branch
+  hiding.
+- A fully hidden folder renders muted with its toggle always shown; a
+  partially hidden folder keeps its toggle shown without muting.
+- Reopening a repository expands all folders and shows all branches.
 
 ## Hiding branches from the graph
 
