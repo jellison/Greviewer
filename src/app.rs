@@ -1678,7 +1678,7 @@ impl App {
                         .child(
                             resizable_panel()
                                 .size(px(340.))
-                                .child(self.render_file_list(entries, cx)),
+                                .child(self.render_file_list(repo, entries, cx)),
                         )
                         .child(resizable_panel().child(
                             crate::workspace::pane_grid::render_pane_group(
@@ -1736,6 +1736,7 @@ impl App {
 
     fn render_file_list(
         &self,
+        repo: &repo::OpenRepository,
         entries: Vec<FileListEntry>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1833,18 +1834,19 @@ impl App {
                     cx.notify();
                 }
             }))
+            .child(self.render_file_tree_repo_header(repo, folder_defaults, cx))
             .child(list_content)
             .when(self.file_tree_hovered, |container| {
                 container.child(
                     div()
                         .absolute()
-                        .top_0()
+                        .top(px(FILE_TREE_ROW_HEIGHT))
                         .left_0()
                         .right_0()
                         .bottom_0()
                         .debug_selector(|| "file-tree-scrollbar".to_string())
                         .child(
-                            // Vertical bar spans the full panel height at the right edge.
+                            // Vertical bar spans the scrollable list below the header.
                             div()
                                 .absolute()
                                 .top_0()
@@ -1871,7 +1873,6 @@ impl App {
                         ),
                 )
             })
-            .child(self.render_file_tree_controls(folder_defaults, cx))
     }
 
     fn file_tree_rows(&self, entries: Vec<FileListEntry>) -> Vec<FileTreeRow> {
@@ -1893,9 +1894,10 @@ impl App {
         }
 
         let mut rows = Vec::new();
+        // Depth 0 belongs to the repo root header row; real rows nest under it.
         append_file_tree_rows(
             &root,
-            0,
+            1,
             "",
             &self.collapsed_file_tree_paths,
             collapse_unchanged_by_default,
@@ -1905,9 +1907,54 @@ impl App {
         rows
     }
 
-    /// The icon-only controls that float over the top-right of the file tree:
-    /// a show-all-files toggle plus collapse-all / expand-all. The controls sit
-    /// outside the scroll area so they stay pinned while the tree scrolls.
+    /// Static header row naming the repository, mirroring the titlebar. The
+    /// tree controls live inline at its trailing edge, so they never overlap
+    /// a row that carries diff stats.
+    fn render_file_tree_repo_header(
+        &self,
+        repo: &repo::OpenRepository,
+        folder_defaults: Vec<(String, bool)>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let name = repository_title(&repo.path);
+        let name_selector = format!("file-tree-repo-root-name-{}", debug_path_fragment(&name));
+
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .w_full()
+            .min_h(px(FILE_TREE_ROW_HEIGHT))
+            .gap_2()
+            .px_2()
+            .bg(rgb(0x171717))
+            .debug_selector(|| "file-tree-repo-root".to_string())
+            .child(render_file_tree_indent_guides(0, "repo-root"))
+            .child(render_file_tree_folder_icon(
+                "repo-root",
+                false,
+                rgb(0x8aa6bd),
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_color(rgb(0x8aa6bd))
+                    .text_size(px(FILE_TREE_TEXT_SIZE))
+                    .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
+                    .font_family(FILE_TREE_FONT_FAMILY)
+                    .whitespace_nowrap()
+                    .debug_selector(move || name_selector.clone())
+                    .child(name),
+            )
+            .child(self.render_file_tree_controls(folder_defaults, cx))
+    }
+
+    /// The icon-only controls at the trailing edge of the repo root header:
+    /// a show-all-files toggle plus collapse-all / expand-all. The header sits
+    /// outside the scroll area, so the controls stay pinned while the tree
+    /// scrolls.
     fn render_file_tree_controls(
         &self,
         folder_defaults: Vec<(String, bool)>,
@@ -1918,15 +1965,10 @@ impl App {
         let show_all_active = matches!(self.file_list_mode, FileListMode::All);
 
         div()
-            .absolute()
-            .top(px(2.))
-            .right(px(2.))
             .flex()
+            .flex_none()
             .items_center()
             .gap(px(2.))
-            // The controls float over the first tree row; occlude so clicks
-            // land on the buttons instead of falling through to the row.
-            .occlude()
             .child(self.render_file_tree_icon_button(
                 LucideIcon::ListTree,
                 "file-list-mode-toggle",
@@ -4769,9 +4811,13 @@ fn render_file_tree_indent_guides(depth: usize, path_fragment: &str) -> gpui::Di
             let selector = format!("file-tree-indent-guide-{path_fragment}-{level}");
             div()
                 .absolute()
-                .left(px(
-                    (level + 1) as f32 * FILE_TREE_INDENT_WIDTH - FILE_TREE_INDENT_GUIDE_WIDTH / 2.
-                ))
+                .left(px((level + 1) as f32 * FILE_TREE_INDENT_WIDTH
+                    + if level > 0 {
+                        FILE_TREE_GUIDE_TO_ITEM_GAP
+                    } else {
+                        0.
+                    }
+                    - FILE_TREE_INDENT_GUIDE_WIDTH / 2.))
                 .top_0()
                 .w(px(FILE_TREE_INDENT_GUIDE_WIDTH))
                 .h(px(FILE_TREE_ROW_HEIGHT))
@@ -8986,18 +9032,29 @@ mod tests {
             .expect("read changeset line stats");
 
         let mut visual = VisualTestContext::from_window(*window, cx);
+        let repo_icon_bounds = visual
+            .debug_bounds("file-tree-folder-icon-open-repo-root")
+            .expect("repo root folder icon debug bounds");
         let folder_icon_bounds = visual
             .debug_bounds("file-tree-folder-icon-open-src")
             .expect("folder icon debug bounds");
         visual
             .debug_bounds("file-tree-folder-icon-open-outline-src")
             .expect("open folder outline debug bounds");
-        let guide_bounds = visual
+        let root_guide_bounds = visual
             .debug_bounds("file-tree-indent-guide-src-notes.txt-0")
+            .expect("root-level indent guide debug bounds");
+        let guide_bounds = visual
+            .debug_bounds("file-tree-indent-guide-src-notes.txt-1")
             .expect("nested file indent guide debug bounds");
         let changed_kind_bounds = visual
             .debug_bounds("changed-file-kind-src-notes.txt")
             .expect("changed file kind marker debug bounds");
+        assert_eq!(
+            root_guide_bounds.origin.x + root_guide_bounds.size.width / 2.,
+            repo_icon_bounds.origin.x + repo_icon_bounds.size.width / 2.,
+            "root guide should be centered under the repo root icon"
+        );
         assert_eq!(
             guide_bounds.origin.x + guide_bounds.size.width / 2.,
             folder_icon_bounds.origin.x + folder_icon_bounds.size.width / 2.,
@@ -9005,7 +9062,7 @@ mod tests {
         );
         assert!(
             changed_kind_bounds.origin.x - (guide_bounds.origin.x + guide_bounds.size.width)
-                >= px(11.),
+                >= px(7.),
             "nested file item should have breathing room after the guide"
         );
         visual
@@ -9025,6 +9082,69 @@ mod tests {
         visual
             .debug_bounds("changed-file-diff-stat-src-notes.txt")
             .expect("changed file diff stat debug bounds");
+    }
+
+    #[gpui::test]
+    async fn file_tree_shows_repo_root_header_with_inline_controls(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_nested_line_stat_changes();
+        let path = dir.path().to_path_buf();
+        let repo_name = path
+            .file_name()
+            .expect("repo dir name")
+            .to_string_lossy()
+            .to_string();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path.clone(), window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open changeset");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let header_bounds = visual
+            .debug_bounds("file-tree-repo-root")
+            .expect("repo root header debug bounds");
+        visual
+            .debug_bounds(test_debug_selector(format!(
+                "file-tree-repo-root-name-{}",
+                repo_name.replace('/', "-")
+            )))
+            .expect("repo root name debug bounds");
+        visual
+            .debug_bounds("file-tree-folder-icon-open-repo-root")
+            .expect("repo root folder icon debug bounds");
+
+        // The controls are inline children of the header row, not a floating overlay.
+        for selector in [
+            "file-list-mode-toggle",
+            "file-tree-collapse-all",
+            "file-tree-expand-all",
+        ] {
+            let control_bounds = visual
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("missing control bounds for {selector}"));
+            assert!(
+                header_bounds.contains(&control_bounds.center()),
+                "{selector} should sit inside the repo root header row"
+            );
+        }
+
+        // The first file row's diff stats are clear of the controls.
+        let stat_bounds = visual
+            .debug_bounds("changed-file-diff-stat-src-notes.txt")
+            .expect("diff stat debug bounds");
+        let toggle_bounds = visual
+            .debug_bounds("file-list-mode-toggle")
+            .expect("toggle debug bounds");
+        assert!(
+            !stat_bounds.intersects(&toggle_bounds),
+            "diff stats must not collide with the tree controls"
+        );
     }
 
     #[test]

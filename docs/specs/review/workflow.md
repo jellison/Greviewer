@@ -251,6 +251,7 @@ With a changeset open, the user sees the rollup change set: a file tree containi
 **Observable outcomes**
 
 - The change set lists every net-changed file across the selection.
+- The tree is headed by a row naming the repository — the same name the title bar shows — and every file and folder nests beneath it. The header stays in place while the tree scrolls and is not itself selectable or collapsible.
 - Paths are grouped into a tree with open and closed folder icons and vertical nesting guides for files under folders.
 - Each changed file entry shows a compact change marker: plus for added, dot for modified, horizontal bar for deleted, and rename marker for renamed.
 - Deleted file entries render their filename struck through.
@@ -268,7 +269,7 @@ With a changeset open, the user sees the rollup change set: a file tree containi
 
 ## Seeing all files for context
 
-The file tree carries a row of icon-only controls that float over the top-right of the tree and stay pinned as the tree scrolls. A single show-all-files toggle switches between the change set and the all-files view; it reads as active while the all-files view is showing. Two further controls collapse every folder or expand every folder in one action. Each control names itself through a hover tooltip.
+The file tree's repository header row carries icon-only controls that stay pinned as the tree scrolls. A single show-all-files toggle switches between the change set and the all-files view; it reads as active while the all-files view is showing. Two further controls collapse every folder or expand every folder in one action. Each control names itself through a hover tooltip.
 
 The show-all-files toggle reveals every file in the repository at the newest selected commit, not just the files in the change set. Files that are part of the change set remain marked so they are distinguishable from unchanged files. Selecting an unchanged file opens it for read-only viewing rather than as a diff.
 
