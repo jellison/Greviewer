@@ -67,22 +67,12 @@ pub fn layout_graph_anchored(commits: &[GraphCommit], head_sha: Option<&str>) ->
         let active_lanes = occupied_lanes(&active_shas);
         let parent_lanes = parent_lanes(
             lane,
-            is_top_first_parent,
             &commit.sha,
             &commit.parent_shas,
             &active_shas,
-            &top_first_parent_history,
             &side_branch_lanes,
         );
-        let connectors = connectors(
-            lane,
-            is_top_first_parent,
-            &commit.sha,
-            &commit.parent_shas,
-            &parent_lanes,
-            &active_shas,
-            &top_first_parent_history,
-        );
+        let connectors = connectors(lane, &commit.sha, &parent_lanes, &active_shas);
         let connector_lanes = connector_lanes(&connectors);
 
         let mut next_active_shas = active_shas.clone();
@@ -94,13 +84,6 @@ pub fn layout_graph_anchored(commits: &[GraphCommit], head_sha: Option<&str>) ->
             &commit.parent_shas,
             &parent_lanes,
             &mut next_color,
-        );
-        clear_shared_sibling_parent_lanes(
-            &mut next_active_shas,
-            &mut next_active_colors,
-            lane,
-            &parent_lanes,
-            &connectors,
         );
         let outgoing_lanes = occupied_lanes(&next_active_shas);
         let lane_count = occupied_lane_count(&active_shas)
@@ -296,11 +279,9 @@ fn occupied_lane_count(active_shas: &[Option<String>]) -> usize {
 
 fn parent_lanes(
     commit_lane: usize,
-    commit_is_top_first_parent: bool,
     commit_sha: &str,
     parent_shas: &[String],
     active_shas: &[Option<String>],
-    top_first_parent_history: &[String],
     side_branch_lanes: &BTreeMap<String, usize>,
 ) -> Vec<usize> {
     let mut lanes = Vec::with_capacity(parent_shas.len());
@@ -316,19 +297,18 @@ fn parent_lanes(
     }
 
     for (index, parent_sha) in parent_shas.iter().enumerate() {
+        // The first-parent edge always continues straight down the commit's
+        // own lane; lane changes happen on the parent's row, never between a
+        // commit and its first parent.
+        if index == 0 {
+            lanes.push(commit_lane);
+            continue;
+        }
+
         let preferred_parent_lane = side_branch_lanes.get(parent_sha).copied();
-        let preferred_first_parent_lane = (index == 0)
-            .then(|| side_branch_lanes.get(commit_sha).copied())
-            .flatten()
-            .filter(|preferred_lane| *preferred_lane > 1);
         let existing_lane = find_lane(active_shas, parent_sha)
             .filter(|existing_lane| *existing_lane != commit_lane);
-        let lane = if index == 0
-            && commit_is_top_first_parent
-            && contains_sha(top_first_parent_history, parent_sha)
-        {
-            commit_lane
-        } else if let Some(preferred_lane) = preferred_first_parent_lane.or(preferred_parent_lane) {
+        let lane = if let Some(preferred_lane) = preferred_parent_lane {
             if active_shas
                 .get(preferred_lane)
                 .and_then(|sha| sha.as_deref())
@@ -344,12 +324,6 @@ fn parent_lanes(
                         lane
                     },
                 )
-            }
-        } else if index == 0 {
-            if let Some(existing_lane) = existing_lane {
-                existing_lane
-            } else {
-                commit_lane
             }
         } else if let Some(existing_lane) = existing_lane {
             existing_lane
@@ -411,12 +385,9 @@ fn connector_lanes(connectors: &[GraphConnector]) -> Vec<usize> {
 
 fn connectors(
     commit_lane: usize,
-    commit_is_top_first_parent: bool,
     commit_sha: &str,
-    parent_shas: &[String],
     parent_lanes: &[usize],
     active_shas: &[Option<String>],
-    top_first_parent_history: &[String],
 ) -> Vec<GraphConnector> {
     let mut connectors = parent_lanes
         .iter()
@@ -428,14 +399,6 @@ fn connectors(
         })
         .collect::<Vec<_>>();
 
-    connectors.extend(visible_sibling_parent_connectors(
-        commit_lane,
-        commit_is_top_first_parent,
-        parent_shas,
-        parent_lanes,
-        active_shas,
-        top_first_parent_history,
-    ));
     connectors.extend(visible_current_commit_connectors(
         commit_lane,
         commit_sha,
@@ -443,32 +406,6 @@ fn connectors(
     ));
 
     connectors
-}
-
-fn visible_sibling_parent_connectors(
-    commit_lane: usize,
-    commit_is_top_first_parent: bool,
-    parent_shas: &[String],
-    parent_lanes: &[usize],
-    active_shas: &[Option<String>],
-    top_first_parent_history: &[String],
-) -> Vec<GraphConnector> {
-    let Some(first_parent_sha) = parent_shas.first() else {
-        return Vec::new();
-    };
-    if commit_is_top_first_parent || !contains_sha(top_first_parent_history, first_parent_sha) {
-        return Vec::new();
-    }
-
-    lanes_for_sha(active_shas, first_parent_sha)
-        .into_iter()
-        .filter(|lane| *lane > commit_lane && !parent_lanes.contains(lane))
-        .map(|lane| GraphConnector {
-            from_lane: commit_lane,
-            to_lane: lane,
-            kind: connector_kind(commit_lane, lane),
-        })
-        .collect()
 }
 
 fn visible_current_commit_connectors(
@@ -576,25 +513,6 @@ fn update_active_lanes(
     for lane in lanes_for_sha(active_shas, commit_sha) {
         if !parent_lanes.contains(&lane) {
             clear_lane(active_shas, active_colors, lane);
-        }
-    }
-
-    trim_empty_lanes(active_shas, active_colors);
-}
-
-fn clear_shared_sibling_parent_lanes(
-    active_shas: &mut Vec<Option<String>>,
-    active_colors: &mut Vec<Option<usize>>,
-    commit_lane: usize,
-    parent_lanes: &[usize],
-    connectors: &[GraphConnector],
-) {
-    for connector in connectors {
-        if connector.kind == GraphConnectorKind::BranchOut
-            && connector.from_lane == commit_lane
-            && !parent_lanes.contains(&connector.to_lane)
-        {
-            clear_lane(active_shas, active_colors, connector.to_lane);
         }
     }
 
@@ -887,28 +805,99 @@ mod tests {
         assert_eq!(rows[0].lane, 2);
         assert_eq!(rows[0].parent_lanes, vec![2]);
 
-        // The earlier tip joins the existing edge to the shared fork instead of
-        // drawing a duplicate parallel edge.
+        // The earlier tip keeps its own parallel edge down to the shared fork
+        // instead of bending on its own row.
         assert_eq!(rows[1].sha, "feature-a");
         assert_eq!(rows[1].lane, 1);
-        assert_eq!(rows[1].parent_lanes, vec![2]);
-        assert!(rows[1].connectors.contains(&GraphConnector {
-            from_lane: 1,
-            to_lane: 2,
-            kind: GraphConnectorKind::BranchOut,
-        }));
+        assert_eq!(rows[1].parent_lanes, vec![1]);
+        assert_eq!(
+            rows[1].connectors,
+            vec![GraphConnector {
+                from_lane: 1,
+                to_lane: 1,
+                kind: GraphConnectorKind::Straight,
+            }]
+        );
+        assert_eq!(rows[1].outgoing_lanes, vec![1, 2]);
         assert_eq!(rows[2].lane, 0);
 
-        // The shared branch edge ends at the fork commit.
+        // Both branch edges end at the fork commit.
         assert_eq!(rows[3].sha, "fork");
         assert_eq!(rows[3].lane, 0);
-        assert_eq!(rows[3].incoming_lanes, vec![0, 2]);
+        assert_eq!(rows[3].incoming_lanes, vec![0, 1, 2]);
+        assert!(rows[3].connectors.contains(&GraphConnector {
+            from_lane: 1,
+            to_lane: 0,
+            kind: GraphConnectorKind::MergeIn,
+        }));
         assert!(rows[3].connectors.contains(&GraphConnector {
             from_lane: 2,
             to_lane: 0,
             kind: GraphConnectorKind::MergeIn,
         }));
         assert_eq!(rows[3].outgoing_lanes, Vec::<usize>::new());
+    }
+
+    #[test]
+    fn sibling_branch_tips_below_an_active_trunk_keep_their_own_edges_to_the_shared_parent() {
+        // Two off-trunk tips share a trunk parent while the trunk edge above is
+        // already active. Each tip keeps its own vertical edge down to the
+        // shared parent row; nothing bends on the tip rows themselves.
+        let rows = layout_graph_anchored(
+            &[
+                commit_at("trunk-tip", 80, &["trunk-mid"]),
+                commit_at("trunk-mid", 70, &["fork"]),
+                commit_at("feature-b", 60, &["fork"]),
+                commit_at("feature-a", 50, &["fork"]),
+                commit_at("fork", 40, &["root"]),
+                commit_at("root", 30, &[]),
+            ],
+            Some("trunk-tip"),
+        );
+
+        // The newer tip takes the outer sibling lane and runs straight down.
+        assert_eq!(rows[2].sha, "feature-b");
+        assert_eq!(rows[2].lane, 2);
+        assert_eq!(rows[2].parent_lanes, vec![2]);
+        assert_eq!(
+            rows[2].connectors,
+            vec![GraphConnector {
+                from_lane: 2,
+                to_lane: 2,
+                kind: GraphConnectorKind::Straight,
+            }]
+        );
+
+        // The older tip keeps its own lane too; its edge does not jump to the
+        // trunk lane or to its sibling's lane on its own row.
+        assert_eq!(rows[3].sha, "feature-a");
+        assert_eq!(rows[3].lane, 1);
+        assert_eq!(rows[3].parent_lanes, vec![1]);
+        assert_eq!(
+            rows[3].connectors,
+            vec![GraphConnector {
+                from_lane: 1,
+                to_lane: 1,
+                kind: GraphConnectorKind::Straight,
+            }]
+        );
+        assert_eq!(rows[3].outgoing_lanes, vec![0, 1, 2]);
+
+        // Both sibling edges merge into the shared parent on its own row.
+        assert_eq!(rows[4].sha, "fork");
+        assert_eq!(rows[4].lane, 0);
+        assert_eq!(rows[4].incoming_lanes, vec![0, 1, 2]);
+        assert!(rows[4].connectors.contains(&GraphConnector {
+            from_lane: 1,
+            to_lane: 0,
+            kind: GraphConnectorKind::MergeIn,
+        }));
+        assert!(rows[4].connectors.contains(&GraphConnector {
+            from_lane: 2,
+            to_lane: 0,
+            kind: GraphConnectorKind::MergeIn,
+        }));
+        assert_eq!(rows[4].outgoing_lanes, vec![0]);
     }
 
     #[test]
@@ -953,23 +942,35 @@ mod tests {
         assert_eq!(rows[0].lane, 0);
         assert_eq!(rows[1].sha, "older-tip");
         assert_eq!(rows[1].lane, 1);
-        assert!(rows[1].connectors.contains(&GraphConnector {
-            from_lane: 1,
-            to_lane: 0,
-            kind: GraphConnectorKind::MergeIn,
-        }));
-        assert_eq!(rows[1].outgoing_lanes, vec![0]);
-        assert_eq!(rows[2].sha, "head-tip");
-        assert_eq!(rows[2].lane, 0);
-        assert_eq!(rows[2].lane_count, 1);
         assert_eq!(
-            rows[2].connectors,
+            rows[1].connectors,
             vec![GraphConnector {
-                from_lane: 0,
-                to_lane: 0,
+                from_lane: 1,
+                to_lane: 1,
                 kind: GraphConnectorKind::Straight,
             }]
         );
+        assert_eq!(rows[1].outgoing_lanes, vec![0, 1]);
+        assert_eq!(rows[2].sha, "head-tip");
+        assert_eq!(rows[2].lane, 0);
+        assert_eq!(rows[2].lane_count, 2);
+        assert_eq!(rows[2].incoming_lanes, vec![0, 1]);
+        assert_eq!(
+            rows[2].connectors,
+            vec![
+                GraphConnector {
+                    from_lane: 0,
+                    to_lane: 0,
+                    kind: GraphConnectorKind::Straight,
+                },
+                GraphConnector {
+                    from_lane: 1,
+                    to_lane: 0,
+                    kind: GraphConnectorKind::MergeIn,
+                },
+            ]
+        );
+        assert_eq!(rows[2].outgoing_lanes, vec![0]);
     }
 
     #[test]
@@ -1022,27 +1023,35 @@ mod tests {
         assert_eq!(rows[2].lane_count, 2);
         assert_eq!(rows[2].active_lanes, vec![0, 1]);
         assert_eq!(rows[2].incoming_lanes, vec![0, 1]);
-        assert_eq!(rows[2].outgoing_lanes, vec![0]);
-        assert_eq!(rows[2].parent_lanes, vec![0]);
-        assert_eq!(rows[2].connector_lanes, vec![0, 1]);
+        assert_eq!(rows[2].outgoing_lanes, vec![0, 1]);
+        assert_eq!(rows[2].parent_lanes, vec![1]);
+        assert_eq!(rows[2].connector_lanes, vec![1]);
         assert_eq!(
             rows[2].connectors,
             vec![GraphConnector {
                 from_lane: 1,
-                to_lane: 0,
-                kind: GraphConnectorKind::MergeIn,
+                to_lane: 1,
+                kind: GraphConnectorKind::Straight,
             }]
         );
         assert_eq!(rows[2].lane_colors, vec![Some(0), Some(1)]);
 
         assert_eq!(rows[3].sha, "base");
         assert_eq!(rows[3].lane, 0);
-        assert_eq!(rows[3].lane_count, 1);
-        assert_eq!(rows[3].incoming_lanes, vec![0]);
+        assert_eq!(rows[3].lane_count, 2);
+        assert_eq!(rows[3].incoming_lanes, vec![0, 1]);
         assert_eq!(rows[3].outgoing_lanes, Vec::<usize>::new());
         assert_eq!(rows[3].parent_lanes, Vec::<usize>::new());
-        assert_eq!(rows[3].connector_lanes, Vec::<usize>::new());
-        assert_eq!(rows[3].lane_colors, vec![Some(0)]);
+        assert_eq!(rows[3].connector_lanes, vec![0, 1]);
+        assert_eq!(
+            rows[3].connectors,
+            vec![GraphConnector {
+                from_lane: 1,
+                to_lane: 0,
+                kind: GraphConnectorKind::MergeIn,
+            }]
+        );
+        assert_eq!(rows[3].lane_colors, vec![Some(0), Some(1)]);
     }
 
     #[test]
@@ -1080,17 +1089,8 @@ mod tests {
             Some("existing-side".to_string()),
         ];
         let parent_shas = shas(&["main-parent", "new-side"]);
-        let top_first_parent_history = shas(&["tip", "main-parent"]);
 
-        let lanes = parent_lanes(
-            0,
-            true,
-            "tip",
-            &parent_shas,
-            &active_shas,
-            &top_first_parent_history,
-            &BTreeMap::new(),
-        );
+        let lanes = parent_lanes(0, "tip", &parent_shas, &active_shas, &BTreeMap::new());
 
         assert_eq!(lanes, vec![0, 1]);
     }
@@ -1110,10 +1110,19 @@ mod tests {
         assert_eq!(rows[2].outgoing_lanes, vec![0, 2]);
 
         assert_eq!(rows[3].lane, 2);
-        assert_eq!(rows[3].parent_lanes, vec![0]);
-        assert_eq!(rows[3].connector_lanes, vec![0, 1, 2]);
+        assert_eq!(rows[3].parent_lanes, vec![2]);
+        assert_eq!(rows[3].connector_lanes, vec![2]);
         assert!(!rows[3].incoming_lanes.contains(&1));
         assert!(!rows[3].outgoing_lanes.contains(&1));
+
+        // The stable branch edge merges into the shared parent on its row.
+        assert_eq!(rows[4].sha, "main-base");
+        assert_eq!(rows[4].incoming_lanes, vec![0, 2]);
+        assert!(rows[4].connectors.contains(&GraphConnector {
+            from_lane: 2,
+            to_lane: 0,
+            kind: GraphConnectorKind::MergeIn,
+        }));
     }
 
     #[test]
@@ -1172,15 +1181,15 @@ mod tests {
 
         assert_eq!(rows[0].parent_lanes, vec![0, 1]);
         assert_eq!(rows[1].lane, 1);
-        assert_eq!(rows[1].parent_lanes, vec![0]);
+        assert_eq!(rows[1].parent_lanes, vec![1]);
         assert_eq!(rows[2].lane, 0);
         assert_eq!(rows[2].parent_lanes, vec![0, 1]);
         assert_eq!(rows[3].lane, 1);
-        assert_eq!(rows[3].parent_lanes, vec![0]);
+        assert_eq!(rows[3].parent_lanes, vec![1]);
         assert_eq!(rows[4].lane, 0);
         assert_eq!(rows[4].parent_lanes, vec![0, 1]);
         assert_eq!(rows[5].lane, 1);
-        assert_eq!(rows[5].parent_lanes, vec![0]);
+        assert_eq!(rows[5].parent_lanes, vec![1]);
     }
 
     #[test]
@@ -1239,28 +1248,41 @@ mod tests {
         );
 
         assert_eq!(rows[3].lane, 1);
-        assert_eq!(rows[3].parent_lanes, vec![0]);
-        assert_eq!(rows[3].connector_lanes, vec![0, 1, 2]);
-        assert!(
-            rows[3].connectors.iter().any(|connector| {
-                connector.from_lane == 1
-                    && connector.to_lane == 2
-                    && connector.kind == GraphConnectorKind::BranchOut
-            }),
-            "the lfs side branch should extend from the earlier sibling branch row",
+        assert_eq!(rows[3].parent_lanes, vec![1]);
+        assert_eq!(rows[3].connector_lanes, vec![1]);
+        assert_eq!(
+            rows[3].connectors,
+            vec![GraphConnector {
+                from_lane: 1,
+                to_lane: 1,
+                kind: GraphConnectorKind::Straight,
+            }],
+            "the docs branch edge should run straight down its own lane",
         );
         assert_eq!(
             rows[3].outgoing_lanes,
-            vec![0],
-            "the lfs side edge should end at the shared sibling branch row",
+            vec![0, 1, 2],
+            "both side edges should stay active until the shared parent row",
         );
 
         assert_eq!(rows[4].lane, 0);
-        assert_eq!(rows[4].incoming_lanes, vec![0]);
-        assert_eq!(rows[4].connector_lanes, Vec::<usize>::new());
+        assert_eq!(rows[4].incoming_lanes, vec![0, 1, 2]);
+        assert_eq!(rows[4].connector_lanes, vec![0, 1, 2]);
         assert!(
-            rows[4].connectors.is_empty(),
-            "the shared parent row should not redraw the sibling branch merge",
+            rows[4].connectors.contains(&GraphConnector {
+                from_lane: 1,
+                to_lane: 0,
+                kind: GraphConnectorKind::MergeIn,
+            }),
+            "the docs side edge should merge into the shared parent row",
+        );
+        assert!(
+            rows[4].connectors.contains(&GraphConnector {
+                from_lane: 2,
+                to_lane: 0,
+                kind: GraphConnectorKind::MergeIn,
+            }),
+            "the lfs side edge should merge into the shared parent row",
         );
     }
 }

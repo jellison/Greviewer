@@ -2707,21 +2707,39 @@ fn render_commit_graph_gutter(
     row_index: usize,
     row: &graph::GraphRow,
     previous_row: Option<&graph::GraphRow>,
+    next_row: Option<&graph::GraphRow>,
     max_lanes: usize,
 ) -> impl IntoElement {
     let lane_count = max_lanes.max(1);
     let debug_selector = format!("commit-graph-gutter-{row_index}");
 
+    // Lanes paint right to left so the edges in lower lanes draw above the
+    // branches that join them.
     div()
-        .flex()
-        .items_center()
+        .relative()
         .w(px(commit_graph_gutter_width(lane_count)))
+        .h(px(COMMIT_GRAPH_LANE_HEIGHT))
         .font_family("monospace")
         .id(("commit-graph-gutter", row_index))
         .debug_selector(move || debug_selector.clone())
         .children(
             (0..lane_count)
-                .map(|lane| render_commit_graph_lane(row_index, lane, row, previous_row))
+                .rev()
+                .map(|lane| {
+                    div()
+                        .absolute()
+                        .left(px(lane as f32 * COMMIT_GRAPH_LANE_WIDTH))
+                        .top_0()
+                        .child(render_commit_graph_lane(
+                            row_index,
+                            lane,
+                            row,
+                            CommitGraphNeighborRows {
+                                previous: previous_row,
+                                next: next_row,
+                            },
+                        ))
+                })
                 .collect::<Vec<_>>(),
         )
 }
@@ -2755,6 +2773,7 @@ fn render_commit_graph_history_overlay(
                                 row_index
                                     .checked_sub(1)
                                     .and_then(|previous_row| rows.get(previous_row)),
+                                rows.get(row_index + 1),
                                 lane_count,
                             ))
                     })
@@ -3053,18 +3072,34 @@ fn commit_graph_shifted_merge_in_commit_dot_connector_geometry() -> CommitGraphR
     }
 }
 
+#[derive(Clone, Copy)]
+struct CommitGraphNeighborRows<'a> {
+    previous: Option<&'a graph::GraphRow>,
+    next: Option<&'a graph::GraphRow>,
+}
+
 fn render_commit_graph_lane(
     row_index: usize,
     lane: usize,
     row: &graph::GraphRow,
-    previous_row: Option<&graph::GraphRow>,
+    neighbors: CommitGraphNeighborRows<'_>,
 ) -> gpui::Div {
     let has_incoming = row.incoming_lanes.contains(&lane);
     let has_outgoing = row.outgoing_lanes.contains(&lane);
     let lane_color = commit_graph_lane_color(row, lane);
     let lane_selector = format!("commit-graph-lane-{row_index}-{lane}");
+    // The upper merge curve into this commit paints first so the commit
+    // lane's own vertical and dot stay on top of the joining branch.
+    let upper_merge_target_elbow = (lane == row.lane)
+        .then(|| {
+            commit_graph_upper_merge_in_connectors(row)
+                .into_iter()
+                .min_by_key(|connector| connector.from_lane)
+        })
+        .flatten();
 
     div()
+        .relative()
         .flex()
         .flex_col()
         .items_center()
@@ -3072,11 +3107,28 @@ fn render_commit_graph_lane(
         .w(px(COMMIT_GRAPH_LANE_WIDTH))
         .h(px(COMMIT_GRAPH_LANE_HEIGHT))
         .debug_selector(move || lane_selector.clone())
+        .when_some(upper_merge_target_elbow, |lane_div, connector| {
+            lane_div.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(px(COMMIT_GRAPH_VERTICAL_HEIGHT))
+                    .w(px(COMMIT_GRAPH_LANE_WIDTH))
+                    .h(px(commit_graph_middle_height()))
+                    .child(render_commit_graph_rounded_elbow(
+                        format!("commit-graph-rounded-upper-merge-target-elbow-{row_index}-{lane}"),
+                        graph::GraphConnectorKind::MergeIn,
+                        false,
+                        commit_graph_upper_merge_in_horizontal_top_in_middle(),
+                        commit_graph_connector_color(row, connector),
+                    )),
+            )
+        })
         .child(render_commit_graph_vertical_segment(
             row_index,
             lane,
             row,
-            previous_row,
+            neighbors,
             "top",
             has_incoming,
             lane_color,
@@ -3088,7 +3140,7 @@ fn render_commit_graph_lane(
             row_index,
             lane,
             row,
-            previous_row,
+            neighbors,
             "bottom",
             has_outgoing,
             lane_color,
@@ -3109,13 +3161,13 @@ fn render_commit_graph_vertical_segment(
     row_index: usize,
     lane: usize,
     row: &graph::GraphRow,
-    previous_row: Option<&graph::GraphRow>,
+    neighbors: CommitGraphNeighborRows<'_>,
     position: &'static str,
     visible: bool,
     color: gpui::Rgba,
 ) -> gpui::Div {
     let selector = format!("commit-graph-vertical-{row_index}-{lane}-{position}");
-    let (top, height) = commit_graph_vertical_segment_geometry(row, previous_row, lane, position);
+    let (top, height) = commit_graph_vertical_segment_geometry(row, neighbors, lane, position);
     let segment = div()
         .absolute()
         .left(px(commit_graph_line_x()))
@@ -3135,15 +3187,25 @@ fn render_commit_graph_vertical_segment(
 
 fn commit_graph_vertical_segment_geometry(
     row: &graph::GraphRow,
-    previous_row: Option<&graph::GraphRow>,
+    neighbors: CommitGraphNeighborRows<'_>,
     lane: usize,
     position: &'static str,
 ) -> (f32, f32) {
     if position == "top" {
-        if let Some(top) =
-            commit_graph_top_vertical_inset_after_previous_row_branch_out(row, previous_row, lane)
-        {
+        if let Some(top) = commit_graph_top_vertical_inset_after_previous_row_branch_out(
+            row,
+            neighbors.previous,
+            lane,
+        ) {
             return (top, COMMIT_GRAPH_VERTICAL_HEIGHT - top);
+        }
+    }
+
+    if position == "bottom" {
+        if let Some(height) =
+            commit_graph_bottom_vertical_inset_before_next_row_merge_in(neighbors.next, lane)
+        {
+            return (0., height);
         }
     }
 
@@ -3185,12 +3247,61 @@ fn commit_graph_top_vertical_inset_after_previous_row_branch_out(
     let connector = commit_graph_target_connector_for_lane(previous_row, lane)?;
     if connector.kind != graph::GraphConnectorKind::BranchOut
         || !commit_graph_connector_uses_lower_branch_out_line(previous_row, connector)
-        || commit_graph_rounded_elbow_turns_up(previous_row, lane, connector)
+        || commit_graph_rounded_elbow_turns_up(previous_row, lane)
     {
         return None;
     }
 
     Some(commit_graph_bend_radius() - commit_graph_line_width())
+}
+
+/// When the next row merges this lane into its commit along the upper border
+/// line, this row's outgoing vertical stops at the curve tangent instead of
+/// running into the bend.
+fn commit_graph_bottom_vertical_inset_before_next_row_merge_in(
+    next_row: Option<&graph::GraphRow>,
+    lane: usize,
+) -> Option<f32> {
+    let next_row = next_row?;
+    commit_graph_upper_merge_in_connectors(next_row)
+        .iter()
+        .any(|connector| connector.from_lane == lane)
+        .then(|| {
+            COMMIT_GRAPH_VERTICAL_HEIGHT - commit_graph_bend_radius() + commit_graph_line_width()
+        })
+}
+
+/// Merge connectors that terminate at this row's commit while the commit lane
+/// is also fed from above. These render along the row's upper border: the
+/// branch verticals curve to horizontal and join the commit lane's vertical
+/// just above the dot.
+fn commit_graph_upper_merge_in_connectors(row: &graph::GraphRow) -> Vec<graph::GraphConnector> {
+    row.connectors
+        .iter()
+        .copied()
+        .filter(|connector| commit_graph_connector_uses_upper_merge_in_line(row, *connector))
+        .collect()
+}
+
+fn commit_graph_connector_uses_upper_merge_in_line(
+    row: &graph::GraphRow,
+    connector: graph::GraphConnector,
+) -> bool {
+    connector.kind == graph::GraphConnectorKind::MergeIn
+        && connector.to_lane == row.lane
+        && row.incoming_lanes.contains(&connector.to_lane)
+}
+
+fn commit_graph_uses_upper_merge_in_line(row: &graph::GraphRow, lane: usize) -> bool {
+    let Some(connector) = commit_graph_connector_for_lane(row, lane) else {
+        return false;
+    };
+
+    commit_graph_connector_uses_upper_merge_in_line(row, connector)
+}
+
+fn commit_graph_upper_merge_in_horizontal_top_in_middle() -> f32 {
+    -(COMMIT_GRAPH_VERTICAL_HEIGHT + commit_graph_line_width() / 2.)
 }
 
 fn commit_graph_rounded_elbow_preserves_target_vertical(
@@ -3205,7 +3316,19 @@ fn commit_graph_rounded_elbow_preserves_target_vertical(
 }
 
 fn commit_graph_rounded_elbow_tangent_y(row: &graph::GraphRow, lane: usize) -> Option<f32> {
-    let connector = commit_graph_target_connector_for_lane(row, lane)?;
+    let Some(connector) = commit_graph_target_connector_for_lane(row, lane) else {
+        // A branch lane merging along the upper border leaves this row
+        // entirely: its curve sits above the row, so no vertical remains.
+        let source_connector = commit_graph_source_connector_for_lane(row, lane)?;
+        if !commit_graph_connector_uses_upper_merge_in_line(row, source_connector) {
+            return None;
+        }
+
+        let middle_center_y = COMMIT_GRAPH_VERTICAL_HEIGHT
+            + commit_graph_upper_merge_in_horizontal_top_in_middle()
+            + commit_graph_line_width() / 2.;
+        return Some(middle_center_y - commit_graph_bend_radius());
+    };
 
     match connector.kind {
         graph::GraphConnectorKind::BranchOut | graph::GraphConnectorKind::MergeIn => {}
@@ -3220,13 +3343,11 @@ fn commit_graph_rounded_elbow_tangent_y(row: &graph::GraphRow, lane: usize) -> O
         COMMIT_GRAPH_VERTICAL_HEIGHT + commit_graph_middle_line_y() + commit_graph_line_width() / 2.
     };
 
-    Some(
-        if commit_graph_rounded_elbow_turns_up(row, lane, connector) {
-            middle_center_y - commit_graph_bend_radius()
-        } else {
-            middle_center_y + commit_graph_bend_radius()
-        },
-    )
+    Some(if commit_graph_rounded_elbow_turns_up(row, lane) {
+        middle_center_y - commit_graph_bend_radius()
+    } else {
+        middle_center_y + commit_graph_bend_radius()
+    })
 }
 
 fn render_commit_graph_middle_segment(
@@ -3278,16 +3399,22 @@ fn render_commit_graph_middle_segment(
             let min_lane = lane_span.clone().min().unwrap_or(lane);
             let max_lane = lane_span.max().unwrap_or(lane);
             let has_left_connector = has_connector && lane > min_lane;
-            let right_target_connector = commit_graph_target_connector_from_side(row, lane, true);
-            let has_right_connector =
-                (has_connector && lane < max_lane) || right_target_connector.is_some();
+            // Merges drawn along the upper border join the commit lane's
+            // vertical above the dot, so they take no dot-height stub.
+            let right_target_connector = commit_graph_target_connector_from_side(row, lane, true)
+                .filter(|connector| !commit_graph_connector_uses_upper_merge_in_line(row, *connector));
+            let right_side_has_non_upper_connector = row.connectors.iter().any(|connector| {
+                connector.from_lane.max(connector.to_lane) > lane
+                    && !commit_graph_connector_uses_upper_merge_in_line(row, *connector)
+            });
+            let has_right_connector = (has_connector
+                && lane < max_lane
+                && right_side_has_non_upper_connector)
+                || right_target_connector.is_some();
             let left_connector = commit_graph_connector_on_side(row, lane, false);
             let right_connectors = commit_graph_connectors_on_side(row, lane, true);
             let right_connector =
                 commit_graph_connector_on_side(row, lane, true).or(right_target_connector);
-            let sibling_branch_extension = right_connector.filter(|connector| {
-                commit_graph_connector_is_sibling_branch_extension(row, *connector)
-            });
             let rounded_left_connector =
                 commit_graph_commit_side_rounded_connector(row, lane, false);
             let rounded_right_connector =
@@ -3307,14 +3434,6 @@ fn render_commit_graph_middle_segment(
                 .filter(|connector| connector.kind == graph::GraphConnectorKind::MergeIn)
                 .map(|_| format!("commit-graph-merge-in-horizontal-{row_index}-{lane}"))
                 .unwrap_or(commit_connector_selector);
-            let commit_side_layer_order = commit_graph_commit_side_layer_order(
-                rounded_left_connector,
-                rounded_right_connector,
-                sibling_branch_extension,
-            );
-            let draw_sibling_branch_extension_below_priority = commit_side_layer_order
-                .first()
-                .is_some_and(|layer| *layer == CommitGraphCommitSideLayer::SiblingBranchExtension);
 
             middle.child(
                 div()
@@ -3359,18 +3478,6 @@ fn render_commit_graph_middle_segment(
                                 has_left_connector && rounded_left_connector.is_none(),
                                 |line| line.bg(left_connector_color),
                             ),
-                    )
-                    .when(
-                        draw_sibling_branch_extension_below_priority,
-                        |commit| {
-                            let connector = sibling_branch_extension
-                                .expect("sibling branch extension layer requires connector");
-                            commit.child(render_commit_graph_shared_branch_horizontal(
-                                row_index,
-                                lane,
-                                commit_graph_connector_color(row, connector),
-                            ))
-                        },
                     )
                     .when_some(rounded_left_connector, |commit, connector| {
                         let selector = match connector.kind {
@@ -3427,9 +3534,7 @@ fn render_commit_graph_middle_segment(
                             .w(px(commit_graph_dot_side_line_width()))
                             .h(px(COMMIT_GRAPH_LINE_WIDTH))
                             .when(
-                                has_right_connector
-                                    && !right_connector_is_rounded
-                                    && sibling_branch_extension.is_none(),
+                                has_right_connector && !right_connector_is_rounded,
                                 |line| {
                                     line.bg(right_connector_color)
                                         .debug_selector(move || right_connector_selector.clone())
@@ -3531,33 +3636,6 @@ fn commit_graph_connectors_on_side(
     connectors
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommitGraphCommitSideLayer {
-    SiblingBranchExtension,
-    RoundedLeftConnector,
-    RoundedRightConnector,
-}
-
-fn commit_graph_commit_side_layer_order(
-    rounded_left_connector: Option<graph::GraphConnector>,
-    rounded_right_connector: Option<graph::GraphConnector>,
-    sibling_branch_extension: Option<graph::GraphConnector>,
-) -> Vec<CommitGraphCommitSideLayer> {
-    let mut layers = Vec::new();
-
-    if sibling_branch_extension.is_some() {
-        layers.push(CommitGraphCommitSideLayer::SiblingBranchExtension);
-    }
-    if rounded_left_connector.is_some() {
-        layers.push(CommitGraphCommitSideLayer::RoundedLeftConnector);
-    }
-    if rounded_right_connector.is_some() {
-        layers.push(CommitGraphCommitSideLayer::RoundedRightConnector);
-    }
-
-    layers
-}
-
 fn commit_graph_commit_side_rounded_connector(
     row: &graph::GraphRow,
     lane: usize,
@@ -3566,9 +3644,6 @@ fn commit_graph_commit_side_rounded_connector(
     if right {
         return commit_graph_connectors_on_side(row, lane, true)
             .into_iter()
-            .filter(|connector| {
-                !commit_graph_connector_is_sibling_branch_extension(row, *connector)
-            })
             .find(|connector| commit_graph_connector_uses_lower_branch_out_line(row, *connector));
     }
 
@@ -3585,24 +3660,8 @@ fn commit_graph_commit_side_rounded_connector(
         .min_by_key(|connector| connector.to_lane.abs_diff(lane))
 }
 
-fn commit_graph_connector_is_sibling_branch_extension(
-    row: &graph::GraphRow,
-    connector: graph::GraphConnector,
-) -> bool {
-    connector.kind == graph::GraphConnectorKind::BranchOut
-        && connector.from_lane == row.lane
-        && !row.parent_lanes.contains(&connector.to_lane)
-}
-
-fn commit_graph_rounded_elbow_turns_up(
-    row: &graph::GraphRow,
-    lane: usize,
-    connector: graph::GraphConnector,
-) -> bool {
-    row.incoming_lanes.contains(&lane)
-        && (!row.outgoing_lanes.contains(&lane)
-            || (connector.kind == graph::GraphConnectorKind::BranchOut
-                && commit_graph_connector_is_sibling_branch_extension(row, connector)))
+fn commit_graph_rounded_elbow_turns_up(row: &graph::GraphRow, lane: usize) -> bool {
+    row.incoming_lanes.contains(&lane) && !row.outgoing_lanes.contains(&lane)
 }
 
 fn commit_graph_uses_lower_branch_out_line(row: &graph::GraphRow, lane: usize) -> bool {
@@ -3618,8 +3677,7 @@ fn commit_graph_connector_uses_lower_branch_out_line(
     connector: graph::GraphConnector,
 ) -> bool {
     connector.kind == graph::GraphConnectorKind::BranchOut
-        && (row.outgoing_lanes.contains(&connector.to_lane)
-            || commit_graph_connector_is_sibling_branch_extension(row, connector))
+        && row.outgoing_lanes.contains(&connector.to_lane)
 }
 
 fn commit_graph_uses_lower_merge_in_line(row: &graph::GraphRow, lane: usize) -> bool {
@@ -3628,6 +3686,7 @@ fn commit_graph_uses_lower_merge_in_line(row: &graph::GraphRow, lane: usize) -> 
     };
 
     connector.kind == graph::GraphConnectorKind::MergeIn
+        && connector.to_lane != row.lane
         && row.incoming_lanes.contains(&connector.to_lane)
         && row.outgoing_lanes.contains(&connector.to_lane)
         && row.incoming_lanes.contains(&connector.from_lane)
@@ -3793,27 +3852,6 @@ fn render_commit_graph_rounded_branch_off_source_bend(
         )
 }
 
-fn render_commit_graph_shared_branch_horizontal(
-    row_index: usize,
-    lane: usize,
-    color: gpui::Rgba,
-) -> gpui::Div {
-    let horizontal_selector = format!("commit-graph-shared-branch-horizontal-{row_index}-{lane}");
-    let horizontal_left =
-        commit_graph_commit_bend_overlay_x() + commit_graph_merge_in_commit_bend_geometry().start.x;
-
-    div()
-        .absolute()
-        .left(px(horizontal_left))
-        .top(px(
-            commit_graph_shifted_lower_merge_in_horizontal_top_in_middle(),
-        ))
-        .w(px(COMMIT_GRAPH_LANE_WIDTH - horizontal_left))
-        .h(px(COMMIT_GRAPH_LINE_WIDTH))
-        .bg(color)
-        .debug_selector(move || horizontal_selector.clone())
-}
-
 fn render_commit_graph_rounded_merge_in_commit_bend(
     selector: String,
     connector_color: gpui::Rgba,
@@ -3956,10 +3994,17 @@ fn render_commit_graph_non_commit_connector(
     let preserve_target_vertical = commit_graph_rounded_elbow_preserves_target_vertical(row, lane);
     let uses_lower_merge_in_line = commit_graph_uses_lower_merge_in_line(row, lane);
     let uses_lower_branch_out_line = commit_graph_uses_lower_branch_out_line(row, lane);
+    let uses_upper_merge_in_line = commit_graph_uses_upper_merge_in_line(row, lane);
     let lane_color = commit_graph_lane_color(row, lane);
     let color = connector
         .map(|connector| commit_graph_connector_color(row, connector))
         .unwrap_or(lane_color);
+    // An outer edge crossing this merging lane along the upper border keeps
+    // its own color underneath this lane's bend.
+    let upper_merge_crossing = source_connector
+        .filter(|connector| commit_graph_connector_uses_upper_merge_in_line(row, *connector))
+        .and_then(|_| commit_graph_spanning_connector_for_lane(row, lane))
+        .filter(|connector| commit_graph_connector_uses_upper_merge_in_line(row, *connector));
     let (left_visible, right_visible) = match (target_connector, source_connector) {
         (Some(connector), _) => match connector.kind {
             graph::GraphConnectorKind::BranchOut => (true, false),
@@ -3969,7 +4014,14 @@ fn render_commit_graph_non_commit_connector(
         (None, Some(connector))
             if connector.kind == graph::GraphConnectorKind::MergeIn && connector.to_lane < lane =>
         {
-            (true, false)
+            // Along the upper border a crossing edge is drawn as a full-width
+            // underlay instead; on the middle line another edge merging across
+            // this lane still needs the right half of the horizontal.
+            (
+                true,
+                !uses_upper_merge_in_line
+                    && commit_graph_spanning_connector_for_lane(row, lane).is_some(),
+            )
         }
         _ => (true, true),
     };
@@ -4035,7 +4087,9 @@ fn render_commit_graph_non_commit_connector(
         .is_some_and(|(_, kind)| *kind == graph::GraphConnectorKind::MergeIn)
         || lower_merge_in_source_bend.is_some();
     let has_rounded_elbow = left_horizontal_is_rounded || right_horizontal_is_rounded;
-    let horizontal_top_y = if uses_lower_merge_in_line || uses_lower_branch_out_line {
+    let horizontal_top_y = if uses_upper_merge_in_line {
+        commit_graph_upper_merge_in_horizontal_top_in_middle()
+    } else if uses_lower_merge_in_line || uses_lower_branch_out_line {
         commit_graph_shifted_lower_merge_in_horizontal_top_in_middle()
     } else {
         commit_graph_middle_line_y()
@@ -4065,7 +4119,7 @@ fn render_commit_graph_non_commit_connector(
     });
     let incoming_vertical_bridge = target_connector.and_then(|connector| {
         if connector.kind != graph::GraphConnectorKind::BranchOut
-            || !commit_graph_rounded_elbow_turns_up(row, lane, connector)
+            || !commit_graph_rounded_elbow_turns_up(row, lane)
         {
             return None;
         }
@@ -4080,10 +4134,24 @@ fn render_commit_graph_non_commit_connector(
     });
     let fill_spanning_center = commit_graph_spanning_connector_requires_center_fill(row, lane);
 
+    let upper_merge_crossing_selector =
+        format!("commit-graph-upper-merge-crossing-{row_index}-{lane}");
     let mut connector_shape = div()
         .relative()
         .w(px(COMMIT_GRAPH_LANE_WIDTH))
         .h(px(commit_graph_middle_height()))
+        .when_some(upper_merge_crossing, |shape, crossing| {
+            shape.child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(horizontal_top_y))
+                    .w(px(COMMIT_GRAPH_LANE_WIDTH))
+                    .h(px(COMMIT_GRAPH_LINE_WIDTH))
+                    .bg(commit_graph_connector_color(row, crossing))
+                    .debug_selector(move || upper_merge_crossing_selector.clone()),
+            )
+        })
         .child(
             div()
                 .absolute()
@@ -4248,7 +4316,7 @@ fn render_commit_graph_non_commit_connector(
             rounded_elbow_selector,
             rounded_elbow_kind,
             target_connector
-                .map(|connector| commit_graph_rounded_elbow_turns_up(row, lane, connector))
+                .map(|_| commit_graph_rounded_elbow_turns_up(row, lane))
                 .unwrap_or(false),
             horizontal_top_y,
             color,
@@ -5704,10 +5772,6 @@ mod tests {
         (dir, left_oid.to_string(), right_oid.to_string())
     }
 
-    fn commit_info_for_graph(sha: &str, parents: &[&str]) -> crate::repo::CommitInfo {
-        commit_info_for_graph_at(sha, 0, parents)
-    }
-
     fn commit_info_for_graph_at(
         sha: &str,
         authored_timestamp: i64,
@@ -7033,7 +7097,7 @@ mod tests {
             .expect("branch-out connector");
         assert_eq!(commit_graph_connector_color_lane(branch_out), 1);
 
-        let merge_in = rows[2]
+        let merge_in = rows[3]
             .connectors
             .iter()
             .copied()
@@ -7386,78 +7450,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sibling_branch_extension_turns_up_into_active_outer_lane() {
-        let rows = graph::layout_graph(&[
-            graph::GraphCommit {
-                sha: "merge-lfs".into(),
-                authored_timestamp: 50,
-                parent_shas: vec!["merge-docs".into(), "lfs-tip".into()],
-            },
-            graph::GraphCommit {
-                sha: "lfs-tip".into(),
-                authored_timestamp: 40,
-                parent_shas: vec!["trunk-base".into()],
-            },
-            graph::GraphCommit {
-                sha: "merge-docs".into(),
-                authored_timestamp: 30,
-                parent_shas: vec!["trunk-base".into(), "docs-tip".into()],
-            },
-            graph::GraphCommit {
-                sha: "docs-tip".into(),
-                authored_timestamp: 20,
-                parent_shas: vec!["trunk-base".into()],
-            },
-            graph::GraphCommit {
-                sha: "trunk-base".into(),
-                authored_timestamp: 10,
-                parent_shas: Vec::new(),
-            },
-        ]);
-        let row = &rows[3];
-        let horizontal_center_y = super::COMMIT_GRAPH_VERTICAL_HEIGHT
-            + super::commit_graph_lower_merge_in_horizontal_top_in_middle()
-            + super::commit_graph_lower_connector_vertical_shift()
-            + super::commit_graph_line_width() / 2.;
-
-        assert_eq!(
-            row.sha, "docs-tip",
-            "test fixture should inspect the earlier sibling side-branch row",
-        );
-        assert_eq!(
-            super::commit_graph_rounded_elbow_tangent_y(row, 2),
-            Some(horizontal_center_y - super::commit_graph_bend_radius()),
-            "shared sibling branch extensions should curve upward into the active outer lane",
-        );
-    }
-
-    #[test]
-    fn sibling_branch_extension_renders_below_priority_branch_bend() {
-        let layer_order = super::commit_graph_commit_side_layer_order(
-            Some(graph::GraphConnector {
-                from_lane: 1,
-                to_lane: 0,
-                kind: graph::GraphConnectorKind::MergeIn,
-            }),
-            None,
-            Some(graph::GraphConnector {
-                from_lane: 1,
-                to_lane: 2,
-                kind: graph::GraphConnectorKind::BranchOut,
-            }),
-        );
-
-        assert_eq!(
-            layer_order,
-            vec![
-                super::CommitGraphCommitSideLayer::SiblingBranchExtension,
-                super::CommitGraphCommitSideLayer::RoundedLeftConnector,
-            ],
-            "shared sibling branch extensions should render below the active side branch bend",
-        );
-    }
-
     #[gpui::test]
     async fn commit_graph_renders_merge_lanes(cx: &mut TestAppContext) {
         let (dir, _left_sha, _right_sha) = init_repo_with_diverged_history();
@@ -7613,94 +7605,67 @@ mod tests {
             continued_lane_bottom_bounds.origin.y,
             "continued lane middle vertical should connect to the outgoing vertical",
         );
-        let merge_in_elbow_bounds = visual
-            .debug_bounds("commit-graph-merge-in-elbow-2-0")
-            .expect("right branch merge-in elbow debug bounds");
+        assert!(
+            visual.debug_bounds("commit-graph-merge-in-2-0").is_none()
+                && visual
+                    .debug_bounds("commit-graph-rounded-merge-in-commit-elbow-2-1")
+                    .is_none(),
+            "the right branch commit should sit on a straight vertical instead of bending on its own row",
+        );
+        let right_branch_top_vertical = visual
+            .debug_bounds("commit-graph-vertical-2-1-top")
+            .expect("right branch incoming vertical debug bounds");
+        let right_branch_bottom_vertical = visual
+            .debug_bounds("commit-graph-vertical-2-1-bottom")
+            .expect("right branch outgoing vertical debug bounds");
+        assert_eq!(
+            right_branch_top_vertical.origin.x, right_branch_bottom_vertical.origin.x,
+            "right branch edge should continue straight through its commit row",
+        );
+        let merge_in_source_elbow_bounds = visual
+            .debug_bounds("commit-graph-rounded-merge-in-source-elbow-3-1")
+            .expect("base row merge-in source elbow debug bounds");
+        let upper_merge_target_elbow_bounds = visual
+            .debug_bounds("commit-graph-rounded-upper-merge-target-elbow-3-0")
+            .expect("base row upper merge target elbow debug bounds");
+        let base_dot_bounds = visual
+            .debug_bounds("commit-graph-dot-3")
+            .expect("base commit dot debug bounds");
+        let base_row_bounds = visual
+            .debug_bounds("commit-row-3")
+            .expect("base commit row debug bounds");
         assert!(
             visual
-                .debug_bounds("commit-graph-rounded-merge-in-elbow-2-0")
+                .debug_bounds("commit-graph-merge-in-horizontal-3-0")
                 .is_none(),
-            "merge-in target trunk should stay vertical; the final rounded bend belongs at the branch commit",
-        );
-        let merge_in_vertical_bounds = visual
-            .debug_bounds("commit-graph-vertical-2-0-bottom")
-            .expect("right branch merge-in outgoing vertical debug bounds");
-        let merge_in_top_vertical_bounds = visual
-            .debug_bounds("commit-graph-vertical-2-0-top")
-            .expect("right branch merge-in incoming trunk vertical debug bounds");
-        let merge_in_middle_vertical_bounds = visual
-            .debug_bounds("commit-graph-middle-vertical-2-0")
-            .expect("right branch merge-in middle trunk vertical debug bounds");
-        let merge_in_horizontal_bounds = visual
-            .debug_bounds("commit-graph-merge-in-horizontal-2-0")
-            .expect("right branch merge-in horizontal debug bounds");
-        let right_branch_commit_row = visual
-            .debug_bounds("commit-row-2")
-            .expect("right branch commit row debug bounds");
-        let branch_off_source_bend_bounds = visual
-            .debug_bounds("commit-graph-rounded-branch-off-source-elbow-2-0")
-            .expect("right branch source-side rounded branch-off bend debug bounds");
-        let merge_in_commit_bend_bounds = visual
-            .debug_bounds("commit-graph-rounded-merge-in-commit-elbow-2-1")
-            .expect("right branch commit rounded merge-in bend debug bounds");
-        let right_branch_commit_dot_bounds = visual
-            .debug_bounds("commit-graph-dot-2")
-            .expect("right branch commit dot debug bounds");
-        assert_eq!(
-            merge_in_horizontal_bounds.origin.y + px(commit_graph_line_width() / 2.),
-            merge_in_commit_bend_bounds.origin.y
-                + px(
-                    super::commit_graph_lower_connector_vertical_shift()
-                        + commit_graph_merge_in_commit_line_y()
-                ),
-            "merge-in horizontal should start right on the lower baseline before bending up into the branch commit",
+            "the merge should join the trunk vertical above the dot, not tee into the dot",
         );
         assert_eq!(
-            merge_in_horizontal_bounds.origin.y + px(commit_graph_line_width() / 2.),
-            right_branch_commit_row.origin.y + right_branch_commit_row.size.height,
-            "merge-in horizontal should be centered on the border below the branch commit row",
+            upper_merge_target_elbow_bounds.origin.y, base_row_bounds.origin.y,
+            "the merge target curve should sit on the base row's upper border",
         );
         assert_eq!(
-            merge_in_horizontal_bounds.origin.x,
-            merge_in_middle_vertical_bounds.origin.x + merge_in_middle_vertical_bounds.size.width,
-            "merge-in horizontal should start at the trunk lane",
+            merge_in_source_elbow_bounds.origin.y, base_row_bounds.origin.y,
+            "the merge source curve should sit on the base row's upper border",
         );
         assert!(
-            branch_off_source_bend_bounds.origin.x < merge_in_commit_bend_bounds.origin.x,
-            "source-side branch-off bend should be left of the commit-side bend",
-        );
-        assert!(
-            branch_off_source_bend_bounds.origin.y < merge_in_horizontal_bounds.origin.y,
-            "source-side branch-off bend should have room above the horizontal run for the quarter-turn",
-        );
-        assert!(
-            branch_off_source_bend_bounds.origin.y + branch_off_source_bend_bounds.size.height
-                > merge_in_horizontal_bounds.origin.y,
-            "source-side branch-off bend should overlap the horizontal run after starting vertically",
-        );
-        assert!(
-            merge_in_commit_bend_bounds.origin.x < right_branch_commit_dot_bounds.origin.x,
-            "merge-in commit-side bend should start before the branch commit dot",
-        );
-        assert!(
-            merge_in_commit_bend_bounds.origin.y + merge_in_commit_bend_bounds.size.height
-                > right_branch_commit_dot_bounds.origin.y
-                    + right_branch_commit_dot_bounds.size.height,
-            "merge-in commit-side bend should have room below the branch commit dot",
+            merge_in_source_elbow_bounds.origin.x
+                > base_dot_bounds.origin.x + base_dot_bounds.size.width,
+            "merge-in source elbow should curve up in the branch lane right of the base dot",
         );
         assert_eq!(
-            merge_in_elbow_bounds.origin.x, merge_in_vertical_bounds.origin.x,
-            "merge-in elbow should align with the parent lane",
+            right_branch_bottom_vertical.size.height,
+            px(
+                super::COMMIT_GRAPH_VERTICAL_HEIGHT - super::commit_graph_bend_radius()
+                    + commit_graph_line_width()
+            ),
+            "the branch edge should stop at the merge curve tangent above the base row",
         );
-        assert_eq!(
-            merge_in_top_vertical_bounds.origin.y + merge_in_top_vertical_bounds.size.height,
-            merge_in_middle_vertical_bounds.origin.y,
-            "merge-in target trunk should stay connected above the rounded branch join",
-        );
-        assert_eq!(
-            merge_in_middle_vertical_bounds.origin.y + merge_in_middle_vertical_bounds.size.height,
-            merge_in_vertical_bounds.origin.y,
-            "merge-in target trunk should stay connected below the rounded branch join",
+        assert!(
+            visual
+                .debug_bounds("commit-graph-vertical-3-1-bottom")
+                .is_none(),
+            "the branch edge should end at the base row",
         );
     }
 
@@ -7783,24 +7748,31 @@ mod tests {
                     }),
                     "the docs side branch should branch independently from the merge row",
                 );
-                assert_eq!(rows[3].connector_lanes, vec![0, 1, 2]);
+                assert_eq!(rows[3].connector_lanes, vec![1]);
                 assert!(
-                    rows[3].connectors.iter().any(|connector| {
-                        connector.from_lane == 1
-                            && connector.to_lane == 2
-                            && connector.kind == GraphConnectorKind::BranchOut
-                    }),
-                    "the lfs side edge should branch from the docs side branch row",
+                    rows[3]
+                        .connectors
+                        .iter()
+                        .all(|connector| { connector.from_lane == 1 && connector.to_lane == 1 }),
+                    "the docs branch edge should run straight down its own lane",
                 );
                 assert_eq!(
                     rows[3].outgoing_lanes,
-                    vec![0],
-                    "the lfs side edge should stop after joining the shared sibling branch",
+                    vec![0, 1, 2],
+                    "both side edges should stay active until the shared parent row",
                 );
-                assert_eq!(rows[4].connector_lanes, Vec::<usize>::new());
+                assert_eq!(rows[4].connector_lanes, vec![0, 1, 2]);
                 assert!(
-                    rows[4].connectors.is_empty(),
-                    "the shared parent row should not redraw the sibling branch merge",
+                    rows[4].connectors.contains(&graph::GraphConnector {
+                        from_lane: 1,
+                        to_lane: 0,
+                        kind: GraphConnectorKind::MergeIn,
+                    }) && rows[4].connectors.contains(&graph::GraphConnector {
+                        from_lane: 2,
+                        to_lane: 0,
+                        kind: GraphConnectorKind::MergeIn,
+                    }),
+                    "both side edges should merge into the shared parent on its own row",
                 );
             })
             .expect("inspect graph layout");
@@ -7840,109 +7812,82 @@ mod tests {
         visual
             .debug_bounds("commit-graph-rounded-branch-out-elbow-2-1")
             .expect("docs side branch should occupy the first side lane");
-        visual
-            .debug_bounds("commit-graph-shared-branch-horizontal-3-1")
-            .expect("lfs side branch should continue the docs branch line from lane 1");
-        let shared_branch_horizontal = visual
-            .debug_bounds("commit-graph-shared-branch-horizontal-3-1")
-            .expect("lfs side branch should continue the docs branch line from lane 1");
-        let docs_tip_row = visual
-            .debug_bounds("commit-row-3")
-            .expect("docs side branch row debug bounds");
-        let branch_out_elbow = visual
-            .debug_bounds("commit-graph-rounded-branch-out-elbow-3-2")
-            .expect("lfs side branch should curve up from the docs side branch row into lane 2");
-        let docs_lane = visual
-            .debug_bounds("commit-graph-lane-3-1")
-            .expect("docs side branch lane");
-        let lfs_lane = visual
-            .debug_bounds("commit-graph-lane-3-2")
-            .expect("lfs side branch lane");
-        let lfs_top_vertical = visual
+        assert!(
+            visual
+                .debug_bounds("commit-graph-rounded-merge-in-commit-elbow-3-1")
+                .is_none()
+                && visual
+                    .debug_bounds("commit-graph-rounded-merge-target-commit-elbow-3-1")
+                    .is_none(),
+            "the docs commit should sit on a straight vertical instead of bending on its own row",
+        );
+        let docs_row_lfs_top = visual
             .debug_bounds("commit-graph-vertical-3-2-top")
-            .expect("lfs side branch incoming vertical");
-        let lfs_vertical_bridge = visual
-            .debug_bounds("commit-graph-rounded-branch-out-vertical-bridge-3-2")
-            .expect("lfs side branch curve should bridge to the incoming vertical");
-        let expected_shared_start_x = super::commit_graph_commit_bend_overlay_x()
-            + super::commit_graph_merge_in_commit_bend_geometry().start.x;
-        let expected_branch_out_tangent_y = super::COMMIT_GRAPH_VERTICAL_HEIGHT
-            + super::commit_graph_lower_merge_in_horizontal_top_in_middle()
-            + super::commit_graph_lower_connector_vertical_shift()
-            + super::commit_graph_line_width() / 2.
-            - super::commit_graph_bend_radius();
-
-        assert!(
-            shared_branch_horizontal.origin.x + shared_branch_horizontal.size.width
-                >= branch_out_elbow.origin.x,
-            "shared sibling branch horizontal should overlap the lane-2 curve",
+            .expect("lfs edge incoming vertical through the docs row");
+        let docs_row_lfs_middle = visual
+            .debug_bounds("commit-graph-middle-vertical-3-2")
+            .expect("lfs edge middle vertical through the docs row");
+        let docs_row_lfs_bottom = visual
+            .debug_bounds("commit-graph-vertical-3-2-bottom")
+            .expect("lfs edge outgoing vertical through the docs row");
+        assert_eq!(
+            docs_row_lfs_top.origin.y + docs_row_lfs_top.size.height,
+            docs_row_lfs_middle.origin.y,
+            "lfs edge should pass the docs row without a gap above the middle segment",
         );
         assert_eq!(
-            shared_branch_horizontal.origin.x,
-            docs_lane.origin.x + px(expected_shared_start_x),
-            "shared sibling branch horizontal should start where the docs branch reaches the lower baseline",
+            docs_row_lfs_middle.origin.y + docs_row_lfs_middle.size.height,
+            docs_row_lfs_bottom.origin.y,
+            "lfs edge should pass the docs row without a gap below the middle segment",
         );
-        assert_eq!(
-            shared_branch_horizontal.origin.y + px(super::commit_graph_line_width() / 2.),
-            docs_tip_row.origin.y + docs_tip_row.size.height,
-            "shared sibling branch horizontal should be centered on the border below its source row",
-        );
-        assert_eq!(
-            lfs_vertical_bridge.origin.x, lfs_top_vertical.origin.x,
-            "lfs vertical bridge should align with the incoming vertical",
-        );
-        assert_eq!(
-            lfs_vertical_bridge.origin.y,
-            lfs_top_vertical.origin.y + lfs_top_vertical.size.height,
-            "lfs vertical bridge should start where the incoming vertical ends",
-        );
-        assert!(
-            lfs_vertical_bridge.origin.y + lfs_vertical_bridge.size.height
-                >= lfs_lane.origin.y
-                    + px(expected_branch_out_tangent_y + super::commit_graph_line_width()),
-            "lfs vertical bridge should overlap the upward curve tangent without a seam",
-        );
-        assert!(
-            visual
-                .debug_bounds("commit-graph-shared-branch-vertical-3-1")
-                .is_none(),
-            "lfs side branch should start horizontally, not vertically from the docs commit",
-        );
-        assert!(
-            visual
-                .debug_bounds("commit-graph-rounded-merge-target-commit-elbow-3-1")
-                .is_none(),
-            "lfs branch extension should not bend through the docs commit dot",
-        );
+        let docs_merge_source_elbow = visual
+            .debug_bounds("commit-graph-rounded-merge-in-source-elbow-4-1")
+            .expect("docs edge should curve into the shared parent on its row");
+        let lfs_merge_source_elbow = visual
+            .debug_bounds("commit-graph-rounded-merge-in-source-elbow-4-2")
+            .expect("lfs edge should curve into the shared parent on its row");
+        let upper_merge_target_elbow = visual
+            .debug_bounds("commit-graph-rounded-upper-merge-target-elbow-4-0")
+            .expect("shared parent should curve the merge into its trunk vertical");
+        let lfs_crossing_underlay = visual
+            .debug_bounds("commit-graph-upper-merge-crossing-4-1")
+            .expect("lfs edge should keep its own horizontal underneath the docs bend");
+        let parent_row = visual
+            .debug_bounds("commit-row-4")
+            .expect("shared parent commit row debug bounds");
         assert!(
             visual
                 .debug_bounds("commit-graph-merge-in-horizontal-4-0")
                 .is_none(),
-            "shared sibling branch should not redraw a separate merge-in at the common parent row",
+            "the merges should join the trunk vertical above the dot, not tee into the dot",
+        );
+        assert_eq!(
+            lfs_crossing_underlay.origin.y + px(super::commit_graph_line_width() / 2.),
+            parent_row.origin.y,
+            "the crossing merge horizontal should be centered on the shared parent row's upper border",
+        );
+        assert_eq!(
+            docs_merge_source_elbow.origin.y, lfs_merge_source_elbow.origin.y,
+            "both merge source elbows should share the same vertical placement",
+        );
+        assert_eq!(
+            upper_merge_target_elbow.origin.y, docs_merge_source_elbow.origin.y,
+            "the trunk-side merge curve should align with the branch-side curves",
         );
         assert!(
-            visual
-                .debug_bounds("commit-graph-spanning-horizontal-left-4-1")
-                .is_none(),
-            "shared sibling branch should not cross an empty lane at the common parent row",
+            docs_merge_source_elbow.origin.x < lfs_merge_source_elbow.origin.x,
+            "the docs elbow should sit in the inner lane, the lfs elbow in the outer lane",
         );
-        assert!(
-            visual
-                .debug_bounds("commit-graph-spanning-horizontal-right-4-1")
-                .is_none(),
-            "shared sibling branch should not cross an empty lane at the common parent row",
-        );
-        assert!(
-            visual
-                .debug_bounds("commit-graph-rounded-merge-in-source-elbow-4-2")
-                .is_none(),
-            "shared sibling branch should not draw a second lower bend back toward the trunk",
-        );
-        assert!(
-            visual
-                .debug_bounds("commit-graph-merge-in-source-horizontal-right-4-2")
-                .is_none(),
-            "lfs merge source should not draw a dangling horizontal to the right",
+        let docs_row_lfs_bottom_inset = visual
+            .debug_bounds("commit-graph-vertical-3-2-bottom")
+            .expect("lfs edge outgoing vertical above the shared parent row");
+        assert_eq!(
+            docs_row_lfs_bottom_inset.size.height,
+            px(
+                super::COMMIT_GRAPH_VERTICAL_HEIGHT - super::commit_graph_bend_radius()
+                    + super::commit_graph_line_width()
+            ),
+            "the lfs edge should stop at its merge curve tangent above the shared parent row",
         );
         assert_eq!(
             side_top.origin.y + side_top.size.height,
@@ -8013,26 +7958,25 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn commit_graph_keeps_lower_merge_in_horizontal_aligned_across_occupied_lanes(
+    async fn commit_graph_keeps_merge_in_horizontal_aligned_across_occupied_lanes(
         cx: &mut TestAppContext,
     ) {
         let dir = tempfile::tempdir().expect("create tempdir");
         let window = add_app_window(cx);
 
+        // feature-x passes through trunk-mid's row in lane 1 while feature-y
+        // merges into trunk-mid from lane 2, crossing the occupied lane.
         window
             .update(cx, |app, _window, cx| {
                 seed_repo_open_mode_with_commits(
                     app,
                     dir.path().to_path_buf(),
                     vec![
-                        commit_info_for_graph(
-                            "merge-tip",
-                            &["main-a", "ending-side", "stable-side"],
-                        ),
-                        commit_info_for_graph("main-a", &["main-base"]),
-                        commit_info_for_graph("stable-side", &["main-base"]),
-                        commit_info_for_graph("ending-side", &["main-base"]),
-                        commit_info_for_graph("main-base", &[]),
+                        commit_info_for_graph_at("trunk-tip", 60, &["trunk-mid"]),
+                        commit_info_for_graph_at("feature-x", 50, &["trunk-base"]),
+                        commit_info_for_graph_at("feature-y", 40, &["trunk-mid"]),
+                        commit_info_for_graph_at("trunk-mid", 30, &["trunk-base"]),
+                        commit_info_for_graph_at("trunk-base", 20, &[]),
                     ],
                 );
                 cx.notify();
@@ -8056,33 +8000,78 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 let rows = graph::layout_graph(&graph_commits);
+                assert_eq!(rows[1].lane, 1);
                 assert_eq!(rows[2].lane, 2);
-                assert_eq!(rows[2].incoming_lanes, vec![0, 1, 2]);
-                assert_eq!(rows[2].connector_lanes, vec![0, 1, 2]);
+                assert_eq!(rows[3].lane, 0);
+                assert_eq!(rows[3].incoming_lanes, vec![0, 1, 2]);
+                assert_eq!(rows[3].outgoing_lanes, vec![0, 1]);
+                assert_eq!(rows[3].connector_lanes, vec![0, 1, 2]);
+                assert!(rows[3].connectors.contains(&graph::GraphConnector {
+                    from_lane: 2,
+                    to_lane: 0,
+                    kind: GraphConnectorKind::MergeIn,
+                }));
             })
             .expect("inspect graph layout");
 
         let mut visual = VisualTestContext::from_window(*window, cx);
-        let target_horizontal = visual
-            .debug_bounds("commit-graph-merge-in-horizontal-2-0")
-            .expect("target trunk merge-in horizontal debug bounds");
-        let spanning_horizontal = visual
-            .debug_bounds("commit-graph-spanning-horizontal-right-2-1")
-            .expect("occupied intermediate merge-in horizontal debug bounds");
-        let commit_bend = visual
-            .debug_bounds("commit-graph-rounded-merge-in-commit-elbow-2-2")
-            .expect("commit-side merge-in bend debug bounds");
+        let spanning_left = visual
+            .debug_bounds("commit-graph-spanning-horizontal-left-3-1")
+            .expect("occupied intermediate lane left merge-in horizontal debug bounds");
+        let spanning_right = visual
+            .debug_bounds("commit-graph-spanning-horizontal-right-3-1")
+            .expect("occupied intermediate lane right merge-in horizontal debug bounds");
+        let source_elbow = visual
+            .debug_bounds("commit-graph-rounded-merge-in-source-elbow-3-2")
+            .expect("source-side merge-in elbow debug bounds");
+        let target_elbow = visual
+            .debug_bounds("commit-graph-rounded-upper-merge-target-elbow-3-0")
+            .expect("trunk-side merge curve debug bounds");
+        let trunk_mid_dot = visual
+            .debug_bounds("commit-graph-dot-3")
+            .expect("trunk-mid commit dot debug bounds");
+        let trunk_mid_row = visual
+            .debug_bounds("commit-row-3")
+            .expect("trunk-mid commit row debug bounds");
+        let occupied_lane_above = visual
+            .debug_bounds("commit-graph-vertical-2-1-bottom")
+            .expect("occupied lane outgoing vertical above the merge row");
+        let occupied_lane_top = visual
+            .debug_bounds("commit-graph-vertical-3-1-top")
+            .expect("occupied lane incoming vertical through the merge row");
 
-        assert_eq!(
-            target_horizontal.origin.y, spanning_horizontal.origin.y,
-            "merge-in horizontal should stay aligned while passing an occupied lane",
+        assert!(
+            visual
+                .debug_bounds("commit-graph-merge-in-horizontal-3-0")
+                .is_none(),
+            "the merge should join the trunk vertical above the dot, not tee into the dot",
         );
         assert_eq!(
-            spanning_horizontal.origin.y + px(commit_graph_line_width() / 2.),
-            commit_bend.origin.y
-                + px(super::commit_graph_lower_connector_vertical_shift()
-                    + commit_graph_merge_in_commit_line_y()),
-            "spanning horizontal should meet the commit-side bend on the lower baseline",
+            spanning_left.origin.y, spanning_right.origin.y,
+            "merge-in horizontal should stay aligned on both sides of the occupied lane",
+        );
+        assert_eq!(
+            spanning_left.origin.y + px(commit_graph_line_width() / 2.),
+            trunk_mid_row.origin.y,
+            "merge-in horizontal should be centered on the merge row's upper border",
+        );
+        assert_eq!(
+            target_elbow.origin.y, source_elbow.origin.y,
+            "the trunk-side merge curve should align with the branch-side curve",
+        );
+        assert_eq!(
+            occupied_lane_above.size.height,
+            px(super::COMMIT_GRAPH_VERTICAL_HEIGHT),
+            "the occupied pass-through lane should keep its full vertical above the merge row",
+        );
+        assert_eq!(
+            occupied_lane_above.origin.y + occupied_lane_above.size.height,
+            occupied_lane_top.origin.y,
+            "the occupied lane vertical should cross the merge horizontal without interruption",
+        );
+        assert!(
+            source_elbow.origin.x > trunk_mid_dot.origin.x,
+            "the merge source elbow should curve up in the outer branch lane",
         );
     }
 
