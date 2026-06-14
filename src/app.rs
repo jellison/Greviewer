@@ -2708,7 +2708,12 @@ impl App {
             .id(("commit-row", index))
             .debug_selector(move || debug_selector.clone())
             .on_click(cx.listener(move |app, event: &ClickEvent, window, cx| {
-                app.select_commit(sha.clone(), event.modifiers(), window, cx);
+                if event.click_count() >= 2 {
+                    app.selection = Selection::Single { sha: sha.clone() };
+                    app.open_changeset(window, cx);
+                } else {
+                    app.select_commit(sha.clone(), event.modifiers(), window, cx);
+                }
             }))
             .child(render_commit_graph_gutter_spacer(max_graph_lanes))
             .child(
@@ -5783,6 +5788,7 @@ mod tests {
     use crate::graph::{self, GraphConnectorKind};
     use crate::repo::{self, ChangeKind, DiffSide, INITIAL_COMMIT_LIMIT};
     use crate::settings::{self, RecentRepository, Settings};
+    use crate::workspace::test_util::simulate_double_click;
     use git2::{IndexAddOption, Repository, Signature};
     use gpui::{font, point, px, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
     use std::{collections::BTreeSet, fs, path::PathBuf, rc::Rc};
@@ -7799,6 +7805,133 @@ mod tests {
         visual
             .debug_bounds("selected-commit-row-2")
             .expect("selected root row debug bounds");
+    }
+
+    #[gpui::test]
+    async fn double_clicking_a_commit_opens_its_changeset(cx: &mut TestAppContext) {
+        let (dir, shas) = init_repo_with_three_commits();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row_bounds = visual
+            .debug_bounds("commit-row-1")
+            .expect("middle commit row debug bounds");
+        simulate_double_click(&mut visual, row_bounds.center());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: shas[1].clone()
+                    },
+                    "double-click selects exactly the double-clicked commit"
+                );
+                match &app.review_screen {
+                    ReviewScreen::Changeset { sha, .. } => assert_eq!(sha, &shas[1]),
+                    ReviewScreen::Graph => panic!("double-click must open the changeset"),
+                }
+            })
+            .expect("read review screen");
+    }
+
+    #[gpui::test]
+    async fn double_clicking_inside_a_range_opens_the_single_commit(cx: &mut TestAppContext) {
+        let (dir, shas) = init_repo_with_three_commits();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let tip_bounds = visual
+            .debug_bounds("commit-row-0")
+            .expect("tip commit row debug bounds");
+        visual.simulate_click(tip_bounds.center(), Modifiers::none());
+        let root_bounds = visual
+            .debug_bounds("commit-row-2")
+            .expect("root commit row debug bounds");
+        visual.simulate_click(root_bounds.center(), Modifiers::shift());
+
+        // Range tip..root is selected; double-click the middle commit.
+        let middle_bounds = visual
+            .debug_bounds("selected-commit-row-1")
+            .expect("middle commit row debug bounds");
+        simulate_double_click(&mut visual, middle_bounds.center());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: shas[1].clone()
+                    },
+                    "double-click replaces the range with the single commit"
+                );
+                match &app.review_screen {
+                    ReviewScreen::Changeset { sha, .. } => assert_eq!(sha, &shas[1]),
+                    ReviewScreen::Graph => panic!(
+                        "double-click inside a range must open the single commit's changeset"
+                    ),
+                }
+            })
+            .expect("read review screen");
+    }
+
+    #[gpui::test]
+    async fn double_clicking_a_selected_commit_still_opens_its_changeset(cx: &mut TestAppContext) {
+        let (dir, shas) = init_repo_with_three_commits();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row_bounds = visual
+            .debug_bounds("commit-row-1")
+            .expect("middle commit row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+
+        let selected_bounds = visual
+            .debug_bounds("selected-commit-row-1")
+            .expect("selected middle commit row debug bounds");
+        simulate_double_click(&mut visual, selected_bounds.center());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: shas[1].clone()
+                    },
+                    "double-click overrides the click-again-to-clear toggle"
+                );
+                match &app.review_screen {
+                    ReviewScreen::Changeset { sha, .. } => assert_eq!(sha, &shas[1]),
+                    ReviewScreen::Graph => {
+                        panic!("double-click on a selected commit must open its changeset")
+                    }
+                }
+            })
+            .expect("read review screen");
     }
 
     #[gpui::test]

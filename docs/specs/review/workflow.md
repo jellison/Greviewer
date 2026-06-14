@@ -205,7 +205,7 @@ shows every branch.
 
 ## Selecting commits to review
 
-The user stages a review by selecting either a single commit or a contiguous sequential range from the graph. Selection is tentative: no review activity begins until the user explicitly opens the changeset (described below). Clicking a commit selects it. Shift-clicking a second commit extends the selection to a range, provided the two commits lie on a single ancestry path (one is an ancestor of the other). The selection is the inclusive set of commits between the two endpoints along that path. Clicking the selected commit again clears the selection.
+The user stages a review by selecting either a single commit or a contiguous sequential range from the graph. Selection is tentative: no review activity begins until the user explicitly opens the changeset (described below). Clicking a commit selects it. Shift-clicking a second commit extends the selection to a range, provided the two commits lie on a single ancestry path (one is an ancestor of the other). The selection is the inclusive set of commits between the two endpoints along that path. Clicking the selected commit again clears the selection. Double-clicking bypasses tentative selection entirely; it is specified under "Opening the changeset" below.
 
 **Triggering conditions**
 
@@ -224,23 +224,26 @@ The user stages a review by selecting either a single commit or a contiguous seq
 
 ## Opening the changeset
 
-With a valid selection in place, the user opens the changeset to begin reviewing. Opening transitions the window from graph mode to review mode, where the file tree and diff viewer are the primary content. The graph remains the basis for the open selection but is not the active surface. The user closes the open changeset to return to graph mode; the prior selection is preserved so it can be adjusted and re-opened without re-selecting from scratch. Modifying the selection while a changeset is open is not supported in v1 — the user closes the changeset, adjusts, and reopens.
+With a valid selection in place, the user opens the changeset to begin reviewing. Opening transitions the window from graph mode to review mode, where the file tree and diff viewer are the primary content. The graph remains the basis for the open selection but is not the active surface. The user closes the open changeset to return to graph mode; the prior selection is preserved so it can be adjusted and re-opened without re-selecting from scratch. Modifying the selection while a changeset is open is not supported in v1 — the user closes the changeset, adjusts, and reopens. Double-clicking a commit in the graph is a one-gesture shortcut that combines selection and opening: it selects exactly that commit — replacing any prior selection, including a range or the commit's own selected state — and immediately opens its changeset.
 
 **Triggering conditions**
 
 - The user activates the open-changeset affordance while a valid selection is active.
+- The user double-clicks a commit in the graph.
 - The user closes the open changeset.
 
 **Observable outcomes**
 
 - Activating the open-changeset affordance transitions the window into review mode and renders the change set for the current selection.
 - The open-changeset affordance is unavailable when no selection is active or when the selection is not a valid contiguous range.
+- Double-clicking a commit transitions the window into review mode showing that single commit's changeset, regardless of the prior selection.
 - Closing the changeset returns the window to graph mode with the prior selection preserved.
 - Review mode does not move HEAD or modify the repository.
 
 **Edge cases**
 
 - Opening a changeset whose net effect is no change still transitions to review mode; the change set view shows the empty-state message described in the next section.
+- Double-clicking a commit inside a selected range opens that single commit's changeset, not the range's.
 
 ## Seeing diff context in the window bar
 
