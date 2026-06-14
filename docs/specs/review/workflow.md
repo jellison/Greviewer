@@ -79,7 +79,7 @@ The user can quit Greviewer with the standard quit keyboard shortcut.
 
 ## Viewing the commit graph
 
-The user sees a graphical history of the repository's commits with branch lanes and merge connectors. The history covers the checked-out commit and every local branch, so work on branches that have not been merged is visible alongside the checked-out history; remote-tracking branches and tags do not contribute commits. Commits from all branches interleave in a single graph ordered newest-first, with no visual distinction between commits that are and are not part of the checked-out history. Branch and merge lines use smooth rounded bends where they turn between lanes, including the final turn into a branch commit. Each commit is presented as a single-row entry whose reading order is graph, short identifier, summary line, author, authored date, and any local branch names that point at it. The graph is scrollable; older commits load progressively as the user scrolls. The currently checked-out tip is visually marked, but selection is independent of checkout state — reviewing never moves HEAD.
+The user sees a graphical history of the repository's commits with branch lanes and merge connectors. The history covers the checked-out commit, every local branch, and every remote-tracking branch, so work that has not been merged or pulled is visible alongside the checked-out history; tags do not contribute commits. Commits from all branches interleave in a single graph ordered newest-first, with no visual distinction between commits that are and are not part of the checked-out history. Branch and merge lines use smooth rounded bends where they turn between lanes, including the final turn into a branch commit. Each commit is presented as a single-row entry whose reading order is graph, short identifier, summary line, author, authored date, and any branch names — local or remote-tracking — that point at it. The graph is scrollable; older commits load progressively as the user scrolls. The currently checked-out tip is visually marked, but selection is independent of checkout state — reviewing never moves HEAD.
 
 **Triggering conditions**
 
@@ -88,10 +88,11 @@ The user sees a graphical history of the repository's commits with branch lanes 
 **Observable outcomes**
 
 - Commits appear in graphical order with branch lanes and merge connectors.
-- Commits reachable only from unmerged local branches appear interleaved with the
+- Commits reachable only from unmerged local or remote-tracking branches appear interleaved with the
   checked-out history; each such branch renders as its own lane that ends at its tip.
 - Each visible commit shows its short identifier, summary line, author, and authored date.
-- Local branch names are shown on the commits they point to.
+- Branch names are shown on the commits they point to; a remote-tracking branch shows its remote-qualified name and renders visually distinct from local branch labels.
+- A local branch and a remote-tracking branch with the same name are never confusable; when both point at the same commit, both labels appear.
 - The currently checked-out tip carries a visual marker.
 
 **Edge cases**
@@ -103,12 +104,12 @@ The user sees a graphical history of the repository's commits with branch lanes 
   left-most lane is simply empty above the checked-out commit's row.
 - A branch that shares no history with the others ends without joining any other lane.
 - A repository whose checked-out branch has no commits yet still shows the history of its
-  other local branches.
+  other local and remote-tracking branches.
 - Detached-HEAD repositories render normally with no checked-out branch marker.
 
 ## Navigating branches from the sidebar
 
-Graph mode includes a sidebar beside the graph listing the repository's local branches by name, in alphabetical order. Branch names containing `/` nest under collapsible folders (see "Nesting branches in sidebar folders" below). The sidebar mirrors the graph's scope: local branches only, with remote-tracking branches and tags excluded. The checked-out branch carries a visual marker. Activating a branch focuses it in the graph: the branch's tip commit becomes the selected commit and the graph scrolls so that commit is visible. The divider between the sidebar and the graph is draggable to resize the sidebar. The sidebar exists only in graph mode; review mode shows the file tree in its place.
+Graph mode includes a sidebar beside the graph listing the repository's branches. The list is split into a Local section and a Remote section. The Local section holds the repository's local branches; the Remote section holds remote-tracking branches, grouped under one collapsible folder per remote so multiple remotes stay separate. Within either section, branch names containing `/` nest under collapsible folders (see "Nesting branches in sidebar folders" below). Tags are excluded. Remote branch entries render visually distinct from local entries. The checked-out branch carries a visual marker. Activating a branch focuses it in the graph: the branch's tip commit becomes the selected commit and the graph scrolls so that commit is visible. The divider between the sidebar and the graph is draggable to resize the sidebar. The sidebar exists only in graph mode; review mode shows the file tree in its place.
 
 **Triggering conditions**
 
@@ -118,14 +119,16 @@ Graph mode includes a sidebar beside the graph listing the repository's local br
 
 **Observable outcomes**
 
-- The sidebar lists every local branch, alphabetically within its folder level, with the checked-out branch visually marked.
+- The sidebar lists every local branch under the Local section and every remote-tracking branch under its remote's folder in the Remote section, alphabetically within each folder level, with the checked-out branch visually marked.
+- A section with no branches does not appear; a repository with no remotes shows no Remote section.
 - Activating a branch selects its tip commit and scrolls the graph so the commit is visible.
 - A branch entry whose tip commit is the current selection is visually distinct, using the same selected treatment as the commit row.
 - Dragging the divider resizes the sidebar.
 
 **Edge cases**
 
-- A repository with no local branches shows an explanatory message in place of the list.
+- A repository with no branches at all shows an explanatory message in place of the list.
+- The remote's default-branch pointer (the remote's "HEAD") is not a branch and never appears.
 - Detached-HEAD repositories list branches normally with no checked-out marker.
 - Activating a branch whose tip commit has not yet been loaded into the visible history loads older history until the tip appears, then selects and reveals it.
 - Activating a branch whose tip is already the selected commit keeps that selection; it does not clear it.
@@ -189,7 +192,7 @@ muted. Activating a hidden branch's row does not focus it; the branch must be
 shown again first. The checked-out branch offers no toggle. If hiding a
 branch removes the selected commit — or any commit in a selected range — the
 selection clears. Visibility choices are not persisted: opening a repository
-shows every branch.
+shows every branch. Remote-tracking branches hide and show exactly like local ones; remote-tracking branches are visible by default. A local branch and a remote-tracking branch that share a display name are independent: hiding, showing, or collapsing one never affects the other.
 
 **Observable outcomes**
 

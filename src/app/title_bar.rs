@@ -542,7 +542,7 @@ mod tests {
             head: None,
             commits,
             has_more_commits: false,
-            local_branches: Vec::new(),
+            branches: Vec::new(),
         }
     }
 
@@ -573,7 +573,7 @@ mod tests {
             authored_timestamp: 0,
             authored_date: "2026-06-07".to_string(),
             parent_shas: Vec::new(),
-            branch_names: Vec::new(),
+            branch_labels: Vec::new(),
             parent_count: 0,
             is_head: false,
         }

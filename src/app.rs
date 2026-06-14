@@ -118,11 +118,13 @@ pub struct App {
     /// True while the cursor is anywhere over the branch sidebar; gates its
     /// hover-revealed scrollbar overlay.
     branch_sidebar_hovered: bool,
-    /// Branch names the user has toggled off in the sidebar. Session-only:
-    /// cleared whenever a repository is opened. The checked-out branch is
-    /// never in this set (its row renders no toggle).
+    /// Branch keys (`heads/{name}` / `remotes/{name}`, see [`branch_key`])
+    /// the user has toggled off in the sidebar. Session-only: cleared
+    /// whenever a repository is opened. The checked-out branch is never in
+    /// this set (its row renders no toggle).
     hidden_branches: BTreeSet<String>,
-    /// Sidebar folder paths the user has collapsed. Session-only: cleared
+    /// Sidebar folder keys (e.g. `heads/features`) the user has collapsed.
+    /// Session-only: cleared
     /// whenever a repository is opened. Folders default to expanded, so an
     /// empty set means every folder shows its contents.
     collapsed_branch_folders: BTreeSet<String>,
@@ -282,12 +284,20 @@ enum FolderVisibility {
 
 /// Render model for the graph branch sidebar: branches grouped under
 /// collapsible folders derived from `/`-separated name segments. Branch rows
-/// carry the full `LocalBranch` — selection, hiding, and debug selectors all
+/// carry the full `Branch` — selection, hiding, and debug selectors all
 /// key on the full name; only `display_name` is shortened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BranchTreeRow {
+    Section(BranchSectionRow),
     Folder(BranchFolderRow),
     Branch(BranchRow),
+}
+
+/// Non-interactive header introducing the Local or Remote half of the
+/// sidebar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchSectionRow {
+    title: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,7 +313,7 @@ struct BranchFolderRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BranchRow {
-    branch: repo::LocalBranch,
+    branch: repo::Branch,
     /// Final name segment, e.g. "some-feature" for `features/some-feature`.
     display_name: String,
     depth: usize,
@@ -640,10 +650,11 @@ impl App {
         };
         let prefix = format!("{path}/");
         let descendants = repo
-            .local_branches
+            .branches
             .iter()
-            .filter(|branch| !branch.is_head && branch.name.starts_with(&prefix))
-            .map(|branch| branch.name.clone())
+            .filter(|branch| !branch.is_head)
+            .map(|branch| branch_key(&branch.name, &branch.kind))
+            .filter(|key| key.starts_with(&prefix))
             .collect::<Vec<_>>();
         if descendants.is_empty() {
             return;
@@ -677,7 +688,7 @@ impl App {
             .map(|commit| commit.sha.as_str());
         let visible = visible_commit_shas(
             &repo.commits,
-            &repo.local_branches,
+            &repo.branches,
             head_sha,
             &self.hidden_branches,
         );
@@ -693,8 +704,8 @@ impl App {
 
     /// Select a branch's tip commit and bring its row into view, paging in
     /// older history first when the tip has not been loaded yet. The revwalk
-    /// behind `load_older_commits` pushes every local branch tip, so paging
-    /// always reaches the commit unless loading itself fails.
+    /// behind `load_older_commits` pushes every local and remote branch tip,
+    /// so paging always reaches the commit unless loading itself fails.
     fn focus_branch(&mut self, tip_sha: String, window: &mut Window, cx: &mut Context<Self>) {
         let (commit_index, commit_count) = loop {
             let (tip_index, can_load_more, loaded_count, visible_count) = match &self.mode {
@@ -1583,7 +1594,7 @@ impl App {
         repo: &repo::OpenRepository,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let list_content: AnyElement = if repo.local_branches.is_empty() {
+        let list_content: AnyElement = if repo.branches.is_empty() {
             div()
                 .flex()
                 .flex_1()
@@ -1596,8 +1607,8 @@ impl App {
                 .child("No branches")
                 .into_any_element()
         } else {
-            let rows = build_branch_tree_rows(
-                &repo.local_branches,
+            let rows = build_branch_sidebar_rows(
+                &repo.branches,
                 &self.collapsed_branch_folders,
                 &self.hidden_branches,
             );
@@ -1605,6 +1616,9 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(index, row)| match row {
+                    BranchTreeRow::Section(section) => self
+                        .render_branch_section_row(index, section)
+                        .into_any_element(),
                     BranchTreeRow::Folder(folder) => self
                         .render_branch_folder_row(index, folder, cx)
                         .into_any_element(),
@@ -1674,7 +1688,8 @@ impl App {
             &self.selection,
             Selection::Single { sha } if sha == &branch.tip_sha
         );
-        let hidden = self.hidden_branches.contains(&branch.name);
+        let key = branch_key(&branch.name, &branch.kind);
+        let hidden = self.hidden_branches.contains(&key);
         let show_toggle = !branch.is_head && (hidden || self.hovered_branch_row == Some(index));
         let row_bg = if selected {
             rgb(0x223248)
@@ -1685,10 +1700,12 @@ impl App {
             rgb(0x999999)
         } else if branch.is_head {
             rgb(0xa3e635)
+        } else if matches!(branch.kind, repo::BranchKind::Remote { .. }) {
+            rgb(REMOTE_BRANCH_TINT)
         } else {
             rgb(0xe6e6e6)
         };
-        let name_fragment = debug_ref_label_fragment(&branch.name);
+        let name_fragment = debug_ref_label_fragment(&key);
         let row_selector = if selected {
             format!("selected-branch-row-{name_fragment}")
         } else {
@@ -1697,7 +1714,7 @@ impl App {
         let marker_selector = format!("branch-head-marker-{name_fragment}");
         let toggle_selector = format!("branch-visibility-{name_fragment}");
         let tip_sha = branch.tip_sha.clone();
-        let toggle_branch_name = branch.name.clone();
+        let toggle_branch_key = key;
         let display_name = row.display_name.clone();
 
         div()
@@ -1774,7 +1791,7 @@ impl App {
                         .debug_selector(move || toggle_selector.clone())
                         .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
                             cx.stop_propagation();
-                            app.toggle_branch_visibility(toggle_branch_name.clone(), cx);
+                            app.toggle_branch_visibility(toggle_branch_key.clone(), cx);
                         }))
                         .child(
                             Icon::new(if hidden {
@@ -1787,6 +1804,29 @@ impl App {
                         ),
                 )
             })
+    }
+
+    fn render_branch_section_row(
+        &self,
+        index: usize,
+        section: &BranchSectionRow,
+    ) -> impl IntoElement {
+        let selector = format!(
+            "branch-section-{}",
+            debug_ref_label_fragment(&section.title)
+        );
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(FILE_TREE_ROW_HEIGHT))
+            .px_3()
+            .bg(rgb(0x171717))
+            .id(("branch-section", index))
+            .debug_selector(move || selector.clone())
+            .text_color(rgb(0x999999))
+            .text_size(px(FILE_TREE_TEXT_SIZE))
+            .child(section.title.clone())
     }
 
     fn render_branch_folder_row(
@@ -2764,6 +2804,10 @@ impl App {
     }
 }
 
+/// Text tint shared by remote branch rows in the sidebar and remote ref
+/// label pills in the graph, so the two surfaces read as one family.
+const REMOTE_BRANCH_TINT: u32 = 0x94a3b8;
+
 const COMMIT_ROW_HEIGHT: f32 = 44.;
 const COMMIT_ROW_HORIZONTAL_PADDING: f32 = 16.;
 const COMMIT_HASH_WIDTH: f32 = 72.;
@@ -2787,24 +2831,7 @@ fn render_commit_ref_labels(
     commit: &repo::CommitInfo,
     hidden_branches: &BTreeSet<String>,
 ) -> gpui::Div {
-    let mut labels = Vec::new();
-    if commit.is_head {
-        labels.push(CommitRefLabel {
-            name: "HEAD".to_string(),
-            kind: CommitRefLabelKind::Head,
-        });
-    }
-    labels.extend(
-        commit
-            .branch_names
-            .iter()
-            .filter(|name| !hidden_branches.contains(*name))
-            .cloned()
-            .map(|name| CommitRefLabel {
-                name,
-                kind: CommitRefLabelKind::Branch,
-            }),
-    );
+    let labels = commit_ref_labels(commit, hidden_branches);
 
     div()
         .flex()
@@ -2828,6 +2855,9 @@ const COMMIT_REF_LABEL_MAX_WIDTH: f32 = COMMIT_REF_LABELS_WIDTH - 8.;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommitRefLabel {
     name: String,
+    /// Namespaced key used for the debug selector, so same-named local and
+    /// remote labels stay distinguishable (`heads/main` vs `remotes/origin/main`).
+    selector_key: String,
     kind: CommitRefLabelKind,
 }
 
@@ -2835,16 +2865,50 @@ struct CommitRefLabel {
 enum CommitRefLabelKind {
     Head,
     Branch,
+    RemoteBranch,
+}
+
+/// The ref label pills a commit row renders: HEAD first when checked out,
+/// then one pill per branch label whose namespaced key (see [`branch_key`])
+/// the user has not hidden.
+fn commit_ref_labels(
+    commit: &repo::CommitInfo,
+    hidden_branches: &BTreeSet<String>,
+) -> Vec<CommitRefLabel> {
+    let mut labels = Vec::new();
+    if commit.is_head {
+        labels.push(CommitRefLabel {
+            name: "HEAD".to_string(),
+            selector_key: "HEAD".to_string(),
+            kind: CommitRefLabelKind::Head,
+        });
+    }
+    labels.extend(
+        commit
+            .branch_labels
+            .iter()
+            .filter(|label| !hidden_branches.contains(&branch_key(&label.name, &label.kind)))
+            .map(|label| CommitRefLabel {
+                name: label.name.clone(),
+                selector_key: branch_key(&label.name, &label.kind),
+                kind: match label.kind {
+                    repo::BranchKind::Local => CommitRefLabelKind::Branch,
+                    repo::BranchKind::Remote { .. } => CommitRefLabelKind::RemoteBranch,
+                },
+            }),
+    );
+    labels
 }
 
 fn render_commit_ref_label(row_index: usize, label: CommitRefLabel) -> gpui::Div {
     let selector = format!(
         "commit-ref-label-{row_index}-{}",
-        debug_ref_label_fragment(&label.name)
+        debug_ref_label_fragment(&label.selector_key)
     );
     let (border_color, background, text_color) = match label.kind {
         CommitRefLabelKind::Head => (rgb(0x0ea5e9), rgb(0x102536), rgb(0x7dd3fc)),
         CommitRefLabelKind::Branch => (rgb(0x3f6212), rgb(0x17230f), rgb(0xa3e635)),
+        CommitRefLabelKind::RemoteBranch => (rgb(0x475569), rgb(0x1b2430), rgb(REMOTE_BRANCH_TINT)),
     };
 
     div()
@@ -2863,12 +2927,13 @@ fn render_commit_ref_label(row_index: usize, label: CommitRefLabel) -> gpui::Div
 }
 
 /// The set of loaded commits reachable from HEAD or from any branch whose
-/// name is not in `hidden_branches`. Parents beyond the loaded page simply
-/// terminate the walk: a commit that is not loaded cannot be rendered anyway,
-/// and paging in more history re-runs this computation over the larger list.
+/// key (see [`branch_key`]) is not in `hidden_branches`. Parents beyond the
+/// loaded page simply terminate the walk: a commit that is not loaded cannot
+/// be rendered anyway, and paging in more history re-runs this computation
+/// over the larger list.
 fn visible_commit_shas(
     commits: &[repo::CommitInfo],
-    local_branches: &[repo::LocalBranch],
+    branches: &[repo::Branch],
     head_sha: Option<&str>,
     hidden_branches: &BTreeSet<String>,
 ) -> HashSet<String> {
@@ -2880,9 +2945,9 @@ fn visible_commit_shas(
     let mut worklist: Vec<&str> = Vec::new();
     worklist.extend(head_sha);
     worklist.extend(
-        local_branches
+        branches
             .iter()
-            .filter(|branch| !hidden_branches.contains(&branch.name))
+            .filter(|branch| !hidden_branches.contains(&branch_key(&branch.name, &branch.kind)))
             .map(|branch| branch.tip_sha.as_str()),
     );
 
@@ -2903,12 +2968,13 @@ fn visible_commit_shas(
 /// order. Render and focus paths must both use this so row indices agree.
 ///
 /// The empty-set fast-path is the identity over loaded commits. For real
-/// repositories that equals the reachability walk, because `repo::read_commit_page`
-/// seeds its revwalk only from local branch tips and HEAD — every loaded commit
-/// is reachable from at least one of those seeds. Synthetic test fixtures seed
-/// commits without `local_branches` and rely on the fast-path to render at
-/// all; if the revwalk ever loads unreachable commits, hide-then-show would
-/// no longer round-trip and this fast-path must be revisited.
+/// repositories that equals the reachability walk, because
+/// `repo::read_commit_page` seeds its revwalk from every local and remote
+/// branch tip plus HEAD — every loaded commit is reachable from at least one
+/// of those seeds. Synthetic test fixtures seed commits without `branches`
+/// and rely on the fast-path to render at all; if the revwalk ever loads
+/// unreachable commits, hide-then-show would no longer round-trip and this
+/// fast-path must be revisited.
 fn visible_commits<'a>(
     repo: &'a repo::OpenRepository,
     hidden_branches: &BTreeSet<String>,
@@ -2921,12 +2987,7 @@ fn visible_commits<'a>(
         .iter()
         .find(|commit| commit.is_head)
         .map(|commit| commit.sha.as_str());
-    let visible = visible_commit_shas(
-        &repo.commits,
-        &repo.local_branches,
-        head_sha,
-        hidden_branches,
-    );
+    let visible = visible_commit_shas(&repo.commits, &repo.branches, head_sha, hidden_branches);
     repo.commits
         .iter()
         .filter(|commit| visible.contains(&commit.sha))
@@ -5575,25 +5636,81 @@ fn append_file_tree_rows(
 /// Tree node used while grouping branches by slash-separated name segments.
 /// The BTreeMap keeps sibling folders alphabetical; branches within a node
 /// stay in input order, which is alphabetical because they share a prefix
-/// and `local_branches` arrives sorted by full name.
+/// and `branches` arrives sorted by full name.
 #[derive(Debug, Default)]
 struct BranchTreeNode {
     folders: BTreeMap<String, BranchTreeNode>,
-    branches: Vec<repo::LocalBranch>,
+    branches: Vec<repo::Branch>,
+}
+
+/// Namespaced identity for a branch, mirroring git's ref layout:
+/// `heads/{name}` for local branches, `remotes/{name}` for remote-tracking
+/// branches. `hidden_branches`, `collapsed_branch_folders`, and debug
+/// selectors key on this so a local branch literally named `origin/main`
+/// never collides with the remote-tracking `origin/main`.
+fn branch_key(name: &str, kind: &repo::BranchKind) -> String {
+    match kind {
+        repo::BranchKind::Local => format!("heads/{name}"),
+        repo::BranchKind::Remote { .. } => format!("remotes/{name}"),
+    }
+}
+
+/// The full sidebar row list: a "Local" section with the local branch tree,
+/// then a "Remote" section whose top-level folders are the remote names
+/// (remote branch names already lead with their remote, so the existing
+/// tree builder folders them for free). A section with no branches is
+/// omitted entirely.
+fn build_branch_sidebar_rows(
+    branches: &[repo::Branch],
+    collapsed_folders: &BTreeSet<String>,
+    hidden_branches: &BTreeSet<String>,
+) -> Vec<BranchTreeRow> {
+    let (local, remote): (Vec<_>, Vec<_>) = branches
+        .iter()
+        .cloned()
+        .partition(|branch| matches!(branch.kind, repo::BranchKind::Local));
+
+    let mut rows = Vec::new();
+    if !local.is_empty() {
+        rows.push(BranchTreeRow::Section(BranchSectionRow {
+            title: "Local".to_string(),
+        }));
+        rows.extend(build_branch_tree_rows(
+            &local,
+            "heads",
+            collapsed_folders,
+            hidden_branches,
+        ));
+    }
+    if !remote.is_empty() {
+        rows.push(BranchTreeRow::Section(BranchSectionRow {
+            title: "Remote".to_string(),
+        }));
+        rows.extend(build_branch_tree_rows(
+            &remote,
+            "remotes",
+            collapsed_folders,
+            hidden_branches,
+        ));
+    }
+    rows
 }
 
 /// Group branches into folders by `/`-separated name segments and flatten
 /// the tree into depth-tagged sidebar rows. Folders list before branches at
 /// each level. A collapsed folder contributes its own row and skips every
 /// descendant. Git rejects ref names with empty segments, so segments are
-/// always non-empty.
+/// always non-empty. `key_prefix` seeds the folder key paths (`heads` for
+/// local branches or `remotes` for remote-tracking branches) without
+/// affecting row indentation.
 fn build_branch_tree_rows(
-    local_branches: &[repo::LocalBranch],
+    branches: &[repo::Branch],
+    key_prefix: &str,
     collapsed_folders: &BTreeSet<String>,
     hidden_branches: &BTreeSet<String>,
 ) -> Vec<BranchTreeRow> {
     let mut root = BranchTreeNode::default();
-    for branch in local_branches {
+    for branch in branches {
         let mut segments = branch.name.split('/').collect::<Vec<_>>();
         segments.pop();
         let mut node = &mut root;
@@ -5604,7 +5721,14 @@ fn build_branch_tree_rows(
     }
 
     let mut rows = Vec::new();
-    append_branch_tree_rows(&root, 0, "", collapsed_folders, hidden_branches, &mut rows);
+    append_branch_tree_rows(
+        &root,
+        0,
+        key_prefix,
+        collapsed_folders,
+        hidden_branches,
+        &mut rows,
+    );
     rows
 }
 
@@ -5684,7 +5808,7 @@ fn collect_folder_visibility(
         if branch.is_head {
             continue;
         }
-        if hidden_branches.contains(&branch.name) {
+        if hidden_branches.contains(&branch_key(&branch.name, &branch.kind)) {
             *any_hidden = true;
         } else {
             *any_visible = true;
@@ -5774,15 +5898,16 @@ fn repository_title(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_diff_highlights, build_branch_tree_rows, commit_graph_connector_color_lane,
-        commit_graph_connector_for_lane, commit_graph_line_width,
-        commit_graph_merge_in_commit_line_y, commit_graph_spanning_connector_requires_center_fill,
+        attach_diff_highlights, build_branch_sidebar_rows, build_branch_tree_rows,
+        commit_graph_connector_color_lane, commit_graph_connector_for_lane,
+        commit_graph_line_width, commit_graph_merge_in_commit_line_y,
+        commit_graph_spanning_connector_requires_center_fill, commit_ref_labels,
         commit_row_separator_width, debug_ref_label_fragment, emphasis_is_subtle,
-        side_by_side_diff_rows, single_side_diff_rows, visible_commit_shas, App, BranchFolderRow,
-        BranchRow, BranchTreeRow, CloseChangeset, DiffLineStatus, FileListEntry, FileListMode,
-        FileTreeRow, FolderVisibility, Mode, OpenChangeset, OpenFailed, PreparedFileDiff,
-        ReviewScreen, Selection,
-        FILE_TREE_FOLDER_ICON_SIZE, FILE_TREE_FONT_FAMILY, FILE_TREE_INDENT_WIDTH,
+        side_by_side_diff_rows, single_side_diff_rows, visible_commit_shas, visible_commits, App,
+        BranchFolderRow, BranchRow, BranchTreeRow, CloseChangeset, CommitRefLabel,
+        CommitRefLabelKind, DiffLineStatus, FileListEntry, FileListMode, FileTreeRow,
+        FolderVisibility, Mode, OpenChangeset, OpenFailed, PreparedFileDiff, ReviewScreen,
+        Selection, FILE_TREE_FOLDER_ICON_SIZE, FILE_TREE_FONT_FAMILY, FILE_TREE_INDENT_WIDTH,
         FILE_TREE_ROW_HEIGHT, FILE_TREE_STATUS_ICON_SIZE, FILE_TREE_TEXT_SIZE,
     };
     use crate::graph::{self, GraphConnectorKind};
@@ -5865,22 +5990,119 @@ mod tests {
             authored_timestamp: 0,
             authored_date: "2026-01-01".to_string(),
             parent_shas: parent_shas.iter().map(|sha| sha.to_string()).collect(),
-            branch_names: Vec::new(),
+            branch_labels: Vec::new(),
             parent_count: parent_shas.len(),
             is_head: false,
         }
     }
 
-    fn local_branch(name: &str, tip_sha: &str) -> repo::LocalBranch {
-        repo::LocalBranch {
+    fn local_branch(name: &str, tip_sha: &str) -> repo::Branch {
+        repo::Branch {
             name: name.to_string(),
             tip_sha: tip_sha.to_string(),
             is_head: false,
+            kind: repo::BranchKind::Local,
+        }
+    }
+
+    fn remote_branch(remote: &str, name: &str, tip_sha: &str) -> repo::Branch {
+        repo::Branch {
+            name: format!("{remote}/{name}"),
+            tip_sha: tip_sha.to_string(),
+            is_head: false,
+            kind: repo::BranchKind::Remote {
+                remote: remote.to_string(),
+            },
         }
     }
 
     fn hidden(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn hiding_a_remote_branch_leaves_a_same_named_local_branch_visible() {
+        // A local branch literally named "origin/main" and the remote-tracking
+        // origin/main key independently: hiding one never hides the other.
+        let commits = vec![
+            commit_info("local-tip", &["root"]),
+            commit_info("remote-tip", &["root"]),
+            commit_info("root", &[]),
+        ];
+        let branches = vec![
+            local_branch("origin/main", "local-tip"),
+            remote_branch("origin", "main", "remote-tip"),
+        ];
+
+        let visible =
+            visible_commit_shas(&commits, &branches, None, &hidden(&["remotes/origin/main"]));
+
+        assert!(visible.contains("local-tip"));
+        assert!(!visible.contains("remote-tip"));
+        assert!(visible.contains("root"));
+    }
+
+    #[test]
+    fn commit_ref_labels_mark_remote_branches_and_show_both_at_a_shared_tip() {
+        let mut commit = commit_info("tip", &[]);
+        commit.branch_labels = vec![
+            repo::BranchLabel {
+                name: "main".to_string(),
+                kind: repo::BranchKind::Local,
+            },
+            repo::BranchLabel {
+                name: "origin/main".to_string(),
+                kind: repo::BranchKind::Remote {
+                    remote: "origin".to_string(),
+                },
+            },
+        ];
+
+        let labels = commit_ref_labels(&commit, &BTreeSet::new());
+
+        assert_eq!(
+            labels,
+            vec![
+                CommitRefLabel {
+                    name: "main".to_string(),
+                    selector_key: "heads/main".to_string(),
+                    kind: CommitRefLabelKind::Branch,
+                },
+                CommitRefLabel {
+                    name: "origin/main".to_string(),
+                    selector_key: "remotes/origin/main".to_string(),
+                    kind: CommitRefLabelKind::RemoteBranch,
+                },
+            ],
+            "a shared tip shows both labels, the remote one marked as remote",
+        );
+    }
+
+    #[test]
+    fn commit_ref_labels_hide_only_the_hidden_namespace() {
+        let mut commit = commit_info("tip", &[]);
+        commit.branch_labels = vec![
+            repo::BranchLabel {
+                name: "origin/main".to_string(),
+                kind: repo::BranchKind::Local,
+            },
+            repo::BranchLabel {
+                name: "origin/main".to_string(),
+                kind: repo::BranchKind::Remote {
+                    remote: "origin".to_string(),
+                },
+            },
+        ];
+        let hidden = ["remotes/origin/main".to_string()].into_iter().collect();
+
+        let labels = commit_ref_labels(&commit, &hidden);
+
+        assert_eq!(
+            labels.len(),
+            1,
+            "hiding the remote ref leaves the same-named local label",
+        );
+        assert_eq!(labels[0].kind, CommitRefLabelKind::Branch);
     }
 
     #[test]
@@ -5896,8 +6118,12 @@ mod tests {
             local_branch("master", "main-tip"),
         ];
 
-        let visible =
-            visible_commit_shas(&commits, &branches, Some("main-tip"), &hidden(&["feature"]));
+        let visible = visible_commit_shas(
+            &commits,
+            &branches,
+            Some("main-tip"),
+            &hidden(&["heads/feature"]),
+        );
 
         assert!(!visible.contains("feature-tip"));
         assert!(visible.contains("main-tip"));
@@ -5913,8 +6139,12 @@ mod tests {
             local_branch("master", "main-tip"),
         ];
 
-        let visible =
-            visible_commit_shas(&commits, &branches, Some("main-tip"), &hidden(&["feature"]));
+        let visible = visible_commit_shas(
+            &commits,
+            &branches,
+            Some("main-tip"),
+            &hidden(&["heads/feature"]),
+        );
 
         assert!(visible.contains("root"));
         assert!(visible.contains("main-tip"));
@@ -5925,8 +6155,12 @@ mod tests {
         let commits = vec![commit_info("head-tip", &["root"]), commit_info("root", &[])];
         let branches = vec![local_branch("feature", "head-tip")];
 
-        let visible =
-            visible_commit_shas(&commits, &branches, Some("head-tip"), &hidden(&["feature"]));
+        let visible = visible_commit_shas(
+            &commits,
+            &branches,
+            Some("head-tip"),
+            &hidden(&["heads/feature"]),
+        );
 
         assert!(visible.contains("head-tip"));
         assert!(visible.contains("root"));
@@ -5984,7 +6218,7 @@ mod tests {
     fn flat_branch_names_produce_flat_rows() {
         let branches = vec![local_branch("feature", "f"), local_branch("master", "m")];
 
-        let rows = build_branch_tree_rows(&branches, &BTreeSet::new(), &BTreeSet::new());
+        let rows = build_branch_tree_rows(&branches, "heads", &BTreeSet::new(), &BTreeSet::new());
 
         assert_eq!(
             rows,
@@ -6007,14 +6241,14 @@ mod tests {
     fn slash_named_branch_nests_under_a_folder_even_when_alone() {
         let branches = vec![local_branch("features/some-feature", "tip")];
 
-        let rows = build_branch_tree_rows(&branches, &BTreeSet::new(), &BTreeSet::new());
+        let rows = build_branch_tree_rows(&branches, "heads", &BTreeSet::new(), &BTreeSet::new());
 
         assert_eq!(
             rows,
             vec![
                 BranchTreeRow::Folder(BranchFolderRow {
                     name: "features".to_string(),
-                    path: "features".to_string(),
+                    path: "heads/features".to_string(),
                     depth: 0,
                     collapsed: false,
                     visibility: FolderVisibility::Visible,
@@ -6032,21 +6266,21 @@ mod tests {
     fn multi_level_names_nest_one_folder_per_segment() {
         let branches = vec![local_branch("team/alice/feature-x", "tip")];
 
-        let rows = build_branch_tree_rows(&branches, &BTreeSet::new(), &BTreeSet::new());
+        let rows = build_branch_tree_rows(&branches, "heads", &BTreeSet::new(), &BTreeSet::new());
 
         assert_eq!(
             rows,
             vec![
                 BranchTreeRow::Folder(BranchFolderRow {
                     name: "team".to_string(),
-                    path: "team".to_string(),
+                    path: "heads/team".to_string(),
                     depth: 0,
                     collapsed: false,
                     visibility: FolderVisibility::Visible,
                 }),
                 BranchTreeRow::Folder(BranchFolderRow {
                     name: "alice".to_string(),
-                    path: "team/alice".to_string(),
+                    path: "heads/team/alice".to_string(),
                     depth: 1,
                     collapsed: false,
                     visibility: FolderVisibility::Visible,
@@ -6070,11 +6304,12 @@ mod tests {
             local_branch("zeta", "z"),
         ];
 
-        let rows = build_branch_tree_rows(&branches, &BTreeSet::new(), &BTreeSet::new());
+        let rows = build_branch_tree_rows(&branches, "heads", &BTreeSet::new(), &BTreeSet::new());
 
         let order = rows
             .iter()
             .map(|row| match row {
+                BranchTreeRow::Section(section) => format!("section:{}", section.title),
                 BranchTreeRow::Folder(folder) => format!("folder:{}", folder.path),
                 BranchTreeRow::Branch(branch_row) => {
                     format!("branch:{}", branch_row.branch.name)
@@ -6084,7 +6319,7 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                "folder:features",
+                "folder:heads/features",
                 "branch:features/x",
                 "branch:alpha",
                 "branch:zeta"
@@ -6099,19 +6334,19 @@ mod tests {
             local_branch("features/x", "x"),
             local_branch("master", "m"),
         ];
-        let collapsed = ["features"]
+        let collapsed = ["heads/features"]
             .iter()
             .map(|path| path.to_string())
             .collect::<BTreeSet<_>>();
 
-        let rows = build_branch_tree_rows(&branches, &collapsed, &BTreeSet::new());
+        let rows = build_branch_tree_rows(&branches, "heads", &collapsed, &BTreeSet::new());
 
         assert_eq!(
             rows,
             vec![
                 BranchTreeRow::Folder(BranchFolderRow {
                     name: "features".to_string(),
-                    path: "features".to_string(),
+                    path: "heads/features".to_string(),
                     depth: 0,
                     collapsed: true,
                     visibility: FolderVisibility::Visible,
@@ -6125,11 +6360,104 @@ mod tests {
         );
     }
 
-    fn head_branch(name: &str, tip_sha: &str) -> repo::LocalBranch {
-        repo::LocalBranch {
+    #[test]
+    fn sidebar_rows_group_local_and_remote_branches_into_sections() {
+        let branches = vec![
+            local_branch("main", "sha-main"),
+            remote_branch("origin", "main", "sha-remote-main"),
+            remote_branch("origin", "feature/x", "sha-remote-feature"),
+            remote_branch("upstream", "main", "sha-upstream-main"),
+        ];
+
+        let rows = build_branch_sidebar_rows(&branches, &BTreeSet::new(), &BTreeSet::new());
+
+        let summary = rows
+            .iter()
+            .map(|row| match row {
+                BranchTreeRow::Section(section) => format!("section:{}", section.title),
+                BranchTreeRow::Folder(folder) => {
+                    format!("folder:{}@{}", folder.path, folder.depth)
+                }
+                BranchTreeRow::Branch(branch_row) => {
+                    format!("branch:{}@{}", branch_row.display_name, branch_row.depth)
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                "section:Local",
+                "branch:main@0",
+                "section:Remote",
+                "folder:remotes/origin@0",
+                "folder:remotes/origin/feature@1",
+                "branch:x@2",
+                "branch:main@1",
+                "folder:remotes/upstream@0",
+                "branch:main@1",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            "locals list under a Local section; each remote folders its branches, \
+             nesting slash-named branches like local ones",
+        );
+    }
+
+    #[test]
+    fn sidebar_rows_omit_empty_sections() {
+        let local_only = vec![local_branch("main", "sha-main")];
+        let rows = build_branch_sidebar_rows(&local_only, &BTreeSet::new(), &BTreeSet::new());
+        assert!(
+            !rows.iter().any(|row| matches!(
+                row,
+                BranchTreeRow::Section(section) if section.title == "Remote"
+            )),
+            "no Remote section without remote branches",
+        );
+
+        let remote_only = vec![remote_branch("origin", "main", "sha-remote")];
+        let rows = build_branch_sidebar_rows(&remote_only, &BTreeSet::new(), &BTreeSet::new());
+        assert!(
+            !rows.iter().any(|row| matches!(
+                row,
+                BranchTreeRow::Section(section) if section.title == "Local"
+            )),
+            "no Local section without local branches",
+        );
+    }
+
+    #[test]
+    fn collapsing_a_local_folder_leaves_the_same_named_remote_folder_open() {
+        let branches = vec![
+            local_branch("origin/main", "sha-local"),
+            remote_branch("origin", "main", "sha-remote"),
+        ];
+        let collapsed = ["heads/origin".to_string()].into_iter().collect();
+
+        let rows = build_branch_sidebar_rows(&branches, &collapsed, &BTreeSet::new());
+
+        let branch_kinds = rows
+            .iter()
+            .filter_map(|row| match row {
+                BranchTreeRow::Branch(branch_row) => Some(branch_row.branch.kind.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            branch_kinds,
+            vec![repo::BranchKind::Remote {
+                remote: "origin".to_string()
+            }],
+            "the collapsed local folder hides its branch row; the remote folder's row stays",
+        );
+    }
+
+    fn head_branch(name: &str, tip_sha: &str) -> repo::Branch {
+        repo::Branch {
             name: name.to_string(),
             tip_sha: tip_sha.to_string(),
             is_head: true,
+            kind: repo::BranchKind::Local,
         }
     }
 
@@ -6138,7 +6466,7 @@ mod tests {
         rows.iter()
             .filter_map(|row| match row {
                 BranchTreeRow::Folder(folder) => Some((folder.path.clone(), folder.visibility)),
-                BranchTreeRow::Branch(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -6150,26 +6478,32 @@ mod tests {
             local_branch("features/b", "b"),
         ];
 
-        let none_hidden = build_branch_tree_rows(&branches, &BTreeSet::new(), &hidden(&[]));
-        let some_hidden =
-            build_branch_tree_rows(&branches, &BTreeSet::new(), &hidden(&["features/a"]));
+        let none_hidden =
+            build_branch_tree_rows(&branches, "heads", &BTreeSet::new(), &hidden(&[]));
+        let some_hidden = build_branch_tree_rows(
+            &branches,
+            "heads",
+            &BTreeSet::new(),
+            &hidden(&["heads/features/a"]),
+        );
         let all_hidden = build_branch_tree_rows(
             &branches,
+            "heads",
             &BTreeSet::new(),
-            &hidden(&["features/a", "features/b"]),
+            &hidden(&["heads/features/a", "heads/features/b"]),
         );
 
         assert_eq!(
             folder_visibilities(&none_hidden),
-            vec![("features".to_string(), FolderVisibility::Visible)]
+            vec![("heads/features".to_string(), FolderVisibility::Visible)]
         );
         assert_eq!(
             folder_visibilities(&some_hidden),
-            vec![("features".to_string(), FolderVisibility::Mixed)]
+            vec![("heads/features".to_string(), FolderVisibility::Mixed)]
         );
         assert_eq!(
             folder_visibilities(&all_hidden),
-            vec![("features".to_string(), FolderVisibility::Hidden)]
+            vec![("heads/features".to_string(), FolderVisibility::Hidden)]
         );
     }
 
@@ -6181,15 +6515,16 @@ mod tests {
 
         let rows = build_branch_tree_rows(
             &branches,
+            "heads",
             &BTreeSet::new(),
-            &hidden(&["team/alice/feature-x"]),
+            &hidden(&["heads/team/alice/feature-x"]),
         );
 
         assert_eq!(
             folder_visibilities(&rows),
             vec![
-                ("team".to_string(), FolderVisibility::Hidden),
-                ("team/alice".to_string(), FolderVisibility::Hidden),
+                ("heads/team".to_string(), FolderVisibility::Hidden),
+                ("heads/team/alice".to_string(), FolderVisibility::Hidden),
             ]
         );
     }
@@ -6201,19 +6536,24 @@ mod tests {
             local_branch("features/other", "o"),
         ];
 
-        let nothing_hidden = build_branch_tree_rows(&branches, &BTreeSet::new(), &hidden(&[]));
-        let other_hidden =
-            build_branch_tree_rows(&branches, &BTreeSet::new(), &hidden(&["features/other"]));
+        let nothing_hidden =
+            build_branch_tree_rows(&branches, "heads", &BTreeSet::new(), &hidden(&[]));
+        let other_hidden = build_branch_tree_rows(
+            &branches,
+            "heads",
+            &BTreeSet::new(),
+            &hidden(&["heads/features/other"]),
+        );
 
         // HEAD never counts: with the only hideable branch hidden, the folder
         // reads fully hidden even though HEAD inside it stays visible.
         assert_eq!(
             folder_visibilities(&nothing_hidden),
-            vec![("features".to_string(), FolderVisibility::Visible)]
+            vec![("heads/features".to_string(), FolderVisibility::Visible)]
         );
         assert_eq!(
             folder_visibilities(&other_hidden),
-            vec![("features".to_string(), FolderVisibility::Hidden)]
+            vec![("heads/features".to_string(), FolderVisibility::Hidden)]
         );
     }
 
@@ -6221,11 +6561,11 @@ mod tests {
     fn folder_containing_only_the_head_branch_is_visible() {
         let branches = vec![head_branch("features/current", "c")];
 
-        let rows = build_branch_tree_rows(&branches, &BTreeSet::new(), &hidden(&[]));
+        let rows = build_branch_tree_rows(&branches, "heads", &BTreeSet::new(), &hidden(&[]));
 
         assert_eq!(
             folder_visibilities(&rows),
-            vec![("features".to_string(), FolderVisibility::Visible)]
+            vec![("heads/features".to_string(), FolderVisibility::Visible)]
         );
     }
 
@@ -6338,6 +6678,34 @@ mod tests {
 
         drop(repo);
         (dir, main_tip.to_string(), alpha_tip.to_string())
+    }
+
+    /// A repo with a checked-out master, a remote-tracking origin/master at the
+    /// same tip, and a remote-only origin/feature/x one commit ahead.
+    fn init_repo_with_remote_branches() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("hello.txt"), "hello\n").expect("write file");
+        let root = commit_all_to_ref_at_time(&repo, Some("HEAD"), "Root", &[], 100);
+
+        fs::write(dir.path().join("feature.txt"), "feature\n").expect("write feature file");
+        let remote_tip = commit_all_to_ref_at_time(&repo, None, "Remote feature", &[root], 200);
+
+        repo.remote("origin", "https://example.invalid/repo.git")
+            .expect("configure remote");
+        repo.reference("refs/remotes/origin/master", root, true, "remote master")
+            .expect("create remote master");
+        repo.reference(
+            "refs/remotes/origin/feature/x",
+            remote_tip,
+            true,
+            "remote feature",
+        )
+        .expect("create remote feature");
+        drop(repo);
+
+        (dir, root.to_string(), remote_tip.to_string())
     }
 
     fn init_repo_with_detached_head() -> (tempfile::TempDir, String) {
@@ -6560,7 +6928,7 @@ mod tests {
             authored_timestamp,
             authored_date: "1970-01-01".to_string(),
             parent_shas: parents.iter().map(|parent| parent.to_string()).collect(),
-            branch_names: Vec::new(),
+            branch_labels: Vec::new(),
             parent_count: parents.len(),
             is_head: false,
         }
@@ -6582,7 +6950,7 @@ mod tests {
                 head,
                 commits,
                 has_more_commits: false,
-                local_branches: Vec::new(),
+                branches: Vec::new(),
             },
         };
     }
@@ -7057,16 +7425,18 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         visual
-            .debug_bounds("branch-row-feature")
+            .debug_bounds("branch-row-heads-feature")
             .expect("feature branch row renders");
         visual
-            .debug_bounds("branch-row-master")
+            .debug_bounds("branch-row-heads-master")
             .expect("master branch row renders");
         visual
-            .debug_bounds("branch-head-marker-master")
+            .debug_bounds("branch-head-marker-heads-master")
             .expect("checked-out branch carries the HEAD marker");
         assert!(
-            visual.debug_bounds("branch-head-marker-feature").is_none(),
+            visual
+                .debug_bounds("branch-head-marker-heads-feature")
+                .is_none(),
             "non-checked-out branch has no HEAD marker",
         );
     }
@@ -7113,7 +7483,7 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let feature_row = visual
-            .debug_bounds("branch-row-feature")
+            .debug_bounds("branch-row-heads-feature")
             .expect("feature branch row renders");
         visual.simulate_click(feature_row.center(), Modifiers::none());
 
@@ -7123,7 +7493,7 @@ mod tests {
             .debug_bounds("selected-commit-row-1")
             .expect("feature tip commit becomes the selected row");
         visual
-            .debug_bounds("selected-branch-row-feature")
+            .debug_bounds("selected-branch-row-heads-feature")
             .expect("the branch row reflects the selection");
     }
 
@@ -7162,7 +7532,7 @@ mod tests {
         // The branch tip is beyond the initial page, yet the sidebar lists it.
         let mut visual = VisualTestContext::from_window(*window, cx);
         let branch_row = visual
-            .debug_bounds("branch-row-old-base")
+            .debug_bounds("branch-row-heads-old-base")
             .expect("old-base branch row renders even though its tip is unloaded");
         visual.simulate_click(branch_row.center(), Modifiers::none());
 
@@ -7594,7 +7964,7 @@ mod tests {
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
                 app.select_single_commit(feature_tip.clone(), cx);
-                app.toggle_branch_visibility("feature".to_string(), cx);
+                app.toggle_branch_visibility("heads/feature".to_string(), cx);
                 assert_eq!(app.selection, Selection::None);
             })
             .expect("update window");
@@ -7610,7 +7980,7 @@ mod tests {
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
                 app.select_single_commit(main_tip.clone(), cx);
-                app.toggle_branch_visibility("feature".to_string(), cx);
+                app.toggle_branch_visibility("heads/feature".to_string(), cx);
                 assert_eq!(
                     app.selection,
                     Selection::Single {
@@ -7630,9 +8000,9 @@ mod tests {
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
-                app.toggle_branch_visibility("feature".to_string(), cx);
-                assert!(app.hidden_branches.contains("feature"));
-                app.toggle_branch_visibility("feature".to_string(), cx);
+                app.toggle_branch_visibility("heads/feature".to_string(), cx);
+                assert!(app.hidden_branches.contains("heads/feature"));
+                app.toggle_branch_visibility("heads/feature".to_string(), cx);
                 assert!(app.hidden_branches.is_empty());
             })
             .expect("update window");
@@ -7647,7 +8017,7 @@ mod tests {
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path.clone(), window, cx);
-                app.toggle_branch_visibility("feature".to_string(), cx);
+                app.toggle_branch_visibility("heads/feature".to_string(), cx);
                 assert!(!app.hidden_branches.is_empty());
                 app.open_repository_at(path, window, cx);
                 assert!(app.hidden_branches.is_empty());
@@ -7664,7 +8034,7 @@ mod tests {
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
-                app.toggle_branch_visibility("feature".to_string(), cx);
+                app.toggle_branch_visibility("heads/feature".to_string(), cx);
             })
             .expect("open repository and hide feature");
         cx.run_until_parked();
@@ -7678,7 +8048,7 @@ mod tests {
         );
         // The feature ref label is gone from every remaining row.
         for row in 0..2usize {
-            let selector = test_debug_selector(format!("commit-ref-label-{row}-feature"));
+            let selector = test_debug_selector(format!("commit-ref-label-{row}-heads-feature"));
             assert!(
                 visual.debug_bounds(selector).is_none(),
                 "hidden branch label must not render on row {row}"
@@ -7695,8 +8065,8 @@ mod tests {
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
-                app.toggle_branch_visibility("feature".to_string(), cx);
-                app.toggle_branch_visibility("feature".to_string(), cx);
+                app.toggle_branch_visibility("heads/feature".to_string(), cx);
+                app.toggle_branch_visibility("heads/feature".to_string(), cx);
             })
             .expect("hide and re-show feature");
         cx.run_until_parked();
@@ -7719,7 +8089,7 @@ mod tests {
             .filter(|row| {
                 visual
                     .debug_bounds(test_debug_selector(format!(
-                        "commit-ref-label-{row}-feature"
+                        "commit-ref-label-{row}-heads-feature"
                     )))
                     .is_some()
             })
@@ -7741,14 +8111,14 @@ mod tests {
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
-                app.toggle_branch_visibility("feature".to_string(), cx);
+                app.toggle_branch_visibility("heads/feature".to_string(), cx);
             })
             .expect("open repository and hide feature");
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let master_row = visual
-            .debug_bounds("branch-row-master")
+            .debug_bounds("branch-row-heads-master")
             .expect("master branch row renders");
         visual.simulate_click(master_row.center(), Modifiers::none());
 
@@ -9149,12 +9519,15 @@ mod tests {
                             authored_timestamp: 0,
                             authored_date: "1970-01-01".to_string(),
                             parent_shas: Vec::new(),
-                            branch_names: vec!["main".to_string()],
+                            branch_labels: vec![repo::BranchLabel {
+                                name: "main".to_string(),
+                                kind: repo::BranchKind::Local,
+                            }],
                             parent_count: 0,
                             is_head: true,
                         }],
                         has_more_commits: false,
-                        local_branches: Vec::new(),
+                        branches: Vec::new(),
                     },
                 };
                 cx.notify();
@@ -9229,7 +9602,10 @@ mod tests {
                     repo.commits
                         .iter()
                         .position(|commit| {
-                            commit.branch_names.iter().any(|name| name == branch_name)
+                            commit
+                                .branch_labels
+                                .iter()
+                                .any(|label| label.name == branch_name)
                         })
                         .expect("branch row")
                 };
@@ -9254,13 +9630,13 @@ mod tests {
             .debug_bounds(label_selector(head_row, "head"))
             .expect("head label on merge commit");
         visual
-            .debug_bounds(label_selector(master_row, "master"))
+            .debug_bounds(label_selector(master_row, "heads-master"))
             .expect("master label on merge commit");
         visual
-            .debug_bounds(label_selector(left_row, "left"))
+            .debug_bounds(label_selector(left_row, "heads-left"))
             .expect("left branch label on left commit");
         visual
-            .debug_bounds(label_selector(right_row, "right"))
+            .debug_bounds(label_selector(right_row, "heads-right"))
             .expect("right branch label on right commit");
     }
 
@@ -9293,7 +9669,12 @@ mod tests {
 
                 repo.commits
                     .iter()
-                    .position(|commit| commit.branch_names.iter().any(|name| name == "master"))
+                    .position(|commit| {
+                        commit
+                            .branch_labels
+                            .iter()
+                            .any(|label| label.name == "master")
+                    })
                     .expect("master branch row")
             })
             .expect("read detached HEAD repo");
@@ -9304,7 +9685,7 @@ mod tests {
             .expect("tip commit row debug bounds");
         visual
             .debug_bounds(test_debug_selector(format!(
-                "commit-ref-label-{master_row}-master"
+                "commit-ref-label-{master_row}-heads-master"
             )))
             .expect("master branch label debug bounds");
         assert!(
@@ -9319,7 +9700,7 @@ mod tests {
         let branch_name = "not-merged-branch-with-a-name-that-would-cover-the-graph".to_string();
         let label_selector = Box::leak(
             format!(
-                "commit-ref-label-0-{}",
+                "commit-ref-label-0-heads-{}",
                 debug_ref_label_fragment(&branch_name)
             )
             .into_boxed_str(),
@@ -9343,12 +9724,15 @@ mod tests {
                             authored_timestamp: 0,
                             authored_date: "1970-01-01".to_string(),
                             parent_shas: Vec::new(),
-                            branch_names: vec![branch_name],
+                            branch_labels: vec![repo::BranchLabel {
+                                name: branch_name,
+                                kind: repo::BranchKind::Local,
+                            }],
                             parent_count: 0,
                             is_head: false,
                         }],
                         has_more_commits: false,
-                        local_branches: Vec::new(),
+                        branches: Vec::new(),
                     },
                 };
                 cx.notify();
@@ -11538,16 +11922,16 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let folder = visual
-            .debug_bounds("branch-folder-features")
+            .debug_bounds("branch-folder-heads-features")
             .expect("slash-named branches render a folder row");
         let alpha = visual
-            .debug_bounds("branch-row-features-alpha")
+            .debug_bounds("branch-row-heads-features-alpha")
             .expect("nested branch row renders, keyed by full name");
         let beta = visual
-            .debug_bounds("branch-row-features-beta")
+            .debug_bounds("branch-row-heads-features-beta")
             .expect("sibling nested branch row renders");
         let master = visual
-            .debug_bounds("branch-row-master")
+            .debug_bounds("branch-row-heads-master")
             .expect("flat branch row renders");
         assert!(
             folder.origin.y < alpha.origin.y
@@ -11572,7 +11956,7 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let folder = visual
-            .debug_bounds("branch-folder-features")
+            .debug_bounds("branch-folder-heads-features")
             .expect("folder row renders");
         visual.simulate_click(folder.center(), Modifiers::none());
 
@@ -11584,7 +11968,7 @@ mod tests {
                     "collapsing is visual only; no branch becomes hidden"
                 );
                 assert!(
-                    app.collapsed_branch_folders.contains("features"),
+                    app.collapsed_branch_folders.contains("heads/features"),
                     "features must be in collapsed_branch_folders after click"
                 );
                 // Verify that the tree builder produces the collapsed layout.
@@ -11592,7 +11976,8 @@ mod tests {
                     panic!("expected RepoOpen mode");
                 };
                 let rows = build_branch_tree_rows(
-                    &repo.local_branches,
+                    &repo.branches,
+                    "heads",
                     &app.collapsed_branch_folders,
                     &app.hidden_branches,
                 );
@@ -11615,12 +12000,12 @@ mod tests {
 
         // Verify the folder row is still rendered (collapsed, not removed).
         visual
-            .debug_bounds("branch-folder-features")
+            .debug_bounds("branch-folder-heads-features")
             .expect("collapsed folder row still renders");
 
         // Click again to expand.
         let folder = visual
-            .debug_bounds("branch-folder-features")
+            .debug_bounds("branch-folder-heads-features")
             .expect("collapsed folder row still renders for second click");
         visual.simulate_click(folder.center(), Modifiers::none());
 
@@ -11643,8 +12028,8 @@ mod tests {
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path.clone(), window, cx);
-                app.toggle_branch_folder("features".to_string(), cx);
-                assert!(app.collapsed_branch_folders.contains("features"));
+                app.toggle_branch_folder("heads/features".to_string(), cx);
+                assert!(app.collapsed_branch_folders.contains("heads/features"));
 
                 app.open_repository_at(path, window, cx);
                 assert!(
@@ -11653,6 +12038,96 @@ mod tests {
                 );
             })
             .expect("open, collapse, reopen");
+    }
+
+    #[gpui::test]
+    async fn sidebar_renders_remote_section_with_a_folder_per_remote(cx: &mut TestAppContext) {
+        let (dir, _root, _remote_tip) = init_repo_with_remote_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let local_section = visual
+            .debug_bounds("branch-section-local")
+            .expect("Local section header renders");
+        let remote_section = visual
+            .debug_bounds("branch-section-remote")
+            .expect("Remote section header renders");
+        visual
+            .debug_bounds("branch-folder-remotes-origin")
+            .expect("the remote renders as a folder");
+        visual
+            .debug_bounds("branch-folder-remotes-origin-feature")
+            .expect("slash-named remote branches nest in subfolders");
+        visual
+            .debug_bounds("branch-row-remotes-origin-master")
+            .expect("remote branch row renders, keyed by namespaced name");
+        visual
+            .debug_bounds("branch-row-remotes-origin-feature-x")
+            .expect("nested remote branch row renders");
+        let local_row = visual
+            .debug_bounds("branch-row-heads-master")
+            .expect("local branch row renders under the Local section");
+        assert!(
+            local_section.origin.y < local_row.origin.y
+                && local_row.origin.y < remote_section.origin.y,
+            "sections order: Local header, local rows, Remote header"
+        );
+        // Row 0 is the remote-only tip (origin/feature/x at time 200, newest).
+        // Row 1 is the root commit (master + origin/master at time 100).
+        visual
+            .debug_bounds("commit-ref-label-0-remotes-origin-feature-x")
+            .expect("remote ref label pill renders in the graph with its namespaced selector");
+        visual
+            .debug_bounds("commit-ref-label-1-remotes-origin-master")
+            .expect("remote ref label pill renders in the graph with its namespaced selector");
+        visual
+            .debug_bounds("commit-ref-label-1-heads-master")
+            .expect("local ref label pill renders on the shared-tip commit row");
+    }
+
+    #[gpui::test]
+    async fn hiding_a_remote_branch_removes_its_exclusive_commits(cx: &mut TestAppContext) {
+        let (dir, _root, remote_tip) = init_repo_with_remote_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                let visible_before = match &app.mode {
+                    Mode::RepoOpen { repo } => visible_commits(repo, &app.hidden_branches)
+                        .iter()
+                        .map(|commit| commit.sha.clone())
+                        .collect::<Vec<_>>(),
+                    Mode::NoRepo => Vec::new(),
+                };
+                assert!(
+                    visible_before.contains(&remote_tip),
+                    "the remote-only commit loads and renders",
+                );
+
+                app.toggle_branch_visibility("remotes/origin/feature/x".to_string(), cx);
+                let visible_after = match &app.mode {
+                    Mode::RepoOpen { repo } => visible_commits(repo, &app.hidden_branches)
+                        .iter()
+                        .map(|commit| commit.sha.clone())
+                        .collect::<Vec<_>>(),
+                    Mode::NoRepo => Vec::new(),
+                };
+                assert!(
+                    !visible_after.contains(&remote_tip),
+                    "hiding the remote branch drops its exclusive commit",
+                );
+            })
+            .expect("toggle remote branch visibility");
     }
 
     /// Like `init_repo_with_slash_named_branches`, but HEAD is moved onto
@@ -11676,11 +12151,11 @@ mod tests {
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
 
-                app.toggle_folder_visibility("features", cx);
-                assert!(app.hidden_branches.contains("features/alpha"));
-                assert!(app.hidden_branches.contains("features/beta"));
+                app.toggle_folder_visibility("heads/features", cx);
+                assert!(app.hidden_branches.contains("heads/features/alpha"));
+                assert!(app.hidden_branches.contains("heads/features/beta"));
 
-                app.toggle_folder_visibility("features", cx);
+                app.toggle_folder_visibility("heads/features", cx);
                 assert!(
                     app.hidden_branches.is_empty(),
                     "toggling a fully hidden folder must show every descendant"
@@ -11698,12 +12173,12 @@ mod tests {
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
-                app.toggle_branch_visibility("features/alpha".to_string(), cx);
+                app.toggle_branch_visibility("heads/features/alpha".to_string(), cx);
 
-                app.toggle_folder_visibility("features", cx);
+                app.toggle_folder_visibility("heads/features", cx);
                 assert!(
-                    app.hidden_branches.contains("features/alpha")
-                        && app.hidden_branches.contains("features/beta"),
+                    app.hidden_branches.contains("heads/features/alpha")
+                        && app.hidden_branches.contains("heads/features/beta"),
                     "a mixed folder toggle must hide the remaining visible branches"
                 );
             })
@@ -11720,14 +12195,14 @@ mod tests {
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
 
-                app.toggle_folder_visibility("features", cx);
+                app.toggle_folder_visibility("heads/features", cx);
                 assert!(
-                    !app.hidden_branches.contains("features/alpha"),
+                    !app.hidden_branches.contains("heads/features/alpha"),
                     "the checked-out branch must never be hidden"
                 );
-                assert!(app.hidden_branches.contains("features/beta"));
+                assert!(app.hidden_branches.contains("heads/features/beta"));
 
-                app.toggle_folder_visibility("features", cx);
+                app.toggle_folder_visibility("heads/features", cx);
                 assert!(app.hidden_branches.is_empty());
             })
             .expect("toggle folder containing HEAD");
@@ -11746,7 +12221,7 @@ mod tests {
                     sha: alpha_tip.clone(),
                 };
 
-                app.toggle_folder_visibility("features", cx);
+                app.toggle_folder_visibility("heads/features", cx);
                 assert_eq!(
                     app.selection,
                     Selection::None,
@@ -11766,8 +12241,9 @@ mod tests {
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
                 // The toggle is hover-revealed; tests drive the hover state
-                // directly. The features folder is row 0.
-                app.hovered_branch_row = Some(0);
+                // directly. Row 0 is the "Local" section header; the
+                // features folder is row 1.
+                app.hovered_branch_row = Some(1);
                 cx.notify();
             })
             .expect("open repository");
@@ -11775,15 +12251,15 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let toggle = visual
-            .debug_bounds("branch-folder-visibility-features")
+            .debug_bounds("branch-folder-visibility-heads-features")
             .expect("hovered folder row reveals its visibility toggle");
         visual.simulate_click(toggle.center(), Modifiers::none());
 
         window
             .update(cx, |app, _window, _cx| {
                 assert!(
-                    app.hidden_branches.contains("features/alpha")
-                        && app.hidden_branches.contains("features/beta"),
+                    app.hidden_branches.contains("heads/features/alpha")
+                        && app.hidden_branches.contains("heads/features/beta"),
                     "folder toggle click must hide every descendant branch"
                 );
                 assert!(
@@ -11803,14 +12279,14 @@ mod tests {
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
-                app.toggle_folder_visibility("features", cx);
+                app.toggle_folder_visibility("heads/features", cx);
             })
             .expect("open repository and hide the folder");
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         visual
-            .debug_bounds("branch-folder-visibility-features")
+            .debug_bounds("branch-folder-visibility-heads-features")
             .expect("a fully hidden folder keeps its toggle visible without hover");
     }
 
@@ -11823,14 +12299,14 @@ mod tests {
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
-                app.toggle_branch_visibility("features/alpha".to_string(), cx);
+                app.toggle_branch_visibility("heads/features/alpha".to_string(), cx);
             })
             .expect("open repository and hide one branch");
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         visual
-            .debug_bounds("branch-folder-visibility-features")
+            .debug_bounds("branch-folder-visibility-heads-features")
             .expect("a mixed folder keeps its toggle visible without hover");
     }
 
@@ -11844,8 +12320,9 @@ mod tests {
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
                 // The toggle is hover-revealed; tests drive the hover state
-                // directly. Branches sort alphabetically: feature is row 0.
-                app.hovered_branch_row = Some(0);
+                // directly. Row 0 is the "Local" section header; branches
+                // sort alphabetically below it, so feature is row 1.
+                app.hovered_branch_row = Some(1);
                 cx.notify();
             })
             .expect("open repository");
@@ -11853,7 +12330,7 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let toggle = visual
-            .debug_bounds("branch-visibility-feature")
+            .debug_bounds("branch-visibility-heads-feature")
             .expect("hovered branch row reveals its visibility toggle");
         visual.simulate_click(toggle.center(), Modifiers::none());
 
@@ -11863,7 +12340,7 @@ mod tests {
         window
             .update(cx, |app, _window, _cx| {
                 assert!(
-                    app.hidden_branches.contains("feature"),
+                    app.hidden_branches.contains("heads/feature"),
                     "visibility toggle click must add branch to hidden_branches"
                 );
                 assert_eq!(
@@ -11881,7 +12358,7 @@ mod tests {
                     .map(|c| c.sha.as_str());
                 let visible = visible_commit_shas(
                     &repo.commits,
-                    &repo.local_branches,
+                    &repo.branches,
                     head_sha,
                     &app.hidden_branches,
                 );
@@ -11903,14 +12380,14 @@ mod tests {
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
-                app.toggle_branch_visibility("feature".to_string(), cx);
+                app.toggle_branch_visibility("heads/feature".to_string(), cx);
             })
             .expect("open repository and hide feature");
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         visual
-            .debug_bounds("branch-visibility-feature")
+            .debug_bounds("branch-visibility-heads-feature")
             .expect("hidden branch keeps its toggle visible without hover");
     }
 
@@ -11932,7 +12409,9 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         assert!(
-            visual.debug_bounds("branch-visibility-master").is_none(),
+            visual
+                .debug_bounds("branch-visibility-heads-master")
+                .is_none(),
             "the HEAD branch must not offer a visibility toggle"
         );
     }
@@ -11946,17 +12425,17 @@ mod tests {
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
-                app.toggle_branch_visibility("feature".to_string(), cx);
+                app.toggle_branch_visibility("heads/feature".to_string(), cx);
             })
             .expect("open repository and hide feature");
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let row = visual
-            .debug_bounds("branch-row-feature")
+            .debug_bounds("branch-row-heads-feature")
             .expect("hidden branch row still renders");
         let toggle = visual
-            .debug_bounds("branch-visibility-feature")
+            .debug_bounds("branch-visibility-heads-feature")
             .expect("hidden branch renders its always-visible toggle");
         assert!(
             row.origin.x + px(8.) < toggle.origin.x,

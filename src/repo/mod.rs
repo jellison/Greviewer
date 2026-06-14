@@ -19,16 +19,36 @@ pub struct OpenRepository {
     pub head: Option<HeadInfo>,
     pub commits: Vec<CommitInfo>,
     pub has_more_commits: bool,
-    pub local_branches: Vec<LocalBranch>,
+    pub branches: Vec<Branch>,
 }
 
-/// A local branch snapshot taken at open time. `is_head` is true only for
-/// the checked-out branch; a detached HEAD marks no branch.
+/// How a branch ref is scoped: a local branch under `refs/heads/`, or a
+/// remote-tracking branch under `refs/remotes/` belonging to a configured
+/// remote.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalBranch {
+pub enum BranchKind {
+    Local,
+    Remote { remote: String },
+}
+
+/// A branch snapshot taken at open time. `name` is the qualified display
+/// name (`main`, or `origin/main` for a remote-tracking branch). `is_head`
+/// is true only for the checked-out local branch; a detached HEAD marks no
+/// branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Branch {
     pub name: String,
     pub tip_sha: String,
     pub is_head: bool,
+    pub kind: BranchKind,
+}
+
+/// A branch name attached to a commit row, with the kind the renderer needs
+/// to style it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchLabel {
+    pub name: String,
+    pub kind: BranchKind,
 }
 
 #[derive(Debug, Clone)]
@@ -46,7 +66,7 @@ pub struct CommitInfo {
     pub authored_timestamp: i64,
     pub authored_date: String,
     pub parent_shas: Vec<String>,
-    pub branch_names: Vec<String>,
+    pub branch_labels: Vec<BranchLabel>,
     pub parent_count: usize,
     pub is_head: bool,
 }
@@ -184,13 +204,13 @@ pub fn open_at(path: &Path) -> Result<OpenRepository, OpenError> {
     let head_oid = head_commit.as_ref().map(|commit| commit.id());
     let head = head_commit.as_ref().map(head_info_from_commit);
     let checked_out_branch_oid = read_checked_out_branch_oid(&repo)?;
-    let branch_names_by_oid = read_local_branch_names_by_oid(&repo)?;
-    let local_branches = read_local_branches(&repo)?;
+    let branches = read_branches(&repo)?;
+    let branch_labels_by_oid = branch_labels_by_oid(&branches)?;
     let page = read_commit_page(
         &repo,
         head_oid,
         checked_out_branch_oid,
-        &branch_names_by_oid,
+        &branch_labels_by_oid,
         None,
         INITIAL_COMMIT_LIMIT,
     )?;
@@ -200,7 +220,7 @@ pub fn open_at(path: &Path) -> Result<OpenRepository, OpenError> {
         head,
         commits: page.commits,
         has_more_commits: page.has_more,
-        local_branches,
+        branches,
     })
 }
 
@@ -239,14 +259,15 @@ pub fn load_commits_after(path: &Path, after_sha: &str) -> Result<CommitPage, Op
     let head_commit = read_head_commit(&repo)?;
     let head_oid = head_commit.as_ref().map(|commit| commit.id());
     let checked_out_branch_oid = read_checked_out_branch_oid(&repo)?;
-    let branch_names_by_oid = read_local_branch_names_by_oid(&repo)?;
+    let branches = read_branches(&repo)?;
+    let branch_labels_by_oid = branch_labels_by_oid(&branches)?;
     let after_oid = git2::Oid::from_str(after_sha).map_err(OpenError::Git)?;
 
     read_commit_page(
         &repo,
         head_oid,
         checked_out_branch_oid,
-        &branch_names_by_oid,
+        &branch_labels_by_oid,
         Some(after_oid),
         INITIAL_COMMIT_LIMIT,
     )
@@ -667,11 +688,11 @@ fn read_commit_page(
     repo: &git2::Repository,
     head_oid: Option<git2::Oid>,
     checked_out_branch_oid: Option<git2::Oid>,
-    branch_names_by_oid: &BTreeMap<git2::Oid, Vec<String>>,
+    branch_labels_by_oid: &BTreeMap<git2::Oid, Vec<BranchLabel>>,
     after_oid: Option<git2::Oid>,
     limit: usize,
 ) -> Result<CommitPage, OpenError> {
-    if head_oid.is_none() && branch_names_by_oid.is_empty() {
+    if head_oid.is_none() && branch_labels_by_oid.is_empty() {
         return Ok(CommitPage {
             commits: Vec::new(),
             has_more: false,
@@ -682,7 +703,7 @@ fn read_commit_page(
     revwalk
         .set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)
         .map_err(OpenError::Git)?;
-    for branch_oid in branch_names_by_oid.keys() {
+    for branch_oid in branch_labels_by_oid.keys() {
         revwalk.push(*branch_oid).map_err(OpenError::Git)?;
     }
     if head_oid.is_some() {
@@ -709,7 +730,7 @@ fn read_commit_page(
         commits.push(commit_info_from_commit(
             &commit,
             checked_out_branch_oid,
-            branch_names_by_oid
+            branch_labels_by_oid
                 .get(&commit.id())
                 .cloned()
                 .unwrap_or_default(),
@@ -728,44 +749,39 @@ fn read_commit_page(
     })
 }
 
-fn read_local_branch_names_by_oid(
-    repo: &git2::Repository,
-) -> Result<BTreeMap<git2::Oid, Vec<String>>, OpenError> {
-    let mut branch_names_by_oid = BTreeMap::<git2::Oid, Vec<String>>::new();
-    let branches = repo
-        .branches(Some(git2::BranchType::Local))
-        .map_err(OpenError::Git)?;
-
+/// Groups branch labels by tip oid. The branch list's local-first/name sort
+/// carries into each commit's label order.
+fn branch_labels_by_oid(
+    branches: &[Branch],
+) -> Result<BTreeMap<git2::Oid, Vec<BranchLabel>>, OpenError> {
+    let mut labels_by_oid = BTreeMap::<git2::Oid, Vec<BranchLabel>>::new();
     for branch in branches {
-        let (branch, _branch_type) = branch.map_err(OpenError::Git)?;
-        let Some(target_oid) = branch.get().target() else {
-            continue;
-        };
-        let Some(name) = branch.name().map_err(OpenError::Git)? else {
-            continue;
-        };
-
-        branch_names_by_oid
-            .entry(target_oid)
-            .or_default()
-            .push(name.to_string());
+        let oid = git2::Oid::from_str(&branch.tip_sha).map_err(OpenError::Git)?;
+        labels_by_oid.entry(oid).or_default().push(BranchLabel {
+            name: branch.name.clone(),
+            kind: branch.kind.clone(),
+        });
     }
-
-    for branch_names in branch_names_by_oid.values_mut() {
-        branch_names.sort();
-    }
-
-    Ok(branch_names_by_oid)
+    Ok(labels_by_oid)
 }
 
-fn read_local_branches(repo: &git2::Repository) -> Result<Vec<LocalBranch>, OpenError> {
-    let mut local_branches = Vec::new();
-    let branches = repo
-        .branches(Some(git2::BranchType::Local))
-        .map_err(OpenError::Git)?;
+/// Reads both local and remote-tracking branches. Local branches sort before
+/// remote-tracking branches; within each group branches are sorted by name.
+/// Refs with no direct target and the remote default-branch pointer
+/// (`{remote}/HEAD`, whether symbolic or direct) are excluded.
+fn read_branches(repo: &git2::Repository) -> Result<Vec<Branch>, OpenError> {
+    let remote_names: Vec<String> = repo
+        .remotes()
+        .map_err(OpenError::Git)?
+        .iter()
+        .flatten()
+        .map(str::to_string)
+        .collect();
 
-    for branch in branches {
-        let (branch, _branch_type) = branch.map_err(OpenError::Git)?;
+    let mut result = Vec::new();
+    for entry in repo.branches(None).map_err(OpenError::Git)? {
+        let (branch, branch_type) = entry.map_err(OpenError::Git)?;
+        // Symbolic refs (a freshly cloned origin/HEAD) have no direct target.
         let Some(target_oid) = branch.get().target() else {
             continue;
         };
@@ -773,15 +789,66 @@ fn read_local_branches(repo: &git2::Repository) -> Result<Vec<LocalBranch>, Open
             continue;
         };
 
-        local_branches.push(LocalBranch {
+        let kind = match branch_type {
+            git2::BranchType::Local => BranchKind::Local,
+            git2::BranchType::Remote => {
+                let remote = remote_name_for(name, &remote_names);
+                if name
+                    .strip_prefix(remote.as_str())
+                    .is_some_and(|rest| rest == "/HEAD")
+                {
+                    continue;
+                }
+                BranchKind::Remote { remote }
+            }
+        };
+
+        result.push(Branch {
             name: name.to_string(),
             tip_sha: target_oid.to_string(),
-            is_head: branch.is_head(),
+            is_head: branch_type == git2::BranchType::Local && branch.is_head(),
+            kind,
         });
     }
 
-    local_branches.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(local_branches)
+    result.sort_by(|left, right| {
+        branch_kind_rank(&left.kind)
+            .cmp(&branch_kind_rank(&right.kind))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(result)
+}
+
+/// Local branches order before remote-tracking branches everywhere a mixed
+/// list is shown.
+fn branch_kind_rank(kind: &BranchKind) -> u8 {
+    match kind {
+        BranchKind::Local => 0,
+        BranchKind::Remote { .. } => 1,
+    }
+}
+
+/// The configured remote a remote-tracking branch belongs to: the longest
+/// remote name that prefixes the branch's qualified name. Falls back to the
+/// first path segment when no configured remote matches (refs left behind
+/// after a remote was removed).
+fn remote_name_for(branch_name: &str, remote_names: &[String]) -> String {
+    remote_names
+        .iter()
+        .filter(|remote| {
+            branch_name
+                .strip_prefix(remote.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .max_by_key(|remote| remote.len())
+        .cloned()
+        .unwrap_or_else(|| {
+            branch_name
+                .split('/')
+                .next()
+                .unwrap_or(branch_name)
+                .to_string()
+        })
 }
 
 fn head_info_from_commit(commit: &git2::Commit<'_>) -> HeadInfo {
@@ -794,7 +861,7 @@ fn head_info_from_commit(commit: &git2::Commit<'_>) -> HeadInfo {
 fn commit_info_from_commit(
     commit: &git2::Commit<'_>,
     head_oid: Option<git2::Oid>,
-    branch_names: Vec<String>,
+    branch_labels: Vec<BranchLabel>,
 ) -> CommitInfo {
     let sha = commit.id().to_string();
     let author = commit.author();
@@ -815,7 +882,7 @@ fn commit_info_from_commit(
         authored_timestamp: commit.time().seconds(),
         authored_date: format_authored_date(commit.time()),
         parent_shas,
-        branch_names,
+        branch_labels,
         parent_count: commit.parent_count(),
         is_head: Some(commit.id()) == head_oid,
     }
@@ -1083,7 +1150,7 @@ mod tests {
         let snapshot = open_at(dir.path()).expect("open succeeds");
 
         let summary = snapshot
-            .local_branches
+            .branches
             .iter()
             .map(|branch| {
                 (
@@ -1118,7 +1185,7 @@ mod tests {
         let snapshot = open_at(dir.path()).expect("open succeeds");
 
         assert!(
-            snapshot.local_branches.iter().all(|branch| !branch.is_head),
+            snapshot.branches.iter().all(|branch| !branch.is_head),
             "detached HEAD marks no branch",
         );
     }
@@ -1129,17 +1196,19 @@ mod tests {
 
         let snapshot = open_at(dir.path()).expect("open succeeds");
 
-        assert!(snapshot.local_branches.is_empty());
+        assert!(snapshot.branches.is_empty());
     }
 
     #[test]
-    fn open_at_excludes_remote_tracking_refs_and_tags() {
+    fn open_at_includes_remote_only_commits_but_not_tag_commits() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let repo = Repository::init(dir.path()).expect("init repo");
 
         let root = commit_tree_to_ref(&repo, Some("HEAD"), "Root", 100, &[]);
         let remote_only = commit_tree_to_ref(&repo, None, "Remote only", 200, &[root]);
         let tag_only = commit_tree_to_ref(&repo, None, "Tag only", 300, &[root]);
+        repo.remote("origin", "https://example.invalid/repo.git")
+            .expect("configure remote");
         repo.reference(
             "refs/remotes/origin/topic",
             remote_only,
@@ -1160,8 +1229,40 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             shas,
-            vec![root.to_string()],
-            "remote-tracking and tag commits stay out of the graph",
+            vec![remote_only.to_string(), root.to_string()],
+            "remote-tracking commits join the graph; tag-only commits stay out",
+        );
+    }
+
+    #[test]
+    fn commit_labels_carry_branch_kind_with_locals_first() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        let tip = commit_tree_to_ref(&repo, Some("HEAD"), "Tip", 100, &[]);
+        repo.remote("origin", "https://example.invalid/repo.git")
+            .expect("configure remote");
+        repo.reference("refs/remotes/origin/master", tip, true, "remote master")
+            .expect("create remote master");
+        drop(repo);
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+
+        assert_eq!(
+            snapshot.commits[0].branch_labels,
+            vec![
+                BranchLabel {
+                    name: "master".to_string(),
+                    kind: BranchKind::Local,
+                },
+                BranchLabel {
+                    name: "origin/master".to_string(),
+                    kind: BranchKind::Remote {
+                        remote: "origin".to_string()
+                    },
+                },
+            ],
+            "a commit at both tips labels the local branch before the remote one",
         );
     }
 
@@ -1359,13 +1460,25 @@ mod tests {
 
         assert_eq!(snapshot.commits[0].sha, tip_oid.to_string());
         assert_eq!(
-            snapshot.commits[0].branch_names,
-            vec!["master".to_string(), "review/topic".to_string()]
+            snapshot.commits[0].branch_labels,
+            vec![
+                BranchLabel {
+                    name: "master".to_string(),
+                    kind: BranchKind::Local,
+                },
+                BranchLabel {
+                    name: "review/topic".to_string(),
+                    kind: BranchKind::Local,
+                },
+            ]
         );
         assert_eq!(snapshot.commits[1].sha, root_oid.to_string());
         assert_eq!(
-            snapshot.commits[1].branch_names,
-            vec!["feature".to_string()]
+            snapshot.commits[1].branch_labels,
+            vec![BranchLabel {
+                name: "feature".to_string(),
+                kind: BranchKind::Local,
+            }]
         );
     }
 
@@ -1836,5 +1949,133 @@ mod tests {
     #[test]
     fn sibling_repositories_is_empty_for_a_path_without_a_parent() {
         assert!(sibling_repositories(Path::new("/")).is_empty());
+    }
+
+    #[test]
+    fn open_at_returns_remote_branches_with_their_remote() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        let root = commit_tree_to_ref(&repo, Some("HEAD"), "Root", 100, &[]);
+        let remote_tip = commit_tree_to_ref(&repo, None, "Remote tip", 200, &[root]);
+        repo.remote("origin", "https://example.invalid/repo.git")
+            .expect("configure remote");
+        repo.reference(
+            "refs/remotes/origin/topic",
+            remote_tip,
+            true,
+            "create remote-tracking ref",
+        )
+        .expect("create remote-tracking ref");
+        drop(repo);
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+
+        let summary = snapshot
+            .branches
+            .iter()
+            .map(|branch| (branch.name.as_str(), branch.kind.clone(), branch.is_head))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            vec![
+                ("master", BranchKind::Local, true),
+                (
+                    "origin/topic",
+                    BranchKind::Remote {
+                        remote: "origin".to_string()
+                    },
+                    false,
+                ),
+            ],
+            "remote branches carry their remote and sort after local branches",
+        );
+    }
+
+    #[test]
+    fn open_at_excludes_the_remote_head_ref() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        let root = commit_tree_to_ref(&repo, Some("HEAD"), "Root", 100, &[]);
+        // origin: symbolic HEAD (excluded by the no-direct-target guard —
+        // `branch.get().target()` returns None for symbolic refs).
+        repo.remote("origin", "https://example.invalid/repo.git")
+            .expect("configure remote");
+        repo.reference("refs/remotes/origin/main", root, true, "remote main")
+            .expect("create remote main");
+        repo.reference_symbolic(
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+            true,
+            "symbolic remote HEAD",
+        )
+        .expect("create symbolic remote HEAD");
+        // upstream: direct HEAD ref (excluded by the `rest == "/HEAD"` check
+        // in read_branches, which runs after the symbolic guard).
+        repo.remote("upstream", "https://example.invalid/upstream.git")
+            .expect("configure upstream remote");
+        repo.reference(
+            "refs/remotes/upstream/main",
+            root,
+            true,
+            "upstream remote main",
+        )
+        .expect("create upstream remote main");
+        repo.reference(
+            "refs/remotes/upstream/HEAD",
+            root,
+            true,
+            "direct remote HEAD",
+        )
+        .expect("create direct upstream HEAD");
+        drop(repo);
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+
+        assert!(
+            snapshot
+                .branches
+                .iter()
+                .all(|branch| branch.name != "origin/HEAD"),
+            "origin/HEAD (symbolic) never appears as a branch",
+        );
+        assert!(
+            snapshot
+                .branches
+                .iter()
+                .any(|branch| branch.name == "origin/main"),
+            "origin/main still appears",
+        );
+        assert!(
+            snapshot
+                .branches
+                .iter()
+                .all(|branch| branch.name != "upstream/HEAD"),
+            "upstream/HEAD (direct) never appears as a branch",
+        );
+        assert!(
+            snapshot
+                .branches
+                .iter()
+                .any(|branch| branch.name == "upstream/main"),
+            "upstream/main still appears",
+        );
+    }
+
+    #[test]
+    fn remote_name_matching_prefers_the_longest_configured_remote() {
+        let remotes = vec!["origin".to_string(), "origin/nested".to_string()];
+        assert_eq!(remote_name_for("origin/main", &remotes), "origin");
+        assert_eq!(
+            remote_name_for("origin/nested/main", &remotes),
+            "origin/nested",
+            "a remote name containing '/' wins over its shorter prefix",
+        );
+        assert_eq!(
+            remote_name_for("ghost/main", &remotes),
+            "ghost",
+            "an unmatched ref falls back to its first path segment",
+        );
     }
 }
