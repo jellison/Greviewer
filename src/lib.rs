@@ -7,6 +7,7 @@ use crate::assets::Assets;
 
 pub mod app;
 pub mod assets;
+pub mod diff_highlight;
 pub mod graph;
 pub mod icons;
 pub mod repo;

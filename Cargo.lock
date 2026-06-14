@@ -2476,6 +2476,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "include_dir",
+ "ropey",
  "serde",
  "serde_json",
  "similar",

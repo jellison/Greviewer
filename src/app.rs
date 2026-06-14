@@ -13,10 +13,11 @@ pub use path_picker::{repository_prompt_options, GpuiPathPicker, PathPicker, Pat
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, canvas, div, point, px, rgb, AnyElement, AppContext, ClickEvent, Context, Entity,
-    EventEmitter, FocusHandle, InteractiveElement, IntoElement, Modifiers, ParentElement,
-    PathBuilder, Pixels, Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement,
-    Styled, Window,
+    actions, canvas, div, pattern_slash, point, px, rgb, rgba, AnyElement, AppContext, Background,
+    ClickEvent, Context, Entity, EventEmitter, FocusHandle, HighlightStyle, Hsla,
+    InteractiveElement, IntoElement, Modifiers, ParentElement, PathBuilder, Pixels, Render,
+    ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledText, TextStyle,
+    Window,
 };
 use gpui_component::notification::{Notification, NotificationList};
 use gpui_component::resizable::{h_resizable, resizable_panel, ResizableState};
@@ -27,6 +28,7 @@ use similar::{DiffTag, TextDiff};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
 };
@@ -34,7 +36,7 @@ use std::{
 use crate::icons::LucideIcon;
 use crate::settings::{self, RecentRepository, Settings, MAX_RECENT_REPOSITORIES};
 use crate::workspace::FileDiffItem;
-use crate::{graph, repo};
+use crate::{diff_highlight, graph, repo};
 
 actions!(
     app,
@@ -2587,7 +2589,10 @@ impl App {
         )
         .map_err(|err| err.to_string())?;
 
-        let prepared = Rc::new(PreparedFileDiff::from_content(diff.content));
+        let prepared = Rc::new(PreparedFileDiff::from_content(
+            diff.content,
+            diff_highlight::language_for_path(&file.path),
+        ));
         self.diff_row_cache
             .borrow_mut()
             .insert(key, prepared.clone());
@@ -2601,8 +2606,6 @@ impl App {
         file: &repo::ChangedFile,
         scroll: &FileDiffScroll,
     ) -> AnyElement {
-        let title = file.path.clone();
-        let kind = change_kind_label(file.kind);
         let rename_source_selector = format!(
             "file-detail-rename-source-{}",
             debug_path_fragment(&file.path)
@@ -2621,37 +2624,13 @@ impl App {
             .overflow_hidden()
             .id("file-detail-shell")
             .debug_selector(|| "file-detail-shell".to_string())
-            .px_4()
-            .py_4()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_color(rgb(0xe6e6e6))
-                            .text_size(px(16.))
-                            .font_family("monospace")
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .border_1()
-                            .border_color(change_kind_border(file.kind))
-                            .bg(change_kind_background(file.kind))
-                            .text_color(change_kind_text(file.kind))
-                            .text_size(px(11.))
-                            .font_family("monospace")
-                            .child(kind),
-                    ),
-            )
             .when_some(file.old_path.clone(), |detail, old_path| {
                 detail.child(
                     div()
+                        .px_3()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(rgb(0x2a2a2a))
                         .text_color(rgb(0x999999))
                         .text_size(px(12.))
                         .font_family("monospace")
@@ -2671,7 +2650,11 @@ impl App {
         scroll: &FileDiffScroll,
     ) -> AnyElement {
         let content = match repo::file_content_at_commit(&repo.path, &changeset.commit_sha, path) {
-            Ok(content) => render_file_content(content.content, scroll),
+            Ok(content) => render_file_content(
+                content.content,
+                scroll,
+                diff_highlight::language_for_path(path),
+            ),
             Err(err) => render_file_diff_error(err.to_string()),
         };
 
@@ -2684,16 +2667,6 @@ impl App {
             .overflow_hidden()
             .id("file-detail-shell")
             .debug_selector(|| "file-detail-shell".to_string())
-            .px_4()
-            .py_4()
-            .gap_3()
-            .child(
-                div()
-                    .text_color(rgb(0xe6e6e6))
-                    .text_size(px(16.))
-                    .font_family("monospace")
-                    .child(path.to_string()),
-            )
             .child(content)
             .into_any_element()
     }
@@ -4589,10 +4562,6 @@ fn render_prepared_file_diff(prepared: &PreparedFileDiff, scroll: &FileDiffScrol
     match prepared {
         PreparedFileDiff::Single { side, rows } => {
             let side = *side;
-            let label = match side {
-                repo::DiffSide::Old => "Before",
-                repo::DiffSide::New => "After",
-            };
             let selector = match side {
                 repo::DiffSide::Old => "file-diff-side-old",
                 repo::DiffSide::New => "file-diff-side-new",
@@ -4605,8 +4574,7 @@ fn render_prepared_file_diff(prepared: &PreparedFileDiff, scroll: &FileDiffScrol
                 })
                 .collect::<Vec<_>>();
 
-            render_file_diff_side(label, selector, cells, scroll.handle_for(side))
-                .into_any_element()
+            render_file_diff_side(selector, cells, scroll.handle_for(side)).into_any_element()
         }
         PreparedFileDiff::SideBySide { rows } => {
             let old_cells = rows.iter().map(|row| row.old.clone()).collect::<Vec<_>>();
@@ -4615,16 +4583,14 @@ fn render_prepared_file_diff(prepared: &PreparedFileDiff, scroll: &FileDiffScrol
             div()
                 .flex()
                 .flex_1()
-                .gap_3()
                 .min_h_0()
                 .child(render_file_diff_side(
-                    "Before",
                     "file-diff-side-old",
                     old_cells,
                     &scroll.side_by_side,
                 ))
+                .child(div().w(px(1.)).flex_none().bg(rgb(0x2a2a2a)))
                 .child(render_file_diff_side(
-                    "After",
                     "file-diff-side-new",
                     new_cells,
                     &scroll.side_by_side,
@@ -4641,9 +4607,7 @@ fn render_binary_diff_placeholder() -> AnyElement {
         .flex_1()
         .items_center()
         .justify_center()
-        .border_1()
-        .border_color(rgb(0x2a2a2a))
-        .bg(rgb(0x141414))
+        .bg(rgb(0x171717))
         .id("file-diff-binary")
         .debug_selector(|| "file-diff-binary".to_string())
         .text_color(rgb(0x999999))
@@ -4652,13 +4616,23 @@ fn render_binary_diff_placeholder() -> AnyElement {
         .into_any_element()
 }
 
-fn render_file_content(content: repo::FileContentBody, scroll: &FileDiffScroll) -> AnyElement {
+fn render_file_content(
+    content: repo::FileContentBody,
+    scroll: &FileDiffScroll,
+    language: &str,
+) -> AnyElement {
     match content {
         repo::FileContentBody::Text(text) => {
-            let cells = read_only_file_cells(&text);
+            let runs = diff_highlight::line_highlight_runs(&text, language);
+            let cells = read_only_file_cells(&text)
+                .into_iter()
+                .map(|mut cell| {
+                    attach_line_runs(&mut cell, &runs);
+                    cell
+                })
+                .collect::<Vec<_>>();
 
             render_file_diff_side(
-                "Contents",
                 "file-read-only-content",
                 cells,
                 scroll.handle_for(repo::DiffSide::New),
@@ -4675,9 +4649,7 @@ fn render_file_diff_error(message: String) -> AnyElement {
         .flex_1()
         .items_center()
         .justify_center()
-        .border_1()
-        .border_color(rgb(0x2a2a2a))
-        .bg(rgb(0x141414))
+        .bg(rgb(0x171717))
         .id("file-diff-error")
         .debug_selector(|| "file-diff-error".to_string())
         .text_color(rgb(0xfca5a5))
@@ -4694,14 +4666,15 @@ enum DiffLineStatus {
     Empty,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct DiffLineCell {
     line_number: Option<usize>,
     text: String,
     status: DiffLineStatus,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct DiffRow {
     old: DiffLineCell,
     new: DiffLineCell,
@@ -4718,9 +4691,11 @@ struct DiffCacheKey {
 }
 
 /// A changed file's diff content with the expensive work already done: the line
-/// diff computed and the per-side rows aligned. This is what the diff cache
-/// holds so `render_changed_file_detail` can rebuild its elements cheaply.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// diff computed, the per-side rows aligned, and syntax/word-level highlights
+/// attached. This is what the diff cache holds so `render_changed_file_detail`
+/// can rebuild its elements cheaply. Not `Eq`: the attached `HighlightStyle`
+/// runs carry colors that only implement `PartialEq`.
+#[derive(Debug, Clone, PartialEq)]
 enum PreparedFileDiff {
     Single {
         side: repo::DiffSide,
@@ -4733,16 +4708,23 @@ enum PreparedFileDiff {
 }
 
 impl PreparedFileDiff {
-    fn from_content(content: repo::FileDiffContent) -> Self {
+    fn from_content(content: repo::FileDiffContent, language: &str) -> Self {
         match content {
-            repo::FileDiffContent::Single { side, text } => PreparedFileDiff::Single {
-                side,
-                rows: single_side_diff_rows(side, &text),
-            },
-            repo::FileDiffContent::SideBySide { old_text, new_text } => {
-                PreparedFileDiff::SideBySide {
-                    rows: side_by_side_diff_rows(&old_text, &new_text),
+            repo::FileDiffContent::Single { side, text } => {
+                let runs = diff_highlight::line_highlight_runs(&text, language);
+                let mut rows = single_side_diff_rows(side, &text);
+                for row in &mut rows {
+                    match side {
+                        repo::DiffSide::Old => attach_line_runs(&mut row.old, &runs),
+                        repo::DiffSide::New => attach_line_runs(&mut row.new, &runs),
+                    }
                 }
+                PreparedFileDiff::Single { side, rows }
+            }
+            repo::FileDiffContent::SideBySide { old_text, new_text } => {
+                let mut rows = side_by_side_diff_rows(&old_text, &new_text);
+                attach_diff_highlights(&mut rows, &old_text, &new_text, language);
+                PreparedFileDiff::SideBySide { rows }
             }
             repo::FileDiffContent::Binary => PreparedFileDiff::Binary,
         }
@@ -4763,6 +4745,7 @@ fn single_side_diff_rows(side: repo::DiffSide, text: &str) -> Vec<DiffRow> {
                 line_number: Some(index + 1),
                 text: line,
                 status,
+                highlights: Vec::new(),
             };
 
             match side {
@@ -4839,11 +4822,71 @@ fn side_by_side_diff_rows(old_text: &str, new_text: &str) -> Vec<DiffRow> {
     rows
 }
 
+/// Emphasis colors for word-level changes (One Dark red/green at ~25% alpha).
+const DIFF_REMOVED_EMPHASIS: u32 = 0xe06c7540;
+const DIFF_ADDED_EMPHASIS: u32 = 0x98c37940;
+
+fn attach_line_runs(cell: &mut DiffLineCell, runs: &[Vec<(Range<usize>, HighlightStyle)>]) {
+    if let Some(line) = cell.line_number {
+        cell.highlights = runs.get(line - 1).cloned().unwrap_or_default();
+    }
+}
+
+fn attach_diff_highlights(rows: &mut [DiffRow], old_text: &str, new_text: &str, language: &str) {
+    let old_runs = diff_highlight::line_highlight_runs(old_text, language);
+    let new_runs = diff_highlight::line_highlight_runs(new_text, language);
+
+    for row in rows.iter_mut() {
+        attach_line_runs(&mut row.old, &old_runs);
+        attach_line_runs(&mut row.new, &new_runs);
+
+        if row.old.status == DiffLineStatus::Removed && row.new.status == DiffLineStatus::Added {
+            let (old_emphasis, new_emphasis) =
+                diff_highlight::inline_diff_ranges(&row.old.text, &row.new.text);
+            let any_changes = !old_emphasis.is_empty() || !new_emphasis.is_empty();
+            if any_changes
+                && emphasis_is_subtle(&old_emphasis, row.old.text.len())
+                && emphasis_is_subtle(&new_emphasis, row.new.text.len())
+            {
+                row.old.highlights = diff_highlight::merge_emphasis(
+                    &row.old.highlights,
+                    &old_emphasis,
+                    rgba(DIFF_REMOVED_EMPHASIS).into(),
+                );
+                row.new.highlights = diff_highlight::merge_emphasis(
+                    &row.new.highlights,
+                    &new_emphasis,
+                    rgba(DIFF_ADDED_EMPHASIS).into(),
+                );
+            }
+        }
+    }
+}
+
+/// Word-level emphasis only helps when it stays a small slice of the line;
+/// a pair whose differences cover most of the line reads better as a
+/// whole-line change. A side with no changed ranges passes trivially —
+/// pure insertions/deletions still emphasize the other side.
+fn emphasis_is_subtle(ranges: &[Range<usize>], line_len: usize) -> bool {
+    if ranges.is_empty() {
+        return true;
+    }
+    if line_len == 0 {
+        return false;
+    }
+    let covered: usize = ranges.iter().map(|range| range.len()).sum();
+    covered * 100 <= line_len * EMPHASIS_MAX_COVERAGE_PERCENT
+}
+
+/// Above this share of the line, word-level emphasis is noise.
+const EMPHASIS_MAX_COVERAGE_PERCENT: usize = 60;
+
 fn diff_cell(line_index: usize, line: &str, status: DiffLineStatus) -> DiffLineCell {
     DiffLineCell {
         line_number: Some(line_index + 1),
         text: trim_line_ending(line),
         status,
+        highlights: Vec::new(),
     }
 }
 
@@ -4852,6 +4895,7 @@ fn empty_diff_cell() -> DiffLineCell {
         line_number: None,
         text: String::new(),
         status: DiffLineStatus::Empty,
+        highlights: Vec::new(),
     }
 }
 
@@ -4863,12 +4907,12 @@ fn read_only_file_cells(text: &str) -> Vec<DiffLineCell> {
             line_number: Some(index + 1),
             text: line,
             status: DiffLineStatus::Unchanged,
+            highlights: Vec::new(),
         })
         .collect()
 }
 
 fn render_file_diff_side(
-    label: &'static str,
     selector: &'static str,
     cells: Vec<DiffLineCell>,
     scroll_handle: &ScrollHandle,
@@ -4885,23 +4929,11 @@ fn render_file_diff_side(
         .flex_1()
         .h_full()
         .min_h_0()
+        .min_w_0()
         .overflow_hidden()
-        .border_1()
-        .border_color(rgb(0x2a2a2a))
-        .bg(rgb(0x141414))
+        .bg(rgb(0x171717))
         .id(selector)
         .debug_selector(move || selector.to_string())
-        .child(
-            div()
-                .px_3()
-                .py_2()
-                .border_b_1()
-                .border_color(rgb(0x2a2a2a))
-                .text_color(rgb(0x999999))
-                .text_size(px(12.))
-                .font_family("monospace")
-                .child(label),
-        )
         .child(
             div()
                 .flex()
@@ -4939,37 +4971,87 @@ fn render_file_diff_line(
     };
     let id_index = row_index * 3 + pane_offset;
     let row_selector = diff_line_debug_selector(cell.status);
-    let row_bg = diff_line_background(cell.status);
-    let text_color = match cell.status {
-        DiffLineStatus::Empty => rgb(0x666666),
-        _ => rgb(0xe6e6e6),
-    };
+    let accent = diff_line_accent(cell.status);
+    let has_text = !cell.text.is_empty();
 
     div()
         .flex()
-        .items_start()
-        .min_h(px(18.))
-        .bg(row_bg)
+        .min_h(px(DIFF_LINE_HEIGHT))
+        .bg(diff_line_fill(cell.status))
         .id(("file-diff-line", id_index))
         .debug_selector(move || row_selector.to_string())
         .child(
             div()
+                .w(px(3.))
+                .flex_none()
+                .when_some(accent, |bar, (color, accent_selector)| {
+                    bar.bg(color)
+                        .debug_selector(move || accent_selector.to_string())
+                }),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_end()
                 .w(px(48.))
-                .px_2()
+                .pr_2()
+                .flex_none()
                 .text_color(rgb(0x666666))
                 .text_size(px(12.))
+                .line_height(px(DIFF_LINE_HEIGHT))
                 .font_family("monospace")
                 .child(line_number),
         )
         .child(
             div()
+                .flex()
+                .items_center()
                 .flex_1()
                 .px_2()
-                .text_color(text_color)
-                .text_size(px(12.))
-                .font_family("monospace")
-                .child(cell.text),
+                .min_w_0()
+                .when(has_text, |content| {
+                    content.child(
+                        StyledText::new(cell.text)
+                            .with_default_highlights(&diff_text_style(), cell.highlights),
+                    )
+                }),
         )
+}
+
+/// Row height for one diff line: tall enough to contain the 12px monospace
+/// glyphs without clipping, and the shared box that vertically centers the
+/// gutter number against its code line.
+const DIFF_LINE_HEIGHT: f32 = 20.;
+
+/// Base text style for diff code lines; syntax runs override color per token.
+fn diff_text_style() -> TextStyle {
+    TextStyle {
+        color: Hsla::from(rgb(0xabb2bf)),
+        font_family: "monospace".into(),
+        font_size: px(12.).into(),
+        line_height: px(DIFF_LINE_HEIGHT).into(),
+        ..TextStyle::default()
+    }
+}
+
+/// One Dark red/green at ~9% alpha over the 0x171717 chrome; alignment gaps
+/// hatch with a diagonal pattern like Zed's.
+fn diff_line_fill(status: DiffLineStatus) -> Background {
+    match status {
+        DiffLineStatus::Unchanged => Hsla::from(rgb(0x171717)).into(),
+        DiffLineStatus::Added => Hsla::from(rgba(0x98c37918)).into(),
+        DiffLineStatus::Removed => Hsla::from(rgba(0xe06c7518)).into(),
+        DiffLineStatus::Empty => pattern_slash(Hsla::from(rgba(0x26262680)), 1., 6.),
+    }
+}
+
+fn diff_line_accent(status: DiffLineStatus) -> Option<(gpui::Rgba, &'static str)> {
+    match status {
+        DiffLineStatus::Added => Some((rgb(0x98c379), "file-diff-accent-added")),
+        DiffLineStatus::Removed => Some((rgb(0xe06c75), "file-diff-accent-removed")),
+        DiffLineStatus::Unchanged | DiffLineStatus::Empty => None,
+    }
 }
 
 fn diff_line_debug_selector(status: DiffLineStatus) -> &'static str {
@@ -4978,15 +5060,6 @@ fn diff_line_debug_selector(status: DiffLineStatus) -> &'static str {
         DiffLineStatus::Added => "file-diff-row-added",
         DiffLineStatus::Removed => "file-diff-row-removed",
         DiffLineStatus::Empty => "file-diff-row-empty",
-    }
-}
-
-fn diff_line_background(status: DiffLineStatus) -> gpui::Rgba {
-    match status {
-        DiffLineStatus::Unchanged => rgb(0x141414),
-        DiffLineStatus::Added => rgb(0x132b1a),
-        DiffLineStatus::Removed => rgb(0x341b1b),
-        DiffLineStatus::Empty => rgb(0x101010),
     }
 }
 
@@ -5000,24 +5073,6 @@ fn content_lines(text: &str) -> Vec<String> {
 
 fn trim_line_ending(line: &str) -> String {
     line.trim_end_matches(['\n', '\r']).to_string()
-}
-
-fn change_kind_label(kind: repo::ChangeKind) -> &'static str {
-    match kind {
-        repo::ChangeKind::Added => "Added",
-        repo::ChangeKind::Modified => "Modified",
-        repo::ChangeKind::Deleted => "Deleted",
-        repo::ChangeKind::Renamed => "Renamed",
-    }
-}
-
-fn change_kind_background(kind: repo::ChangeKind) -> gpui::Rgba {
-    match kind {
-        repo::ChangeKind::Added => rgb(0x132b1a),
-        repo::ChangeKind::Modified => rgb(0x1d283a),
-        repo::ChangeKind::Deleted => rgb(0x341b1b),
-        repo::ChangeKind::Renamed => rgb(0x2f2a14),
-    }
 }
 
 fn change_kind_border(kind: repo::ChangeKind) -> gpui::Rgba {
@@ -5714,13 +5769,14 @@ fn repository_title(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_branch_tree_rows, commit_graph_connector_color_lane, commit_graph_connector_for_lane,
-        commit_graph_line_width, commit_graph_merge_in_commit_line_y,
-        commit_graph_spanning_connector_requires_center_fill, commit_row_separator_width,
-        debug_ref_label_fragment, side_by_side_diff_rows, single_side_diff_rows,
-        visible_commit_shas, App, BranchFolderRow, BranchRow, BranchTreeRow, CloseChangeset,
-        DiffLineStatus, FileListEntry, FileListMode, FileTreeRow, FolderVisibility, Mode,
-        OpenChangeset, OpenFailed, PreparedFileDiff, ReviewScreen, Selection,
+        attach_diff_highlights, build_branch_tree_rows, commit_graph_connector_color_lane,
+        commit_graph_connector_for_lane, commit_graph_line_width,
+        commit_graph_merge_in_commit_line_y, commit_graph_spanning_connector_requires_center_fill,
+        commit_row_separator_width, debug_ref_label_fragment, emphasis_is_subtle,
+        side_by_side_diff_rows, single_side_diff_rows, visible_commit_shas, App, BranchFolderRow,
+        BranchRow, BranchTreeRow, CloseChangeset, DiffLineStatus, FileListEntry, FileListMode,
+        FileTreeRow, FolderVisibility, Mode, OpenChangeset, OpenFailed, PreparedFileDiff,
+        ReviewScreen, Selection,
         FILE_TREE_FOLDER_ICON_SIZE, FILE_TREE_FONT_FAMILY, FILE_TREE_INDENT_WIDTH,
         FILE_TREE_ROW_HEIGHT, FILE_TREE_STATUS_ICON_SIZE, FILE_TREE_TEXT_SIZE,
     };
@@ -6179,6 +6235,20 @@ mod tests {
 
         drop(repo);
 
+        (dir, update_oid.to_string())
+    }
+
+    fn init_repo_with_python_change() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("cli.py"), "threshold = 10\n").expect("write file");
+        let root_oid = commit_all(&repo, "Add cli.py", &[]);
+
+        fs::write(dir.path().join("cli.py"), "threshold = None\n").expect("update file");
+        let update_oid = commit_all(&repo, "Update cli.py", &[root_oid]);
+
+        drop(repo);
         (dir, update_oid.to_string())
     }
 
@@ -6720,6 +6790,80 @@ mod tests {
         assert_eq!(rows[2].old.status, DiffLineStatus::Empty);
         assert_eq!(rows[2].new.status, DiffLineStatus::Added);
         assert_eq!(rows[2].new.text, "beta");
+    }
+
+    #[test]
+    fn python_replace_rows_carry_syntax_and_word_level_highlights() {
+        let old_text = "threshold = 10\n";
+        let new_text = "threshold = None\n";
+        let mut rows = side_by_side_diff_rows(old_text, new_text);
+        attach_diff_highlights(&mut rows, old_text, new_text, "py");
+
+        assert!(
+            !rows[0].old.highlights.is_empty(),
+            "old side should carry syntax runs"
+        );
+        assert!(
+            rows[0]
+                .new
+                .highlights
+                .iter()
+                .any(|(_, style)| style.background_color.is_some()),
+            "changed token on the new side should carry an emphasis background"
+        );
+    }
+
+    #[test]
+    fn unrelated_replace_rows_skip_word_level_emphasis() {
+        let old_text = "alpha beta gamma\n";
+        let new_text = "completely different text\n";
+        let mut rows = side_by_side_diff_rows(old_text, new_text);
+        attach_diff_highlights(&mut rows, old_text, new_text, "");
+
+        assert!(
+            rows[0]
+                .new
+                .highlights
+                .iter()
+                .all(|(_, style)| style.background_color.is_none()),
+            "near-total rewrites should read as whole-line changes"
+        );
+    }
+
+    #[test]
+    fn pure_insertion_replace_rows_keep_word_level_emphasis() {
+        let old_text = "return x\n";
+        let new_text = "return x + 1\n";
+        let mut rows = side_by_side_diff_rows(old_text, new_text);
+        attach_diff_highlights(&mut rows, old_text, new_text, "");
+
+        assert!(
+            rows[0]
+                .new
+                .highlights
+                .iter()
+                .any(|(_, style)| style.background_color.is_some()),
+            "an appended token should still be emphasized on the new side"
+        );
+        assert!(
+            rows[0]
+                .old
+                .highlights
+                .iter()
+                .all(|(_, style)| style.background_color.is_none()),
+            "the unchanged old side has nothing to emphasize"
+        );
+    }
+
+    #[test]
+    fn emphasis_subtlety_gate_boundary() {
+        // Exactly 60% coverage passes; just over fails; empty side passes.
+        // Use struct-literal form to avoid the single_range_in_vec_init Clippy lint.
+        let r = |start, end| std::ops::Range::<usize> { start, end };
+        assert!(emphasis_is_subtle(&[r(0, 6)], 10));
+        assert!(!emphasis_is_subtle(&[r(0, 7)], 10));
+        assert!(emphasis_is_subtle(&[], 0));
+        assert!(!emphasis_is_subtle(&[r(0, 1)], 0));
     }
 
     #[gpui::test]
@@ -10993,6 +11137,36 @@ mod tests {
         visual
             .debug_bounds("file-diff-row-added")
             .expect("added line row debug bounds");
+    }
+
+    #[gpui::test]
+    async fn modified_file_diff_renders_status_accent_bars(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_python_change();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open python changeset");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row_bounds = visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+
+        visual
+            .debug_bounds("file-diff-accent-removed")
+            .expect("removed accent bar debug bounds");
+        visual
+            .debug_bounds("file-diff-accent-added")
+            .expect("added accent bar debug bounds");
     }
 
     #[gpui::test]

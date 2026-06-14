@@ -414,7 +414,9 @@ Tabs answer to the mouse: a reviewer can drag one along its own row to reorder, 
 
 ## Inspecting a file's diff
 
-Opening a file in the change set presents its diff. For files that exist on both sides of the selection (modified or renamed files), the diff is shown side-by-side: the "before" state on the left, the "after" state on the right, with corresponding lines aligned. Added, removed, and modified lines are visually distinguished. The user can scroll both sides; the alignment is preserved as they scroll. Line numbers are shown for each side.
+Opening a file in the change set presents its diff. The diff fills the pane edge to edge below the tab bar; the tab itself names the file and colors it by change kind, so the pane adds no header of its own. For files that exist on both sides of the selection (modified or renamed files), the diff is shown side-by-side: the "before" state on the left, the "after" state on the right, with corresponding lines aligned and the two sides separated by a thin divider. The user can scroll both sides; the alignment is preserved as they scroll. Line numbers are shown for each side.
+
+Code is syntax-highlighted when the file's type is recognized; unrecognized types render as plain text. Changed lines read as color blocks: removed lines carry a red row tint and a red accent bar at the row's left edge, added lines the same in green. Within a modified line pair, the specific tokens that changed carry a stronger tint than the rest of the line, except when the pair differs almost entirely — a near-total rewrite reads as a whole-line change. Alignment gaps, where one side has no counterpart lines, render as a hatched region rather than blank space.
 
 For files that exist on only one side of the selection — added or deleted files — the diff is shown full-width as a single pane. An added file shows its post-add content full-width; a deleted file shows its pre-delete content full-width. The full-width treatment exists because an empty pane wastes screen space without conveying additional information.
 
@@ -424,10 +426,14 @@ For files that exist on only one side of the selection — added or deleted file
 
 **Observable outcomes**
 
-- Modified and renamed files render as a side-by-side diff with aligned, scroll-synchronized panes.
+- The diff content starts directly below the tab bar with no inner header, padding, or border.
+- Modified and renamed files render as a side-by-side diff with aligned, scroll-synchronized panes separated by a thin divider.
 - Added files render full-width showing the post-add content.
 - Deleted files render full-width showing the pre-delete content.
-- Added, removed, and modified lines are visually distinguished.
+- Removed lines show a red background tint and a red left-edge accent bar; added lines show the same in green.
+- Within a modified line pair, changed tokens carry a stronger background tint, unless the lines differ almost entirely.
+- Rows with no counterpart line on the other side render as a hatched region.
+- Files with a recognized type render syntax-highlighted; unrecognized types render as plain text.
 - Line numbers appear for each side of a side-by-side diff and for the single side of a full-width view.
 
 **Edge cases**
