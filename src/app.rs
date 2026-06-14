@@ -28,6 +28,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
 use crate::icons::LucideIcon;
@@ -84,6 +85,14 @@ pub struct App {
     /// RefCell because render paths take `&self`; ScrollHandle clones share
     /// their underlying state, so handing out clones is safe.
     pane_scrolls: RefCell<HashMap<crate::workspace::PaneId, PaneScrollState>>,
+    /// Computed diff rows for the changed-file detail view, keyed by file path
+    /// plus the commit/base shas they were derived from. `render_changed_file_detail`
+    /// runs on every App render; without this cache it would re-read the file from
+    /// git and recompute the line diff each time. Cleared whenever the changeset
+    /// selection changes (see `open_changeset`/`apply_open_repository`), so entries
+    /// never outlive the changeset they describe. `RefCell` because render paths
+    /// take `&self`; the `Rc` lets a cache hit hand back the rows without cloning.
+    diff_row_cache: RefCell<HashMap<DiffCacheKey, Rc<PreparedFileDiff>>>,
     /// While a tab drag hovers a pane's edge zone, the pane and the split
     /// direction its half-highlight previews. None when no edge is hovered.
     pub(crate) tab_drop_zone: Option<(crate::workspace::PaneId, crate::workspace::SplitDirection)>,
@@ -427,6 +436,7 @@ impl App {
             workspace: crate::workspace::Workspace::new(),
             file_tree_highlight_path: None,
             pane_scrolls: RefCell::new(HashMap::new()),
+            diff_row_cache: RefCell::new(HashMap::new()),
             tab_drop_zone: None,
             file_list_mode: FileListMode::Changed,
             settings,
@@ -535,6 +545,7 @@ impl App {
         self.review_screen = ReviewScreen::Graph;
         self.workspace = crate::workspace::Workspace::new();
         self.pane_scrolls.borrow_mut().clear();
+        self.diff_row_cache.borrow_mut().clear();
         self.file_tree_highlight_path = None;
         self.file_list_mode = FileListMode::Changed;
         self.collapsed_file_tree_paths.clear();
@@ -833,6 +844,7 @@ impl App {
                 // splits last only while the changeset stays open.
                 self.workspace = crate::workspace::Workspace::new();
                 self.pane_scrolls.borrow_mut().clear();
+                self.diff_row_cache.borrow_mut().clear();
                 self.file_tree_highlight_path = None;
                 self.file_tree_scroll.set_offset(point(px(0.), px(0.)));
                 self.file_tree_hscroll.set_offset(point(px(0.), px(0.)));
@@ -852,6 +864,7 @@ impl App {
         self.workspace.clear();
         self.file_tree_highlight_path = None;
         self.reset_pane_scrolls();
+        self.diff_row_cache.borrow_mut().clear();
         cx.notify();
     }
 
@@ -2546,6 +2559,41 @@ impl App {
         }
     }
 
+    /// The prepared diff for `file` in `changeset`, computed once and cached.
+    /// On a miss this reads the file from git and computes the line diff; on a
+    /// hit it returns the shared rows untouched. Read errors are not cached —
+    /// they are surfaced to the caller and recomputed on the next render.
+    fn prepared_file_diff(
+        &self,
+        repo: &repo::OpenRepository,
+        changeset: &repo::ChangeSet,
+        file: &repo::ChangedFile,
+    ) -> Result<Rc<PreparedFileDiff>, String> {
+        let key = DiffCacheKey {
+            path: file.path.clone(),
+            commit_sha: changeset.commit_sha.clone(),
+            base_sha: changeset.base_sha.clone(),
+        };
+
+        if let Some(cached) = self.diff_row_cache.borrow().get(&key) {
+            return Ok(cached.clone());
+        }
+
+        let diff = repo::file_diff_for_changed_file_between(
+            &repo.path,
+            &changeset.commit_sha,
+            changeset.base_sha.as_deref(),
+            file,
+        )
+        .map_err(|err| err.to_string())?;
+
+        let prepared = Rc::new(PreparedFileDiff::from_content(diff.content));
+        self.diff_row_cache
+            .borrow_mut()
+            .insert(key, prepared.clone());
+        Ok(prepared)
+    }
+
     fn render_changed_file_detail(
         &self,
         repo: &repo::OpenRepository,
@@ -2559,14 +2607,9 @@ impl App {
             "file-detail-rename-source-{}",
             debug_path_fragment(&file.path)
         );
-        let content = match repo::file_diff_for_changed_file_between(
-            &repo.path,
-            &changeset.commit_sha,
-            changeset.base_sha.as_deref(),
-            file,
-        ) {
-            Ok(diff) => render_file_diff_content(diff.content, scroll),
-            Err(err) => render_file_diff_error(err.to_string()),
+        let content = match self.prepared_file_diff(repo, changeset, file) {
+            Ok(prepared) => render_prepared_file_diff(&prepared, scroll),
+            Err(err) => render_file_diff_error(err),
         };
 
         div()
@@ -4542,9 +4585,10 @@ fn render_commit_graph_non_commit_connector(
         .child(connector_shape)
 }
 
-fn render_file_diff_content(content: repo::FileDiffContent, scroll: &FileDiffScroll) -> AnyElement {
-    match content {
-        repo::FileDiffContent::Single { side, text } => {
+fn render_prepared_file_diff(prepared: &PreparedFileDiff, scroll: &FileDiffScroll) -> AnyElement {
+    match prepared {
+        PreparedFileDiff::Single { side, rows } => {
+            let side = *side;
             let label = match side {
                 repo::DiffSide::Old => "Before",
                 repo::DiffSide::New => "After",
@@ -4553,21 +4597,20 @@ fn render_file_diff_content(content: repo::FileDiffContent, scroll: &FileDiffScr
                 repo::DiffSide::Old => "file-diff-side-old",
                 repo::DiffSide::New => "file-diff-side-new",
             };
-            let cells = single_side_diff_rows(side, &text)
-                .into_iter()
+            let cells = rows
+                .iter()
                 .map(|row| match side {
-                    repo::DiffSide::Old => row.old,
-                    repo::DiffSide::New => row.new,
+                    repo::DiffSide::Old => row.old.clone(),
+                    repo::DiffSide::New => row.new.clone(),
                 })
                 .collect::<Vec<_>>();
 
             render_file_diff_side(label, selector, cells, scroll.handle_for(side))
                 .into_any_element()
         }
-        repo::FileDiffContent::SideBySide { old_text, new_text } => {
-            let rows = side_by_side_diff_rows(&old_text, &new_text);
+        PreparedFileDiff::SideBySide { rows } => {
             let old_cells = rows.iter().map(|row| row.old.clone()).collect::<Vec<_>>();
-            let new_cells = rows.into_iter().map(|row| row.new).collect::<Vec<_>>();
+            let new_cells = rows.iter().map(|row| row.new.clone()).collect::<Vec<_>>();
 
             div()
                 .flex()
@@ -4588,21 +4631,25 @@ fn render_file_diff_content(content: repo::FileDiffContent, scroll: &FileDiffScr
                 ))
                 .into_any_element()
         }
-        repo::FileDiffContent::Binary => div()
-            .flex()
-            .flex_1()
-            .items_center()
-            .justify_center()
-            .border_1()
-            .border_color(rgb(0x2a2a2a))
-            .bg(rgb(0x141414))
-            .id("file-diff-binary")
-            .debug_selector(|| "file-diff-binary".to_string())
-            .text_color(rgb(0x999999))
-            .text_size(px(14.))
-            .child("No textual diff is available for this file.")
-            .into_any_element(),
+        PreparedFileDiff::Binary => render_binary_diff_placeholder(),
     }
+}
+
+fn render_binary_diff_placeholder() -> AnyElement {
+    div()
+        .flex()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .border_1()
+        .border_color(rgb(0x2a2a2a))
+        .bg(rgb(0x141414))
+        .id("file-diff-binary")
+        .debug_selector(|| "file-diff-binary".to_string())
+        .text_color(rgb(0x999999))
+        .text_size(px(14.))
+        .child("No textual diff is available for this file.")
+        .into_any_element()
 }
 
 fn render_file_content(content: repo::FileContentBody, scroll: &FileDiffScroll) -> AnyElement {
@@ -4618,9 +4665,7 @@ fn render_file_content(content: repo::FileContentBody, scroll: &FileDiffScroll) 
             )
             .into_any_element()
         }
-        repo::FileContentBody::Binary => {
-            render_file_diff_content(repo::FileDiffContent::Binary, scroll)
-        }
+        repo::FileContentBody::Binary => render_binary_diff_placeholder(),
     }
 }
 
@@ -4660,6 +4705,48 @@ struct DiffLineCell {
 struct DiffRow {
     old: DiffLineCell,
     new: DiffLineCell,
+}
+
+/// Identifies a cached diff: the changed file's path plus the commit and base
+/// shas it was diffed against. Two changesets that touch the same path produce
+/// different keys, so a stale entry is never served.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DiffCacheKey {
+    path: String,
+    commit_sha: String,
+    base_sha: Option<String>,
+}
+
+/// A changed file's diff content with the expensive work already done: the line
+/// diff computed and the per-side rows aligned. This is what the diff cache
+/// holds so `render_changed_file_detail` can rebuild its elements cheaply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreparedFileDiff {
+    Single {
+        side: repo::DiffSide,
+        rows: Vec<DiffRow>,
+    },
+    SideBySide {
+        rows: Vec<DiffRow>,
+    },
+    Binary,
+}
+
+impl PreparedFileDiff {
+    fn from_content(content: repo::FileDiffContent) -> Self {
+        match content {
+            repo::FileDiffContent::Single { side, text } => PreparedFileDiff::Single {
+                side,
+                rows: single_side_diff_rows(side, &text),
+            },
+            repo::FileDiffContent::SideBySide { old_text, new_text } => {
+                PreparedFileDiff::SideBySide {
+                    rows: side_by_side_diff_rows(&old_text, &new_text),
+                }
+            }
+            repo::FileDiffContent::Binary => PreparedFileDiff::Binary,
+        }
+    }
 }
 
 fn single_side_diff_rows(side: repo::DiffSide, text: &str) -> Vec<DiffRow> {
@@ -5633,16 +5720,16 @@ mod tests {
         debug_ref_label_fragment, side_by_side_diff_rows, single_side_diff_rows,
         visible_commit_shas, App, BranchFolderRow, BranchRow, BranchTreeRow, CloseChangeset,
         DiffLineStatus, FileListEntry, FileListMode, FileTreeRow, FolderVisibility, Mode,
-        OpenChangeset, OpenFailed, ReviewScreen, Selection, FILE_TREE_FOLDER_ICON_SIZE,
-        FILE_TREE_FONT_FAMILY, FILE_TREE_INDENT_WIDTH, FILE_TREE_ROW_HEIGHT,
-        FILE_TREE_STATUS_ICON_SIZE, FILE_TREE_TEXT_SIZE,
+        OpenChangeset, OpenFailed, PreparedFileDiff, ReviewScreen, Selection,
+        FILE_TREE_FOLDER_ICON_SIZE, FILE_TREE_FONT_FAMILY, FILE_TREE_INDENT_WIDTH,
+        FILE_TREE_ROW_HEIGHT, FILE_TREE_STATUS_ICON_SIZE, FILE_TREE_TEXT_SIZE,
     };
     use crate::graph::{self, GraphConnectorKind};
     use crate::repo::{self, ChangeKind, DiffSide, INITIAL_COMMIT_LIMIT};
     use crate::settings::{self, RecentRepository, Settings};
     use git2::{IndexAddOption, Repository, Signature};
     use gpui::{font, point, px, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
-    use std::{collections::BTreeSet, fs, path::PathBuf};
+    use std::{collections::BTreeSet, fs, path::PathBuf, rc::Rc};
 
     /// Open a window holding a freshly constructed `App`, with the
     /// gpui-component theme installed. The theme global is required by themed
@@ -9577,6 +9664,111 @@ mod tests {
         visual
             .debug_bounds("file-diff-side-new")
             .expect("new file diff side debug bounds");
+    }
+
+    #[gpui::test]
+    async fn prepared_file_diff_reuses_cached_rows_within_a_changeset(cx: &mut TestAppContext) {
+        let (dir, shas) = init_repo_with_three_commits();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(shas[1].clone(), cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open changeset");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, _cx| {
+                let repo = match &app.mode {
+                    Mode::RepoOpen { repo } => repo,
+                    Mode::NoRepo => panic!("expected an open repository"),
+                };
+                let changeset = match &app.review_screen {
+                    ReviewScreen::Changeset { changeset, .. } => changeset,
+                    ReviewScreen::Graph => panic!("expected the changeset screen"),
+                };
+                let file = &changeset.files[0];
+
+                let first = app
+                    .prepared_file_diff(repo, changeset, file)
+                    .expect("prepare diff");
+                // The computed rows are non-empty for a real text change.
+                match first.as_ref() {
+                    PreparedFileDiff::SideBySide { rows } => assert!(!rows.is_empty()),
+                    other => panic!("expected a side-by-side diff, got {other:?}"),
+                }
+
+                let second = app
+                    .prepared_file_diff(repo, changeset, file)
+                    .expect("prepare diff again");
+
+                assert!(
+                    Rc::ptr_eq(&first, &second),
+                    "a repeated call should return the cached rows, not recompute them"
+                );
+                assert_eq!(
+                    app.diff_row_cache.borrow().len(),
+                    1,
+                    "only one entry should be cached for the single rendered file"
+                );
+            })
+            .expect("inspect cache");
+    }
+
+    #[gpui::test]
+    async fn changing_changeset_selection_invalidates_diff_cache(cx: &mut TestAppContext) {
+        let (dir, shas) = init_repo_with_three_commits();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(shas[1].clone(), cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open first changeset");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, _cx| {
+                let repo = match &app.mode {
+                    Mode::RepoOpen { repo } => repo,
+                    Mode::NoRepo => panic!("expected an open repository"),
+                };
+                let changeset = match &app.review_screen {
+                    ReviewScreen::Changeset { changeset, .. } => changeset,
+                    ReviewScreen::Graph => panic!("expected the changeset screen"),
+                };
+                let file = &changeset.files[0];
+                app.prepared_file_diff(repo, changeset, file)
+                    .expect("prime cache");
+                assert_eq!(app.diff_row_cache.borrow().len(), 1);
+            })
+            .expect("prime cache");
+
+        // Selecting and opening a different changeset must clear the cache so a
+        // later render recomputes against the new commit.
+        window
+            .update(cx, |app, window, cx| {
+                app.select_single_commit(shas[0].clone(), cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open second changeset");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, _cx| {
+                assert!(
+                    app.diff_row_cache.borrow().is_empty(),
+                    "switching changesets should invalidate the diff cache"
+                );
+            })
+            .expect("verify invalidation");
     }
 
     #[gpui::test]
