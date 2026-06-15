@@ -13,11 +13,11 @@ pub use path_picker::{repository_prompt_options, GpuiPathPicker, PathPicker, Pat
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, canvas, div, pattern_slash, point, px, rgb, rgba, AnyElement, AppContext, Background,
-    ClickEvent, Context, Entity, EventEmitter, FocusHandle, HighlightStyle, Hsla,
-    InteractiveElement, IntoElement, Modifiers, ParentElement, PathBuilder, Pixels, Render,
+    actions, canvas, div, pattern_slash, point, px, rgb, rgba, uniform_list, AnyElement,
+    AppContext, Background, ClickEvent, Context, Entity, EventEmitter, FocusHandle, HighlightStyle,
+    Hsla, InteractiveElement, IntoElement, Modifiers, ParentElement, PathBuilder, Pixels, Render,
     ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledText, TextStyle,
-    Window,
+    UniformListScrollHandle, Window,
 };
 use gpui_component::notification::{Notification, NotificationList};
 use gpui_component::resizable::{h_resizable, resizable_panel, ResizableState};
@@ -140,9 +140,9 @@ pub struct App {
 
 #[derive(Clone)]
 pub(crate) struct FileDiffScroll {
-    old: ScrollHandle,
-    new: ScrollHandle,
-    side_by_side: ScrollHandle,
+    old: UniformListScrollHandle,
+    new: UniformListScrollHandle,
+    side_by_side: UniformListScrollHandle,
 }
 
 /// One pane's scroll handles: the tab strip plus the diff content sides.
@@ -164,13 +164,13 @@ impl PaneScrollState {
 impl FileDiffScroll {
     fn new() -> Self {
         Self {
-            old: ScrollHandle::new(),
-            new: ScrollHandle::new(),
-            side_by_side: ScrollHandle::new(),
+            old: UniformListScrollHandle::new(),
+            new: UniformListScrollHandle::new(),
+            side_by_side: UniformListScrollHandle::new(),
         }
     }
 
-    fn handle_for(&self, side: repo::DiffSide) -> &ScrollHandle {
+    fn handle_for(&self, side: repo::DiffSide) -> &UniformListScrollHandle {
         match side {
             repo::DiffSide::Old => &self.old,
             repo::DiffSide::New => &self.new,
@@ -179,9 +179,19 @@ impl FileDiffScroll {
 
     fn reset(&self) {
         let origin = point(px(0.), px(0.));
-        self.old.set_offset(origin);
-        self.new.set_offset(origin);
-        self.side_by_side.set_offset(origin);
+        self.old.0.borrow().base_handle.set_offset(origin);
+        self.new.0.borrow().base_handle.set_offset(origin);
+        self.side_by_side.0.borrow().base_handle.set_offset(origin);
+    }
+
+    #[cfg(test)]
+    fn side_by_side_offset(&self) -> gpui::Point<gpui::Pixels> {
+        self.side_by_side.0.borrow().base_handle.offset()
+    }
+
+    #[cfg(test)]
+    fn side_by_side_max_offset(&self) -> gpui::Size<gpui::Pixels> {
+        self.side_by_side.0.borrow().base_handle.max_offset()
     }
 }
 
@@ -1279,24 +1289,21 @@ impl App {
     fn file_diff_old_scroll_offset(&self) -> gpui::Point<gpui::Pixels> {
         self.pane_scroll(self.workspace.active_pane())
             .diff
-            .side_by_side
-            .offset()
+            .side_by_side_offset()
     }
 
     #[cfg(test)]
     fn file_diff_new_scroll_offset(&self) -> gpui::Point<gpui::Pixels> {
         self.pane_scroll(self.workspace.active_pane())
             .diff
-            .side_by_side
-            .offset()
+            .side_by_side_offset()
     }
 
     #[cfg(test)]
     fn file_diff_new_scroll_max_offset(&self) -> gpui::Size<gpui::Pixels> {
         self.pane_scroll(self.workspace.active_pane())
             .diff
-            .side_by_side
-            .max_offset()
+            .side_by_side_max_offset()
     }
 
     fn render_no_repo(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -4640,7 +4647,8 @@ fn render_prepared_file_diff(prepared: &PreparedFileDiff, scroll: &FileDiffScrol
                 })
                 .collect::<Vec<_>>();
 
-            render_file_diff_side(selector, cells, scroll.handle_for(side)).into_any_element()
+            render_file_diff_side(selector, cells, scroll.handle_for(side).clone())
+                .into_any_element()
         }
         PreparedFileDiff::SideBySide { rows } => {
             let old_cells = rows.iter().map(|row| row.old.clone()).collect::<Vec<_>>();
@@ -4653,13 +4661,13 @@ fn render_prepared_file_diff(prepared: &PreparedFileDiff, scroll: &FileDiffScrol
                 .child(render_file_diff_side(
                     "file-diff-side-old",
                     old_cells,
-                    &scroll.side_by_side,
+                    scroll.side_by_side.clone(),
                 ))
                 .child(div().w(px(1.)).flex_none().bg(rgb(0x2a2a2a)))
                 .child(render_file_diff_side(
                     "file-diff-side-new",
                     new_cells,
-                    &scroll.side_by_side,
+                    scroll.side_by_side.clone(),
                 ))
                 .into_any_element()
         }
@@ -4701,7 +4709,7 @@ fn render_file_content(
             render_file_diff_side(
                 "file-read-only-content",
                 cells,
-                scroll.handle_for(repo::DiffSide::New),
+                scroll.handle_for(repo::DiffSide::New).clone(),
             )
             .into_any_element()
         }
@@ -4981,44 +4989,25 @@ fn read_only_file_cells(text: &str) -> Vec<DiffLineCell> {
 fn render_file_diff_side(
     selector: &'static str,
     cells: Vec<DiffLineCell>,
-    scroll_handle: &ScrollHandle,
+    scroll_handle: UniformListScrollHandle,
 ) -> impl IntoElement {
-    let scroll_selector = match selector {
-        "file-diff-side-old" => "file-diff-side-old-scroll",
-        "file-diff-side-new" => "file-diff-side-new-scroll",
-        _ => "file-diff-side-scroll",
-    };
-
-    div()
-        .flex()
-        .flex_col()
-        .flex_1()
-        .h_full()
-        .min_h_0()
-        .min_w_0()
-        .overflow_hidden()
-        .bg(rgb(0x171717))
-        .id(selector)
-        .debug_selector(move || selector.to_string())
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h_0()
-                .id(scroll_selector)
-                .debug_selector(move || scroll_selector.to_string())
-                .overflow_y_scroll()
-                .scrollbar_width(px(12.))
-                .track_scroll(scroll_handle)
-                .children(
-                    cells
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, cell)| render_file_diff_line(selector, index, cell))
-                        .collect::<Vec<_>>(),
-                ),
-        )
+    uniform_list(selector, cells.len(), move |range, _window, _cx| {
+        range
+            .map(|index| render_file_diff_line(selector, index, cells[index].clone()))
+            .collect::<Vec<_>>()
+    })
+    .flex_1()
+    .h_full()
+    .min_h_0()
+    .min_w_0()
+    .bg(rgb(0x171717))
+    // Reserve the same 12px right gutter the pre-virtualization scroll area
+    // held via `scrollbar_width`. `UniformList` does not implement
+    // `StatefulInteractiveElement`, so that modifier is unavailable; right
+    // padding insets the rows identically and keeps the diff's appearance.
+    .pr(px(12.))
+    .track_scroll(scroll_handle)
+    .debug_selector(move || selector.to_string())
 }
 
 fn render_file_diff_line(
@@ -5042,7 +5031,7 @@ fn render_file_diff_line(
 
     div()
         .flex()
-        .min_h(px(DIFF_LINE_HEIGHT))
+        .h(px(DIFF_LINE_HEIGHT))
         .bg(diff_line_fill(cell.status))
         .id(("file-diff-line", id_index))
         .debug_selector(move || row_selector.to_string())
@@ -5067,6 +5056,7 @@ fn render_file_diff_line(
                 .text_size(px(12.))
                 .line_height(px(DIFF_LINE_HEIGHT))
                 .font_family("monospace")
+                .debug_selector(move || diff_line_index_selector(pane_selector, row_index))
                 .child(line_number),
         )
         .child(
@@ -5083,6 +5073,19 @@ fn render_file_diff_line(
                     )
                 }),
         )
+}
+
+/// Per-row debug selector encoding the column side and row index, e.g.
+/// `file-diff-line-new-12`. Called from a `debug_selector` closure, so it runs
+/// only in test/test-support builds and only for rows the virtualized list
+/// actually renders — which is what lets a test prove off-screen rows are absent.
+fn diff_line_index_selector(pane_selector: &str, row_index: usize) -> String {
+    let side = match pane_selector {
+        "file-diff-side-old" => "old",
+        "file-diff-side-new" => "new",
+        _ => "single",
+    };
+    format!("file-diff-line-{side}-{row_index}")
 }
 
 /// Row height for one diff line: tall enough to contain the 12px monospace
@@ -11709,8 +11712,8 @@ mod tests {
         visual.simulate_resize(size(px(700.), px(320.)));
 
         let scroll_bounds = visual
-            .debug_bounds("file-diff-side-new-scroll")
-            .expect("new file diff scroll debug bounds");
+            .debug_bounds("file-diff-side-new")
+            .expect("new file diff side debug bounds");
         let max_offset = window
             .read_with(cx, |app, _cx| app.file_diff_new_scroll_max_offset())
             .expect("read new diff scroll max offset");
@@ -11760,8 +11763,8 @@ mod tests {
         visual.simulate_resize(size(px(700.), px(320.)));
 
         let scroll_bounds = visual
-            .debug_bounds("file-diff-side-new-scroll")
-            .expect("new file diff scroll debug bounds");
+            .debug_bounds("file-diff-side-new")
+            .expect("new file diff side debug bounds");
         let old_before = window
             .read_with(cx, |app, _cx| app.file_diff_old_scroll_offset())
             .expect("read old diff scroll offset before wheel");
@@ -11819,8 +11822,8 @@ mod tests {
         visual.simulate_resize(size(px(700.), px(320.)));
 
         let scroll_bounds = visual
-            .debug_bounds("file-diff-side-old-scroll")
-            .expect("old file diff scroll debug bounds");
+            .debug_bounds("file-diff-side-old")
+            .expect("old file diff side debug bounds");
         let old_before = window
             .read_with(cx, |app, _cx| app.file_diff_old_scroll_offset())
             .expect("read old diff scroll offset before wheel");
@@ -11852,6 +11855,43 @@ mod tests {
         assert_eq!(
             old_after.y, new_after.y,
             "new side should stay aligned with old side"
+        );
+    }
+
+    #[gpui::test]
+    async fn diff_view_virtualizes_offscreen_rows(cx: &mut TestAppContext) {
+        use gpui::size;
+
+        let (dir, oid_hex) = init_repo_with_long_diff();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.open_file_preview("long.txt".to_string(), cx);
+            })
+            .expect("open long diff");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        // The diff rewrites 160 lines, so the content (>=160 rows x 20px) far
+        // exceeds this 320px-tall viewport (~16 rows visible).
+        visual.simulate_resize(size(px(700.), px(320.)));
+
+        // The first row is on screen and must be materialized.
+        visual
+            .debug_bounds("file-diff-line-new-0")
+            .expect("first diff row should be materialized");
+
+        // Row 150 sits ~3000px down, far past the viewport, and must NOT be
+        // built while off screen. That asymmetry is the proof of virtualization.
+        assert!(
+            visual.debug_bounds("file-diff-line-new-150").is_none(),
+            "row 150 is far below the viewport and must not be materialized"
         );
     }
 
