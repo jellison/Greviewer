@@ -35,6 +35,7 @@ pub(crate) fn branch_key(name: &str, kind: &repo::BranchKind) -> String {
 pub(crate) fn build_branch_sidebar_rows(
     branches: &[repo::Branch],
     collapsed_folders: &BTreeSet<String>,
+    collapsed_sections: &BTreeSet<String>,
     hidden_branches: &BTreeSet<String>,
 ) -> Vec<BranchTreeRow> {
     let (local, remote): (Vec<_>, Vec<_>) = branches
@@ -43,29 +44,58 @@ pub(crate) fn build_branch_sidebar_rows(
         .partition(|branch| matches!(branch.kind, repo::BranchKind::Local));
 
     let mut rows = Vec::new();
-    if !local.is_empty() {
-        rows.push(BranchTreeRow::Section(BranchSectionRow {
-            title: "Local".to_string(),
-        }));
-        rows.extend(build_branch_tree_rows(
-            &local,
-            "heads",
-            collapsed_folders,
-            hidden_branches,
-        ));
-    }
-    if !remote.is_empty() {
-        rows.push(BranchTreeRow::Section(BranchSectionRow {
-            title: "Remote".to_string(),
-        }));
-        rows.extend(build_branch_tree_rows(
-            &remote,
-            "remotes",
-            collapsed_folders,
-            hidden_branches,
-        ));
-    }
+    append_branch_section(
+        &mut rows,
+        "Local",
+        "heads",
+        &local,
+        collapsed_folders,
+        collapsed_sections,
+        hidden_branches,
+    );
+    append_branch_section(
+        &mut rows,
+        "Remote",
+        "remotes",
+        &remote,
+        collapsed_folders,
+        collapsed_sections,
+        hidden_branches,
+    );
     rows
+}
+
+/// Append one sidebar section: a header carrying the branch count and collapse
+/// state, followed by the branch tree unless the section is collapsed. A
+/// section with no branches contributes nothing.
+fn append_branch_section(
+    rows: &mut Vec<BranchTreeRow>,
+    title: &str,
+    key: &str,
+    branches: &[repo::Branch],
+    collapsed_folders: &BTreeSet<String>,
+    collapsed_sections: &BTreeSet<String>,
+    hidden_branches: &BTreeSet<String>,
+) {
+    if branches.is_empty() {
+        return;
+    }
+
+    let collapsed = collapsed_sections.contains(key);
+    rows.push(BranchTreeRow::Section(BranchSectionRow {
+        title: title.to_string(),
+        key: key.to_string(),
+        count: branches.len(),
+        collapsed,
+    }));
+    if !collapsed {
+        rows.extend(build_branch_tree_rows(
+            branches,
+            key,
+            collapsed_folders,
+            hidden_branches,
+        ));
+    }
 }
 
 /// Group branches into folders by `/`-separated name segments and flatten
@@ -350,7 +380,12 @@ mod tests {
             remote_branch("upstream", "main", "sha-upstream-main"),
         ];
 
-        let rows = build_branch_sidebar_rows(&branches, &BTreeSet::new(), &BTreeSet::new());
+        let rows = build_branch_sidebar_rows(
+            &branches,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
 
         let summary = rows
             .iter()
@@ -387,7 +422,12 @@ mod tests {
     #[test]
     fn sidebar_rows_omit_empty_sections() {
         let local_only = vec![local_branch("main", "sha-main")];
-        let rows = build_branch_sidebar_rows(&local_only, &BTreeSet::new(), &BTreeSet::new());
+        let rows = build_branch_sidebar_rows(
+            &local_only,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
         assert!(
             !rows.iter().any(|row| matches!(
                 row,
@@ -397,13 +437,84 @@ mod tests {
         );
 
         let remote_only = vec![remote_branch("origin", "main", "sha-remote")];
-        let rows = build_branch_sidebar_rows(&remote_only, &BTreeSet::new(), &BTreeSet::new());
+        let rows = build_branch_sidebar_rows(
+            &remote_only,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
         assert!(
             !rows.iter().any(|row| matches!(
                 row,
                 BranchTreeRow::Section(section) if section.title == "Local"
             )),
             "no Local section without local branches",
+        );
+    }
+
+    #[test]
+    fn section_rows_carry_their_branch_counts() {
+        let branches = vec![
+            local_branch("main", "sha-main"),
+            local_branch("feature", "sha-feature"),
+            remote_branch("origin", "main", "sha-remote-main"),
+        ];
+
+        let rows = build_branch_sidebar_rows(
+            &branches,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+
+        let sections = rows
+            .iter()
+            .filter_map(|row| match row {
+                BranchTreeRow::Section(section) => Some((section.title.clone(), section.count)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sections,
+            vec![("Local".to_string(), 2), ("Remote".to_string(), 1)],
+            "each section header reports the number of branches it contains",
+        );
+    }
+
+    #[test]
+    fn collapsed_section_omits_its_child_rows() {
+        let branches = vec![
+            local_branch("main", "sha-main"),
+            remote_branch("origin", "main", "sha-remote"),
+        ];
+        let collapsed_sections = ["heads".to_string()].into_iter().collect();
+
+        let rows = build_branch_sidebar_rows(
+            &branches,
+            &BTreeSet::new(),
+            &collapsed_sections,
+            &BTreeSet::new(),
+        );
+
+        let summary = rows
+            .iter()
+            .map(|row| match row {
+                BranchTreeRow::Section(section) => {
+                    format!("section:{}:{}", section.title, section.collapsed)
+                }
+                BranchTreeRow::Folder(folder) => format!("folder:{}", folder.path),
+                BranchTreeRow::Branch(branch_row) => format!("branch:{}", branch_row.branch.name),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            vec![
+                "section:Local:true".to_string(),
+                "section:Remote:false".to_string(),
+                "folder:remotes/origin".to_string(),
+                "branch:origin/main".to_string(),
+            ],
+            "a collapsed section keeps its header (marked collapsed) but drops every descendant row",
         );
     }
 
@@ -415,7 +526,8 @@ mod tests {
         ];
         let collapsed = ["heads/origin".to_string()].into_iter().collect();
 
-        let rows = build_branch_sidebar_rows(&branches, &collapsed, &BTreeSet::new());
+        let rows =
+            build_branch_sidebar_rows(&branches, &collapsed, &BTreeSet::new(), &BTreeSet::new());
 
         let branch_kinds = rows
             .iter()
@@ -1066,5 +1178,137 @@ mod tests {
                 assert_eq!(app.selection, Selection::None);
             })
             .expect("read selection");
+    }
+
+    /// Rebuild the flat sidebar rows from an open app's current state, the way
+    /// `render_branch_sidebar` does. Lets collapse tests assert against the
+    /// model rather than the last-drawn frame.
+    fn rebuild_sidebar_rows(app: &App) -> Vec<BranchTreeRow> {
+        let Mode::RepoOpen { repo } = &app.mode else {
+            panic!("expected RepoOpen mode");
+        };
+        build_branch_sidebar_rows(
+            &repo.branches,
+            &app.collapsed_branch_folders,
+            &app.collapsed_branch_sections,
+            &app.hidden_branches,
+        )
+    }
+
+    fn local_branch_rows_present(app: &App) -> bool {
+        rebuild_sidebar_rows(app).iter().any(|row| {
+            matches!(row, BranchTreeRow::Branch(b) if matches!(b.branch.kind, repo::BranchKind::Local))
+        })
+    }
+
+    fn remote_branch_rows_present(app: &App) -> bool {
+        rebuild_sidebar_rows(app).iter().any(|row| {
+            matches!(row, BranchTreeRow::Branch(b) if matches!(b.branch.kind, repo::BranchKind::Remote { .. }))
+        })
+    }
+
+    #[gpui::test]
+    async fn section_header_renders_its_icon_and_count(cx: &mut TestAppContext) {
+        let (dir, _root, _remote_tip) = init_repo_with_remote_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("branch-section-icon-local")
+            .expect("the Local section header renders its icon");
+        visual
+            .debug_bounds("branch-section-count-local")
+            .expect("the Local section header renders its branch count");
+        visual
+            .debug_bounds("branch-section-icon-remote")
+            .expect("the Remote section header renders its icon");
+        visual
+            .debug_bounds("branch-section-count-remote")
+            .expect("the Remote section header renders its branch count");
+    }
+
+    #[gpui::test]
+    async fn clicking_a_section_header_collapses_and_expands_the_section(cx: &mut TestAppContext) {
+        let (dir, _root, _remote_tip) = init_repo_with_remote_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let header = visual
+            .debug_bounds("branch-section-local")
+            .expect("the Local section header renders");
+        visual.simulate_click(header.center(), Modifiers::none());
+
+        // Verify collapse through the rows builder, mirroring the folder-row
+        // collapse test: debug_bounds reflects the last drawn frame, which is
+        // unreliable to assert against immediately after a click.
+        window
+            .update(cx, |app, _window, _cx| {
+                assert!(
+                    app.collapsed_branch_sections.contains("heads"),
+                    "clicking the Local header collapses the heads section"
+                );
+                assert!(
+                    !local_branch_rows_present(app),
+                    "the collapsed Local section hides its branch rows"
+                );
+                assert!(
+                    remote_branch_rows_present(app),
+                    "collapsing Local leaves the Remote section expanded"
+                );
+            })
+            .expect("read state after collapse");
+
+        // Click the header again (its position is unchanged) to expand.
+        visual.simulate_click(header.center(), Modifiers::none());
+
+        window
+            .update(cx, |app, _window, _cx| {
+                assert!(
+                    app.collapsed_branch_sections.is_empty(),
+                    "a second click expands the section"
+                );
+                assert!(
+                    local_branch_rows_present(app),
+                    "the expanded Local section shows its branch rows again"
+                );
+            })
+            .expect("read state after expand");
+    }
+
+    #[gpui::test]
+    async fn reopening_a_repository_expands_all_sections(cx: &mut TestAppContext) {
+        let (dir, _root, _remote_tip) = init_repo_with_remote_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path.clone(), window, cx);
+                app.toggle_branch_section("heads".to_string(), cx);
+                assert!(app.collapsed_branch_sections.contains("heads"));
+
+                app.open_repository_at(path, window, cx);
+                assert!(
+                    app.collapsed_branch_sections.is_empty(),
+                    "reopening must reset section collapse state"
+                );
+            })
+            .expect("open, collapse, reopen");
     }
 }

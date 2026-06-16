@@ -109,17 +109,19 @@ The user sees a graphical history of the repository's commits with branch lanes 
 
 ## Navigating branches from the sidebar
 
-Graph mode includes a sidebar beside the graph listing the repository's branches. The list is split into a Local section and a Remote section. The Local section holds the repository's local branches; the Remote section holds remote-tracking branches, grouped under one collapsible folder per remote so multiple remotes stay separate. Within either section, branch names containing `/` nest under collapsible folders (see "Nesting branches in sidebar folders" below). Tags are excluded. Remote branch entries render visually distinct from local entries. The checked-out branch carries a visual marker. Activating a branch focuses it in the graph: the branch's tip commit becomes the selected commit and the graph scrolls so that commit is visible. The divider between the sidebar and the graph is draggable to resize the sidebar. The sidebar exists only in graph mode; review mode shows the file tree in its place.
+Graph mode includes a sidebar beside the graph listing the repository's branches. The list is split into a Local section and a Remote section. Each section is introduced by a header that bears a distinguishing icon, the section's name, and a count of the branches the section contains; the header also acts as a collapse control for the whole section (see "Collapsing a section" below). The Local section holds the repository's local branches; the Remote section holds remote-tracking branches, grouped under one collapsible folder per remote so multiple remotes stay separate. Within either section, branch names containing `/` nest under collapsible folders (see "Nesting branches in sidebar folders" below). Tags are excluded. Remote branch entries render visually distinct from local entries. The checked-out branch carries a visual marker. Activating a branch focuses it in the graph: the branch's tip commit becomes the selected commit and the graph scrolls so that commit is visible. The divider between the sidebar and the graph is draggable to resize the sidebar. The sidebar exists only in graph mode; review mode shows the file tree in its place.
 
 **Triggering conditions**
 
 - A repository is open and the window is in graph mode.
 - The user activates a branch entry in the sidebar.
+- The user activates a section header to collapse or expand the section.
 - The user drags the divider between the sidebar and the graph.
 
 **Observable outcomes**
 
 - The sidebar lists every local branch under the Local section and every remote-tracking branch under its remote's folder in the Remote section, alphabetically within each folder level, with the checked-out branch visually marked.
+- Each section header shows a distinguishing icon, the section's name, and the number of branches the section contains.
 - A section with no branches does not appear; a repository with no remotes shows no Remote section.
 - Activating a branch selects its tip commit and scrolls the graph so the commit is visible.
 - A branch entry whose tip commit is the current selection is visually distinct, using the same selected treatment as the commit row.
@@ -133,6 +135,26 @@ Graph mode includes a sidebar beside the graph listing the repository's branches
 - Activating a branch whose tip commit has not yet been loaded into the visible history loads older history until the tip appears, then selects and reveals it.
 - Activating a branch whose tip is already the selected commit keeps that selection; it does not clear it.
 - When the branch list exceeds the sidebar's height, it scrolls; a scrollbar appears while the pointer is over the sidebar and stays out of the way otherwise.
+
+## Collapsing a section
+
+Activating a section header collapses or expands the whole section. Collapsing
+is purely visual: the section's rows — folders and branches alike — leave the
+sidebar, but graph visibility does not change, and branches hidden from the
+graph stay hidden while the section is collapsed. The header reflects the
+collapsed state, and the count it shows always reports every branch the section
+contains, regardless of collapse state or whether individual branches are
+hidden from the graph. Sections start expanded, and collapse state is not
+persisted: opening a repository expands both sections.
+
+**Observable outcomes**
+
+- Activating a section header removes that section's rows from the sidebar;
+  activating it again restores them. Graph contents are unchanged either way.
+- The count in a section header reports the total number of branches the
+  section contains and does not change when the section is collapsed or when
+  branches are hidden from the graph.
+- Reopening a repository expands both sections.
 
 ## Nesting branches in sidebar folders
 

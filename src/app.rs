@@ -140,6 +140,10 @@ pub struct App {
     /// whenever a repository is opened. Folders default to expanded, so an
     /// empty set means every folder shows its contents.
     collapsed_branch_folders: BTreeSet<String>,
+    /// Sidebar section keys (`heads` / `remotes`) the user has collapsed.
+    /// Session-only: cleared whenever a repository is opened. Sections default
+    /// to expanded, so an empty set means both sections show their branches.
+    collapsed_branch_sections: BTreeSet<String>,
     /// Sidebar row index the cursor is currently over, if any. Gates the
     /// hover-revealed visibility toggle on visible branches.
     hovered_branch_row: Option<usize>,
@@ -315,11 +319,21 @@ enum BranchTreeRow {
     Branch(BranchRow),
 }
 
-/// Non-interactive header introducing the Local or Remote half of the
-/// sidebar.
+/// Header introducing the Local or Remote half of the sidebar. Clicking it
+/// collapses or expands the whole section; the header shows a section icon and
+/// a count of the branches it contains.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BranchSectionRow {
+    /// User-facing label, e.g. "Local" or "Remote".
     title: String,
+    /// Ref-namespace key (`heads` / `remotes`); keys collapse state and
+    /// selects the section icon.
+    key: String,
+    /// Number of branches the section contains (leaf refs, ignoring hidden and
+    /// collapse state).
+    count: usize,
+    /// Whether the section is collapsed, hiding its descendant rows.
+    collapsed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -488,6 +502,7 @@ impl App {
             branch_sidebar_hovered: false,
             hidden_branches: BTreeSet::new(),
             collapsed_branch_folders: BTreeSet::new(),
+            collapsed_branch_sections: BTreeSet::new(),
             hovered_branch_row: None,
             focus_handle,
             context_popover_open: false,
@@ -592,6 +607,7 @@ impl App {
         self.branch_sidebar_hovered = false;
         self.hidden_branches.clear();
         self.collapsed_branch_folders.clear();
+        self.collapsed_branch_sections.clear();
         self.hovered_branch_row = None;
         self.file_tree_hovered = false;
         self.context_popover_open = false;
@@ -658,6 +674,16 @@ impl App {
     pub(crate) fn toggle_branch_folder(&mut self, path: String, cx: &mut Context<Self>) {
         if !self.collapsed_branch_folders.insert(path.clone()) {
             self.collapsed_branch_folders.remove(&path);
+        }
+        cx.notify();
+    }
+
+    /// Collapse or expand a whole sidebar section (Local or Remote, keyed by
+    /// its ref namespace `heads` / `remotes`). Purely visual: removes the
+    /// section's descendant rows without touching graph visibility.
+    pub(crate) fn toggle_branch_section(&mut self, key: String, cx: &mut Context<Self>) {
+        if !self.collapsed_branch_sections.insert(key.clone()) {
+            self.collapsed_branch_sections.remove(&key);
         }
         cx.notify();
     }
@@ -1629,6 +1655,7 @@ impl App {
             let rows = build_branch_sidebar_rows(
                 &repo.branches,
                 &self.collapsed_branch_folders,
+                &self.collapsed_branch_sections,
                 &self.hidden_branches,
             );
             let rows = rows
@@ -1636,7 +1663,7 @@ impl App {
                 .enumerate()
                 .map(|(index, row)| match row {
                     BranchTreeRow::Section(section) => self
-                        .render_branch_section_row(index, section)
+                        .render_branch_section_row(index, section, cx)
                         .into_any_element(),
                     BranchTreeRow::Folder(folder) => self
                         .render_branch_folder_row(index, folder, cx)
@@ -1829,23 +1856,74 @@ impl App {
         &self,
         index: usize,
         section: &BranchSectionRow,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let selector = format!(
-            "branch-section-{}",
-            debug_ref_label_fragment(&section.title)
-        );
+        let fragment = debug_ref_label_fragment(&section.title);
+        let row_selector = format!("branch-section-{fragment}");
+        let icon_selector = format!("branch-section-icon-{fragment}");
+        let count_selector = format!("branch-section-count-{fragment}");
+        let section_icon = if section.key == "remotes" {
+            LucideIcon::Cloud
+        } else {
+            LucideIcon::Monitor
+        };
+        let toggle_key = section.key.clone();
+
         div()
             .flex()
             .items_center()
             .w_full()
             .h(px(FILE_TREE_ROW_HEIGHT))
+            .gap_2()
             .px_3()
             .bg(rgb(0x171717))
+            .border_b_1()
+            .border_color(rgb(0x242424))
+            .cursor_pointer()
             .id(("branch-section", index))
-            .debug_selector(move || selector.clone())
-            .text_color(rgb(0x999999))
-            .text_size(px(FILE_TREE_TEXT_SIZE))
-            .child(section.title.clone())
+            .debug_selector(move || row_selector.clone())
+            .hover(|style| style.bg(rgb(0x1f2733)))
+            .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
+                app.toggle_branch_section(toggle_key.clone(), cx);
+            }))
+            .child(
+                Icon::new(if section.collapsed {
+                    LucideIcon::ChevronRight
+                } else {
+                    LucideIcon::ChevronDown
+                })
+                .text_color(rgb(0x999999))
+                .size(px(FILE_TREE_STATUS_ICON_SIZE)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
+                    .debug_selector(move || icon_selector.clone())
+                    .child(
+                        Icon::new(section_icon)
+                            .text_color(rgb(0x999999))
+                            .size(px(FILE_TREE_STATUS_ICON_SIZE)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_color(rgb(0x999999))
+                    .text_size(px(FILE_TREE_TEXT_SIZE))
+                    .truncate()
+                    .child(section.title.to_uppercase()),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(rgb(0x999999))
+                    .text_size(px(FILE_TREE_TEXT_SIZE))
+                    .debug_selector(move || count_selector.clone())
+                    .child(section.count.to_string()),
+            )
     }
 
     fn render_branch_folder_row(
