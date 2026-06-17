@@ -82,11 +82,17 @@ fn append_branch_section(
     }
 
     let collapsed = collapsed_sections.contains(key);
+    // Draw a separating top border only when this header follows content rows.
+    // Headers stacking directly (a collapsed section above) lean on the upper
+    // header's bottom border, and the topmost header leans on the sidebar's own
+    // border; either way a top border here would double up.
+    let top_border = !matches!(rows.last(), None | Some(BranchTreeRow::Section(_)));
     rows.push(BranchTreeRow::Section(BranchSectionRow {
         title: title.to_string(),
         key: key.to_string(),
         count: branches.len(),
         collapsed,
+        top_border,
     }));
     if !collapsed {
         rows.extend(build_branch_tree_rows(
@@ -515,6 +521,81 @@ mod tests {
                 "branch:origin/main".to_string(),
             ],
             "a collapsed section keeps its header (marked collapsed) but drops every descendant row",
+        );
+    }
+
+    fn section_top_borders(rows: &[BranchTreeRow]) -> Vec<(String, bool)> {
+        rows.iter()
+            .filter_map(|row| match row {
+                BranchTreeRow::Section(section) => {
+                    Some((section.title.clone(), section.top_border))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn remote_section_draws_a_top_border_below_expanded_local_rows() {
+        let branches = vec![
+            local_branch("main", "sha-main"),
+            remote_branch("origin", "main", "sha-remote"),
+        ];
+
+        let rows = build_branch_sidebar_rows(
+            &branches,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(
+            section_top_borders(&rows),
+            vec![("Local".to_string(), false), ("Remote".to_string(), true)],
+            "Local heads the list with no top border; Remote, sitting below the \
+             expanded local rows, draws one to close the group",
+        );
+    }
+
+    #[test]
+    fn stacked_section_headers_draw_no_top_border() {
+        // Local collapsed: the two headers stack directly, so Remote must not
+        // stack a top border atop Local's bottom border.
+        let branches = vec![
+            local_branch("main", "sha-main"),
+            remote_branch("origin", "main", "sha-remote"),
+        ];
+        let collapsed_sections = ["heads".to_string()].into_iter().collect();
+
+        let rows = build_branch_sidebar_rows(
+            &branches,
+            &BTreeSet::new(),
+            &collapsed_sections,
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(
+            section_top_borders(&rows),
+            vec![("Local".to_string(), false), ("Remote".to_string(), false)],
+            "with Local collapsed the headers stack; neither draws a top border",
+        );
+    }
+
+    #[test]
+    fn lone_remote_section_draws_no_top_border() {
+        let branches = vec![remote_branch("origin", "main", "sha-remote")];
+
+        let rows = build_branch_sidebar_rows(
+            &branches,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(
+            section_top_borders(&rows),
+            vec![("Remote".to_string(), false)],
+            "a Remote section at the top of the list relies on the sidebar's own border",
         );
     }
 
@@ -1208,6 +1289,64 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn branch_rows_render_a_leading_branch_icon(cx: &mut TestAppContext) {
+        let (dir, _main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let icon = visual
+            .debug_bounds("branch-icon-heads-feature")
+            .expect("a branch row renders a leading branch icon");
+        let row = visual
+            .debug_bounds("branch-row-heads-feature")
+            .expect("the branch row renders");
+        assert!(
+            icon.origin.x >= row.origin.x && icon.origin.x < row.center().x,
+            "the branch icon sits at the start of its row"
+        );
+        visual
+            .debug_bounds("branch-icon-heads-master")
+            .expect("the checked-out branch row also renders a branch icon");
+    }
+
+    #[gpui::test]
+    async fn branch_row_icon_renders_smaller_than_the_section_icon(cx: &mut TestAppContext) {
+        let (dir, _root, _remote_tip) = init_repo_with_remote_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let branch_icon = visual
+            .debug_bounds("branch-icon-heads-master")
+            .expect("the branch row renders its leading icon");
+        let section_icon = visual
+            .debug_bounds("branch-section-icon-local")
+            .expect("the section header renders its icon");
+        assert!(
+            branch_icon.size.width < section_icon.size.width,
+            "the branch-row icon should render slightly smaller than the section icon, \
+             got branch {:?} vs section {:?}",
+            branch_icon.size.width,
+            section_icon.size.width
+        );
+    }
+
+    #[gpui::test]
     async fn section_header_renders_its_icon_and_count(cx: &mut TestAppContext) {
         let (dir, _root, _remote_tip) = init_repo_with_remote_branches();
         let path = dir.path().to_path_buf();
@@ -1233,6 +1372,52 @@ mod tests {
         visual
             .debug_bounds("branch-section-count-remote")
             .expect("the Remote section header renders its branch count");
+    }
+
+    #[gpui::test]
+    async fn sidebar_rows_pad_inside_their_background_without_gaps(cx: &mut TestAppContext) {
+        let (dir, _main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let header = visual
+            .debug_bounds("branch-section-local")
+            .expect("the Local section header renders");
+        let feature = visual
+            .debug_bounds("branch-row-heads-feature")
+            .expect("the feature branch row renders");
+        let master = visual
+            .debug_bounds("branch-row-heads-master")
+            .expect("the master branch row renders");
+
+        // The breathing room is padding inside each row's border + background:
+        // the row box grows ~2px so the highlight fills it, and adjacent rows —
+        // group headings included — stay flush rather than showing a gap.
+        let row_height = feature.size.height;
+        assert!(
+            row_height > px(FILE_TREE_ROW_HEIGHT + 1.5)
+                && row_height < px(FILE_TREE_ROW_HEIGHT + 2.5),
+            "each row carries 1px of inner padding top and bottom, growing it ~2px, got {row_height:?}"
+        );
+
+        let header_to_feature = feature.origin.y - (header.origin.y + header.size.height);
+        let feature_to_master = master.origin.y - (feature.origin.y + feature.size.height);
+        assert!(
+            header_to_feature > px(-0.5) && header_to_feature < px(0.5),
+            "heading and first row sit flush; the spacing is inside the row, got {header_to_feature:?}"
+        );
+        assert!(
+            feature_to_master > px(-0.5) && feature_to_master < px(0.5),
+            "adjacent branch rows sit flush, got {feature_to_master:?}"
+        );
     }
 
     #[gpui::test]

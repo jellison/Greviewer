@@ -26,6 +26,8 @@ pub enum LucideIcon {
     Eye,
     /// `eye-off.svg`
     EyeOff,
+    /// `git-branch.svg`
+    GitBranch,
     /// `list-tree.svg`
     ListTree,
     /// `monitor.svg`
@@ -55,6 +57,7 @@ impl LucideIcon {
         LucideIcon::Columns2,
         LucideIcon::Eye,
         LucideIcon::EyeOff,
+        LucideIcon::GitBranch,
         LucideIcon::ListTree,
         LucideIcon::Monitor,
         LucideIcon::Rows2,
@@ -77,6 +80,7 @@ impl IconNamed for LucideIcon {
             LucideIcon::Columns2 => "icons/columns-2.svg",
             LucideIcon::Eye => "icons/eye.svg",
             LucideIcon::EyeOff => "icons/eye-off.svg",
+            LucideIcon::GitBranch => "icons/git-branch.svg",
             LucideIcon::ListTree => "icons/list-tree.svg",
             LucideIcon::Monitor => "icons/monitor.svg",
             LucideIcon::Rows2 => "icons/rows-2.svg",

@@ -71,6 +71,11 @@ actions!(
 pub(crate) const FILE_TREE_FONT_FAMILY: &str = "BerkeleyMono Nerd Font";
 const FILE_TREE_INDENT_WIDTH: f32 = 16.;
 const FILE_TREE_ROW_HEIGHT: f32 = 24.;
+/// Vertical breathing room added inside each branch-sidebar row, within its
+/// border and background so adjacent rows stay flush instead of showing a gap.
+/// gpui lays out border-box, so the row height carries this padding: the box
+/// grows by twice this value while the content area stays `FILE_TREE_ROW_HEIGHT`.
+const BRANCH_ROW_VERTICAL_PADDING: f32 = 1.;
 const FILE_TREE_TEXT_SIZE: f32 = 14.;
 const FILE_TREE_ROW_TEXT_LINE_HEIGHT: f32 = 20.;
 const FILE_TREE_SECONDARY_TEXT_SIZE: f32 = 10.;
@@ -78,6 +83,9 @@ const FILE_TREE_BADGE_TEXT_SIZE: f32 = 9.;
 const FILE_TREE_DIFF_STAT_TEXT_SIZE: f32 = 13.;
 const FILE_TREE_FOLDER_ICON_SIZE: f32 = 16.;
 const FILE_TREE_STATUS_ICON_SIZE: f32 = 14.;
+/// Leading branch-glyph size on sidebar branch rows: a touch smaller than the
+/// shared status-icon size so the icon sits lighter beside the branch name.
+const BRANCH_ROW_ICON_SIZE: f32 = FILE_TREE_STATUS_ICON_SIZE * 0.9;
 const FILE_TREE_INDENT_GUIDE_WIDTH: f32 = 1.;
 const FILE_TREE_GUIDE_TO_ITEM_GAP: f32 = 4.;
 const FILE_TREE_CONTROL_BUTTON_SIZE: f32 = 22.;
@@ -334,6 +342,11 @@ struct BranchSectionRow {
     count: usize,
     /// Whether the section is collapsed, hiding its descendant rows.
     collapsed: bool,
+    /// Whether the header draws a separating top border. True only when the row
+    /// directly above it is content (a branch or folder), never when it follows
+    /// another header or heads the list — so stacked headers and the topmost
+    /// section don't double the sidebar's own border.
+    top_border: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1737,15 +1750,17 @@ impl App {
         let key = branch_key(&branch.name, &branch.kind);
         let hidden = self.hidden_branches.contains(&key);
         let show_toggle = !branch.is_head && (hidden || self.hovered_branch_row == Some(index));
+        // The checked-out branch is marked by a subtle background tint instead
+        // of a check icon; an active commit selection still takes precedence.
         let row_bg = if selected {
             rgb(0x223248)
+        } else if branch.is_head {
+            rgb(CURRENT_BRANCH_BG)
         } else {
             rgb(0x171717)
         };
         let name_color = if hidden {
             rgb(0x999999)
-        } else if branch.is_head {
-            rgb(0xa3e635)
         } else if matches!(branch.kind, repo::BranchKind::Remote { .. }) {
             rgb(REMOTE_BRANCH_TINT)
         } else {
@@ -1757,8 +1772,8 @@ impl App {
         } else {
             format!("branch-row-{name_fragment}")
         };
-        let marker_selector = format!("branch-head-marker-{name_fragment}");
         let toggle_selector = format!("branch-visibility-{name_fragment}");
+        let icon_selector = format!("branch-icon-{name_fragment}");
         let tip_sha = branch.tip_sha.clone();
         let toggle_branch_key = key;
         let display_name = row.display_name.clone();
@@ -1767,7 +1782,8 @@ impl App {
             .flex()
             .items_center()
             .w_full()
-            .h(px(FILE_TREE_ROW_HEIGHT))
+            .h(px(FILE_TREE_ROW_HEIGHT + BRANCH_ROW_VERTICAL_PADDING * 2.))
+            .py(px(BRANCH_ROW_VERTICAL_PADDING))
             .gap_2()
             .px_3()
             .bg(row_bg)
@@ -1805,6 +1821,18 @@ impl App {
             })
             .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
+                    .debug_selector(move || icon_selector.clone())
+                    .child(
+                        Icon::new(LucideIcon::GitBranch)
+                            .text_color(name_color)
+                            .size(px(BRANCH_ROW_ICON_SIZE)),
+                    ),
+            )
+            .child(
+                div()
                     .flex_1()
                     .min_w_0()
                     .text_color(name_color)
@@ -1812,20 +1840,6 @@ impl App {
                     .truncate()
                     .child(display_name),
             )
-            .when(branch.is_head, |row| {
-                row.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .flex_shrink_0()
-                        .debug_selector(move || marker_selector.clone())
-                        .child(
-                            Icon::new(LucideIcon::Check)
-                                .text_color(rgb(0xa3e635))
-                                .size(px(FILE_TREE_STATUS_ICON_SIZE)),
-                        ),
-                )
-            })
             .when(show_toggle, |row| {
                 row.child(
                     div()
@@ -1873,11 +1887,13 @@ impl App {
             .flex()
             .items_center()
             .w_full()
-            .h(px(FILE_TREE_ROW_HEIGHT))
+            .h(px(FILE_TREE_ROW_HEIGHT + BRANCH_ROW_VERTICAL_PADDING * 2.))
+            .py(px(BRANCH_ROW_VERTICAL_PADDING))
             .gap_2()
             .px_3()
             .bg(rgb(0x171717))
             .border_b_1()
+            .when(section.top_border, |header| header.border_t_1())
             .border_color(rgb(0x242424))
             .cursor_pointer()
             .id(("branch-section", index))
@@ -1947,7 +1963,8 @@ impl App {
             .flex()
             .items_center()
             .w_full()
-            .h(px(FILE_TREE_ROW_HEIGHT))
+            .h(px(FILE_TREE_ROW_HEIGHT + BRANCH_ROW_VERTICAL_PADDING * 2.))
+            .py(px(BRANCH_ROW_VERTICAL_PADDING))
             .gap_2()
             .px_3()
             .bg(rgb(0x171717))
@@ -2905,6 +2922,12 @@ impl App {
 /// label pills in the graph, so the two surfaces read as one family.
 const REMOTE_BRANCH_TINT: u32 = 0x94a3b8;
 
+/// Background marking the checked-out branch's sidebar row: a bright slate blue
+/// for clear contrast against the dark sidebar, in the spirit of GitKraken's
+/// current-branch highlight. The darker selection blue still takes precedence
+/// when a row is both current and selected.
+const CURRENT_BRANCH_BG: u32 = 0x34426a;
+
 const COMMIT_ROW_HEIGHT: f32 = 44.;
 const COMMIT_ROW_HORIZONTAL_PADDING: f32 = 16.;
 const COMMIT_HASH_WIDTH: f32 = 72.;
@@ -3233,7 +3256,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn graph_mode_lists_local_branches_with_head_marked(cx: &mut TestAppContext) {
+    async fn graph_mode_lists_local_branches_without_a_head_check_marker(cx: &mut TestAppContext) {
         let (dir, _main_tip, _root) = init_repo_with_feature_branch();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
@@ -3253,14 +3276,13 @@ mod tests {
         visual
             .debug_bounds("branch-row-heads-master")
             .expect("master branch row renders");
-        visual
-            .debug_bounds("branch-head-marker-heads-master")
-            .expect("checked-out branch carries the HEAD marker");
+        // The checked-out branch is now distinguished by its row background
+        // rather than a check icon, so no marker element renders for it.
         assert!(
             visual
-                .debug_bounds("branch-head-marker-heads-feature")
+                .debug_bounds("branch-head-marker-heads-master")
                 .is_none(),
-            "non-checked-out branch has no HEAD marker",
+            "the checked-out branch carries no check marker",
         );
     }
 

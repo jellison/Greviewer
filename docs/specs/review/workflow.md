@@ -122,6 +122,7 @@ Graph mode includes a sidebar beside the graph listing the repository's branches
 
 - The sidebar lists every local branch under the Local section and every remote-tracking branch under its remote's folder in the Remote section, alphabetically within each folder level, with the checked-out branch visually marked.
 - Each section header shows a distinguishing icon, the section's name, and the number of branches the section contains.
+- The two sections are set off from each other by a single divider: it sits below the local rows when Local is expanded, and is shared between the two headers when they stack directly (Local collapsed), never doubling. A section at the top of the list relies on the sidebar's own border rather than adding one.
 - A section with no branches does not appear; a repository with no remotes shows no Remote section.
 - Activating a branch selects its tip commit and scrolls the graph so the commit is visible.
 - A branch entry whose tip commit is the current selection is visually distinct, using the same selected treatment as the commit row.
