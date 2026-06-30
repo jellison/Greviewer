@@ -242,6 +242,29 @@ pub(crate) fn init_repo_with_slash_named_branches() -> (tempfile::TempDir, Strin
     (dir, main_tip.to_string(), alpha_tip.to_string())
 }
 
+/// A repo whose checked-out branch has ~200 sibling local branches named
+/// `branch-000` .. `branch-199`. Zero-padded so the sidebar's alphabetical
+/// row order is deterministic, which lets virtualization tests assert that an
+/// early row is materialized and a far one is culled.
+pub(crate) fn init_repo_with_many_branches() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let repo = Repository::init(dir.path()).expect("init repo");
+
+    fs::write(dir.path().join("hello.txt"), "hello\n").expect("write file");
+    let root_oid = commit_all_to_ref_at_time(&repo, Some("HEAD"), "Root", &[], 10);
+    let root_commit = repo.find_commit(root_oid).expect("find root commit");
+
+    for index in 0..200 {
+        let name = format!("branch-{index:03}");
+        repo.branch(&name, &root_commit, false)
+            .unwrap_or_else(|err| panic!("create branch {name}: {err}"));
+    }
+
+    drop(root_commit);
+    drop(repo);
+    dir
+}
+
 /// A repo with a checked-out master, a remote-tracking origin/master at the
 /// same tip, and a remote-only origin/feature/x one commit ahead.
 pub(crate) fn init_repo_with_remote_branches() -> (tempfile::TempDir, String, String) {

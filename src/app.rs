@@ -124,7 +124,13 @@ pub struct App {
     notifications: Entity<NotificationList>,
     path_picker: Box<dyn PathPicker>,
     settings_store_path: Option<PathBuf>,
-    commit_history_scroll: ScrollHandle,
+    /// Memoized DAG layout; see [`GraphLayout`]. `RefCell` because render takes
+    /// `&self`, mirroring `diff_row_cache`.
+    graph_layout_cache: RefCell<Option<(GraphLayoutSignature, Rc<GraphLayout>)>>,
+    /// Test-only counter proving the layout is reused across renders.
+    #[cfg(test)]
+    graph_layout_recompute_count: std::cell::Cell<u64>,
+    commit_history_scroll: UniformListScrollHandle,
     file_tree_scroll: ScrollHandle,
     /// Horizontal scroll handle for the path pane only; the stat gutter stays
     /// fixed while this scrolls.
@@ -134,7 +140,14 @@ pub struct App {
     file_tree_hovered: bool,
     changeset_resizable: Entity<ResizableState>,
     graph_resizable: Entity<ResizableState>,
-    branch_sidebar_scroll: ScrollHandle,
+    branch_sidebar_scroll: UniformListScrollHandle,
+    /// Bumped whenever `repo.branches` is (re)loaded, so the sidebar row cache
+    /// can detect a branch-set change without comparing the branch list.
+    branches_generation: std::cell::Cell<u64>,
+    /// Memoized flat sidebar row model; `RefCell` because render takes `&self`.
+    sidebar_rows_cache: RefCell<Option<(SidebarRowsSignature, Rc<Vec<BranchTreeRow>>)>>,
+    #[cfg(test)]
+    sidebar_rows_recompute_count: std::cell::Cell<u64>,
     /// True while the cursor is anywhere over the branch sidebar; gates its
     /// hover-revealed scrollbar overlay.
     branch_sidebar_hovered: bool,
@@ -152,9 +165,6 @@ pub struct App {
     /// Session-only: cleared whenever a repository is opened. Sections default
     /// to expanded, so an empty set means both sections show their branches.
     collapsed_branch_sections: BTreeSet<String>,
-    /// Sidebar row index the cursor is currently over, if any. Gates the
-    /// hover-revealed visibility toggle on visible branches.
-    hovered_branch_row: Option<usize>,
     focus_handle: FocusHandle,
     /// Whether the title-bar context popover (the diff "switcher") is open.
     context_popover_open: bool,
@@ -217,6 +227,33 @@ impl FileDiffScroll {
     fn side_by_side_max_offset(&self) -> gpui::Size<gpui::Pixels> {
         self.side_by_side.0.borrow().base_handle.max_offset()
     }
+}
+
+/// Memoized commit-graph layout. Recomputed only when its signature changes,
+/// so scroll, selection, and hover no longer pay the O(n^2) DAG relayout.
+pub(crate) struct GraphLayout {
+    pub(crate) rows: Vec<graph::GraphRow>,
+    pub(crate) max_lanes: usize,
+}
+
+/// Inputs that determine the graph layout. Cheap to build and compare: the
+/// loaded-commit count (history only ever grows by paging within a session),
+/// the HEAD sha, and the hidden-branch set.
+#[derive(PartialEq, Eq)]
+struct GraphLayoutSignature {
+    commit_count: usize,
+    head_sha: Option<String>,
+    hidden_branches: BTreeSet<String>,
+}
+
+/// Inputs that determine the flat branch-sidebar row model. Recomputed only
+/// when the branch set, collapse state, or hidden-branch set changes.
+#[derive(PartialEq, Eq)]
+struct SidebarRowsSignature {
+    branches_generation: u64,
+    collapsed_folders: BTreeSet<String>,
+    collapsed_sections: BTreeSet<String>,
+    hidden_branches: BTreeSet<String>,
 }
 
 pub enum Mode {
@@ -505,18 +542,24 @@ impl App {
             notifications,
             path_picker,
             settings_store_path,
-            commit_history_scroll: ScrollHandle::new(),
+            graph_layout_cache: RefCell::new(None),
+            #[cfg(test)]
+            graph_layout_recompute_count: std::cell::Cell::new(0),
+            commit_history_scroll: UniformListScrollHandle::new(),
             file_tree_scroll: ScrollHandle::new(),
             file_tree_hscroll: ScrollHandle::new(),
             file_tree_hovered: false,
             changeset_resizable,
             graph_resizable,
-            branch_sidebar_scroll: ScrollHandle::new(),
+            branch_sidebar_scroll: UniformListScrollHandle::new(),
+            branches_generation: std::cell::Cell::new(0),
+            sidebar_rows_cache: RefCell::new(None),
+            #[cfg(test)]
+            sidebar_rows_recompute_count: std::cell::Cell::new(0),
             branch_sidebar_hovered: false,
             hidden_branches: BTreeSet::new(),
             collapsed_branch_folders: BTreeSet::new(),
             collapsed_branch_sections: BTreeSet::new(),
-            hovered_branch_row: None,
             focus_handle,
             context_popover_open: false,
             repo_switcher_open: false,
@@ -608,20 +651,31 @@ impl App {
         self.workspace = crate::workspace::Workspace::new();
         self.pane_scrolls.borrow_mut().clear();
         self.diff_row_cache.borrow_mut().clear();
+        self.graph_layout_cache.borrow_mut().take();
         self.file_tree_highlight_path = None;
         self.file_list_mode = FileListMode::Changed;
         self.collapsed_file_tree_paths.clear();
         self.record_recent_repository(recent_path);
         self.persist_settings();
-        self.commit_history_scroll.set_offset(point(px(0.), px(0.)));
+        self.commit_history_scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), px(0.)));
         self.file_tree_scroll.set_offset(point(px(0.), px(0.)));
         self.file_tree_hscroll.set_offset(point(px(0.), px(0.)));
-        self.branch_sidebar_scroll.set_offset(point(px(0.), px(0.)));
+        self.branch_sidebar_scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), px(0.)));
         self.branch_sidebar_hovered = false;
         self.hidden_branches.clear();
         self.collapsed_branch_folders.clear();
         self.collapsed_branch_sections.clear();
-        self.hovered_branch_row = None;
+        self.branches_generation
+            .set(self.branches_generation.get() + 1);
+        self.sidebar_rows_cache.borrow_mut().take();
         self.file_tree_hovered = false;
         self.context_popover_open = false;
         self.repo_switcher_open = false;
@@ -811,12 +865,22 @@ impl App {
     /// rather than the scroll handle's max offset, which is stale when this
     /// runs in the same frame that paged in more commits.
     fn scroll_commit_row_into_view(&self, index: usize, commit_count: usize) {
-        let viewport_height = self.commit_history_scroll.bounds().size.height;
+        let viewport_height = self
+            .commit_history_scroll
+            .0
+            .borrow()
+            .base_handle
+            .bounds()
+            .size
+            .height;
         let row_top = px(index as f32 * COMMIT_ROW_HEIGHT);
         if viewport_height <= px(0.) {
             // Not laid out yet; pin the row to the top rather than centering
             // against a zero-height viewport.
             self.commit_history_scroll
+                .0
+                .borrow()
+                .base_handle
                 .set_offset(point(px(0.), -row_top));
             return;
         }
@@ -824,7 +888,11 @@ impl App {
         let content_height = px(commit_count as f32 * COMMIT_ROW_HEIGHT);
         let max_offset = (content_height - viewport_height).max(px(0.));
         let target = (-centered_top).clamp(-max_offset, px(0.));
-        self.commit_history_scroll.set_offset(point(px(0.), target));
+        self.commit_history_scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), target));
     }
 
     fn select_commit(
@@ -1286,8 +1354,14 @@ impl App {
         event: &ScrollWheelEvent,
         window: &Window,
     ) -> Pixels {
-        let max_offset = self.commit_history_scroll.max_offset().height;
-        let current_offset = self.commit_history_scroll.offset().y;
+        let max_offset = self
+            .commit_history_scroll
+            .0
+            .borrow()
+            .base_handle
+            .max_offset()
+            .height;
+        let current_offset = self.commit_history_scroll.0.borrow().base_handle.offset().y;
         let delta = event.delta.pixel_delta(window.line_height()).y;
         let next_offset = (current_offset + delta).clamp(-max_offset, px(0.));
 
@@ -1510,6 +1584,54 @@ impl App {
         }
     }
 
+    /// Returns the memoized graph layout for `repo`, recomputing only when the
+    /// loaded commits, HEAD, or hidden branches change.
+    fn graph_layout(&self, repo: &repo::OpenRepository) -> Rc<GraphLayout> {
+        let visible_commits = visible_commits(repo, &self.hidden_branches);
+        let head_sha = visible_commits
+            .iter()
+            .find(|commit| commit.is_head)
+            .map(|commit| commit.sha.clone());
+        let signature = GraphLayoutSignature {
+            commit_count: visible_commits.len(),
+            // Defensive: HEAD movement in practice only happens on repo reopen,
+            // which already clears this cache. Keying on it too costs nothing
+            // and guards against any future in-session HEAD change.
+            head_sha: head_sha.clone(),
+            hidden_branches: self.hidden_branches.clone(),
+        };
+
+        if let Some((cached_signature, layout)) = self.graph_layout_cache.borrow().as_ref() {
+            if *cached_signature == signature {
+                return Rc::clone(layout);
+            }
+        }
+
+        let graph_commits = visible_commits
+            .iter()
+            .map(|commit| graph::GraphCommit {
+                sha: commit.sha.clone(),
+                authored_timestamp: commit.authored_timestamp,
+                parent_shas: commit.parent_shas.clone(),
+            })
+            .collect::<Vec<_>>();
+        let rows = graph::layout_graph_anchored(&graph_commits, head_sha.as_deref());
+        let max_lanes = rows.iter().map(|row| row.lane_count).max().unwrap_or(1);
+        let layout = Rc::new(GraphLayout { rows, max_lanes });
+
+        #[cfg(test)]
+        self.graph_layout_recompute_count
+            .set(self.graph_layout_recompute_count.get() + 1);
+
+        *self.graph_layout_cache.borrow_mut() = Some((signature, Rc::clone(&layout)));
+        layout
+    }
+
+    #[cfg(test)]
+    pub(crate) fn graph_layout_recompute_count(&self) -> u64 {
+        self.graph_layout_recompute_count.get()
+    }
+
     fn render_graph_screen(
         &self,
         repo: &repo::OpenRepository,
@@ -1531,66 +1653,49 @@ impl App {
                 .text_color(rgb(0x999999))
                 .text_size(px(14.))
                 .child("This repository has no commits to review.")
+                .into_any_element()
         } else {
-            let visible_commits = visible_commits(repo, &self.hidden_branches);
-            let graph_commits = visible_commits
-                .iter()
-                .map(|commit| graph::GraphCommit {
-                    sha: commit.sha.clone(),
-                    authored_timestamp: commit.authored_timestamp,
-                    parent_shas: commit.parent_shas.clone(),
-                })
-                .collect::<Vec<_>>();
-            let head_sha = visible_commits
-                .iter()
-                .find(|commit| commit.is_head)
-                .map(|commit| commit.sha.as_str());
-            let graph_rows = graph::layout_graph_anchored(&graph_commits, head_sha);
-            let max_graph_lanes = graph_rows
-                .iter()
-                .map(|row| row.lane_count)
-                .max()
-                .unwrap_or(1);
-
-            let commit_rows = visible_commits
-                .iter()
-                .zip(graph_rows.iter())
-                .enumerate()
-                .map(|(index, (commit, graph_row))| {
-                    self.render_commit_row(
-                        index,
-                        commit,
-                        graph_row,
-                        max_graph_lanes,
-                        self.is_commit_selected(&commit.sha),
-                        cx,
-                    )
-                })
-                .collect::<Vec<_>>();
-
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .id("commit-history")
-                .overflow_y_scroll()
-                .scrollbar_width(px(12.))
-                .track_scroll(&self.commit_history_scroll)
-                .on_scroll_wheel(cx.listener(|app, event, window, cx| {
-                    app.load_older_commits_after_scroll(event, window, cx);
-                }))
-                .child(
-                    div()
-                        .relative()
-                        .flex()
-                        .flex_col()
-                        .w_full()
-                        .children(commit_rows)
-                        .child(render_commit_graph_history_overlay(
-                            &graph_rows,
-                            max_graph_lanes,
-                        )),
-                )
+            let layout = self.graph_layout(repo);
+            let item_count = layout.rows.len();
+            let scroll_handle = self.commit_history_scroll.clone();
+            uniform_list(
+                "commit-history",
+                item_count,
+                cx.processor(move |app, range: std::ops::Range<usize>, _window, cx| {
+                    let Mode::RepoOpen { repo } = &app.mode else {
+                        return Vec::new();
+                    };
+                    // Cheap O(loaded-commits) filter of references (no heavy
+                    // clones); recomputed per frame intentionally. The
+                    // expensive O(n^2) DAG layout it feeds is memoized by
+                    // `graph_layout`.
+                    let visible_commits = visible_commits(repo, &app.hidden_branches);
+                    let layout = app.graph_layout(repo);
+                    range
+                        .map(|index| {
+                            app.render_commit_row(
+                                index,
+                                visible_commits[index],
+                                &layout.rows,
+                                layout.max_lanes,
+                                app.is_commit_selected(&visible_commits[index].sha),
+                                cx,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .flex_1()
+            .h_full()
+            .min_h_0()
+            .min_w_0()
+            .pr(px(12.))
+            .track_scroll(scroll_handle)
+            .on_scroll_wheel(cx.listener(|app, event, window, cx| {
+                app.load_older_commits_after_scroll(event, window, cx);
+            }))
+            .debug_selector(|| "commit-history".to_string())
+            .into_any_element()
         };
 
         let history_panel = div()
@@ -1647,6 +1752,42 @@ impl App {
             )
     }
 
+    /// Returns the memoized flat sidebar row model, recomputing only when the
+    /// branch set, collapse state, or hidden-branch set changes.
+    fn sidebar_rows(&self, repo: &repo::OpenRepository) -> Rc<Vec<BranchTreeRow>> {
+        let signature = SidebarRowsSignature {
+            branches_generation: self.branches_generation.get(),
+            collapsed_folders: self.collapsed_branch_folders.clone(),
+            collapsed_sections: self.collapsed_branch_sections.clone(),
+            hidden_branches: self.hidden_branches.clone(),
+        };
+
+        if let Some((cached_signature, rows)) = self.sidebar_rows_cache.borrow().as_ref() {
+            if *cached_signature == signature {
+                return Rc::clone(rows);
+            }
+        }
+
+        let rows = Rc::new(build_branch_sidebar_rows(
+            &repo.branches,
+            &self.collapsed_branch_folders,
+            &self.collapsed_branch_sections,
+            &self.hidden_branches,
+        ));
+
+        #[cfg(test)]
+        self.sidebar_rows_recompute_count
+            .set(self.sidebar_rows_recompute_count.get() + 1);
+
+        *self.sidebar_rows_cache.borrow_mut() = Some((signature, Rc::clone(&rows)));
+        rows
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sidebar_rows_recompute_count(&self) -> u64 {
+        self.sidebar_rows_recompute_count.get()
+    }
+
     fn render_branch_sidebar(
         &self,
         repo: &repo::OpenRepository,
@@ -1665,39 +1806,37 @@ impl App {
                 .child("No branches")
                 .into_any_element()
         } else {
-            let rows = build_branch_sidebar_rows(
-                &repo.branches,
-                &self.collapsed_branch_folders,
-                &self.collapsed_branch_sections,
-                &self.hidden_branches,
-            );
-            let rows = rows
-                .iter()
-                .enumerate()
-                .map(|(index, row)| match row {
-                    BranchTreeRow::Section(section) => self
-                        .render_branch_section_row(index, section, cx)
-                        .into_any_element(),
-                    BranchTreeRow::Folder(folder) => self
-                        .render_branch_folder_row(index, folder, cx)
-                        .into_any_element(),
-                    BranchTreeRow::Branch(branch_row) => self
-                        .render_branch_row(index, branch_row, cx)
-                        .into_any_element(),
-                })
-                .collect::<Vec<_>>();
-
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h_0()
-                .id("branch-sidebar-scroll")
-                .debug_selector(|| "branch-sidebar-scroll".to_string())
-                .overflow_y_scroll()
-                .track_scroll(&self.branch_sidebar_scroll)
-                .child(div().flex().flex_col().w_full().children(rows))
-                .into_any_element()
+            let rows = self.sidebar_rows(repo);
+            let item_count = rows.len();
+            let scroll_handle = self.branch_sidebar_scroll.clone();
+            uniform_list(
+                "branch-sidebar-scroll",
+                item_count,
+                cx.processor(move |app, range: std::ops::Range<usize>, _window, cx| {
+                    let Mode::RepoOpen { repo } = &app.mode else {
+                        return Vec::new();
+                    };
+                    let rows = app.sidebar_rows(repo);
+                    range
+                        .map(|index| match &rows[index] {
+                            BranchTreeRow::Section(section) => app
+                                .render_branch_section_row(index, section, cx)
+                                .into_any_element(),
+                            BranchTreeRow::Folder(folder) => app
+                                .render_branch_folder_row(index, folder, cx)
+                                .into_any_element(),
+                            BranchTreeRow::Branch(branch_row) => app
+                                .render_branch_row(index, branch_row, cx)
+                                .into_any_element(),
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .flex_1()
+            .min_h_0()
+            .track_scroll(scroll_handle)
+            .debug_selector(|| "branch-sidebar-scroll".to_string())
+            .into_any_element()
         };
 
         div()
@@ -1729,7 +1868,7 @@ impl App {
                         .bottom_0()
                         .debug_selector(|| "branch-sidebar-scrollbar".to_string())
                         .child(
-                            Scrollbar::vertical(&self.branch_sidebar_scroll)
+                            Scrollbar::vertical(&self.branch_sidebar_scroll.0.borrow().base_handle)
                                 .scrollbar_show(ScrollbarShow::Always),
                         ),
                 )
@@ -1749,7 +1888,10 @@ impl App {
         );
         let key = branch_key(&branch.name, &branch.kind);
         let hidden = self.hidden_branches.contains(&key);
-        let show_toggle = !branch.is_head && (hidden || self.hovered_branch_row == Some(index));
+        // The icon is always laid out; hover/opacity controls visibility.
+        let show_toggle = !branch.is_head;
+        // A hidden branch keeps the icon opaque without hover.
+        let always_show = hidden;
         // The checked-out branch is marked by a subtle background tint instead
         // of a check icon; an active commit selection still takes precedence.
         let row_bg = if selected {
@@ -1774,6 +1916,7 @@ impl App {
         };
         let toggle_selector = format!("branch-visibility-{name_fragment}");
         let icon_selector = format!("branch-icon-{name_fragment}");
+        let group_name = format!("branch-row-group-{name_fragment}");
         let tip_sha = branch.tip_sha.clone();
         let toggle_branch_key = key;
         let display_name = row.display_name.clone();
@@ -1788,21 +1931,11 @@ impl App {
             .px_3()
             .bg(row_bg)
             .id(("branch-row", index))
+            .group(group_name.clone())
             .debug_selector(move || row_selector.clone())
             .when(!selected && !hidden, |row| {
                 row.hover(|style| style.bg(rgb(0x1f2733)))
             })
-            .on_hover(cx.listener(move |app, hovered: &bool, _window, cx| {
-                if *hovered {
-                    if app.hovered_branch_row != Some(index) {
-                        app.hovered_branch_row = Some(index);
-                        cx.notify();
-                    }
-                } else if app.hovered_branch_row == Some(index) {
-                    app.hovered_branch_row = None;
-                    cx.notify();
-                }
-            }))
             .when(!hidden, |row| {
                 row.cursor_pointer().on_click(cx.listener(
                     move |app, _event: &ClickEvent, window, cx| {
@@ -1849,6 +1982,11 @@ impl App {
                         .cursor_pointer()
                         .id(("branch-visibility", index))
                         .debug_selector(move || toggle_selector.clone())
+                        .when(!always_show, |toggle| {
+                            toggle
+                                .opacity(0.)
+                                .group_hover(group_name.clone(), |toggle| toggle.opacity(1.))
+                        })
                         .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
                             cx.stop_propagation();
                             app.toggle_branch_visibility(toggle_branch_key.clone(), cx);
@@ -1954,10 +2092,10 @@ impl App {
         let collapse_path = folder.path.clone();
         let toggle_path = folder.path.clone();
         let hidden = folder.visibility == FolderVisibility::Hidden;
-        let show_toggle = folder.visibility != FolderVisibility::Visible
-            || self.hovered_branch_row == Some(index);
+        let always_show = folder.visibility != FolderVisibility::Visible;
         let name_color = if hidden { rgb(0x999999) } else { rgb(0x8aa6bd) };
         let depth = folder.depth;
+        let group_name = format!("branch-folder-group-{path_fragment}");
 
         div()
             .flex()
@@ -1970,19 +2108,9 @@ impl App {
             .bg(rgb(0x171717))
             .cursor_pointer()
             .id(("branch-folder", index))
+            .group(group_name.clone())
             .debug_selector(move || row_selector.clone())
             .hover(|style| style.bg(rgb(0x1f2733)))
-            .on_hover(cx.listener(move |app, hovered: &bool, _window, cx| {
-                if *hovered {
-                    if app.hovered_branch_row != Some(index) {
-                        app.hovered_branch_row = Some(index);
-                        cx.notify();
-                    }
-                } else if app.hovered_branch_row == Some(index) {
-                    app.hovered_branch_row = None;
-                    cx.notify();
-                }
-            }))
             .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
                 app.toggle_branch_folder(collapse_path.clone(), cx);
             }))
@@ -2013,30 +2141,33 @@ impl App {
                     .truncate()
                     .child(folder.name.clone()),
             )
-            .when(show_toggle, |row| {
-                row.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .flex_shrink_0()
-                        .cursor_pointer()
-                        .id(("branch-folder-visibility", index))
-                        .debug_selector(move || toggle_selector.clone())
-                        .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
-                            cx.stop_propagation();
-                            app.toggle_folder_visibility(&toggle_path, cx);
-                        }))
-                        .child(
-                            Icon::new(if folder.visibility == FolderVisibility::Visible {
-                                LucideIcon::Eye
-                            } else {
-                                LucideIcon::EyeOff
-                            })
-                            .text_color(rgb(0x999999))
-                            .size(px(FILE_TREE_STATUS_ICON_SIZE)),
-                        ),
-                )
-            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
+                    .cursor_pointer()
+                    .id(("branch-folder-visibility", index))
+                    .debug_selector(move || toggle_selector.clone())
+                    .when(!always_show, |toggle| {
+                        toggle
+                            .opacity(0.)
+                            .group_hover(group_name.clone(), |toggle| toggle.opacity(1.))
+                    })
+                    .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        app.toggle_folder_visibility(&toggle_path, cx);
+                    }))
+                    .child(
+                        Icon::new(if folder.visibility == FolderVisibility::Visible {
+                            LucideIcon::Eye
+                        } else {
+                            LucideIcon::EyeOff
+                        })
+                        .text_color(rgb(0x999999))
+                        .size(px(FILE_TREE_STATUS_ICON_SIZE)),
+                    ),
+            )
     }
 
     fn render_changeset_screen(
@@ -2829,7 +2960,7 @@ impl App {
         &self,
         index: usize,
         commit: &repo::CommitInfo,
-        _graph_row: &graph::GraphRow,
+        graph_rows: &[graph::GraphRow],
         max_graph_lanes: usize,
         selected: bool,
         cx: &mut Context<Self>,
@@ -2869,7 +3000,13 @@ impl App {
                     app.select_commit(sha.clone(), event.modifiers(), window, cx);
                 }
             }))
-            .child(render_commit_graph_gutter_spacer(max_graph_lanes))
+            .child(render_commit_graph_gutter(
+                index,
+                &graph_rows[index],
+                index.checked_sub(1).and_then(|prev| graph_rows.get(prev)),
+                graph_rows.get(index + 1),
+                max_graph_lanes,
+            ))
             .child(
                 div()
                     .w(px(COMMIT_HASH_WIDTH))
@@ -2929,7 +3066,6 @@ const REMOTE_BRANCH_TINT: u32 = 0x94a3b8;
 const CURRENT_BRANCH_BG: u32 = 0x34426a;
 
 const COMMIT_ROW_HEIGHT: f32 = 44.;
-const COMMIT_ROW_HORIZONTAL_PADDING: f32 = 16.;
 const COMMIT_HASH_WIDTH: f32 = 72.;
 const COMMIT_AUTHOR_WIDTH: f32 = 168.;
 const COMMIT_TIME_WIDTH: f32 = 96.;
@@ -3397,7 +3533,7 @@ mod tests {
                     },
                     "the branch tip commit is selected",
                 );
-                let offset = app.commit_history_scroll.offset();
+                let offset = app.commit_history_scroll.0.borrow().base_handle.offset();
                 assert!(
                     offset.y < px(-1000.),
                     "focusing a deep branch tip scrolled the history substantially, got {:?}",

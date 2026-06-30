@@ -231,6 +231,86 @@ mod tests {
     use crate::repo;
     use gpui::{px, TestAppContext, VisualTestContext};
 
+    #[gpui::test]
+    async fn branch_sidebar_virtualizes_offscreen_rows(cx: &mut TestAppContext) {
+        use gpui::size;
+
+        let dir = init_repo_with_many_branches(); // ~200 local branches
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(900.), px(400.)));
+
+        // Branch names are zero-padded so row order is deterministic; an early
+        // row is on screen, a far one is culled.
+        visual
+            .debug_bounds("branch-row-heads-branch-000")
+            .expect("first branch row should be materialized");
+        assert!(
+            visual.debug_bounds("branch-row-heads-branch-150").is_none(),
+            "row 150 is far below the viewport and must not be materialized"
+        );
+    }
+
+    #[gpui::test]
+    async fn sidebar_rows_are_cached_until_inputs_change(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let first = window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                let _ = app.sidebar_rows(repo);
+                app.sidebar_rows_recompute_count()
+            })
+            .expect("first build");
+
+        let second = window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                let _ = app.sidebar_rows(repo);
+                app.sidebar_rows_recompute_count()
+            })
+            .expect("second build");
+        assert_eq!(first, second, "identical inputs must not rebuild the model");
+
+        let after_collapse = window
+            .update(cx, |app, _window, cx| {
+                app.toggle_branch_folder("heads/features".to_string(), cx);
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                let _ = app.sidebar_rows(repo);
+                app.sidebar_rows_recompute_count()
+            })
+            .expect("build after collapse");
+        assert_eq!(
+            after_collapse,
+            second + 1,
+            "collapsing a folder must rebuild the model exactly once"
+        );
+    }
+
     #[test]
     fn flat_branch_names_produce_flat_rows() {
         let branches = vec![local_branch("feature", "f"), local_branch("master", "m")];
@@ -1046,11 +1126,6 @@ mod tests {
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
-                // The toggle is hover-revealed; tests drive the hover state
-                // directly. Row 0 is the "Local" section header; the
-                // features folder is row 1.
-                app.hovered_branch_row = Some(1);
-                cx.notify();
             })
             .expect("open repository");
         cx.run_until_parked();
@@ -1058,7 +1133,7 @@ mod tests {
         let mut visual = VisualTestContext::from_window(*window, cx);
         let toggle = visual
             .debug_bounds("branch-folder-visibility-heads-features")
-            .expect("hovered folder row reveals its visibility toggle");
+            .expect("folder row lays out its visibility toggle (revealed via group-hover)");
         visual.simulate_click(toggle.center(), Modifiers::none());
 
         window
@@ -1125,11 +1200,6 @@ mod tests {
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
-                // The toggle is hover-revealed; tests drive the hover state
-                // directly. Row 0 is the "Local" section header; branches
-                // sort alphabetically below it, so feature is row 1.
-                app.hovered_branch_row = Some(1);
-                cx.notify();
             })
             .expect("open repository");
         cx.run_until_parked();
@@ -1137,7 +1207,7 @@ mod tests {
         let mut visual = VisualTestContext::from_window(*window, cx);
         let toggle = visual
             .debug_bounds("branch-visibility-heads-feature")
-            .expect("hovered branch row reveals its visibility toggle");
+            .expect("branch row lays out its visibility toggle (revealed via group-hover)");
         visual.simulate_click(toggle.center(), Modifiers::none());
 
         // Verify clicking the toggle called toggle_branch_visibility:
@@ -1206,9 +1276,6 @@ mod tests {
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
-                // master is the HEAD branch; alphabetically it is row 1.
-                app.hovered_branch_row = Some(1);
-                cx.notify();
             })
             .expect("open repository");
         cx.run_until_parked();
@@ -1495,5 +1562,58 @@ mod tests {
                 );
             })
             .expect("open, collapse, reopen");
+    }
+
+    #[gpui::test]
+    async fn hovering_a_sidebar_row_does_not_invalidate_the_cached_model(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let baseline_rows = window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                let _ = app.sidebar_rows(repo);
+                app.sidebar_rows_recompute_count()
+            })
+            .expect("baseline build");
+
+        // Move the cursor over a branch row. Hover state is not part of
+        // `SidebarRowsSignature`, so a hover must not invalidate the cached
+        // model: the next `sidebar_rows` call cache-hits and the recompute
+        // count stays put. (This guards the cache signature only. It does not
+        // assert anything about `Render::render`: gpui re-renders the root view
+        // once when the hovered hitbox set changes over the row's kept pure
+        // `.hover(...)` styling, independent of any `cx.notify()` in our code,
+        // so a render-count probe cannot isolate a re-introduced notify here.)
+        let row = visual
+            .debug_bounds("branch-row-heads-master")
+            .expect("branch row renders");
+        visual.simulate_mouse_move(row.center(), None, Modifiers::none());
+        cx.run_until_parked();
+
+        let after_rows = window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                let _ = app.sidebar_rows(repo);
+                app.sidebar_rows_recompute_count()
+            })
+            .expect("build after hover");
+        assert_eq!(
+            baseline_rows, after_rows,
+            "hovering a row must not invalidate the cached sidebar model"
+        );
     }
 }

@@ -199,6 +199,11 @@ pub(crate) fn render_commit_graph_gutter(
     // branches that join them.
     div()
         .relative()
+        // The gutter now lives inside the flex commit row (folded in when the
+        // history list became a virtualized `uniform_list`). Flex children
+        // shrink by default; pin the gutter so its fixed lane geometry never
+        // compresses at narrow panel widths.
+        .flex_shrink_0()
         .w(px(commit_graph_gutter_width(lane_count)))
         .h(px(COMMIT_GRAPH_LANE_HEIGHT))
         .font_family("monospace")
@@ -224,55 +229,6 @@ pub(crate) fn render_commit_graph_gutter(
                 })
                 .collect::<Vec<_>>(),
         )
-}
-
-pub(crate) fn render_commit_graph_history_overlay(
-    rows: &[graph::GraphRow],
-    max_lanes: usize,
-) -> impl IntoElement {
-    let lane_count = max_lanes.max(1);
-    let height = rows.len() as f32 * COMMIT_ROW_HEIGHT;
-
-    div()
-        .absolute()
-        .left(px(COMMIT_ROW_HORIZONTAL_PADDING))
-        .top_0()
-        .w(px(commit_graph_gutter_width(lane_count)))
-        .h(px(height))
-        .debug_selector(|| "commit-graph-overlay".to_string())
-        .child(
-            div().relative().w_full().h(px(height)).children(
-                commit_graph_overlay_row_indices(rows.len())
-                    .into_iter()
-                    .map(|row_index| {
-                        div()
-                            .absolute()
-                            .left_0()
-                            .top(px(row_index as f32 * COMMIT_ROW_HEIGHT))
-                            .child(render_commit_graph_gutter(
-                                row_index,
-                                &rows[row_index],
-                                row_index
-                                    .checked_sub(1)
-                                    .and_then(|previous_row| rows.get(previous_row)),
-                                rows.get(row_index + 1),
-                                lane_count,
-                            ))
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-        )
-}
-
-pub(crate) fn commit_graph_overlay_row_indices(row_count: usize) -> Vec<usize> {
-    (0..row_count).rev().collect()
-}
-
-pub(crate) fn render_commit_graph_gutter_spacer(max_lanes: usize) -> impl IntoElement {
-    div()
-        .w(px(commit_graph_gutter_width(max_lanes.max(1))))
-        .h(px(COMMIT_GRAPH_LANE_HEIGHT))
-        .flex_shrink_0()
 }
 
 pub(crate) fn commit_graph_gutter_width(lane_count: usize) -> f32 {
@@ -2123,6 +2079,27 @@ mod tests {
     }
 
     #[test]
+    fn commit_graph_bend_overlay_spans_into_the_neighboring_row() {
+        // Connector continuity across rows depends on each row's bend overlay
+        // reaching beyond its own band: it starts above its row (`top < 0`)
+        // and is a full row tall, so it overlaps the adjacent row where the
+        // gutter is now folded into each virtualized commit row. This guards
+        // the cross-row continuity that the removed overlay test used to cover.
+        let overlay_top = super::commit_graph_bend_overlay_top();
+        let overlay_height = super::commit_graph_bend_overlay_height();
+
+        assert!(
+            overlay_top < 0.,
+            "the bend overlay must start above its own row to join the row above",
+        );
+        assert_eq!(
+            overlay_height,
+            super::COMMIT_GRAPH_LANE_HEIGHT,
+            "the bend overlay must be a full row tall so it reaches into the row below",
+        );
+    }
+
+    #[test]
     fn commit_side_branch_bend_turns_from_horizontal_into_vertical() {
         let bend = super::commit_graph_merge_in_commit_bend_geometry();
 
@@ -2340,15 +2317,6 @@ mod tests {
                 + super::commit_graph_line_width() / 2.,
             row_boundary_center_y_in_middle,
             "horizontal lane-change strokes should be centered on the border between graph rows",
-        );
-    }
-
-    #[test]
-    fn commit_graph_overlay_paints_lower_rows_first() {
-        assert_eq!(
-            super::commit_graph_overlay_row_indices(4),
-            vec![3, 2, 1, 0],
-            "lower graph rows should paint first so row-boundary branch turns cover the next row's vertical continuation",
         );
     }
 
@@ -3383,7 +3351,9 @@ mod tests {
             .debug_bounds("commit-row-0")
             .expect("first commit row debug bounds");
         let before_scroll = window
-            .read_with(cx, |app, _cx| app.commit_history_scroll.offset())
+            .read_with(cx, |app, _cx| {
+                app.commit_history_scroll.0.borrow().base_handle.offset()
+            })
             .expect("read commit history offset before wheel");
         visual.simulate_event(ScrollWheelEvent {
             position: first_row_bounds.center(),
@@ -3394,8 +3364,12 @@ mod tests {
         let (after_scroll, max_scroll) = window
             .read_with(cx, |app, _cx| {
                 (
-                    app.commit_history_scroll.offset(),
-                    app.commit_history_scroll.max_offset(),
+                    app.commit_history_scroll.0.borrow().base_handle.offset(),
+                    app.commit_history_scroll
+                        .0
+                        .borrow()
+                        .base_handle
+                        .max_offset(),
                 )
             })
             .expect("read commit history offset after wheel");
@@ -3428,5 +3402,100 @@ mod tests {
         visual
             .debug_bounds(oldest_row_selector)
             .expect("oldest loaded commit row debug bounds");
+    }
+
+    #[gpui::test]
+    async fn commit_graph_virtualizes_offscreen_rows(cx: &mut TestAppContext) {
+        use gpui::size;
+
+        // INITIAL_COMMIT_LIMIT linear commits all load in the first page, so
+        // row 150 exists in the layout and would render if the list were not
+        // virtualized.
+        let (dir, _shas) = init_repo_with_linear_history(INITIAL_COMMIT_LIMIT);
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        // 44px rows; a 400px-tall viewport shows ~9 rows.
+        visual.simulate_resize(size(px(900.), px(400.)));
+
+        visual
+            .debug_bounds("commit-row-0")
+            .expect("first commit row should be materialized");
+        visual
+            .debug_bounds("commit-graph-gutter-0")
+            .expect("first row's gutter should be materialized");
+        assert!(
+            visual.debug_bounds("commit-row-150").is_none(),
+            "row 150 is far below the viewport and must not be materialized"
+        );
+        assert!(
+            visual.debug_bounds("commit-graph-gutter-150").is_none(),
+            "row 150's gutter must not be materialized either"
+        );
+    }
+
+    #[gpui::test]
+    async fn graph_layout_is_cached_until_inputs_change(cx: &mut TestAppContext) {
+        let (dir, _main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        // Force a render and capture the recompute count.
+        let after_first = window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                let _ = app.graph_layout(repo);
+                app.graph_layout_recompute_count()
+            })
+            .expect("first layout");
+
+        // A second access with identical inputs must reuse the cache.
+        let after_second = window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                let _ = app.graph_layout(repo);
+                app.graph_layout_recompute_count()
+            })
+            .expect("second layout");
+        assert_eq!(
+            after_first, after_second,
+            "identical inputs must not recompute the layout"
+        );
+
+        // Hiding a branch changes the signature and must recompute.
+        let after_hide = window
+            .update(cx, |app, _window, cx| {
+                app.toggle_branch_visibility("heads/feature".to_string(), cx);
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                let _ = app.graph_layout(repo);
+                app.graph_layout_recompute_count()
+            })
+            .expect("layout after hide");
+        assert_eq!(
+            after_hide,
+            after_second + 1,
+            "changing hidden branches must recompute the layout exactly once"
+        );
     }
 }
