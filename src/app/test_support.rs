@@ -751,6 +751,47 @@ pub(crate) fn open_deeply_nested_changeset_at_360x200(
     (window, visual)
 }
 
+/// Open a changeset whose only changed file has a short, single-segment path,
+/// then resize the window wide enough that the path pane far exceeds the
+/// content width. Returns the window handle and visual context.
+///
+/// This is the setup for the "highlight fills the widened pane" regression:
+/// the longest row is much narrower than the pane, so a row background that
+/// only spans its content leaves a visible gap on the right.
+pub(crate) fn open_short_path_changeset_wide(
+    cx: &mut TestAppContext,
+) -> (WindowHandle<App>, VisualTestContext) {
+    use gpui::{px, size};
+
+    let (dir, sha) = init_repo_with_changed_and_context_files();
+    let path = dir.path().to_path_buf();
+    let window = add_app_window(cx);
+
+    window
+        .update(cx, |app, window, cx| {
+            app.open_repository_at(path, window, cx);
+            app.select_single_commit(sha.clone(), cx);
+        })
+        .expect("open repo and select commit");
+    cx.run_until_parked();
+
+    let mut visual = VisualTestContext::from_window(*window, cx);
+    let open_bounds = visual
+        .debug_bounds("open-changeset")
+        .expect("open-changeset button must be visible after selecting a commit");
+    visual.simulate_click(open_bounds.center(), Modifiers::none());
+    cx.run_until_parked();
+
+    // A very wide window guarantees the path pane is far wider than the single
+    // short-path row, exposing any background that stops at the content width.
+    // The changeset split sizes the file-tree panel proportionally to the
+    // window width, so the panel must be widened via the window.
+    visual.simulate_resize(size(px(2400.), px(600.)));
+    cx.run_until_parked();
+
+    (window, visual)
+}
+
 pub(crate) fn changed_file_entry(path: &str) -> FileListEntry {
     FileListEntry::Changed(crate::repo::ChangedFile {
         path: path.to_string(),

@@ -517,6 +517,39 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn highlighted_row_fills_pane_when_wider_than_content(cx: &mut TestAppContext) {
+        use gpui::px;
+
+        // A single short-path changed file in a very wide window: the path pane
+        // is far wider than the longest row's content. The selected row's
+        // background must still span the pane's full width — otherwise it stops
+        // at the content edge and leaves an unhighlighted gap on the right.
+        let (_window, mut visual) = open_short_path_changeset_wide(cx);
+
+        // Click the changed-file row to highlight it.
+        let row = visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed-file row must be rendered");
+        visual.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        let pane = visual
+            .debug_bounds("changed-files-path-pane")
+            .expect("path pane bounds");
+        let selected = visual
+            .debug_bounds("selected-changed-file-row-0")
+            .expect("selected changed-file row must be rendered after click");
+
+        assert!(
+            (selected.size.width - pane.size.width).abs() < px(1.),
+            "selected row background must fill the path pane's full width \
+             (row {:?} vs pane {:?})",
+            selected.size.width,
+            pane.size.width
+        );
+    }
+
+    #[gpui::test]
     async fn diff_stats_stay_frozen_during_horizontal_scroll(cx: &mut TestAppContext) {
         use gpui::{point, px};
 

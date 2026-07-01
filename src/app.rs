@@ -2645,8 +2645,17 @@ impl App {
                                 .track_scroll(&self.file_tree_hscroll)
                                 .child(
                                     // flex_none inner column sizes to the widest
-                                    // path; rows use w_full so backgrounds are uniform.
-                                    div().flex().flex_col().flex_none().children(path_cells),
+                                    // path so long paths scroll; min_w_full keeps
+                                    // it at least the pane's width when the pane
+                                    // is wider than the content, so rows (w_full)
+                                    // fill the pane and the selection background
+                                    // has no trailing gap.
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_none()
+                                        .min_w_full()
+                                        .children(path_cells),
                                 ),
                         )
                         .child(
