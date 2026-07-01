@@ -14,6 +14,8 @@ pub enum LucideIcon {
     ChevronDown,
     /// `chevron-right.svg`
     ChevronRight,
+    /// `chevron-up.svg`
+    ChevronUp,
     /// `chevrons-down-up.svg`
     ChevronsDownUp,
     /// `chevrons-up-down.svg`
@@ -53,6 +55,7 @@ impl LucideIcon {
         LucideIcon::Check,
         LucideIcon::ChevronDown,
         LucideIcon::ChevronRight,
+        LucideIcon::ChevronUp,
         LucideIcon::ChevronsDownUp,
         LucideIcon::ChevronsUpDown,
         LucideIcon::Cloud,
@@ -77,6 +80,7 @@ impl IconNamed for LucideIcon {
             LucideIcon::Check => "icons/check.svg",
             LucideIcon::ChevronDown => "icons/chevron-down.svg",
             LucideIcon::ChevronRight => "icons/chevron-right.svg",
+            LucideIcon::ChevronUp => "icons/chevron-up.svg",
             LucideIcon::ChevronsDownUp => "icons/chevrons-down-up.svg",
             LucideIcon::ChevronsUpDown => "icons/chevrons-up-down.svg",
             LucideIcon::Cloud => "icons/cloud.svg",

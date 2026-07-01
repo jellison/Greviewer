@@ -10,7 +10,7 @@ pub(crate) fn render_prepared_file_diff(
     scroll: &FileDiffScroll,
 ) -> AnyElement {
     match prepared {
-        PreparedFileDiff::Single { side, rows } => {
+        PreparedFileDiff::Single { side, rows, .. } => {
             let side = *side;
             let selector = match side {
                 repo::DiffSide::Old => "file-diff-side-old",
@@ -27,7 +27,7 @@ pub(crate) fn render_prepared_file_diff(
             render_file_diff_side(selector, cells, scroll.handle_for(side).clone())
                 .into_any_element()
         }
-        PreparedFileDiff::SideBySide { rows } => {
+        PreparedFileDiff::SideBySide { rows, .. } => {
             let old_cells = rows.iter().map(|row| row.old.clone()).collect::<Vec<_>>();
             let new_cells = rows.iter().map(|row| row.new.clone()).collect::<Vec<_>>();
 
@@ -50,6 +50,243 @@ pub(crate) fn render_prepared_file_diff(
         }
         PreparedFileDiff::Binary => render_binary_diff_placeholder(),
     }
+}
+
+/// The block the counter reports: the first block still at or below the top of
+/// the viewport (`end_row >= topmost_row`). This reads correctly even when the
+/// diff is scrolled to the bottom and a late block cannot reach the very top —
+/// the block is still visible, so it is still reported. Falls back to the last
+/// block when everything is scrolled above the top, and returns 0 for an empty
+/// slice (callers only invoke this with at least one block).
+pub(crate) fn current_block_index(blocks: &[ChangeBlock], topmost_row: usize) -> usize {
+    blocks
+        .iter()
+        .position(|block| block.end_row >= topmost_row)
+        .unwrap_or_else(|| blocks.len().saturating_sub(1))
+}
+
+/// The block to step forward to: the first block that begins strictly below the
+/// anchor row. This is visibility-aware — a block below the current top is the
+/// next stop even when the counter already reports it, so a step never skips an
+/// unseen change. Wraps to the first block when no block begins below the
+/// anchor. (The caller handles the bottom-clamp wrap, where a late block sits
+/// below the anchor only because the viewport cannot scroll far enough.)
+pub(crate) fn next_block_index(blocks: &[ChangeBlock], anchor_row: usize) -> usize {
+    blocks
+        .iter()
+        .position(|block| block.start_row > anchor_row)
+        .unwrap_or(0)
+}
+
+/// The block to step backward to: the last block that begins strictly above the
+/// anchor row. Wraps to the last block when no block begins above the anchor
+/// (e.g. stepping back from the first block or the top of the file). Returns 0
+/// for an empty slice.
+pub(crate) fn previous_block_index(blocks: &[ChangeBlock], anchor_row: usize) -> usize {
+    blocks
+        .iter()
+        .rposition(|block| block.start_row < anchor_row)
+        .unwrap_or_else(|| blocks.len().saturating_sub(1))
+}
+
+/// The index of the topmost row visible for a given vertical scroll offset. The
+/// offset is zero at the top and grows negative as the content scrolls up, so
+/// the row count above the fold is `-offset / row_height`, floored. Clamped to
+/// the last row.
+pub(crate) fn topmost_row_for_offset(offset_y: Pixels, row_count: usize) -> usize {
+    if row_count == 0 {
+        return 0;
+    }
+    let rows_above = (-offset_y / px(DIFF_LINE_HEIGHT)).floor().max(0.) as usize;
+    rows_above.min(row_count - 1)
+}
+
+/// The scroll handle and row count that change-block navigation drives for a
+/// prepared diff: the shared handle for a side-by-side diff, or the visible
+/// side's handle for a single-side one. `None` for a binary diff, which has no
+/// navigable rows.
+pub(crate) fn change_block_scroll_target(
+    prepared: &PreparedFileDiff,
+    scroll: &FileDiffScroll,
+) -> Option<(UniformListScrollHandle, usize)> {
+    match prepared {
+        PreparedFileDiff::Single { side, rows, .. } => {
+            Some((scroll.handle_for(*side).clone(), rows.len()))
+        }
+        PreparedFileDiff::SideBySide { rows, .. } => {
+            Some((scroll.side_by_side.clone(), rows.len()))
+        }
+        PreparedFileDiff::Binary => None,
+    }
+}
+
+/// The topmost visible row for a prepared diff at its current scroll position.
+/// `None` for a binary diff.
+pub(crate) fn change_block_topmost_row(
+    prepared: &PreparedFileDiff,
+    scroll: &FileDiffScroll,
+) -> Option<usize> {
+    let (handle, row_count) = change_block_scroll_target(prepared, scroll)?;
+    let offset_y = handle.0.borrow().base_handle.offset().y;
+    Some(topmost_row_for_offset(offset_y, row_count))
+}
+
+/// The anchor row that next/previous navigation compares block starts against:
+/// the topmost visible row plus the context margin, so a block resting at its
+/// scrolled position (context rows above it) is treated as the current block
+/// and a step moves off it. `None` for a binary diff.
+pub(crate) fn change_block_anchor_row(
+    prepared: &PreparedFileDiff,
+    scroll: &FileDiffScroll,
+) -> Option<usize> {
+    Some(change_block_topmost_row(prepared, scroll)? + CHANGE_BLOCK_CONTEXT_ROWS)
+}
+
+/// Whether the diff is scrolled to the bottom, where a late change block cannot
+/// be brought fully to the top. Forward navigation treats this as "past the
+/// last block" so the next step wraps to the first. Requires a real scroll
+/// range, so a short diff that entirely fits is never considered at-bottom.
+pub(crate) fn change_block_scrolled_to_bottom(
+    prepared: &PreparedFileDiff,
+    scroll: &FileDiffScroll,
+) -> bool {
+    let Some((handle, _row_count)) = change_block_scroll_target(prepared, scroll) else {
+        return false;
+    };
+    let state = handle.0.borrow();
+    let max_height = state.base_handle.max_offset().height;
+    let offset_y = state.base_handle.offset().y;
+    max_height > px(0.) && offset_y <= -max_height + px(1.)
+}
+
+/// The block the reviewer is currently looking at, for a prepared diff at its
+/// current scroll position. `None` when the diff has no change blocks.
+pub(crate) fn current_change_block(
+    prepared: &PreparedFileDiff,
+    scroll: &FileDiffScroll,
+) -> Option<usize> {
+    let blocks = prepared.blocks();
+    if blocks.is_empty() {
+        return None;
+    }
+    let topmost = change_block_topmost_row(prepared, scroll)?;
+    Some(current_block_index(blocks, topmost))
+}
+
+/// The vertical scroll offset that places a block's `start_row` at the top of
+/// the viewport, leaving up to `context_rows` of context above it. The offset
+/// is negative because the content scrolls up. Clamped at the top of the file
+/// via `saturating_sub`, so early blocks simply sit at the top.
+pub(crate) fn scroll_offset_for_block_top(start_row: usize, context_rows: usize) -> Pixels {
+    let top_row = start_row.saturating_sub(context_rows);
+    -px(top_row as f32 * DIFF_LINE_HEIGHT)
+}
+
+/// Set a diff side's vertical scroll offset directly, preserving the horizontal
+/// offset. Used to jump to a change block synchronously so the footer counter
+/// reflects the new position in the same frame.
+pub(crate) fn set_diff_scroll_top(handle: &UniformListScrollHandle, offset_y: Pixels) {
+    let state = handle.0.borrow();
+    let x = state.base_handle.offset().x;
+    state.base_handle.set_offset(point(x, offset_y));
+}
+
+/// When a diff is first shown, scroll it to its first change block so the
+/// reviewer lands on the change instead of the file's top. Consumes the
+/// scroll's pending-focus flag (set on open), so it fires once per open and
+/// leaves later manual scrolling untouched. A no-op for a diff with no blocks.
+pub(crate) fn focus_first_change_block(prepared: &PreparedFileDiff, scroll: &FileDiffScroll) {
+    if !scroll.take_pending_focus() {
+        return;
+    }
+    let Some(first) = prepared.blocks().first() else {
+        return;
+    };
+    let Some((handle, _row_count)) = change_block_scroll_target(prepared, scroll) else {
+        return;
+    };
+    set_diff_scroll_top(
+        &handle,
+        scroll_offset_for_block_top(first.start_row, CHANGE_BLOCK_CONTEXT_ROWS),
+    );
+}
+
+/// Height of the change-block navigation footer.
+const CHANGE_BLOCK_FOOTER_HEIGHT: f32 = 28.;
+const CHANGE_BLOCK_BUTTON_SIZE: f32 = 20.;
+const CHANGE_BLOCK_ICON_SIZE: f32 = 14.;
+
+/// The right-aligned footer bar for change-block navigation: a `Change N of M`
+/// counter and up/down chevrons that jump to the previous/next change block.
+/// `None` when the diff has no change blocks, so the caller renders nothing.
+pub(crate) fn render_change_block_footer(
+    prepared: &PreparedFileDiff,
+    scroll: &FileDiffScroll,
+) -> Option<AnyElement> {
+    let total = prepared.blocks().len();
+    let current = current_change_block(prepared, scroll)?;
+
+    Some(
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_end()
+            .gap_2()
+            .h(px(CHANGE_BLOCK_FOOTER_HEIGHT))
+            .px_2()
+            .border_t_1()
+            .border_color(rgb(0x2a2a2a))
+            .bg(rgb(0x1d1d1d))
+            .id("change-block-footer")
+            .debug_selector(|| "change-block-footer".to_string())
+            .child(
+                div()
+                    .text_color(rgb(0x999999))
+                    .text_size(px(12.))
+                    .font_family(MONO_FONT_FAMILY)
+                    .debug_selector(|| "change-block-label".to_string())
+                    .child(format!("Change {} of {}", current + 1, total)),
+            )
+            .child(change_block_button(
+                "change-block-prev",
+                LucideIcon::ChevronUp,
+                |window, cx| window.dispatch_action(Box::new(PreviousChangeBlock), cx),
+            ))
+            .child(change_block_button(
+                "change-block-next",
+                LucideIcon::ChevronDown,
+                |window, cx| window.dispatch_action(Box::new(NextChangeBlock), cx),
+            ))
+            .into_any_element(),
+    )
+}
+
+/// One chevron button in the change-block footer. Clicking it dispatches the
+/// navigation action `dispatch` runs, so the button and keybinding share one
+/// path.
+fn change_block_button(
+    selector: &'static str,
+    icon: LucideIcon,
+    dispatch: impl Fn(&mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(selector)
+        .debug_selector(move || selector.to_string())
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(CHANGE_BLOCK_BUTTON_SIZE))
+        .h(px(CHANGE_BLOCK_BUTTON_SIZE))
+        .rounded(px(2.))
+        .cursor_pointer()
+        .hover(|button| button.bg(rgb(0x2a2a2a)))
+        .on_click(move |_event: &gpui::ClickEvent, window, cx| dispatch(window, cx))
+        .child(
+            Icon::new(icon)
+                .size(px(CHANGE_BLOCK_ICON_SIZE))
+                .text_color(rgb(0x999999)),
+        )
 }
 
 pub(crate) fn render_binary_diff_placeholder() -> AnyElement {
@@ -131,6 +368,63 @@ pub(crate) struct DiffRow {
     pub(crate) new: DiffLineCell,
 }
 
+impl DiffRow {
+    /// A row is "changed" when either side departs from `Unchanged`. `Empty`
+    /// is the alignment counterpart of a change on the other side, so it
+    /// counts as changed too.
+    fn is_changed(&self) -> bool {
+        self.old.status != DiffLineStatus::Unchanged || self.new.status != DiffLineStatus::Unchanged
+    }
+}
+
+/// A navigable region of change: an inclusive range of row indices into the
+/// flat rows vec. Endpoints are always changed rows; runs of changed rows
+/// separated by no more than `CHANGE_BLOCK_MAX_GAP` unchanged rows merge into
+/// a single block, so the merged-in context rows sit inside the span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChangeBlock {
+    pub(crate) start_row: usize,
+    pub(crate) end_row: usize,
+}
+
+/// Two runs of changed rows separated by this many unchanged "context" rows or
+/// fewer merge into a single change block, mirroring git's default 3-line
+/// context.
+pub(crate) const CHANGE_BLOCK_MAX_GAP: usize = 3;
+
+/// When navigating to a change block, leave up to this many context rows above
+/// it so the reviewer sees a little of what precedes the change. Clamped
+/// automatically at the top of the file.
+pub(crate) const CHANGE_BLOCK_CONTEXT_ROWS: usize = 3;
+
+/// Group the flat diff rows into navigable change blocks. Contiguous runs of
+/// changed rows separated by `max_gap` or fewer unchanged rows merge into one
+/// block; larger gaps split them. Returns blocks in row order.
+pub(crate) fn change_blocks(rows: &[DiffRow], max_gap: usize) -> Vec<ChangeBlock> {
+    let mut blocks: Vec<ChangeBlock> = Vec::new();
+
+    for (index, row) in rows.iter().enumerate() {
+        if !row.is_changed() {
+            continue;
+        }
+
+        match blocks.last_mut() {
+            // Extend the open block when this change is within the gap of the
+            // previous change (the unchanged rows between them number
+            // `index - last.end_row - 1`).
+            Some(last) if index - last.end_row - 1 <= max_gap => {
+                last.end_row = index;
+            }
+            _ => blocks.push(ChangeBlock {
+                start_row: index,
+                end_row: index,
+            }),
+        }
+    }
+
+    blocks
+}
+
 /// Identifies a cached diff: the changed file's path plus the commit and base
 /// shas it was diffed against. Two changesets that touch the same path produce
 /// different keys, so a stale entry is never served.
@@ -151,9 +445,11 @@ pub(crate) enum PreparedFileDiff {
     Single {
         side: repo::DiffSide,
         rows: Vec<DiffRow>,
+        blocks: Vec<ChangeBlock>,
     },
     SideBySide {
         rows: Vec<DiffRow>,
+        blocks: Vec<ChangeBlock>,
     },
     Binary,
 }
@@ -170,14 +466,26 @@ impl PreparedFileDiff {
                         repo::DiffSide::New => attach_line_runs(&mut row.new, &runs),
                     }
                 }
-                PreparedFileDiff::Single { side, rows }
+                let blocks = change_blocks(&rows, CHANGE_BLOCK_MAX_GAP);
+                PreparedFileDiff::Single { side, rows, blocks }
             }
             repo::FileDiffContent::SideBySide { old_text, new_text } => {
                 let mut rows = side_by_side_diff_rows(&old_text, &new_text);
                 attach_diff_highlights(&mut rows, &old_text, &new_text, language);
-                PreparedFileDiff::SideBySide { rows }
+                let blocks = change_blocks(&rows, CHANGE_BLOCK_MAX_GAP);
+                PreparedFileDiff::SideBySide { rows, blocks }
             }
             repo::FileDiffContent::Binary => PreparedFileDiff::Binary,
+        }
+    }
+
+    /// The navigable change blocks for this diff, in row order. Empty for a
+    /// binary diff or a diff with no changes.
+    pub(crate) fn blocks(&self) -> &[ChangeBlock] {
+        match self {
+            PreparedFileDiff::Single { blocks, .. }
+            | PreparedFileDiff::SideBySide { blocks, .. } => blocks,
+            PreparedFileDiff::Binary => &[],
         }
     }
 }
@@ -554,7 +862,183 @@ mod tests {
     use super::*;
     use crate::app::test_support::*;
     use crate::repo::{ChangeKind, DiffSide};
-    use gpui::{px, TestAppContext, VisualTestContext};
+    use gpui::{px, TestAppContext, VisualTestContext, WindowHandle};
+
+    #[test]
+    fn change_blocks_group_one_contiguous_run() {
+        let rows = side_by_side_diff_rows("a_old\nb_old\n", "a_new\nb_new\n");
+        let blocks = change_blocks(&rows, CHANGE_BLOCK_MAX_GAP);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].start_row, 0);
+        assert_eq!(blocks[0].end_row, 1);
+    }
+
+    #[test]
+    fn change_blocks_split_runs_separated_by_a_large_gap() {
+        // Four unchanged context rows separate the two changes: gap > max, so
+        // the runs stay distinct blocks.
+        let old_text = "a_old\nctx1\nctx2\nctx3\nctx4\nb_old\n";
+        let new_text = "a_new\nctx1\nctx2\nctx3\nctx4\nb_new\n";
+        let rows = side_by_side_diff_rows(old_text, new_text);
+        let blocks = change_blocks(&rows, CHANGE_BLOCK_MAX_GAP);
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].start_row, 0);
+        assert_eq!(blocks[0].end_row, 0);
+        assert_eq!(blocks[1].start_row, 5);
+        assert_eq!(blocks[1].end_row, 5);
+    }
+
+    #[test]
+    fn change_blocks_merge_runs_within_the_gap() {
+        // Exactly three unchanged context rows separate the changes: gap == max,
+        // so the runs merge into one block whose endpoints are changed rows.
+        let old_text = "a_old\nctx1\nctx2\nctx3\nb_old\n";
+        let new_text = "a_new\nctx1\nctx2\nctx3\nb_new\n";
+        let rows = side_by_side_diff_rows(old_text, new_text);
+        let blocks = change_blocks(&rows, CHANGE_BLOCK_MAX_GAP);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].start_row, 0);
+        assert_eq!(blocks[0].end_row, 4);
+    }
+
+    #[test]
+    fn change_blocks_single_side_is_one_block() {
+        let rows = single_side_diff_rows(DiffSide::New, "first\nsecond\nthird\n");
+        let blocks = change_blocks(&rows, CHANGE_BLOCK_MAX_GAP);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].start_row, 0);
+        assert_eq!(blocks[0].end_row, 2);
+    }
+
+    #[test]
+    fn change_blocks_are_empty_when_nothing_changed() {
+        let rows = side_by_side_diff_rows("same\nlines\n", "same\nlines\n");
+        let blocks = change_blocks(&rows, CHANGE_BLOCK_MAX_GAP);
+
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn prepared_side_by_side_diff_exposes_change_blocks() {
+        let content = repo::FileDiffContent::SideBySide {
+            old_text: "a_old\nctx\nb_old\n".to_string(),
+            new_text: "a_new\nctx\nb_new\n".to_string(),
+        };
+        let prepared = PreparedFileDiff::from_content(content, "");
+
+        // One unchanged context row separates the changes (gap 1 <= max), so
+        // they merge into a single block.
+        assert_eq!(prepared.blocks().len(), 1);
+        assert_eq!(prepared.blocks()[0].start_row, 0);
+        assert_eq!(prepared.blocks()[0].end_row, 2);
+    }
+
+    #[test]
+    fn prepared_binary_diff_has_no_change_blocks() {
+        let prepared = PreparedFileDiff::from_content(repo::FileDiffContent::Binary, "");
+        assert!(prepared.blocks().is_empty());
+    }
+
+    #[test]
+    fn current_block_index_reports_the_first_block_at_or_below_the_top() {
+        let blocks = [
+            ChangeBlock {
+                start_row: 4,
+                end_row: 6,
+            },
+            ChangeBlock {
+                start_row: 29,
+                end_row: 31,
+            },
+        ];
+
+        // Above the first block: it is the first one still in view.
+        assert_eq!(current_block_index(&blocks, 0), 0);
+        // Within the first block.
+        assert_eq!(current_block_index(&blocks, 5), 0);
+        // Below the first block but above the second: the second is next in view.
+        assert_eq!(current_block_index(&blocks, 20), 1);
+        // Within the second block — reported even if it cannot reach the top.
+        assert_eq!(current_block_index(&blocks, 30), 1);
+        // Scrolled past every block: clamp to the last.
+        assert_eq!(current_block_index(&blocks, 50), 1);
+    }
+
+    #[test]
+    fn next_block_index_steps_to_the_first_block_below_the_anchor() {
+        let blocks = [
+            ChangeBlock {
+                start_row: 4,
+                end_row: 4,
+            },
+            ChangeBlock {
+                start_row: 29,
+                end_row: 29,
+            },
+        ];
+
+        // Anchor above the first block: the first block is the next stop, not
+        // skipped (the visibility-aware fix).
+        assert_eq!(next_block_index(&blocks, 0), 0);
+        // Resting on the first block: advance to the second.
+        assert_eq!(next_block_index(&blocks, 4), 1);
+        // In the gap: the second block is the next stop.
+        assert_eq!(next_block_index(&blocks, 10), 1);
+        // Nothing begins below the anchor: wrap to the first block.
+        assert_eq!(next_block_index(&blocks, 29), 0);
+    }
+
+    #[test]
+    fn previous_block_index_steps_to_the_last_block_above_the_anchor() {
+        let blocks = [
+            ChangeBlock {
+                start_row: 4,
+                end_row: 4,
+            },
+            ChangeBlock {
+                start_row: 29,
+                end_row: 29,
+            },
+        ];
+
+        // At or before the first block: wrap to the last.
+        assert_eq!(previous_block_index(&blocks, 4), 1);
+        assert_eq!(previous_block_index(&blocks, 0), 1);
+        // In the gap: step back to the first block.
+        assert_eq!(previous_block_index(&blocks, 10), 0);
+        // At the last block: step back to the first.
+        assert_eq!(previous_block_index(&blocks, 29), 0);
+    }
+
+    #[test]
+    fn topmost_row_for_offset_floors_by_row_height() {
+        // No scroll: the first row is at the top.
+        assert_eq!(topmost_row_for_offset(px(0.), 10), 0);
+        // Offset is negative as the content scrolls up; 2.5 rows down floors to 2.
+        assert_eq!(topmost_row_for_offset(px(-DIFF_LINE_HEIGHT * 2.5), 10), 2);
+        // Beyond the last row clamps to it.
+        assert_eq!(topmost_row_for_offset(px(-DIFF_LINE_HEIGHT * 100.), 10), 9);
+        // An empty diff has no rows to land on.
+        assert_eq!(topmost_row_for_offset(px(-50.), 0), 0);
+    }
+
+    #[test]
+    fn scroll_offset_for_block_top_leaves_context_above_the_block() {
+        // A block starting at row 10 lands with three context rows above it.
+        assert_eq!(
+            scroll_offset_for_block_top(10, CHANGE_BLOCK_CONTEXT_ROWS),
+            -px(7. * DIFF_LINE_HEIGHT)
+        );
+        // A block within the context margin of the top clamps to the top.
+        assert_eq!(
+            scroll_offset_for_block_top(2, CHANGE_BLOCK_CONTEXT_ROWS),
+            px(0.)
+        );
+    }
 
     #[test]
     fn line_diff_single_side_added_marks_lines_as_added() {
@@ -1072,6 +1556,228 @@ mod tests {
         assert!(
             visual.debug_bounds("file-diff-line-new-150").is_none(),
             "row 150 is far below the viewport and must not be materialized"
+        );
+    }
+
+    /// Open the three-block modified file in a single pane at a size that keeps
+    /// the diff scrollable, returning the temp repo (kept alive by the caller),
+    /// the window, and its visual context.
+    fn open_multi_block_diff(
+        cx: &mut TestAppContext,
+    ) -> (tempfile::TempDir, WindowHandle<App>, VisualTestContext) {
+        use gpui::{px, size};
+
+        let (dir, oid_hex) = init_repo_with_multiple_change_blocks();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.open_file_preview("blocks.txt".to_string(), cx);
+            })
+            .expect("open multi-block diff");
+
+        cx.run_until_parked();
+
+        let visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(360.)));
+        cx.run_until_parked();
+
+        (dir, window, visual)
+    }
+
+    #[gpui::test]
+    async fn change_block_footer_reports_the_current_position(cx: &mut TestAppContext) {
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+
+        visual
+            .debug_bounds("change-block-footer")
+            .expect("change-block footer");
+        visual
+            .debug_bounds("change-block-label")
+            .expect("change-block label");
+
+        let position = window
+            .read_with(cx, |app, _cx| app.active_diff_block_position())
+            .expect("read block position");
+        assert_eq!(
+            position,
+            Some((0, 3)),
+            "a fresh diff sits on the first of three blocks"
+        );
+    }
+
+    #[gpui::test]
+    async fn clicking_next_change_block_advances_and_scrolls(cx: &mut TestAppContext) {
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+
+        let before = window
+            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .expect("read offset before");
+
+        let next = visual
+            .debug_bounds("change-block-next")
+            .expect("next button");
+        visual.simulate_click(next.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        let position = window
+            .read_with(cx, |app, _cx| app.active_diff_block_position())
+            .expect("read block position");
+        assert_eq!(position, Some((1, 3)), "next advances to the second block");
+
+        let after = window
+            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .expect("read offset after");
+        assert!(
+            after.y < before.y,
+            "advancing to the next block scrolls the diff down"
+        );
+    }
+
+    #[gpui::test]
+    async fn clicking_previous_change_block_wraps_to_the_last(cx: &mut TestAppContext) {
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+
+        let prev = visual
+            .debug_bounds("change-block-prev")
+            .expect("previous button");
+        visual.simulate_click(prev.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        let position = window
+            .read_with(cx, |app, _cx| app.active_diff_block_position())
+            .expect("read block position");
+        assert_eq!(
+            position,
+            Some((2, 3)),
+            "previous from the first block wraps to the last"
+        );
+    }
+
+    #[gpui::test]
+    async fn change_block_keybindings_navigate_the_active_diff(cx: &mut TestAppContext) {
+        cx.update(crate::app::bind_app_keys);
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+
+        visual.simulate_keystrokes("cmd-down");
+        cx.run_until_parked();
+        let after_next = window
+            .read_with(cx, |app, _cx| app.active_diff_block_position())
+            .expect("read block position after cmd-down");
+        assert_eq!(after_next, Some((1, 3)), "cmd-down advances a block");
+
+        visual.simulate_keystrokes("cmd-up");
+        cx.run_until_parked();
+        let after_prev = window
+            .read_with(cx, |app, _cx| app.active_diff_block_position())
+            .expect("read block position after cmd-up");
+        assert_eq!(after_prev, Some((0, 3)), "cmd-up steps back a block");
+    }
+
+    #[gpui::test]
+    async fn opening_a_diff_scrolls_to_its_first_change_block(cx: &mut TestAppContext) {
+        use gpui::px;
+
+        let (_dir, window, _visual) = open_multi_block_diff(cx);
+
+        let offset = window
+            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .expect("read offset");
+        assert!(
+            offset.y < px(0.),
+            "a freshly opened diff auto-scrolls down to its first change block"
+        );
+    }
+
+    #[gpui::test]
+    async fn stepping_next_from_the_top_lands_on_the_first_block_without_skipping(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::{point, px, ScrollDelta, ScrollWheelEvent};
+
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+
+        // Scroll back above the first change, to the very top of the file.
+        let side = visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new file diff side");
+        visual.simulate_event(ScrollWheelEvent {
+            position: side.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(480.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+
+        let at_top = window
+            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .expect("read offset at top");
+        assert_eq!(at_top.y, px(0.), "scrolled to the very top of the file");
+        let at_top_position = window
+            .read_with(cx, |app, _cx| app.active_diff_block_position())
+            .expect("read block position at top");
+        assert_eq!(
+            at_top_position,
+            Some((0, 3)),
+            "the counter still points at the first block while above it"
+        );
+
+        // Next must bring the first block into view, not skip to the second.
+        let next = visual
+            .debug_bounds("change-block-next")
+            .expect("next button");
+        visual.simulate_click(next.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        let after = window
+            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .expect("read offset after next");
+        assert!(
+            after.y < px(0.),
+            "next from the top scrolls down into the first block"
+        );
+        let after_position = window
+            .read_with(cx, |app, _cx| app.active_diff_block_position())
+            .expect("read block position after next");
+        assert_eq!(
+            after_position,
+            Some((0, 3)),
+            "next stepped onto the first block rather than skipping it"
+        );
+    }
+
+    #[gpui::test]
+    async fn binary_diff_hides_the_change_block_footer(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_binary_file();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open binary changeset");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row_bounds = visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        visual
+            .debug_bounds("file-diff-binary")
+            .expect("binary diff placeholder");
+        assert!(
+            visual.debug_bounds("change-block-footer").is_none(),
+            "a binary diff has no change blocks and shows no footer"
         );
     }
 }

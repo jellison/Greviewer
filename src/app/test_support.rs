@@ -618,6 +618,34 @@ pub(crate) fn init_repo_with_long_diff() -> (tempfile::TempDir, String) {
     (dir, update_oid.to_string())
 }
 
+/// A modified file with three well-separated change blocks: a 60-line file
+/// whose lines 5, 30, and 55 change, leaving far more than the merge gap of
+/// unchanged context between each change. Exercises multi-block navigation.
+pub(crate) fn init_repo_with_multiple_change_blocks() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let repo = Repository::init(dir.path()).expect("init repo");
+
+    let base = (1..=60)
+        .map(|line| format!("line {line:03}\n"))
+        .collect::<String>();
+    fs::write(dir.path().join("blocks.txt"), base).expect("write base file");
+    let root_oid = commit_all(&repo, "Add blocks.txt", &[]);
+
+    let mut lines = (1..=60)
+        .map(|line| format!("line {line:03}"))
+        .collect::<Vec<_>>();
+    lines[4] = "line 005 changed".to_string();
+    lines[29] = "line 030 changed".to_string();
+    lines[54] = "line 055 changed".to_string();
+    let updated = lines.join("\n") + "\n";
+    fs::write(dir.path().join("blocks.txt"), updated).expect("write updated file");
+    let update_oid = commit_all(&repo, "Change three blocks", &[root_oid]);
+
+    drop(repo);
+
+    (dir, update_oid.to_string())
+}
+
 pub(crate) fn init_repo_with_binary_file() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().expect("create tempdir");
     let repo = Repository::init(dir.path()).expect("init repo");

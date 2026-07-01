@@ -4,8 +4,8 @@ use gpui::{Action, App as GpuiApp, KeyBinding, Menu, MenuItem, SharedString};
 
 use super::{
     ActivateNextTab, ActivatePreviousTab, ClearSelection, CloseActivePane, CloseActiveTab,
-    OpenChangeset, OpenRepository, QuitApplication, SplitPaneDown, SplitPaneLeft, SplitPaneRight,
-    SplitPaneUp,
+    NextChangeBlock, OpenChangeset, OpenRepository, PreviousChangeBlock, QuitApplication,
+    SplitPaneDown, SplitPaneLeft, SplitPaneRight, SplitPaneUp,
 };
 
 pub const GREVIEWER_MENU_LABEL: &str = "Greviewer";
@@ -26,6 +26,8 @@ pub const CLOSE_ACTIVE_PANE_KEYSTROKE: &str = "cmd-k w";
 /// the branch-filter input) bind these keys in their own context and win.
 pub const OPEN_CHANGESET_KEYSTROKE: &str = "enter";
 pub const CLEAR_SELECTION_KEYSTROKE: &str = "escape";
+pub const NEXT_CHANGE_BLOCK_KEYSTROKE: &str = "cmd-down";
+pub const PREVIOUS_CHANGE_BLOCK_KEYSTROKE: &str = "cmd-up";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuSnapshot {
@@ -80,6 +82,8 @@ pub fn bind_app_keys(cx: &mut GpuiApp) {
         KeyBinding::new(CLOSE_ACTIVE_PANE_KEYSTROKE, CloseActivePane, None),
         KeyBinding::new(OPEN_CHANGESET_KEYSTROKE, OpenChangeset, None),
         KeyBinding::new(CLEAR_SELECTION_KEYSTROKE, ClearSelection, None),
+        KeyBinding::new(NEXT_CHANGE_BLOCK_KEYSTROKE, NextChangeBlock, None),
+        KeyBinding::new(PREVIOUS_CHANGE_BLOCK_KEYSTROKE, PreviousChangeBlock, None),
     ]);
 }
 

@@ -527,3 +527,57 @@ For files that exist on only one side of the selection — added or deleted file
 
 - Renamed files diff old-path content against new-path content; the file's pre-rename path is surfaced so the user can see what was renamed.
 - Binary files render an explanatory placeholder rather than attempting a textual diff.
+
+## Navigating change blocks
+
+A file diff groups its changes into blocks: runs of changed lines, with runs
+separated by only a few unchanged lines joined into one block so a single edit
+does not fragment into many stops. When a diff is first opened it scrolls
+straight to its first change block, so the reviewer lands on the change rather
+than the top of the file. While viewing a diff that has at least one change
+block, the user sees a navigation control that reports the current position as
+`Change N of M` and offers a step-to-previous and a step-to-next affordance.
+Keyboard shortcuts step to the next and previous block as well. The control and
+the shortcuts share one behavior.
+
+Stepping is relative to the top of the view: the next step goes to the first
+block that begins below the current top, and the previous step to the last
+block that begins above it. A block scrolled off the top of the view is
+therefore stepped to rather than skipped. Stepping moves the diff so the target
+block sits near the top, with a little of the preceding context kept visible.
+Navigation wraps: stepping past the last block returns to the first, and
+stepping back from the first goes to the last. The reported position always
+reflects what is on screen — scrolling the diff by hand updates the counter to
+the block at the top of the view, so the next step is always relative to what
+the user is currently looking at.
+
+**Triggering conditions**
+
+- A diff is opened, which scrolls it to its first change block.
+- The user activates the previous- or next-block affordance in the navigation
+  control while viewing a diff with at least one change block.
+- The user presses the next- or previous-block keyboard shortcut while a
+  changeset is open.
+- The user scrolls the diff by hand.
+
+**Observable outcomes**
+
+- Opening a diff scrolls it to its first change block.
+- A diff with at least one change block shows a navigation control reporting
+  `Change N of M` with previous- and next-block affordances.
+- Stepping to a block scrolls the diff so that block sits near the top, keeping
+  a little preceding context in view, and updates the reported position.
+- A block that begins below the current top is the next step's destination even
+  when the counter already reports it, so no unseen change is skipped.
+- Navigation wraps at both ends: next from the last block goes to the first, and
+  previous from the first goes to the last.
+- Scrolling the diff by hand updates the reported position to the block at the
+  top of the view.
+- Added and deleted files, shown full-width, count their changes as blocks and
+  navigate the same way.
+
+**Edge cases**
+
+- A diff with no change blocks — a binary file, or a change whose net effect
+  leaves no differing lines — shows no navigation control.
+- The block-navigation keyboard shortcuts do nothing while no changeset is open.

@@ -41,7 +41,7 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::Icon;
 use similar::{DiffTag, TextDiff};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::Range,
     path::{Path, PathBuf},
@@ -68,7 +68,9 @@ actions!(
         SplitPaneRight,
         SplitPaneUp,
         SplitPaneDown,
-        CloseActivePane
+        CloseActivePane,
+        NextChangeBlock,
+        PreviousChangeBlock
     ]
 );
 
@@ -200,6 +202,11 @@ pub(crate) struct FileDiffScroll {
     old: UniformListScrollHandle,
     new: UniformListScrollHandle,
     side_by_side: UniformListScrollHandle,
+    /// Set when the shown file changes (via `reset`); consumed on the next
+    /// render to scroll the diff to its first change block exactly once per
+    /// open. Shared across clones so every reference to a pane's scroll sees
+    /// the same pending state.
+    pending_focus: Rc<Cell<bool>>,
 }
 
 /// One pane's scroll handles: the tab strip plus the diff content sides.
@@ -224,6 +231,7 @@ impl FileDiffScroll {
             old: UniformListScrollHandle::new(),
             new: UniformListScrollHandle::new(),
             side_by_side: UniformListScrollHandle::new(),
+            pending_focus: Rc::new(Cell::new(false)),
         }
     }
 
@@ -239,6 +247,15 @@ impl FileDiffScroll {
         self.old.0.borrow().base_handle.set_offset(origin);
         self.new.0.borrow().base_handle.set_offset(origin);
         self.side_by_side.0.borrow().base_handle.set_offset(origin);
+        // A newly shown diff should land on its first change; the next render
+        // consumes this to scroll there.
+        self.pending_focus.set(true);
+    }
+
+    /// Take the pending-focus flag, returning whether a first-change scroll is
+    /// owed and clearing it so it fires only once per open.
+    fn take_pending_focus(&self) -> bool {
+        self.pending_focus.replace(false)
     }
 
     #[cfg(test)]
@@ -1301,6 +1318,81 @@ impl App {
         }
         let pane = self.workspace.active_pane();
         self.close_workspace_pane(pane, cx);
+    }
+
+    /// The prepared diff and scroll state for the file open in the active pane,
+    /// or `None` when no changeset is open, no file is shown, or the file has
+    /// no diff to prepare. Shared by change-block navigation and its footer.
+    fn active_pane_prepared_diff(&self) -> Option<(Rc<PreparedFileDiff>, FileDiffScroll)> {
+        let Mode::RepoOpen { repo } = &self.mode else {
+            return None;
+        };
+        let ReviewScreen::Changeset { changeset, .. } = &self.review_screen else {
+            return None;
+        };
+        let pane = self.workspace.active_pane();
+        let path = self
+            .workspace
+            .active_item(pane)
+            .map(|item| item.path().to_string())?;
+        let file = changeset.files.iter().find(|file| file.path == path)?;
+        let prepared = self.prepared_file_diff(repo, changeset, file).ok()?;
+        Some((prepared, self.pane_scroll(pane).diff))
+    }
+
+    /// Scroll the active pane's diff to the next or previous change block,
+    /// wrapping around at the ends. A no-op outside a changeset or when the
+    /// open file has no change blocks. Navigation is relative to the top of the
+    /// viewport, so a block scrolled off screen is stepped to rather than
+    /// skipped.
+    fn navigate_change_block(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some((prepared, scroll)) = self.active_pane_prepared_diff() else {
+            return;
+        };
+        let blocks = prepared.blocks();
+        if blocks.is_empty() {
+            return;
+        }
+        let Some(anchor) = diff_view::change_block_anchor_row(&prepared, &scroll) else {
+            return;
+        };
+        let Some((handle, _row_count)) = diff_view::change_block_scroll_target(&prepared, &scroll)
+        else {
+            return;
+        };
+
+        let target = if forward {
+            if diff_view::change_block_scrolled_to_bottom(&prepared, &scroll) {
+                // A late block clamped at the bottom counts as the last block,
+                // so the next step wraps to the first rather than sticking.
+                0
+            } else {
+                diff_view::next_block_index(blocks, anchor)
+            }
+        } else {
+            diff_view::previous_block_index(blocks, anchor)
+        };
+        // Set the offset directly (as `FileDiffScroll::reset` does) rather than
+        // via a deferred `scroll_to_item`, so the footer counter reads the new
+        // position in the same frame instead of lagging one behind.
+        diff_view::set_diff_scroll_top(
+            &handle,
+            diff_view::scroll_offset_for_block_top(
+                blocks[target].start_row,
+                diff_view::CHANGE_BLOCK_CONTEXT_ROWS,
+            ),
+        );
+        cx.notify();
+    }
+
+    /// The active pane's change-block position as `(current_index, total)`,
+    /// both derived from the live scroll offset. `None` when there is no
+    /// navigable diff. Test-only observation hook.
+    #[cfg(test)]
+    fn active_diff_block_position(&self) -> Option<(usize, usize)> {
+        let (prepared, scroll) = self.active_pane_prepared_diff()?;
+        let current = diff_view::current_change_block(&prepared, &scroll)?;
+        Some((current, prepared.blocks().len()))
     }
 
     pub(crate) fn activate_workspace_pane(
@@ -3241,7 +3333,17 @@ impl App {
             "file-detail-rename-source-{}",
             debug_path_fragment(&file.path)
         );
-        let content = match self.prepared_file_diff(repo, changeset, file) {
+        let prepared = self.prepared_file_diff(repo, changeset, file);
+        if let Ok(prepared) = prepared.as_ref() {
+            // On first display of this diff, land on its first change block
+            // before the footer and content read the scroll offset.
+            focus_first_change_block(prepared, scroll);
+        }
+        let footer = prepared
+            .as_ref()
+            .ok()
+            .and_then(|prepared| render_change_block_footer(prepared, scroll));
+        let content = match prepared {
             Ok(prepared) => render_prepared_file_diff(&prepared, scroll),
             Err(err) => render_file_diff_error(err),
         };
@@ -3270,6 +3372,7 @@ impl App {
                 )
             })
             .child(content)
+            .when_some(footer, |detail, footer| detail.child(footer))
             .into_any_element()
     }
 
@@ -3475,6 +3578,12 @@ impl Render for App {
             }))
             .on_action(cx.listener(|app, _: &CloseActivePane, _window, cx| {
                 app.close_active_workspace_pane(cx);
+            }))
+            .on_action(cx.listener(|app, _: &NextChangeBlock, _window, cx| {
+                app.navigate_change_block(true, cx);
+            }))
+            .on_action(cx.listener(|app, _: &PreviousChangeBlock, _window, cx| {
+                app.navigate_change_block(false, cx);
             }))
             .child(self.render_title_bar(cx))
             .child(div().flex().flex_1().min_h(px(0.)).w_full().child(body))
@@ -5046,7 +5155,7 @@ mod tests {
                     .expect("prepare diff");
                 // The computed rows are non-empty for a real text change.
                 match first.as_ref() {
-                    PreparedFileDiff::SideBySide { rows } => assert!(!rows.is_empty()),
+                    PreparedFileDiff::SideBySide { rows, .. } => assert!(!rows.is_empty()),
                     other => panic!("expected a side-by-side diff, got {other:?}"),
                 }
 
