@@ -104,7 +104,7 @@ pub fn capture_window_state(window: &Window, cx: &App) -> Option<WindowState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{Settings, WindowMode, WindowState};
+    use crate::settings::{Settings, SidebarWidths, WindowMode, WindowState};
     use gpui::TestAppContext;
 
     fn sample_state(mode: WindowMode, display: &str) -> WindowState {
@@ -164,6 +164,7 @@ mod tests {
             let settings = Settings {
                 recent_repositories: vec![],
                 window_state: Some(sample_state(WindowMode::Windowed, &saved_uuid)),
+                sidebar_widths: SidebarWidths::default(),
             };
 
             let (bounds, display_id) = restore_window_options(&settings, cx);
@@ -183,6 +184,7 @@ mod tests {
             let settings = Settings {
                 recent_repositories: vec![],
                 window_state: Some(sample_state(WindowMode::Windowed, "uuid-not-connected")),
+                sidebar_widths: SidebarWidths::default(),
             };
 
             let (bounds, display_id) = restore_window_options(&settings, cx);

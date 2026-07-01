@@ -1,9 +1,11 @@
 # Window Placement
 
 This contract defines how the application's main window remembers where and how
-it was shown, so that each launch returns the user to the window they left
-rather than a generic default. It covers restoring the window on launch and
-capturing its placement whenever the user leaves.
+it was shown, and how it remembers the widths the user has given its resizable
+sidebars, so that each launch returns the user to the layout they left rather
+than a generic default. It covers restoring the window on launch, capturing its
+placement whenever the user leaves, and remembering sidebar widths across
+sessions.
 
 ## Restoring the window on launch
 
@@ -53,3 +55,30 @@ loses where the user had put it.
 
 - The most recent size, position, display state, and monitor are remembered for
   the next launch.
+
+## Remembering sidebar widths
+
+The application remembers how wide the user has made its resizable sidebars —
+the branch sidebar in the graph view and the changed-files list in the
+changeset view — and restores those widths on the next launch. Widths are a
+single global preference, shared across all repositories.
+
+**Triggering conditions**
+
+- The user drags a sidebar divider to resize it, then closes the window or
+  quits the application.
+
+**Observable outcomes**
+
+- On the next launch, each sidebar opens at the width the user last left it.
+
+**Guaranteed invariants**
+
+- Sidebar widths persist across application restarts.
+
+**Edge cases the user can encounter**
+
+- A sidebar the user has never resized opens at its default width.
+- A sidebar that was not shown at all before the application closed keeps its
+  previously remembered width rather than being reset.
+- A remembered width never opens a sidebar below a usable minimum.

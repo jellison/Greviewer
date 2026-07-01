@@ -6,7 +6,7 @@
 use super::*;
 use crate::graph;
 use crate::repo::{self, ChangeKind};
-use crate::settings::{self, RecentRepository, Settings};
+use crate::settings::{self, RecentRepository, Settings, SidebarWidths};
 use git2::{IndexAddOption, Repository, Signature};
 use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowHandle};
 use std::{collections::BTreeSet, fs, path::PathBuf};
@@ -31,6 +31,23 @@ pub(crate) fn add_app_window_with_store_path(
     })
 }
 
+/// Build an app window seeded with recent repositories AND sidebar widths, so
+/// restore-on-render behavior can be asserted. Uses no settings store path
+/// (nothing persists to disk).
+pub(crate) fn add_app_window_with_recent_and_widths(
+    cx: &mut TestAppContext,
+    recent_repositories: Vec<RecentRepository>,
+    sidebar_widths: SidebarWidths,
+) -> WindowHandle<App> {
+    cx.update(gpui_component::init);
+    let settings = Settings {
+        recent_repositories,
+        window_state: None,
+        sidebar_widths,
+    };
+    cx.add_window(move |window, cx| App::new_with_settings(window, cx, settings.clone()))
+}
+
 /// Write a settings file at `path` whose only populated field is the recent
 /// repository list. Mirrors how the storage tests seed state on disk.
 pub(crate) fn seed_recent_repositories(
@@ -42,6 +59,7 @@ pub(crate) fn seed_recent_repositories(
         &Settings {
             recent_repositories,
             window_state: None,
+            sidebar_widths: SidebarWidths::default(),
         },
     )
     .expect("seed settings store");

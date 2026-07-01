@@ -49,7 +49,7 @@ use std::{
 };
 
 use crate::icons::LucideIcon;
-use crate::settings::{self, RecentRepository, Settings, MAX_RECENT_REPOSITORIES};
+use crate::settings::{self, RecentRepository, Settings, SidebarWidths, MAX_RECENT_REPOSITORIES};
 use crate::workspace::FileDiffItem;
 use crate::{diff_highlight, graph, repo};
 
@@ -111,6 +111,11 @@ const SELECTION_BAR_HEIGHT: f32 = 34.;
 /// reads as chrome rather than another row.
 const SELECTION_BAR_BG: u32 = 0x1a2332;
 const SELECTION_BAR_BORDER: u32 = 0x2a3a50;
+const CHANGESET_FILES_DEFAULT_WIDTH: f32 = 340.;
+/// Smallest width a restored sidebar may take, guarding against a corrupt or
+/// degenerate saved value. The resizable widget clamps further to its own
+/// panel minimum and the container size.
+const SIDEBAR_MIN_WIDTH: f32 = 120.;
 /// Background tint painted behind fuzzy-match characters in filtered sidebar
 /// rows. A translucent accent so it reads over both normal and tinted rows.
 const BRANCH_FILTER_MATCH_BG: u32 = 0x3d5a80cc;
@@ -525,6 +530,7 @@ impl App {
         let settings = Settings {
             recent_repositories,
             window_state: None,
+            sidebar_widths: SidebarWidths::default(),
         };
         Self::new_with_picker_and_settings(window, cx, Box::new(GpuiPathPicker), settings)
     }
@@ -543,6 +549,21 @@ impl App {
             Box::new(GpuiPathPicker),
             settings,
             Some(settings_store_path),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_settings(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        settings: Settings,
+    ) -> Self {
+        Self::new_with_picker_settings_and_store_path(
+            window,
+            cx,
+            Box::new(GpuiPathPicker),
+            settings,
+            None,
         )
     }
 
@@ -612,27 +633,38 @@ impl App {
             }
         }
 
-        // Persist window geometry when the window closes. Two hooks cover the
-        // two macOS quit paths, which never both fire for a single window:
+        // Persist window geometry and sidebar widths when the window closes.
+        // Two hooks cover the two macOS quit paths, which never both fire for a
+        // single window:
         //   * close button / Cmd+W -> windowShouldClose
         //   * Cmd+Q / in-app Quit  -> applicationWillTerminate (on_app_quit)
-        // No in-memory cache: each hook reads the live geometry at the moment
-        // it fires.
+        // No in-memory cache: each hook reads the live geometry and split widths
+        // at the moment it fires.
         let should_close_entity = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             should_close_entity
-                .update(cx, |app, cx| app.persist_window_state(window, cx))
+                .update(cx, |app, cx| app.persist_session_state(window, cx))
                 .ok();
             true
         });
 
-        gpui::App::on_app_quit(cx, |cx| {
+        // Reach the window and this `App` WITHOUT assuming the window's root
+        // view type. The window is rooted at a `gpui_component::Root` wrapper
+        // (see `run` in lib.rs), so `handle.downcast::<App>()` would always be
+        // `None` and this quit-time save would silently never run. Instead take
+        // the live `Window` from the untyped handle and persist through a weak
+        // handle to this entity, exactly as the close-button hook above does.
+        // Do NOT replace this with `downcast::<Self>()`.
+        let quit_entity = cx.entity().downgrade();
+        gpui::App::on_app_quit(cx, move |cx| {
             for handle in cx.windows() {
-                if let Some(window_handle) = handle.downcast::<Self>() {
-                    window_handle
-                        .update(cx, |app, window, cx| app.persist_window_state(window, cx))
-                        .ok();
-                }
+                handle
+                    .update(cx, |_root_view, window, cx| {
+                        quit_entity
+                            .update(cx, |app, cx| app.persist_session_state(window, cx))
+                            .ok();
+                    })
+                    .ok();
             }
             async move {}
         })
@@ -828,13 +860,41 @@ impl App {
         }
     }
 
-    /// Read the live window geometry and monitor, store it, and write settings.
-    /// Called from the window's close hooks; a failed write is swallowed by
-    /// `persist_settings` so it can never block the window from closing.
-    fn persist_window_state(&mut self, window: &Window, cx: &gpui::App) {
+    /// Capture the live window geometry and sidebar widths, then persist once.
+    /// Invoked from the window close/quit hooks. Each piece updates settings
+    /// independently, so a missing display or an unrendered split never blocks
+    /// saving the rest.
+    fn persist_session_state(&mut self, window: &Window, cx: &gpui::App) {
         if let Some(state) = crate::window_placement::capture_window_state(window, cx) {
             self.settings.window_state = Some(state);
-            self.persist_settings();
+        }
+        self.capture_sidebar_widths(cx);
+        self.persist_settings();
+    }
+
+    /// Read each resizable split's current left-panel width and store it. A
+    /// split whose `sizes()` is empty (never rendered this session) is skipped,
+    /// so it never overwrites a previously-saved width with nothing.
+    fn capture_sidebar_widths(&mut self, cx: &gpui::App) {
+        if let Some(width) = self
+            .graph_resizable
+            .read(cx)
+            .sizes()
+            .first()
+            .copied()
+            .map(f32::from)
+        {
+            self.settings.sidebar_widths.branch_sidebar = Some(width);
+        }
+        if let Some(width) = self
+            .changeset_resizable
+            .read(cx)
+            .sizes()
+            .first()
+            .copied()
+            .map(f32::from)
+        {
+            self.settings.sidebar_widths.changeset_files = Some(width);
         }
     }
 
@@ -1948,7 +2008,7 @@ impl App {
                     .with_state(&self.graph_resizable)
                     .child(
                         resizable_panel()
-                            .size(px(BRANCH_SIDEBAR_DEFAULT_WIDTH))
+                            .size(px(self.branch_sidebar_width()))
                             .child(self.render_branch_sidebar(repo, cx)),
                     )
                     .child(resizable_panel().child(history_panel)),
@@ -2029,6 +2089,24 @@ impl App {
                     .child("Open changeset")
                     .child(keycap("\u{23ce}", 0x6b96f0, 0xbfd3fb)),
             )
+    }
+
+    /// Width the branch sidebar opens at: the saved width when present and
+    /// sane, otherwise the default. See [`restored_width`].
+    fn branch_sidebar_width(&self) -> f32 {
+        restored_width(
+            self.settings.sidebar_widths.branch_sidebar,
+            BRANCH_SIDEBAR_DEFAULT_WIDTH,
+        )
+    }
+
+    /// Width the changed-files list opens at: the saved width when present and
+    /// sane, otherwise the default. See [`restored_width`].
+    fn changeset_files_width(&self) -> f32 {
+        restored_width(
+            self.settings.sidebar_widths.changeset_files,
+            CHANGESET_FILES_DEFAULT_WIDTH,
+        )
     }
 
     /// Returns the memoized flat sidebar row model, recomputing only when the
@@ -2615,7 +2693,7 @@ impl App {
                         .with_state(&self.changeset_resizable)
                         .child(
                             resizable_panel()
-                                .size(px(340.))
+                                .size(px(self.changeset_files_width()))
                                 .child(self.render_file_list(repo, entries, cx)),
                         )
                         .child(resizable_panel().child(
@@ -3672,20 +3750,79 @@ fn repository_title(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Resolve a persisted sidebar width to the value to open at: the saved width
+/// when it is a sane positive value at least [`SIDEBAR_MIN_WIDTH`], the minimum
+/// when a saved value is present but too small/corrupt (including negatives and
+/// NaN), or `default` when nothing has been saved.
+fn restored_width(saved: Option<f32>, default: f32) -> f32 {
+    match saved {
+        Some(width) if width >= SIDEBAR_MIN_WIDTH => width,
+        Some(_) => SIDEBAR_MIN_WIDTH,
+        None => default,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        selection_summary, App, CloseChangeset, Mode, OpenChangeset, OpenFailed, PreparedFileDiff,
-        ReviewScreen, Selection, FILE_TREE_ROW_HEIGHT,
+        restored_width, selection_summary, App, CloseChangeset, Mode, OpenChangeset, OpenFailed,
+        PreparedFileDiff, ReviewScreen, Selection, FILE_TREE_ROW_HEIGHT, SIDEBAR_MIN_WIDTH,
     };
     use crate::repo::{ChangeKind, INITIAL_COMMIT_LIMIT};
-    use crate::settings::{RecentRepository, WindowMode};
+    use crate::settings::{RecentRepository, Settings, SidebarWidths, WindowMode};
     use crate::workspace::test_util::simulate_double_click;
     use git2::{IndexAddOption, Repository, Signature};
     use gpui::{px, Modifiers, TestAppContext, VisualTestContext};
     use std::{fs, rc::Rc};
 
     use super::test_support::*;
+
+    #[test]
+    fn restored_width_uses_default_when_unset_and_clamps_bad_values() {
+        // Unset -> default.
+        assert_eq!(restored_width(None, 240.), 240.);
+        // Valid saved value passes through.
+        assert_eq!(restored_width(Some(300.), 240.), 300.);
+        // Below the minimum clamps up to the minimum.
+        assert_eq!(restored_width(Some(10.), 240.), SIDEBAR_MIN_WIDTH);
+        // Negative and NaN are treated as corrupt and clamped to the minimum.
+        assert_eq!(restored_width(Some(-5.), 240.), SIDEBAR_MIN_WIDTH);
+        assert_eq!(restored_width(Some(f32::NAN), 240.), SIDEBAR_MIN_WIDTH);
+    }
+
+    #[gpui::test]
+    async fn restores_saved_branch_sidebar_width_on_render(cx: &mut TestAppContext) {
+        let (dir, _) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+
+        // Seed a non-default width, then build the app from those settings.
+        let window = add_app_window_with_recent_and_widths(
+            cx,
+            vec![RecentRepository::available(path.clone())],
+            SidebarWidths {
+                branch_sidebar: Some(400.),
+                changeset_files: None,
+            },
+        );
+        cx.run_until_parked();
+
+        let left = window
+            .update(cx, |app, _window, cx| {
+                app.graph_resizable
+                    .read(cx)
+                    .sizes()
+                    .first()
+                    .copied()
+                    .map(f32::from)
+            })
+            .expect("read graph split sizes");
+
+        let left = left.expect("branch sidebar should have a measured width after render");
+        assert!(
+            (left - 400.).abs() <= 2.0,
+            "restored branch sidebar width should be ~400, got {left}"
+        );
+    }
 
     #[gpui::test]
     async fn closing_the_window_persists_its_bounds(cx: &mut TestAppContext) {
@@ -3710,6 +3847,81 @@ mod tests {
         assert_eq!(state.width, f32::from(bounds.size.width));
         assert_eq!(state.height, f32::from(bounds.size.height));
         assert!(!state.display.is_empty());
+    }
+
+    #[gpui::test]
+    async fn closing_the_window_persists_the_branch_sidebar_width(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store = dir.path().join("settings.json");
+        let (repo_dir, _) = init_repo_with_one_commit();
+        let repo_path = repo_dir.path().to_path_buf();
+
+        let window = add_app_window_with_store_path(cx, store.clone());
+        // Render the graph split so its ResizableState measures a width.
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(repo_path, window, cx);
+            })
+            .expect("open repo");
+        cx.run_until_parked();
+
+        let measured = window
+            .update(cx, |app, _window, cx| {
+                app.graph_resizable
+                    .read(cx)
+                    .sizes()
+                    .first()
+                    .copied()
+                    .map(f32::from)
+            })
+            .expect("read sizes")
+            .expect("branch sidebar measured after render");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.simulate_close(), "window should accept the close");
+
+        let saved = crate::settings::load(&store)
+            .sidebar_widths
+            .branch_sidebar
+            .expect("branch sidebar width persisted on close");
+        assert!(
+            (saved - measured).abs() <= 0.5,
+            "persisted width {saved} should match measured {measured}"
+        );
+    }
+
+    #[gpui::test]
+    async fn closing_without_rendering_a_split_does_not_clobber_its_saved_width(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store = dir.path().join("settings.json");
+        // Seed a previously-saved changeset width on disk.
+        crate::settings::save(
+            &store,
+            &Settings {
+                recent_repositories: vec![],
+                window_state: None,
+                sidebar_widths: SidebarWidths {
+                    branch_sidebar: None,
+                    changeset_files: Some(333.0),
+                },
+            },
+        )
+        .expect("seed settings");
+
+        // Open a window (no repo -> changeset split never renders) and close it.
+        let window = add_app_window_with_store_path(cx, store.clone());
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.simulate_close(), "window should accept the close");
+
+        // The unrendered changeset width must be preserved, not overwritten.
+        assert_eq!(
+            crate::settings::load(&store).sidebar_widths.changeset_files,
+            Some(333.0),
+            "an unrendered split must not clobber its saved width"
+        );
     }
 
     #[gpui::test]

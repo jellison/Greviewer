@@ -25,6 +25,9 @@ pub struct Settings {
     /// Persisted geometry of the main window, or `None` when nothing has been
     /// saved yet. Restored on launch; see the `window_placement` module.
     pub window_state: Option<WindowState>,
+    /// Persisted widths of the resizable sidebars. Each entry is `None` until a
+    /// width has been measured and saved for that sidebar.
+    pub sidebar_widths: SidebarWidths,
 }
 
 /// A repository the user has opened before, plus whether its folder could still
@@ -74,6 +77,18 @@ pub struct WindowState {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+}
+
+/// Persisted widths (in logical pixels) of the resizable sidebars. A field is
+/// `None` when no width has been captured for that sidebar yet, in which case
+/// the app falls back to that sidebar's default width.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SidebarWidths {
+    /// Left width of the branch sidebar in the graph view.
+    pub branch_sidebar: Option<f32>,
+    /// Left width of the changed-files list in the changeset view.
+    pub changeset_files: Option<f32>,
 }
 
 /// Read settings from `path`. Returns [`Settings::default`] when the file is
@@ -143,6 +158,7 @@ mod tests {
                 RecentRepository::unavailable(dir.path().join("repo\t\n\r-two")),
             ],
             window_state: None,
+            sidebar_widths: SidebarWidths::default(),
         };
 
         save(&path, &settings).expect("save settings");
@@ -197,6 +213,7 @@ mod tests {
                     width: 1440.0,
                     height: 900.0,
                 }),
+                sidebar_widths: SidebarWidths::default(),
             };
 
             save(&path, &settings).expect("save settings");
@@ -214,5 +231,32 @@ mod tests {
         fs::write(&path, r#"{"recent_repositories": []}"#).expect("write file");
 
         assert_eq!(load(&path).window_state, None);
+    }
+
+    #[test]
+    fn sidebar_widths_survive_json_round_trip() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("settings.json");
+        let settings = Settings {
+            recent_repositories: vec![],
+            window_state: None,
+            sidebar_widths: SidebarWidths {
+                branch_sidebar: Some(275.5),
+                changeset_files: Some(360.0),
+            },
+        };
+
+        save(&path, &settings).expect("save settings");
+
+        assert_eq!(load(&path), settings);
+    }
+
+    #[test]
+    fn settings_without_sidebar_widths_load_as_all_none() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"recent_repositories": []}"#).expect("write file");
+
+        assert_eq!(load(&path).sidebar_widths, SidebarWidths::default());
     }
 }
