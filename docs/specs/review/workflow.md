@@ -518,6 +518,7 @@ For files that exist on only one side of the selection — added or deleted file
 - Added files render full-width showing the post-add content.
 - Deleted files render full-width showing the pre-delete content.
 - Removed lines show a red background tint and a red left-edge accent bar; added lines show the same in green.
+- A changed line's tint and an alignment gap's hatch span the full width of their side of the diff, from the accent bar to the pane's edge, rather than stopping at the code text. Widening the pane past its longest line stretches the fill to the new edge instead of leaving a gap.
 - Within a modified line pair, changed tokens carry a stronger background tint, unless the lines differ almost entirely.
 - Rows with no counterpart line on the other side render as a hatched region.
 - Files with a recognized type render syntax-highlighted; unrecognized types render as plain text.

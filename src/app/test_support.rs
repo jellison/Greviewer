@@ -191,6 +191,28 @@ pub(crate) fn init_repo_with_python_change() -> (tempfile::TempDir, String) {
     (dir, update_oid.to_string())
 }
 
+/// A modified file whose second version inserts two brand-new lines into the
+/// middle of the original. Rendered side by side, the old column gains two
+/// hatched alignment-gap rows (`DiffLineStatus::Empty`) opposite the inserted
+/// lines, which is what exercises the empty-row background.
+pub(crate) fn init_repo_with_inserted_lines() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let repo = Repository::init(dir.path()).expect("init repo");
+
+    fs::write(dir.path().join("notes.txt"), "first\nsecond\nthird\n").expect("write file");
+    let root_oid = commit_all(&repo, "Add notes.txt", &[]);
+
+    fs::write(
+        dir.path().join("notes.txt"),
+        "first\ninserted alpha\ninserted beta\nsecond\nthird\n",
+    )
+    .expect("update file");
+    let update_oid = commit_all(&repo, "Insert two lines", &[root_oid]);
+
+    drop(repo);
+    (dir, update_oid.to_string())
+}
+
 /// Two commits on master (HEAD at the tip) plus a `feature` branch pointing
 /// at the root commit. Returns (dir, master_tip_sha, root_sha).
 pub(crate) fn init_repo_with_feature_branch() -> (tempfile::TempDir, String, String) {

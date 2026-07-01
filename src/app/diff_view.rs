@@ -725,6 +725,12 @@ pub(crate) fn render_file_diff_line(
     div()
         .flex()
         .h(px(DIFF_LINE_HEIGHT))
+        // `uniform_list` lays each row out with the pane's width as the
+        // available space, but a bare flex row sizes to its content. Without
+        // this the status fill and the empty-gap hatch stop at the code text
+        // instead of spanning the row. `min_w_full` fills at least the pane
+        // width while still letting a long line grow past it.
+        .min_w_full()
         .bg(diff_line_fill(cell.status))
         .id(("file-diff-line", id_index))
         .debug_selector(move || row_selector.to_string())
@@ -818,13 +824,15 @@ pub(crate) fn diff_text_style() -> TextStyle {
 }
 
 /// One Dark red/green at ~9% alpha over the 0x171717 chrome; alignment gaps
-/// hatch with a diagonal pattern like Zed's.
+/// hatch with a diagonal pattern like Zed's. The hatch uses 2px strokes every
+/// 11px in a light grey at ~80% alpha so the slashes read clearly against the
+/// dark chrome instead of blending into it.
 pub(crate) fn diff_line_fill(status: DiffLineStatus) -> Background {
     match status {
         DiffLineStatus::Unchanged => Hsla::from(rgb(0x171717)).into(),
         DiffLineStatus::Added => Hsla::from(rgba(0x98c37918)).into(),
         DiffLineStatus::Removed => Hsla::from(rgba(0xe06c7518)).into(),
-        DiffLineStatus::Empty => pattern_slash(Hsla::from(rgba(0x26262680)), 1., 6.),
+        DiffLineStatus::Empty => pattern_slash(Hsla::from(rgba(0x4a4a4acc)), 2., 11.),
     }
 }
 
@@ -1351,6 +1359,110 @@ mod tests {
         visual
             .debug_bounds("file-diff-accent-added")
             .expect("added accent bar debug bounds");
+    }
+
+    #[gpui::test]
+    async fn status_row_background_fills_the_full_side_width(cx: &mut TestAppContext) {
+        use gpui::{px, size};
+
+        let (dir, oid_hex) = init_repo_with_python_change();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open python changeset");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        // A wide window makes each diff side far wider than its short code
+        // lines, so a row background that only spans its text leaves a gap.
+        visual.simulate_resize(size(px(1600.), px(600.)));
+
+        let row_bounds = visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        let old_side = visual
+            .debug_bounds("file-diff-side-old")
+            .expect("old diff side debug bounds");
+        let new_side = visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new diff side debug bounds");
+        let removed = visual
+            .debug_bounds("file-diff-row-removed")
+            .expect("removed row debug bounds");
+        let added = visual
+            .debug_bounds("file-diff-row-added")
+            .expect("added row debug bounds");
+
+        // The removed row lives on the old side, the added row on the new side;
+        // each background must reach its side's full width (less the reserved
+        // scrollbar gutter), not stop at the code text.
+        assert!(
+            removed.size.width >= old_side.size.width - px(16.),
+            "removed row background must fill the old side (row {:?} vs side {:?})",
+            removed.size.width,
+            old_side.size.width
+        );
+        assert!(
+            added.size.width >= new_side.size.width - px(16.),
+            "added row background must fill the new side (row {:?} vs side {:?})",
+            added.size.width,
+            new_side.size.width
+        );
+    }
+
+    #[gpui::test]
+    async fn empty_alignment_row_background_fills_the_full_side_width(cx: &mut TestAppContext) {
+        use gpui::{px, size};
+
+        let (dir, oid_hex) = init_repo_with_inserted_lines();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open inserted-lines changeset");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(1600.), px(600.)));
+
+        let row_bounds = visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        let old_side = visual
+            .debug_bounds("file-diff-side-old")
+            .expect("old diff side debug bounds");
+        let empty = visual
+            .debug_bounds("file-diff-row-empty")
+            .expect("empty alignment row debug bounds");
+
+        // The inserted lines put hatched alignment gaps on the old side; the
+        // hatch must span the side's full width so the gap reads as a filled
+        // slashed block rather than a thin strip beside the gutter.
+        assert!(
+            empty.size.width >= old_side.size.width - px(16.),
+            "empty alignment row must fill the old side (row {:?} vs side {:?})",
+            empty.size.width,
+            old_side.size.width
+        );
     }
 
     #[gpui::test]
