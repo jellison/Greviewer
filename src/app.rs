@@ -1,5 +1,6 @@
 //! Top-level application entity and root view.
 
+mod branch_filter;
 mod branch_sidebar;
 mod commit_graph;
 mod diff_view;
@@ -10,6 +11,7 @@ pub mod path_picker;
 mod test_support;
 mod title_bar;
 
+use self::branch_filter::*;
 use self::branch_sidebar::*;
 use self::commit_graph::*;
 use self::diff_view::*;
@@ -31,6 +33,7 @@ use gpui::{
     ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledText, TextStyle,
     UniformListScrollHandle, Window,
 };
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::notification::{Notification, NotificationList};
 use gpui_component::resizable::{h_resizable, resizable_panel, ResizableState};
 use gpui_component::scroll::{Scrollbar, ScrollbarShow};
@@ -97,6 +100,9 @@ const FILE_TREE_CONTROL_ICON_SIZE: f32 = 15.;
 const FILE_TREE_DIFF_STAT_WIDTH: f32 = 68.;
 const FILE_TREE_STAT_GUTTER_WIDTH: f32 = 84.; // diff-stat width + horizontal cell padding
 const BRANCH_SIDEBAR_DEFAULT_WIDTH: f32 = 240.;
+/// Background tint painted behind fuzzy-match characters in filtered sidebar
+/// rows. A translucent accent so it reads over both normal and tinted rows.
+const BRANCH_FILTER_MATCH_BG: u32 = 0x3d5a80cc;
 
 pub struct App {
     pub mode: Mode,
@@ -169,6 +175,10 @@ pub struct App {
     /// Session-only: cleared whenever a repository is opened. Sections default
     /// to expanded, so an empty set means both sections show their branches.
     collapsed_branch_sections: BTreeSet<String>,
+    /// The branch-sidebar filter query field. Session-only: its value is
+    /// cleared when a repository is opened. Purely a sidebar view filter — it
+    /// never changes graph contents or the commit selection.
+    filter_input: Entity<InputState>,
     focus_handle: FocusHandle,
     /// Whether the title-bar context popover (the diff "switcher") is open.
     context_popover_open: bool,
@@ -258,6 +268,7 @@ struct SidebarRowsSignature {
     collapsed_folders: BTreeSet<String>,
     collapsed_sections: BTreeSet<String>,
     hidden_branches: BTreeSet<String>,
+    query: String,
 }
 
 pub enum Mode {
@@ -500,6 +511,20 @@ impl App {
         let graph_resizable = cx.new(|_| ResizableState::default());
         let focus_handle = cx.focus_handle();
 
+        let filter_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Search branches…")
+                .clean_on_escape()
+        });
+        // Re-render the sidebar whenever the query changes so the filter
+        // re-applies; the input owns its own state, App only observes it.
+        cx.subscribe(&filter_input, |_app, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
+
         window.focus(&focus_handle);
         cx.on_next_frame(window, |app, window, _cx| {
             window.focus(&app.focus_handle);
@@ -564,6 +589,7 @@ impl App {
             hidden_branches: BTreeSet::new(),
             collapsed_branch_folders: BTreeSet::new(),
             collapsed_branch_sections: BTreeSet::new(),
+            filter_input,
             focus_handle,
             context_popover_open: false,
             repo_switcher_open: false,
@@ -677,6 +703,8 @@ impl App {
         self.hidden_branches.clear();
         self.collapsed_branch_folders.clear();
         self.collapsed_branch_sections.clear();
+        self.filter_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
         self.branches_generation
             .set(self.branches_generation.get() + 1);
         self.sidebar_rows_cache.borrow_mut().take();
@@ -1758,12 +1786,13 @@ impl App {
 
     /// Returns the memoized flat sidebar row model, recomputing only when the
     /// branch set, collapse state, or hidden-branch set changes.
-    fn sidebar_rows(&self, repo: &repo::OpenRepository) -> Rc<Vec<BranchTreeRow>> {
+    fn sidebar_rows(&self, repo: &repo::OpenRepository, query: &str) -> Rc<Vec<BranchTreeRow>> {
         let signature = SidebarRowsSignature {
             branches_generation: self.branches_generation.get(),
             collapsed_folders: self.collapsed_branch_folders.clone(),
             collapsed_sections: self.collapsed_branch_sections.clone(),
             hidden_branches: self.hidden_branches.clone(),
+            query: query.to_string(),
         };
 
         if let Some((cached_signature, rows)) = self.sidebar_rows_cache.borrow().as_ref() {
@@ -1777,6 +1806,7 @@ impl App {
             &self.collapsed_branch_folders,
             &self.collapsed_branch_sections,
             &self.hidden_branches,
+            query,
         ));
 
         #[cfg(test)]
@@ -1797,6 +1827,61 @@ impl App {
         repo: &repo::OpenRepository,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let query = self.filter_input.read(cx).value().to_string();
+        let has_query = !query.is_empty();
+
+        // Lay the filter row out explicitly rather than via the Input's own
+        // prefix/cleanable slots: that keeps the search glyph aligned with the
+        // section/folder chevrons below (both at `px_3`) and pins the clear
+        // button to the right edge. The Input sits in a `flex_1` middle with its
+        // internal horizontal padding zeroed so the text starts right after the
+        // glyph and the row's own padding governs alignment.
+        let search_field = div()
+            .flex()
+            .items_center()
+            .flex_none()
+            .w_full()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .border_b_1()
+            .border_color(rgb(0x242424))
+            .id("branch-filter-input")
+            .debug_selector(|| "branch-filter-input".to_string())
+            .child(
+                Icon::new(LucideIcon::Search)
+                    .text_color(rgb(0x999999))
+                    .size(px(FILE_TREE_STATUS_ICON_SIZE)),
+            )
+            .child(
+                div().flex_1().min_w_0().child(
+                    Input::new(&self.filter_input)
+                        .appearance(false)
+                        .pl_0()
+                        .pr_0(),
+                ),
+            )
+            .when(has_query, |row| {
+                row.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .id("branch-filter-clear")
+                        .debug_selector(|| "branch-filter-clear".to_string())
+                        .on_click(cx.listener(|app, _event: &ClickEvent, window, cx| {
+                            app.filter_input
+                                .update(cx, |state, cx| state.set_value("", window, cx));
+                        }))
+                        .child(
+                            Icon::new(LucideIcon::X)
+                                .text_color(rgb(0x999999))
+                                .size(px(FILE_TREE_STATUS_ICON_SIZE)),
+                        ),
+                )
+            });
+
         let list_content: AnyElement = if repo.branches.is_empty() {
             div()
                 .flex()
@@ -1810,41 +1895,60 @@ impl App {
                 .child("No branches")
                 .into_any_element()
         } else {
-            let rows = self.sidebar_rows(repo);
-            let item_count = rows.len();
-            let scroll_handle = self.branch_sidebar_scroll.clone();
-            uniform_list(
-                "branch-sidebar-scroll",
-                item_count,
-                cx.processor(move |app, range: std::ops::Range<usize>, _window, cx| {
-                    let Mode::RepoOpen { repo } = &app.mode else {
-                        return Vec::new();
-                    };
-                    let rows = app.sidebar_rows(repo);
-                    range
-                        .map(|index| match &rows[index] {
-                            BranchTreeRow::Section(section) => app
-                                .render_branch_section_row(index, section, cx)
-                                .into_any_element(),
-                            BranchTreeRow::Folder(folder) => app
-                                .render_branch_folder_row(index, folder, cx)
-                                .into_any_element(),
-                            BranchTreeRow::Branch(branch_row) => app
-                                .render_branch_row(index, branch_row, cx)
-                                .into_any_element(),
-                        })
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .flex_1()
-            .min_h_0()
-            .track_scroll(scroll_handle)
-            .debug_selector(|| "branch-sidebar-scroll".to_string())
-            .into_any_element()
+            let rows = self.sidebar_rows(repo, &query);
+            if rows.is_empty() {
+                // Invariant: `build_branch_sidebar_rows` with a non-empty
+                // branch list and an empty query always emits at least a
+                // section header, so an empty `rows` here can only mean a
+                // non-empty query matched zero branches (an empty repo took
+                // the branch above). Show the no-match message.
+                div()
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .id("branch-filter-empty")
+                    .debug_selector(|| "branch-filter-empty".to_string())
+                    .text_color(rgb(0x999999))
+                    .text_size(px(14.))
+                    .child("No matching branches")
+                    .into_any_element()
+            } else {
+                let item_count = rows.len();
+                let scroll_handle = self.branch_sidebar_scroll.clone();
+                let processor_query = query.clone();
+                uniform_list(
+                    "branch-sidebar-scroll",
+                    item_count,
+                    cx.processor(move |app, range: std::ops::Range<usize>, _window, cx| {
+                        let Mode::RepoOpen { repo } = &app.mode else {
+                            return Vec::new();
+                        };
+                        let rows = app.sidebar_rows(repo, &processor_query);
+                        range
+                            .map(|index| match &rows[index] {
+                                BranchTreeRow::Section(section) => app
+                                    .render_branch_section_row(index, section, cx)
+                                    .into_any_element(),
+                                BranchTreeRow::Folder(folder) => app
+                                    .render_branch_folder_row(index, folder, &processor_query, cx)
+                                    .into_any_element(),
+                                BranchTreeRow::Branch(branch_row) => app
+                                    .render_branch_row(index, branch_row, &processor_query, cx)
+                                    .into_any_element(),
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .flex_1()
+                .min_h_0()
+                .track_scroll(scroll_handle)
+                .debug_selector(|| "branch-sidebar-scroll".to_string())
+                .into_any_element()
+            }
         };
 
         div()
-            .relative()
             .flex()
             .flex_col()
             .w_full()
@@ -1861,28 +1965,79 @@ impl App {
                     cx.notify();
                 }
             }))
-            .child(list_content)
-            .when(self.branch_sidebar_hovered, |container| {
-                container.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .debug_selector(|| "branch-sidebar-scrollbar".to_string())
-                        .child(
-                            Scrollbar::vertical(&self.branch_sidebar_scroll.0.borrow().base_handle)
-                                .scrollbar_show(ScrollbarShow::Always),
-                        ),
-                )
-            })
+            .child(search_field)
+            .child(
+                // The scrollbar overlay lives inside this list region, not the
+                // whole sidebar, so it starts at the top of the scrollable area
+                // rather than over the fixed search field above it.
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(list_content)
+                    .when(self.branch_sidebar_hovered, |container| {
+                        container.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .debug_selector(|| "branch-sidebar-scrollbar".to_string())
+                                .child(
+                                    Scrollbar::vertical(
+                                        &self.branch_sidebar_scroll.0.borrow().base_handle,
+                                    )
+                                    .scrollbar_show(ScrollbarShow::Always),
+                                ),
+                        )
+                    }),
+            )
+    }
+
+    /// Render a sidebar row label, painting a highlight background behind the
+    /// `highlight` char indices (positions within `text`). With no highlights
+    /// this is an ordinary colored text node, identical to the pre-filter
+    /// rendering.
+    fn branch_label(&self, text: &str, highlight: &[usize], color: Hsla) -> AnyElement {
+        if highlight.is_empty() {
+            return div()
+                .text_color(color)
+                .child(text.to_string())
+                .into_any_element();
+        }
+
+        let ranges = highlight_byte_ranges(text, highlight);
+        // `StyledText::with_default_highlights` takes the font family from this
+        // base style (it only inherits font_size/line_height from the ambient
+        // window text style), so set the sidebar's monospace family explicitly
+        // to keep matched labels visually consistent with unhighlighted rows.
+        let base = TextStyle {
+            color,
+            font_family: MONO_FONT_FAMILY.into(),
+            ..Default::default()
+        };
+        let highlights = ranges.into_iter().map(|range| {
+            (
+                range,
+                HighlightStyle {
+                    background_color: Some(rgba(BRANCH_FILTER_MATCH_BG).into()),
+                    ..Default::default()
+                },
+            )
+        });
+        StyledText::new(text.to_string())
+            .with_default_highlights(&base, highlights)
+            .into_any_element()
     }
 
     fn render_branch_row(
         &self,
         index: usize,
         row: &BranchRow,
+        query: &str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let branch = &row.branch;
@@ -1972,10 +2127,18 @@ impl App {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_color(name_color)
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .truncate()
-                    .child(display_name),
+                    .child({
+                        let highlight = if query.is_empty() {
+                            Vec::new()
+                        } else {
+                            fuzzy_match(&branch.name, query)
+                                .map(|idx| final_segment_highlights(&branch.name, &idx))
+                                .unwrap_or_default()
+                        };
+                        self.branch_label(&display_name, &highlight, name_color.into())
+                    }),
             )
             .when(show_toggle, |row| {
                 row.child(
@@ -2088,6 +2251,7 @@ impl App {
         &self,
         index: usize,
         folder: &BranchFolderRow,
+        query: &str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let path_fragment = debug_ref_label_fragment(&folder.path);
@@ -2140,10 +2304,24 @@ impl App {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_color(name_color)
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .truncate()
-                    .child(folder.name.clone()),
+                    .child({
+                        let highlight = if query.is_empty() {
+                            Vec::new()
+                        } else {
+                            // Strip the `heads`/`remotes` key prefix to get the
+                            // display path this folder's segment lives in.
+                            let display_path = folder
+                                .path
+                                .split_once('/')
+                                .map(|(_, rest)| rest)
+                                .unwrap_or(folder.path.as_str());
+                            let idx = prefix_match_indices(display_path, query);
+                            final_segment_highlights(display_path, &idx)
+                        };
+                        self.branch_label(&folder.name, &highlight, name_color.into())
+                    }),
             )
             .child(
                 div()

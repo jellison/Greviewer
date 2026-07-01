@@ -9,9 +9,10 @@ pub mod common;
 
 use common::QueuedPathPicker;
 use gpui::{
-    Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, TestAppContext,
-    VisualTestContext,
+    AppContext, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point,
+    TestAppContext, VisualTestContext,
 };
+use gpui_component::Root;
 use greviewer::app::{
     bind_app_keys, App, Mode, PathPickerOutcome, ReviewScreen, Selection, OPEN_REPOSITORY_KEYSTROKE,
 };
@@ -189,4 +190,45 @@ async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
             );
         })
         .expect("read split state");
+}
+
+/// Booting through the production window shell — the `App` view wrapped in a
+/// `gpui_component::Root` — must render the graph sidebar's filter `Input`
+/// without panicking. gpui-component's `Input` reaches for `Root` via
+/// `Root::read`/`Root::update` during paint (see `gpui_component::input`), so a
+/// window whose root entity is a bare `App` crashes at runtime the moment the
+/// sidebar's filter field is on screen. This guards `run()`'s Root wrapper: the
+/// window root is a `Root`, and the filter field lays out inside that shell.
+#[gpui::test]
+async fn boots_with_root_shell_renders_filter_input(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        bind_app_keys(cx);
+    });
+
+    let dir = common::load_fixture("two-commits");
+    let picker = QueuedPathPicker::new([PathPickerOutcome::Picked(dir.path().to_path_buf())]);
+    // Mirror `greviewer::run()`: the window's root entity is a `Root` wrapping
+    // the `App` view. If this wrapper is dropped, the sidebar's `Input` panics
+    // in the real windowing runtime.
+    let window = cx.add_window(|window, cx| {
+        let app = cx.new(|cx| App::new_with_picker(window, cx, Box::new(picker)));
+        Root::new(app, window, cx)
+    });
+
+    cx.simulate_keystrokes(*window, OPEN_REPOSITORY_KEYSTROKE);
+    cx.run_until_parked();
+
+    // The window root is a `gpui_component::Root` (this closure only type-checks
+    // and reads if the root entity is a `Root`), satisfying the Input's
+    // `Root::read`/`Root::update` contract.
+    window
+        .read_with(cx, |_root: &Root, _cx| {})
+        .expect("window root is a gpui_component::Root");
+
+    // The graph sidebar's always-visible filter field renders inside the shell.
+    let mut visual = VisualTestContext::from_window(*window, cx);
+    visual
+        .debug_bounds("branch-filter-input")
+        .expect("branch filter input renders inside the Root shell in graph mode");
 }

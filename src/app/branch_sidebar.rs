@@ -37,11 +37,26 @@ pub(crate) fn build_branch_sidebar_rows(
     collapsed_folders: &BTreeSet<String>,
     collapsed_sections: &BTreeSet<String>,
     hidden_branches: &BTreeSet<String>,
+    query: &str,
 ) -> Vec<BranchTreeRow> {
+    let filtering = !query.is_empty();
+
     let (local, remote): (Vec<_>, Vec<_>) = branches
         .iter()
+        .filter(|branch| !filtering || fuzzy_match(&branch.name, query).is_some())
         .cloned()
         .partition(|branch| matches!(branch.kind, repo::BranchKind::Local));
+
+    // While filtering, ignore saved collapse state so every surviving folder
+    // and section is expanded and its matches are visible. Section counts fall
+    // out of the (already filtered) slice lengths in `append_branch_section`.
+    let no_collapsed_folders = BTreeSet::new();
+    let no_collapsed_sections = BTreeSet::new();
+    let (folders, sections) = if filtering {
+        (&no_collapsed_folders, &no_collapsed_sections)
+    } else {
+        (collapsed_folders, collapsed_sections)
+    };
 
     let mut rows = Vec::new();
     append_branch_section(
@@ -49,8 +64,8 @@ pub(crate) fn build_branch_sidebar_rows(
         "Local",
         "heads",
         &local,
-        collapsed_folders,
-        collapsed_sections,
+        folders,
+        sections,
         hidden_branches,
     );
     append_branch_section(
@@ -58,8 +73,8 @@ pub(crate) fn build_branch_sidebar_rows(
         "Remote",
         "remotes",
         &remote,
-        collapsed_folders,
-        collapsed_sections,
+        folders,
+        sections,
         hidden_branches,
     );
     rows
@@ -278,7 +293,7 @@ mod tests {
                 let Mode::RepoOpen { repo } = &app.mode else {
                     panic!("expected RepoOpen mode");
                 };
-                let _ = app.sidebar_rows(repo);
+                let _ = app.sidebar_rows(repo, "");
                 app.sidebar_rows_recompute_count()
             })
             .expect("first build");
@@ -288,7 +303,7 @@ mod tests {
                 let Mode::RepoOpen { repo } = &app.mode else {
                     panic!("expected RepoOpen mode");
                 };
-                let _ = app.sidebar_rows(repo);
+                let _ = app.sidebar_rows(repo, "");
                 app.sidebar_rows_recompute_count()
             })
             .expect("second build");
@@ -300,7 +315,7 @@ mod tests {
                 let Mode::RepoOpen { repo } = &app.mode else {
                     panic!("expected RepoOpen mode");
                 };
-                let _ = app.sidebar_rows(repo);
+                let _ = app.sidebar_rows(repo, "");
                 app.sidebar_rows_recompute_count()
             })
             .expect("build after collapse");
@@ -309,6 +324,161 @@ mod tests {
             second + 1,
             "collapsing a folder must rebuild the model exactly once"
         );
+    }
+
+    #[test]
+    fn empty_query_reproduces_the_unfiltered_tree() {
+        let branches = vec![
+            local_branch("features/alpha", "a"),
+            local_branch("master", "m"),
+        ];
+        let collapsed_folders = ["heads/features".to_string()].into_iter().collect();
+
+        let filtered = build_branch_sidebar_rows(
+            &branches,
+            &collapsed_folders,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            "",
+        );
+        // The empty-query build must produce the honored-collapse tree: a
+        // non-empty set of rows containing the `master` branch and the
+        // `features` folder (rather than a vacuous compare-to-self).
+        assert!(!filtered.is_empty(), "empty query must render the tree");
+        assert!(
+            filtered.iter().any(|row| matches!(
+                row,
+                BranchTreeRow::Branch(b) if b.branch.name == "master"
+            )),
+            "empty query must include the master branch row"
+        );
+        assert!(
+            filtered.iter().any(|row| matches!(
+                row,
+                BranchTreeRow::Folder(f) if f.path == "heads/features"
+            )),
+            "empty query must include the features folder row"
+        );
+        // The collapsed folder still suppresses its descendant branch row.
+        assert!(
+            !filtered.iter().any(|row| matches!(
+                row,
+                BranchTreeRow::Branch(b) if b.branch.name == "features/alpha"
+            )),
+            "empty query must not force-expand collapsed folders"
+        );
+    }
+
+    #[test]
+    fn query_prunes_non_matching_branches_and_empty_folders() {
+        let branches = vec![
+            local_branch("features/login", "l"),
+            local_branch("features/search", "s"),
+            local_branch("master", "m"),
+        ];
+
+        let rows = build_branch_sidebar_rows(
+            &branches,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            "login",
+        );
+
+        let summary = rows
+            .iter()
+            .map(|row| match row {
+                BranchTreeRow::Section(s) => format!("section:{}:{}", s.title, s.count),
+                BranchTreeRow::Folder(f) => format!("folder:{}", f.path),
+                BranchTreeRow::Branch(b) => format!("branch:{}", b.branch.name),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            vec![
+                "section:Local:1".to_string(),
+                "folder:heads/features".to_string(),
+                "branch:features/login".to_string(),
+            ],
+            "only the matching branch, its folder, and a count of 1 survive"
+        );
+    }
+
+    #[test]
+    fn query_force_expands_collapsed_folders_and_sections() {
+        let branches = vec![local_branch("features/login", "l")];
+        let collapsed_folders = ["heads/features".to_string()].into_iter().collect();
+        let collapsed_sections = ["heads".to_string()].into_iter().collect();
+
+        let rows = build_branch_sidebar_rows(
+            &branches,
+            &collapsed_folders,
+            &collapsed_sections,
+            &BTreeSet::new(),
+            "login",
+        );
+
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                BranchTreeRow::Branch(b) if b.branch.name == "features/login"
+            )),
+            "a match inside a collapsed folder/section is revealed"
+        );
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                BranchTreeRow::Section(s) if s.title == "Local" && !s.collapsed
+            )),
+            "the section renders expanded while filtering"
+        );
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                BranchTreeRow::Folder(f) if f.path == "heads/features" && !f.collapsed
+            )),
+            "the folder renders expanded while filtering"
+        );
+    }
+
+    #[test]
+    fn query_matching_nothing_yields_no_rows() {
+        let branches = vec![local_branch("master", "m")];
+        let rows = build_branch_sidebar_rows(
+            &branches,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            "zzz",
+        );
+        assert!(rows.is_empty(), "no branch matches, so the model is empty");
+    }
+
+    #[test]
+    fn query_matches_across_the_full_remote_path() {
+        let branches = vec![
+            remote_branch("origin", "feature/login", "l"),
+            remote_branch("origin", "feature/search", "s"),
+        ];
+
+        let rows = build_branch_sidebar_rows(
+            &branches,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            " orglgn".trim(),
+        );
+
+        // "orglgn" is a subsequence of "origin/feature/login" but not of
+        // "origin/feature/search".
+        let branch_names = rows
+            .iter()
+            .filter_map(|row| match row {
+                BranchTreeRow::Branch(b) => Some(b.branch.name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(branch_names, vec!["origin/feature/login".to_string()]);
     }
 
     #[test]
@@ -471,6 +641,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            "",
         );
 
         let summary = rows
@@ -513,6 +684,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            "",
         );
         assert!(
             !rows.iter().any(|row| matches!(
@@ -528,6 +700,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            "",
         );
         assert!(
             !rows.iter().any(|row| matches!(
@@ -551,6 +724,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            "",
         );
 
         let sections = rows
@@ -580,6 +754,7 @@ mod tests {
             &BTreeSet::new(),
             &collapsed_sections,
             &BTreeSet::new(),
+            "",
         );
 
         let summary = rows
@@ -627,6 +802,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            "",
         );
 
         assert_eq!(
@@ -652,6 +828,7 @@ mod tests {
             &BTreeSet::new(),
             &collapsed_sections,
             &BTreeSet::new(),
+            "",
         );
 
         assert_eq!(
@@ -670,6 +847,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
             &BTreeSet::new(),
+            "",
         );
 
         assert_eq!(
@@ -687,8 +865,13 @@ mod tests {
         ];
         let collapsed = ["heads/origin".to_string()].into_iter().collect();
 
-        let rows =
-            build_branch_sidebar_rows(&branches, &collapsed, &BTreeSet::new(), &BTreeSet::new());
+        let rows = build_branch_sidebar_rows(
+            &branches,
+            &collapsed,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            "",
+        );
 
         let branch_kinds = rows
             .iter()
@@ -1340,6 +1523,7 @@ mod tests {
             &app.collapsed_branch_folders,
             &app.collapsed_branch_sections,
             &app.hidden_branches,
+            "",
         )
     }
 
@@ -1583,7 +1767,7 @@ mod tests {
                 let Mode::RepoOpen { repo } = &app.mode else {
                     panic!("expected RepoOpen mode");
                 };
-                let _ = app.sidebar_rows(repo);
+                let _ = app.sidebar_rows(repo, "");
                 app.sidebar_rows_recompute_count()
             })
             .expect("baseline build");
@@ -1607,7 +1791,7 @@ mod tests {
                 let Mode::RepoOpen { repo } = &app.mode else {
                     panic!("expected RepoOpen mode");
                 };
-                let _ = app.sidebar_rows(repo);
+                let _ = app.sidebar_rows(repo, "");
                 app.sidebar_rows_recompute_count()
             })
             .expect("build after hover");
@@ -1615,5 +1799,242 @@ mod tests {
             baseline_rows, after_rows,
             "hovering a row must not invalidate the cached sidebar model"
         );
+    }
+
+    #[gpui::test]
+    async fn typing_a_query_filters_the_branch_rows(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        // Type "alpha" into the sidebar filter.
+        window
+            .update(cx, |app, window, cx| {
+                app.filter_input
+                    .update(cx, |state, cx| state.set_value("alpha", window, cx));
+            })
+            .expect("set filter query");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("branch-row-heads-features-alpha")
+            .expect("the matching branch row remains");
+        assert!(
+            visual.debug_bounds("branch-row-heads-master").is_none(),
+            "a non-matching branch row is filtered out"
+        );
+    }
+
+    #[gpui::test]
+    async fn highlighted_rows_still_render_their_labels(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                // "fal" spans folder->leaf: f@0 and a@2 fall in the "features"
+                // folder segment, and the final "l" matches inside the "alpha"
+                // leaf, so both the folder and leaf rows get a highlight.
+                app.filter_input
+                    .update(cx, |state, cx| state.set_value("fal", window, cx));
+            })
+            .expect("open and filter with a cross-segment match");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("branch-folder-heads-features")
+            .expect("the matched folder row renders with a highlighted segment");
+        visual
+            .debug_bounds("branch-row-heads-features-alpha")
+            .expect("the matched leaf row renders with a highlighted segment");
+    }
+
+    #[gpui::test]
+    async fn clearing_the_query_restores_prior_collapse_state(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                // Collapse the features folder before filtering.
+                app.toggle_branch_folder("heads/features".to_string(), cx);
+                app.filter_input
+                    .update(cx, |state, cx| state.set_value("alpha", window, cx));
+            })
+            .expect("collapse then filter");
+        cx.run_until_parked();
+
+        // While filtering, the collapsed folder is force-expanded.
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("branch-row-heads-features-alpha")
+            .expect("filtering force-expands the collapsed folder");
+
+        // Clear the query; the folder returns to collapsed, hiding descendants.
+        window
+            .update(cx, |app, window, cx| {
+                app.filter_input
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+            })
+            .expect("clear query");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(
+            visual
+                .debug_bounds("branch-row-heads-features-alpha")
+                .is_none(),
+            "clearing the query restores the collapsed folder's hidden descendants"
+        );
+        visual
+            .debug_bounds("branch-folder-heads-features")
+            .expect("the collapsed folder row itself remains");
+    }
+
+    #[gpui::test]
+    async fn a_query_matching_nothing_shows_the_empty_message(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.filter_input
+                    .update(cx, |state, cx| state.set_value("zzzznomatch", window, cx));
+            })
+            .expect("open and filter to nothing");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("branch-filter-empty")
+            .expect("a no-match query shows the empty message");
+    }
+
+    #[gpui::test]
+    async fn clear_button_appears_only_with_a_query_and_clears_it(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        // With no query, the clear button is absent.
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(
+            visual.debug_bounds("branch-filter-clear").is_none(),
+            "the clear button is hidden while the query is empty"
+        );
+
+        // Typing a query reveals the clear button.
+        window
+            .update(cx, |app, window, cx| {
+                app.filter_input
+                    .update(cx, |state, cx| state.set_value("alpha", window, cx));
+            })
+            .expect("set filter query");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let clear = visual
+            .debug_bounds("branch-filter-clear")
+            .expect("the clear button appears once the query has content");
+        visual.simulate_click(clear.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, cx| {
+                assert_eq!(
+                    app.filter_input.read(cx).value().as_ref(),
+                    "",
+                    "clicking the clear button empties the query"
+                );
+            })
+            .expect("read filter value after clear");
+    }
+
+    #[gpui::test]
+    async fn reopening_a_repository_clears_the_filter_query(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path.clone(), window, cx);
+                app.filter_input
+                    .update(cx, |state, cx| state.set_value("alpha", window, cx));
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open, filter, reopen");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, cx| {
+                assert_eq!(
+                    app.filter_input.read(cx).value().as_ref(),
+                    "",
+                    "reopening a repository resets the filter query"
+                );
+            })
+            .expect("read filter value");
+    }
+
+    #[gpui::test]
+    async fn filtering_alone_does_not_change_the_graph(cx: &mut TestAppContext) {
+        let (dir, _master_tip, _alpha_tip) = init_repo_with_slash_named_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                let before = visible_commits(repo, &app.hidden_branches)
+                    .iter()
+                    .map(|c| c.sha.clone())
+                    .collect::<Vec<_>>();
+                let selection_before = app.selection.clone();
+
+                app.filter_input
+                    .update(cx, |state, cx| state.set_value("alpha", window, cx));
+
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                let after = visible_commits(repo, &app.hidden_branches)
+                    .iter()
+                    .map(|c| c.sha.clone())
+                    .collect::<Vec<_>>();
+
+                assert_eq!(before, after, "the filter must not change visible commits");
+                assert_eq!(
+                    selection_before, app.selection,
+                    "the filter must not change the selection"
+                );
+            })
+            .expect("filter and compare graph state");
     }
 }

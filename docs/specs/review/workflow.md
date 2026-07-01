@@ -154,7 +154,9 @@ persisted: opening a repository expands both sections.
   activating it again restores them. Graph contents are unchanged either way.
 - The count in a section header reports the total number of branches the
   section contains and does not change when the section is collapsed or when
-  branches are hidden from the graph.
+  branches are hidden from the graph. The one exception is while a sidebar
+  filter is active, when the count reports the number of matching branches
+  (see "Filtering branches in the sidebar").
 - Reopening a repository expands both sections.
 
 ## Nesting branches in sidebar folders
@@ -200,6 +202,55 @@ normal color but also keeps its toggle visible.
 - A fully hidden folder renders muted with its toggle always shown; a
   partially hidden folder keeps its toggle shown without muting.
 - Reopening a repository expands all folders and shows all branches.
+
+## Filtering branches in the sidebar
+
+The branch sidebar carries an always-visible search field pinned above the
+section list, showing a search icon, the placeholder "Search branches…", and,
+whenever it holds text, a control to clear it. Typing filters the branch tree
+in place. The filter is purely a view concern: it changes only what the
+sidebar shows. The commit graph, the current selection, and every other
+surface are untouched by the filter itself — only the sidebar's ordinary
+actions (activating a branch, hiding a branch, collapsing a section or folder)
+affect the rest of the app, and they behave identically whether or not a
+filter is active.
+
+Matching is a case-insensitive subsequence ("fuzzy") test against each
+branch's full display path — a local branch's own name, and a remote branch's
+name led by its remote (for example `origin/feature/login`). While a filter is
+active, only sections and folders that contain at least one matching branch
+appear, and they render expanded regardless of any saved collapse state;
+clearing the query restores that collapse state. Matched characters are
+highlighted wherever they fall, across folder rows and the leaf branch row.
+Section counts report the number of matching branches while filtering. The
+checked-out branch is filtered like any other and is not kept visible when it
+does not match.
+
+**Triggering conditions**
+
+- A repository is open and the window is in graph mode.
+- The user types in, or clears, the sidebar search field.
+
+**Observable outcomes**
+
+- With an empty query the sidebar is unchanged: saved collapse state is
+  honored and section counts report every branch each section contains.
+- With a non-empty query, only matching branches and their ancestor folders
+  and sections appear; matched characters are highlighted on both folder and
+  leaf rows.
+- While filtering, section and folder rows render expanded, and each section
+  count reports the number of matching branches it contains.
+- Clearing the query restores the pre-filter view, including any collapsed
+  sections and folders.
+- Applying or changing a filter never alters which commits the graph shows or
+  which commit is selected.
+
+**Edge cases**
+
+- A non-empty query that matches no branch shows a "No matching branches"
+  message in place of the tree.
+- Pressing Escape while the field is focused clears the query.
+- The query is not persisted: opening a repository clears the field.
 
 ## Hiding branches from the graph
 

@@ -1,7 +1,7 @@
 //! Greviewer library entry point.
 
 use gpui::{px, size, App, AppContext, Application, Bounds, WindowBounds, WindowOptions};
-use gpui_component::TitleBar;
+use gpui_component::{Root, TitleBar};
 
 use crate::assets::Assets;
 
@@ -30,7 +30,14 @@ pub fn run() {
                 titlebar: Some(TitleBar::title_bar_options()),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| app::App::new(window, cx)),
+            // The window's root entity must be a `gpui_component::Root`: components
+            // like `Input` reach for it via `Root::read`/`Root::update` during paint
+            // (see gpui_component::input), and panic if the window's first layer is
+            // not a `Root`. Wrap the `App` view in one so those components work.
+            |window, cx| {
+                let app = cx.new(|cx| app::App::new(window, cx));
+                cx.new(|cx| Root::new(app, window, cx))
+            },
         )
         .expect("opening the main window");
 

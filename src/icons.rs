@@ -34,6 +34,8 @@ pub enum LucideIcon {
     Monitor,
     /// `rows-2.svg`
     Rows2,
+    /// `search.svg`
+    Search,
     /// `square-dot.svg`
     SquareDot,
     /// `square-minus.svg`
@@ -61,6 +63,7 @@ impl LucideIcon {
         LucideIcon::ListTree,
         LucideIcon::Monitor,
         LucideIcon::Rows2,
+        LucideIcon::Search,
         LucideIcon::SquareDot,
         LucideIcon::SquareMinus,
         LucideIcon::SquarePlus,
@@ -84,6 +87,7 @@ impl IconNamed for LucideIcon {
             LucideIcon::ListTree => "icons/list-tree.svg",
             LucideIcon::Monitor => "icons/monitor.svg",
             LucideIcon::Rows2 => "icons/rows-2.svg",
+            LucideIcon::Search => "icons/search.svg",
             LucideIcon::SquareDot => "icons/square-dot.svg",
             LucideIcon::SquareMinus => "icons/square-minus.svg",
             LucideIcon::SquarePlus => "icons/square-plus.svg",
