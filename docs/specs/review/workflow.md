@@ -282,22 +282,25 @@ shows every branch. Remote-tracking branches hide and show exactly like local on
 
 ## Selecting commits to review
 
-The user stages a review by selecting either a single commit or a contiguous sequential range from the graph. Selection is tentative: no review activity begins until the user explicitly opens the changeset (described below). Clicking a commit selects it. Shift-clicking a second commit extends the selection to a range, provided the two commits lie on a single ancestry path (one is an ancestor of the other). The selection is the inclusive set of commits between the two endpoints along that path. Clicking the selected commit again clears the selection. Double-clicking bypasses tentative selection entirely; it is specified under "Opening the changeset" below.
+The user stages a review by selecting either a single commit or a contiguous sequential range from the graph. Selection is tentative: no review activity begins until the user explicitly opens the changeset (described below). Clicking a commit selects it. Shift-clicking a second commit extends the selection to a range, provided the two commits lie on a single ancestry path (one is an ancestor of the other). The selection is the inclusive set of commits between the two endpoints along that path. Clicking the selected commit again clears the selection, as does a dedicated clear-selection affordance and the escape key. Double-clicking bypasses tentative selection entirely; it is specified under "Opening the changeset" below.
 
 **Triggering conditions**
 
 - The user clicks a commit in the graph.
 - The user shift-clicks a second commit while a single-commit selection is active.
 - The user clicks the selected commit again.
+- The user activates the clear-selection affordance or presses escape while a selection is active.
 
 **Observable outcomes**
 
 - The selected commit or range is visually distinct in the graph.
+- While a selection is active, the graph shows how many commits the selection covers, alongside the open-changeset and clear-selection affordances. All of it disappears when the selection clears.
 
 **Edge cases**
 
 - If the two endpoints do not share a linear ancestry — they lie on diverged branches — the second click is rejected with a message explaining why, and the original selection is preserved.
 - Merge commits inside a selected range are included in the range and contribute to the rollup.
+- Escape does not clear the selection while a changeset is open (the selection is preserved for adjustment after closing) or while the user is typing in the branch filter.
 
 ## Opening the changeset
 
@@ -306,6 +309,7 @@ With a valid selection in place, the user opens the changeset to begin reviewing
 **Triggering conditions**
 
 - The user activates the open-changeset affordance while a valid selection is active.
+- The user presses enter while a valid selection is active; this is equivalent to activating the affordance.
 - The user double-clicks a commit in the graph.
 - The user closes the open changeset.
 
@@ -321,6 +325,8 @@ With a valid selection in place, the user opens the changeset to begin reviewing
 
 - Opening a changeset whose net effect is no change still transitions to review mode; the change set view shows the empty-state message described in the next section.
 - Double-clicking a commit inside a selected range opens that single commit's changeset, not the range's.
+- Pressing enter while a changeset is already open has no effect: the open changeset and any tab or split layout the user has built are unchanged.
+- Pressing enter while typing in the branch filter does not open a changeset.
 
 ## Seeing diff context in the window bar
 

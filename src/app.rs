@@ -59,6 +59,7 @@ actions!(
         OpenRepository,
         OpenChangeset,
         CloseChangeset,
+        ClearSelection,
         QuitApplication,
         CloseActiveTab,
         ActivateNextTab,
@@ -100,6 +101,14 @@ const FILE_TREE_CONTROL_ICON_SIZE: f32 = 15.;
 const FILE_TREE_DIFF_STAT_WIDTH: f32 = 68.;
 const FILE_TREE_STAT_GUTTER_WIDTH: f32 = 84.; // diff-stat width + horizontal cell padding
 const BRANCH_SIDEBAR_DEFAULT_WIDTH: f32 = 240.;
+/// Height of the graph's contextual selection bar (docked to the bottom of
+/// the history panel while a selection is active).
+const SELECTION_BAR_HEIGHT: f32 = 34.;
+/// Selection-bar surface and hairline: the same slate-blue family as the
+/// selected-row background (`0x223248`), one step darker/lighter so the bar
+/// reads as chrome rather than another row.
+const SELECTION_BAR_BG: u32 = 0x1a2332;
+const SELECTION_BAR_BORDER: u32 = 0x2a3a50;
 /// Background tint painted behind fuzzy-match characters in filtered sidebar
 /// rows. A translucent accent so it reads over both normal and tinted rows.
 const BRANCH_FILTER_MATCH_BG: u32 = 0x3d5a80cc;
@@ -287,6 +296,17 @@ pub enum Selection {
         end_sha: String,
         shas: Vec<String>,
     },
+}
+
+/// Human-readable label for the graph's selection bar: how many commits the
+/// current selection covers, or `None` when nothing is selected (the bar does
+/// not render at all in that case).
+fn selection_summary(selection: &Selection) -> Option<String> {
+    match selection {
+        Selection::None => None,
+        Selection::Single { .. } => Some("1 commit selected".to_string()),
+        Selection::Range { shas, .. } => Some(format!("{} commits selected", shas.len())),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1022,6 +1042,28 @@ impl App {
         }
     }
 
+    /// True while the branch-filter input owns keyboard focus. The enter and
+    /// escape bindings are app-global and would otherwise fire while the user
+    /// is typing a filter query (the input's own bindings do not consume
+    /// them), so the selection action handlers bail out in that state.
+    fn branch_filter_has_focus(&self, window: &Window, cx: &Context<Self>) -> bool {
+        gpui::Focusable::focus_handle(&self.filter_input, cx).is_focused(window)
+    }
+
+    /// Clears the graph's tentative selection. A no-op while a changeset is
+    /// open: the spec preserves the prior selection so it can be adjusted and
+    /// re-opened after closing.
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.review_screen, ReviewScreen::Graph) {
+            return;
+        }
+        if matches!(self.selection, Selection::None) {
+            return;
+        }
+        self.selection = Selection::None;
+        cx.notify();
+    }
+
     fn range_shas_between(
         &self,
         start_sha: &str,
@@ -1051,6 +1093,13 @@ impl App {
     }
 
     fn open_changeset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Re-opening while a changeset is already open would rebuild the
+        // workspace and throw away the user's tabs and splits. The spec makes
+        // changing the open changeset an explicit close-adjust-reopen flow,
+        // so ignore the action (reachable via the enter binding) until then.
+        if matches!(self.review_screen, ReviewScreen::Changeset { .. }) {
+            return;
+        }
         let repo_path = match &self.mode {
             Mode::RepoOpen { repo } => repo.path.clone(),
             Mode::NoRepo => return,
@@ -1724,11 +1773,6 @@ impl App {
         repo: &repo::OpenRepository,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let can_open_changeset = matches!(
-            self.selection,
-            Selection::Single { .. } | Selection::Range { .. }
-        );
-
         let history = if repo.commits.is_empty() {
             div()
                 .flex()
@@ -1793,32 +1837,12 @@ impl App {
             .h_full()
             .bg(rgb(0x171717))
             .child(history)
-            // The open-changeset control floats over the top-right of the graph,
-            // outside the scroll area, so it stays pinned while the history
-            // scrolls. The repo/HEAD context that used to sit beside it is
-            // moving into the window bar.
-            .when(can_open_changeset, |screen| {
-                screen.child(
-                    div()
-                        .absolute()
-                        .top(px(2.))
-                        .right(px(2.))
-                        .occlude()
-                        .px_3()
-                        .py_1()
-                        .border_1()
-                        .border_color(rgb(0x3b82f6))
-                        .bg(rgb(0x1d283a))
-                        .text_color(rgb(0xdbeafe))
-                        .text_size(px(12.))
-                        .cursor_pointer()
-                        .id("open-changeset")
-                        .debug_selector(|| "open-changeset".to_string())
-                        .on_click(cx.listener(|app, _event, window, cx| {
-                            app.open_changeset(window, cx);
-                        }))
-                        .child("Open changeset"),
-                )
+            // Contextual selection bar, docked to the bottom edge of the
+            // history panel while a selection is active. It owns the
+            // open-changeset affordance; enter/escape drive the same
+            // transitions through the OpenChangeset/ClearSelection actions.
+            .when_some(selection_summary(&self.selection), |screen, summary| {
+                screen.child(self.render_selection_bar(summary, cx))
             });
 
         div()
@@ -1836,6 +1860,82 @@ impl App {
                             .child(self.render_branch_sidebar(repo, cx)),
                     )
                     .child(resizable_panel().child(history_panel)),
+            )
+    }
+
+    /// The graph's contextual selection bar: selection count on the left,
+    /// clear and open-changeset affordances (with their keyboard hints) on
+    /// the right. Rendered only while a selection is active.
+    fn render_selection_bar(
+        &self,
+        summary: String,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let keycap = |label: &'static str, border: u32, text: u32| {
+            div()
+                .flex_none()
+                .px(px(4.))
+                .border_1()
+                .border_color(rgb(border))
+                .rounded(px(3.))
+                .text_size(px(9.))
+                .text_color(rgb(text))
+                .child(label)
+        };
+
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .h(px(SELECTION_BAR_HEIGHT))
+            .px_3()
+            .bg(rgb(SELECTION_BAR_BG))
+            .border_t_1()
+            .border_color(rgb(SELECTION_BAR_BORDER))
+            .text_size(px(12.))
+            .id("selection-bar")
+            .debug_selector(|| "selection-bar".to_string())
+            .child(div().text_color(rgb(0x8ab4f8)).child(summary))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py(px(3.))
+                    .rounded(px(4.))
+                    .text_color(rgb(0x8b98a9))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x223248)))
+                    .id("clear-selection")
+                    .debug_selector(|| "clear-selection".to_string())
+                    .on_click(cx.listener(|app, _event, _window, cx| {
+                        app.clear_selection(cx);
+                    }))
+                    .child("Clear")
+                    .child(keycap("esc", SELECTION_BAR_BORDER, 0x8b98a9)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py(px(3.))
+                    .rounded(px(4.))
+                    .bg(rgb(0x1d4ed8))
+                    .text_color(rgb(0xdbeafe))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x2563eb)))
+                    .id("open-changeset")
+                    .debug_selector(|| "open-changeset".to_string())
+                    .on_click(cx.listener(|app, _event, window, cx| {
+                        app.open_changeset(window, cx);
+                    }))
+                    .child("Open changeset")
+                    .child(keycap("\u{23ce}", 0x6b96f0, 0xbfd3fb)),
             )
     }
 
@@ -3326,10 +3426,19 @@ impl Render for App {
                 app.prompt_and_open_repository(window, cx);
             }))
             .on_action(cx.listener(|app, _: &OpenChangeset, window, cx| {
+                if app.branch_filter_has_focus(window, cx) {
+                    return;
+                }
                 app.open_changeset(window, cx);
             }))
             .on_action(cx.listener(|app, _: &CloseChangeset, _window, cx| {
                 app.close_changeset(cx);
+            }))
+            .on_action(cx.listener(|app, _: &ClearSelection, window, cx| {
+                if app.branch_filter_has_focus(window, cx) {
+                    return;
+                }
+                app.clear_selection(cx);
             }))
             .on_action(cx.listener(|app, _: &QuitApplication, _window, cx| {
                 app.quit_application(cx);
@@ -3448,8 +3557,8 @@ fn repository_title(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, CloseChangeset, Mode, OpenChangeset, OpenFailed, PreparedFileDiff, ReviewScreen,
-        Selection, FILE_TREE_ROW_HEIGHT,
+        selection_summary, App, CloseChangeset, Mode, OpenChangeset, OpenFailed, PreparedFileDiff,
+        ReviewScreen, Selection, FILE_TREE_ROW_HEIGHT,
     };
     use crate::repo::{ChangeKind, INITIAL_COMMIT_LIMIT};
     use crate::settings::{RecentRepository, WindowMode};
@@ -4748,13 +4857,12 @@ mod tests {
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
                 app.select_single_commit(oid_hex.clone(), cx);
-                app.open_changeset(window, cx);
-                // Simulate the popover being left open, then re-open the
-                // changeset: opening must dismiss the popover.
+                // Simulate a stale popover flag, then open the changeset:
+                // opening must dismiss the popover.
                 app.context_popover_open = true;
                 app.open_changeset(window, cx);
             })
-            .expect("reopen changeset");
+            .expect("open changeset with stale popover flag");
 
         window
             .read_with(cx, |app, _cx| {
@@ -4982,10 +5090,12 @@ mod tests {
             })
             .expect("prime cache");
 
-        // Selecting and opening a different changeset must clear the cache so a
-        // later render recomputes against the new commit.
+        // Closing, selecting a different commit, and reopening (the supported
+        // way to change the open changeset) must clear the cache so a later
+        // render recomputes against the new commit.
         window
             .update(cx, |app, window, cx| {
+                app.close_changeset(cx);
                 app.select_single_commit(shas[0].clone(), cx);
                 app.open_changeset(window, cx);
             })
@@ -5277,6 +5387,302 @@ mod tests {
         visual
             .debug_bounds("changed-file-row-0")
             .expect("changed file row debug bounds");
+    }
+
+    #[test]
+    fn selection_summary_describes_single_and_range_counts() {
+        assert_eq!(selection_summary(&Selection::None), None);
+        assert_eq!(
+            selection_summary(&Selection::Single {
+                sha: "abc".to_string(),
+            }),
+            Some("1 commit selected".to_string()),
+        );
+        assert_eq!(
+            selection_summary(&Selection::Range {
+                start_sha: "a".to_string(),
+                end_sha: "c".to_string(),
+                shas: vec!["c".to_string(), "b".to_string(), "a".to_string()],
+            }),
+            Some("3 commits selected".to_string()),
+        );
+    }
+
+    #[gpui::test]
+    async fn selection_bar_is_absent_without_a_selection(cx: &mut TestAppContext) {
+        let (dir, _oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(
+            visual.debug_bounds("selection-bar").is_none(),
+            "the selection bar renders only while a selection is active",
+        );
+    }
+
+    #[gpui::test]
+    async fn selecting_a_commit_shows_the_selection_bar_with_both_actions(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+            })
+            .expect("open repo and select commit");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("selection-bar")
+            .expect("selection bar renders while a selection is active");
+        visual
+            .debug_bounds("open-changeset")
+            .expect("open-changeset affordance lives in the selection bar");
+        visual
+            .debug_bounds("clear-selection")
+            .expect("clear-selection affordance lives in the selection bar");
+    }
+
+    #[gpui::test]
+    async fn clicking_clear_selection_clears_the_selection_and_hides_the_bar(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+            })
+            .expect("open repo and select commit");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let clear_bounds = visual
+            .debug_bounds("clear-selection")
+            .expect("clear-selection debug bounds");
+        let open_bounds = visual
+            .debug_bounds("open-changeset")
+            .expect("open-changeset debug bounds");
+
+        visual.simulate_click(clear_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(app.selection, Selection::None);
+            })
+            .expect("read cleared selection");
+
+        // `debug_bounds` accumulates for the life of the window in gpui
+        // 0.2.2 (`Frame::clear` misses it), so asserting the selector is
+        // gone would pass against a stale frame. Assert behaviorally
+        // instead: with the bar dismissed, a click where the open-changeset
+        // affordance used to be must not open a changeset.
+        visual.simulate_click(open_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.review_screen,
+                    ReviewScreen::Graph,
+                    "clearing the selection dismisses the open-changeset affordance",
+                );
+            })
+            .expect("read review screen after clicking dismissed bar");
+    }
+
+    #[gpui::test]
+    async fn pressing_enter_opens_the_changeset_for_the_selection(cx: &mut TestAppContext) {
+        cx.update(crate::app::bind_app_keys);
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex.clone(), cx);
+            })
+            .expect("open repo and select commit");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_keystrokes("enter");
+
+        window
+            .read_with(cx, |app, _cx| match &app.review_screen {
+                ReviewScreen::Changeset { sha, .. } => assert_eq!(sha, &oid_hex),
+                ReviewScreen::Graph => panic!("enter should open the selected changeset"),
+            })
+            .expect("read review screen after enter");
+    }
+
+    #[gpui::test]
+    async fn pressing_escape_clears_the_selection(cx: &mut TestAppContext) {
+        cx.update(crate::app::bind_app_keys);
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+            })
+            .expect("open repo and select commit");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_keystrokes("escape");
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(app.selection, Selection::None);
+            })
+            .expect("read cleared selection after escape");
+    }
+
+    #[gpui::test]
+    async fn pressing_enter_while_a_changeset_is_open_keeps_the_workspace_intact(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::app::bind_app_keys);
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open changeset");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_keystrokes("cmd-k right");
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(app.workspace.pane_ids().len(), 2, "split created");
+            })
+            .expect("read split workspace");
+
+        visual.simulate_keystrokes("enter");
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert!(
+                    matches!(app.review_screen, ReviewScreen::Changeset { .. }),
+                    "enter must not leave changeset mode",
+                );
+                assert_eq!(
+                    app.workspace.pane_ids().len(),
+                    2,
+                    "enter must not rebuild the workspace while a changeset is open",
+                );
+            })
+            .expect("read workspace after enter in changeset mode");
+    }
+
+    #[gpui::test]
+    async fn pressing_escape_while_a_changeset_is_open_preserves_the_selection(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::app::bind_app_keys);
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex.clone(), cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open changeset");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_keystrokes("escape");
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert!(
+                    matches!(app.review_screen, ReviewScreen::Changeset { .. }),
+                    "escape must not leave changeset mode",
+                );
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: oid_hex.clone()
+                    },
+                    "the spec preserves the selection while a changeset is open",
+                );
+            })
+            .expect("read selection after escape in changeset mode");
+    }
+
+    #[gpui::test]
+    async fn pressing_enter_in_the_branch_filter_does_not_open_a_changeset(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        cx.update(crate::app::bind_app_keys);
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+
+        // The filter input reaches for `gpui_component::Root` when focused, so
+        // this test mirrors production (`lib.rs`) and wraps the app in one;
+        // `add_app_window` skips the wrapper because nothing else needs it.
+        let mut app_entity: Option<gpui::Entity<App>> = None;
+        let window = cx.add_window(|window, cx| {
+            let app = gpui::AppContext::new(cx, |cx| App::new(window, cx));
+            app_entity = Some(app.clone());
+            gpui_component::Root::new(app, window, cx)
+        });
+        let app_entity = app_entity.expect("app entity captured");
+
+        window
+            .update(cx, |_root, window, cx| {
+                app_entity.update(cx, |app, cx| {
+                    app.open_repository_at(path, window, cx);
+                    app.select_single_commit(oid_hex, cx);
+                    let filter_focus = gpui::Focusable::focus_handle(&app.filter_input, cx);
+                    window.focus(&filter_focus);
+                });
+            })
+            .expect("open repo, select commit, focus filter");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_keystrokes("enter");
+
+        app_entity.read_with(cx, |app, _cx| {
+            assert_eq!(
+                app.review_screen,
+                ReviewScreen::Graph,
+                "enter while typing in the branch filter must not open a changeset",
+            );
+        });
     }
 
     #[gpui::test]

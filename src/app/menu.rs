@@ -3,8 +3,9 @@
 use gpui::{Action, App as GpuiApp, KeyBinding, Menu, MenuItem, SharedString};
 
 use super::{
-    ActivateNextTab, ActivatePreviousTab, CloseActivePane, CloseActiveTab, OpenRepository,
-    QuitApplication, SplitPaneDown, SplitPaneLeft, SplitPaneRight, SplitPaneUp,
+    ActivateNextTab, ActivatePreviousTab, ClearSelection, CloseActivePane, CloseActiveTab,
+    OpenChangeset, OpenRepository, QuitApplication, SplitPaneDown, SplitPaneLeft, SplitPaneRight,
+    SplitPaneUp,
 };
 
 pub const GREVIEWER_MENU_LABEL: &str = "Greviewer";
@@ -19,6 +20,12 @@ pub const SPLIT_PANE_RIGHT_KEYSTROKE: &str = "cmd-k right";
 pub const SPLIT_PANE_UP_KEYSTROKE: &str = "cmd-k up";
 pub const SPLIT_PANE_DOWN_KEYSTROKE: &str = "cmd-k down";
 pub const CLOSE_ACTIVE_PANE_KEYSTROKE: &str = "cmd-k w";
+/// Graph-screen selection shortcuts: enter opens the changeset for the
+/// current selection, escape clears it. Both are app-level bindings; the
+/// action handlers no-op outside graph mode, and focused components (such as
+/// the branch-filter input) bind these keys in their own context and win.
+pub const OPEN_CHANGESET_KEYSTROKE: &str = "enter";
+pub const CLEAR_SELECTION_KEYSTROKE: &str = "escape";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuSnapshot {
@@ -71,6 +78,8 @@ pub fn bind_app_keys(cx: &mut GpuiApp) {
         KeyBinding::new(SPLIT_PANE_UP_KEYSTROKE, SplitPaneUp, None),
         KeyBinding::new(SPLIT_PANE_DOWN_KEYSTROKE, SplitPaneDown, None),
         KeyBinding::new(CLOSE_ACTIVE_PANE_KEYSTROKE, CloseActivePane, None),
+        KeyBinding::new(OPEN_CHANGESET_KEYSTROKE, OpenChangeset, None),
+        KeyBinding::new(CLEAR_SELECTION_KEYSTROKE, ClearSelection, None),
     ]);
 }
 
