@@ -438,9 +438,9 @@ pub(crate) fn render_file_diff_line(
                 .pr_2()
                 .flex_none()
                 .text_color(rgb(0x666666))
-                .text_size(px(12.))
+                .text_size(px(DIFF_TEXT_SIZE))
                 .line_height(px(DIFF_LINE_HEIGHT))
-                .font_family("monospace")
+                .font_family(MONO_FONT_FAMILY)
                 .debug_selector(move || diff_line_index_selector(pane_selector, row_index))
                 .child(line_number),
         )
@@ -451,6 +451,15 @@ pub(crate) fn render_file_diff_line(
                 .flex_1()
                 .px_2()
                 .min_w_0()
+                // gpui's `StyledText` takes its font size and line height from
+                // the ambient `window.text_style()` (the cascade of `.text_size`
+                // / `.line_height` from ancestor divs), NOT from the `TextStyle`
+                // passed to `with_default_highlights` — that style only supplies
+                // per-run font family, weight, and color. So the authoritative
+                // sizing for the code text lives here on the parent div; changing
+                // the fields in `diff_text_style()` alone has no visual effect.
+                .text_size(px(DIFF_TEXT_SIZE))
+                .line_height(px(DIFF_LINE_HEIGHT))
                 .when(has_text, |content| {
                     content.child(
                         StyledText::new(cell.text)
@@ -473,17 +482,28 @@ pub(crate) fn diff_line_index_selector(pane_selector: &str, row_index: usize) ->
     format!("file-diff-line-{side}-{row_index}")
 }
 
-/// Row height for one diff line: tall enough to contain the 12px monospace
-/// glyphs without clipping, and the shared box that vertically centers the
-/// gutter number against its code line.
-pub(crate) const DIFF_LINE_HEIGHT: f32 = 20.;
+/// Row height for one diff line: tall enough to contain the 14px monospace
+/// glyphs without clipping, with extra vertical padding around them, and the
+/// shared box that vertically centers the gutter number against its code line.
+pub(crate) const DIFF_LINE_HEIGHT: f32 = 22.;
+
+/// Font size for diff gutter numbers and code lines. Kept in one place so the
+/// gutter and the code text always render at the same scale.
+pub(crate) const DIFF_TEXT_SIZE: f32 = 14.;
 
 /// Base text style for diff code lines; syntax runs override color per token.
+///
+/// Note: gpui's `StyledText` reads `font_size` and `line_height` from the
+/// ambient `window.text_style()`, not from this struct — only the per-run
+/// font family, weight, and color carry through `with_default_highlights`.
+/// The `font_size`/`line_height` here are kept in sync with `DIFF_TEXT_SIZE`
+/// and `DIFF_LINE_HEIGHT` for documentation, but the values that actually
+/// drive layout are set on the code-cell div in `render_file_diff_line`.
 pub(crate) fn diff_text_style() -> TextStyle {
     TextStyle {
         color: Hsla::from(rgb(0xabb2bf)),
-        font_family: "monospace".into(),
-        font_size: px(12.).into(),
+        font_family: MONO_FONT_FAMILY.into(),
+        font_size: px(DIFF_TEXT_SIZE).into(),
         line_height: px(DIFF_LINE_HEIGHT).into(),
         ..TextStyle::default()
     }

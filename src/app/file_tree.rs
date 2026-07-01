@@ -208,7 +208,7 @@ pub(crate) fn render_file_tree_file_name(
         .text_color(rgb(0xe6eef0))
         .text_size(px(FILE_TREE_TEXT_SIZE))
         .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
-        .font_family(FILE_TREE_FONT_FAMILY)
+        .font_family(MONO_FONT_FAMILY)
         .whitespace_nowrap()
         .debug_selector(move || selector.clone())
         .child(display_name.to_string())
@@ -247,7 +247,7 @@ pub(crate) fn render_change_status_icon(
             .into_any_element(),
         repo::ChangeKind::Renamed => div()
             .text_size(px(FILE_TREE_BADGE_TEXT_SIZE))
-            .font_family(FILE_TREE_FONT_FAMILY)
+            .font_family(MONO_FONT_FAMILY)
             .text_color(color)
             .child("R")
             .into_any_element(),
@@ -289,7 +289,7 @@ pub(crate) fn render_file_diff_stat(selector: String, stats: repo::LineStats) ->
         .gap_2()
         .w(px(FILE_TREE_DIFF_STAT_WIDTH))
         .flex_none()
-        .font_family(FILE_TREE_FONT_FAMILY)
+        .font_family(MONO_FONT_FAMILY)
         .text_size(px(FILE_TREE_DIFF_STAT_TEXT_SIZE))
         .debug_selector(move || selector.clone())
         .child(
@@ -857,21 +857,21 @@ mod tests {
     }
 
     #[test]
-    fn file_tree_font_family_uses_installed_berkeley_mono_family() {
-        assert_eq!(FILE_TREE_FONT_FAMILY, "BerkeleyMono Nerd Font");
+    fn mono_font_family_uses_installed_berkeley_mono_family() {
+        assert_eq!(MONO_FONT_FAMILY, "BerkeleyMono Nerd Font");
     }
 
     #[gpui::test]
-    async fn file_tree_font_family_resolves_without_fallback(cx: &mut TestAppContext) {
+    async fn mono_font_family_resolves_without_fallback(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            let requested_font = font(FILE_TREE_FONT_FAMILY);
+            let requested_font = font(MONO_FONT_FAMILY);
             let font_id = cx.text_system().resolve_font(&requested_font);
             let resolved_font = cx
                 .text_system()
                 .get_font_for_id(font_id)
                 .expect("resolved font should be cached");
 
-            assert_eq!(resolved_font.family.as_ref(), FILE_TREE_FONT_FAMILY);
+            assert_eq!(resolved_font.family.as_ref(), MONO_FONT_FAMILY);
         });
     }
 

@@ -9,7 +9,7 @@ use gpui::{
 };
 use gpui_component::{TitleBar, TITLE_BAR_HEIGHT};
 
-use super::{App, Mode, ReviewScreen, Selection};
+use super::{App, Mode, ReviewScreen, Selection, MONO_FONT_FAMILY};
 use crate::repo::{ChangeKind, ChangeSet, CommitInfo};
 
 /// First seven characters of a full commit sha, matching the short form the
@@ -129,7 +129,7 @@ fn switcher_pill(id: &'static str, text_color: u32, open: bool) -> Stateful<Div>
     let pill = div()
         .id(id)
         .debug_selector(move || id.to_string())
-        .font_family("monospace")
+        .font_family(MONO_FONT_FAMILY)
         .text_size(px(13.))
         .text_color(rgb(text_color))
         .px_2()
@@ -235,7 +235,7 @@ impl App {
         if let Some((oldest, newest)) = endpoints {
             header = header.child(
                 div()
-                    .font_family("monospace")
+                    .font_family(MONO_FONT_FAMILY)
                     .text_size(px(12.))
                     .text_color(rgb(0x8a8a93))
                     .child(format!("{oldest} \u{2026} {newest}")),
@@ -330,7 +330,7 @@ impl App {
                         .text_size(px(12.))
                         .child(
                             div()
-                                .font_family("monospace")
+                                .font_family(MONO_FONT_FAMILY)
                                 .text_color(rgb(0x7aa2f7))
                                 .child(sha.clone()),
                         )
@@ -410,7 +410,7 @@ impl App {
             .py_2()
             .border_b_1()
             .border_color(rgb(0x26262c))
-            .font_family("monospace")
+            .font_family(MONO_FONT_FAMILY)
             .text_size(px(12.))
             .text_color(rgb(0x8a8a93))
             .child(parent_label);
@@ -442,7 +442,7 @@ impl App {
                     .text_size(px(12.))
                     .child(
                         div()
-                            .font_family("monospace")
+                            .font_family(MONO_FONT_FAMILY)
                             .text_color(rgb(0xc7c7cf))
                             .child(name),
                     );

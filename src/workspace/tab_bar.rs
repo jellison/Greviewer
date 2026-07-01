@@ -15,7 +15,7 @@ use gpui::{
 use gpui_component::Icon;
 
 use super::{PaneId, SplitDirection, Workspace};
-use crate::app::{change_kind_text, App, FILE_TREE_FONT_FAMILY};
+use crate::app::{change_kind_text, App, MONO_FONT_FAMILY};
 use crate::icons::LucideIcon;
 use crate::repo;
 
@@ -60,7 +60,7 @@ impl gpui::Render for TabDragPreview {
             .border_color(rgb(TAB_ACCENT))
             .rounded(px(3.))
             .text_size(px(TAB_TEXT_SIZE))
-            .font_family(FILE_TREE_FONT_FAMILY)
+            .font_family(MONO_FONT_FAMILY)
             .text_color(rgb(TAB_DEFAULT_TEXT))
             .opacity(0.9)
             .child(self.title.clone())
@@ -223,7 +223,7 @@ pub fn render_tab_bar(
             .child(
                 div()
                     .text_size(px(TAB_TEXT_SIZE))
-                    .font_family(FILE_TREE_FONT_FAMILY)
+                    .font_family(MONO_FONT_FAMILY)
                     .text_color(title_color)
                     .whitespace_nowrap()
                     .when(preview, |label| label.italic())
@@ -233,7 +233,7 @@ pub fn render_tab_bar(
                 tab.child(
                     div()
                         .text_size(px(TAB_DIR_HINT_TEXT_SIZE))
-                        .font_family(FILE_TREE_FONT_FAMILY)
+                        .font_family(MONO_FONT_FAMILY)
                         .text_color(rgb(TAB_MUTED_TEXT))
                         .whitespace_nowrap()
                         .child(hint),

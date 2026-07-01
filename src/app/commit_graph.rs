@@ -110,7 +110,7 @@ pub(crate) fn render_commit_ref_label(row_index: usize, label: CommitRefLabel) -
         .bg(background)
         .text_color(text_color)
         .text_size(px(10.))
-        .font_family("monospace")
+        .font_family(MONO_FONT_FAMILY)
         .max_w(px(COMMIT_REF_LABEL_MAX_WIDTH))
         .truncate()
         .debug_selector(move || selector.clone())
@@ -206,7 +206,7 @@ pub(crate) fn render_commit_graph_gutter(
         .flex_shrink_0()
         .w(px(commit_graph_gutter_width(lane_count)))
         .h(px(COMMIT_GRAPH_LANE_HEIGHT))
-        .font_family("monospace")
+        .font_family(MONO_FONT_FAMILY)
         .id(("commit-graph-gutter", row_index))
         .debug_selector(move || debug_selector.clone())
         .children(

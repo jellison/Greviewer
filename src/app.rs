@@ -68,7 +68,11 @@ actions!(
     ]
 );
 
-pub(crate) const FILE_TREE_FONT_FAMILY: &str = "BerkeleyMono Nerd Font";
+/// The application-wide monospace font, used by every text surface (file tree,
+/// branch sidebar, tab bar, diff view, and commit graph) so they render
+/// consistently. The value is the installed family name of the Nerd Font
+/// variant; see the resolution test in `file_tree` for the no-fallback contract.
+pub(crate) const MONO_FONT_FAMILY: &str = "BerkeleyMono Nerd Font";
 const FILE_TREE_INDENT_WIDTH: f32 = 16.;
 const FILE_TREE_ROW_HEIGHT: f32 = 24.;
 /// Vertical breathing room added inside each branch-sidebar row, within its
@@ -1531,7 +1535,7 @@ impl App {
             .child(
                 div()
                     .flex_1()
-                    .font_family("monospace")
+                    .font_family(MONO_FONT_FAMILY)
                     .text_size(px(13.))
                     .text_color(path_color)
                     .child(display_path),
@@ -1850,7 +1854,7 @@ impl App {
             .debug_selector(|| "branch-sidebar".to_string())
             .border_1()
             .border_color(rgb(0x242424))
-            .font_family(FILE_TREE_FONT_FAMILY)
+            .font_family(MONO_FONT_FAMILY)
             .on_hover(cx.listener(|app, hovered: &bool, _window, cx| {
                 if app.branch_sidebar_hovered != *hovered {
                     app.branch_sidebar_hovered = *hovered;
@@ -2452,7 +2456,7 @@ impl App {
                     .text_color(rgb(0x8aa6bd))
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
-                    .font_family(FILE_TREE_FONT_FAMILY)
+                    .font_family(MONO_FONT_FAMILY)
                     .whitespace_nowrap()
                     .debug_selector(move || name_selector.clone())
                     .child(name),
@@ -2657,7 +2661,7 @@ impl App {
                     .text_color(rgb(0x8aa6bd))
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
-                    .font_family(FILE_TREE_FONT_FAMILY)
+                    .font_family(MONO_FONT_FAMILY)
                     .whitespace_nowrap()
                     .child(name.to_string()),
             )
@@ -2737,7 +2741,7 @@ impl App {
                                 .bg(rgb(0x242424))
                                 .text_color(rgb(0xbdbdbd))
                                 .text_size(px(FILE_TREE_BADGE_TEXT_SIZE))
-                                .font_family(FILE_TREE_FONT_FAMILY)
+                                .font_family(MONO_FONT_FAMILY)
                                 .debug_selector(move || binary_selector.clone())
                                 .child("Binary"),
                         )
@@ -2747,7 +2751,7 @@ impl App {
                             div()
                                 .text_color(rgb(0x8a8a8a))
                                 .text_size(px(FILE_TREE_SECONDARY_TEXT_SIZE))
-                                .font_family(FILE_TREE_FONT_FAMILY)
+                                .font_family(MONO_FONT_FAMILY)
                                 .whitespace_nowrap()
                                 .debug_selector(move || rename_source_selector.clone())
                                 .child(format!("(from {old_path})")),
@@ -2809,7 +2813,7 @@ impl App {
                     .text_color(rgb(0xb8c0c7))
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
-                    .font_family(FILE_TREE_FONT_FAMILY)
+                    .font_family(MONO_FONT_FAMILY)
                     .whitespace_nowrap()
                     .child(display_name.to_string()),
             )
@@ -2918,7 +2922,7 @@ impl App {
                         .border_color(rgb(0x2a2a2a))
                         .text_color(rgb(0x999999))
                         .text_size(px(12.))
-                        .font_family("monospace")
+                        .font_family(MONO_FONT_FAMILY)
                         .debug_selector(move || rename_source_selector.clone())
                         .child(format!("Renamed from {old_path}")),
                 )
@@ -2982,6 +2986,7 @@ impl App {
             .items_center()
             .w_full()
             .h(px(COMMIT_ROW_HEIGHT))
+            .font_family(MONO_FONT_FAMILY)
             .gap_3()
             .px_4()
             .bg(row_bg)
@@ -3013,7 +3018,7 @@ impl App {
                     .flex_shrink_0()
                     .text_color(rgb(0xa3e635))
                     .text_size(px(12.))
-                    .font_family("monospace")
+                    .font_family(MONO_FONT_FAMILY)
                     .debug_selector(move || format!("commit-hash-{index}"))
                     .child(commit.short_sha.clone()),
             )
