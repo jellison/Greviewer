@@ -224,6 +224,40 @@ fn side_branch_lanes(
         }
     }
 
+    // A fork commit's reserved lane belongs to its entire first-parent chain,
+    // not just the single commit that touches the trunk. Propagate each fork
+    // commit's floor to the off-trunk descendants that reach it through
+    // first-parent edges. Without this, a side branch's newer commits (for
+    // example a merge tip several commits above the fork point) fall back to
+    // the default floor of lane 1 and collide with whichever sibling branch
+    // legitimately reserved lane 1 — clobbering it and fragmenting its color.
+    let commits_by_sha: BTreeMap<&str, &GraphCommit> = commits
+        .iter()
+        .map(|commit| (commit.sha.as_str(), commit))
+        .collect();
+    let fork_floors = lane_floors.clone();
+    for commit in commits {
+        if contains_sha(top_first_parent_history, &commit.sha)
+            || lane_floors.contains_key(&commit.sha)
+        {
+            continue;
+        }
+
+        let mut cursor = commit.parent_shas.first();
+        while let Some(parent_sha) = cursor {
+            if let Some(floor) = fork_floors.get(parent_sha) {
+                lane_floors.insert(commit.sha.clone(), *floor);
+                break;
+            }
+            if contains_sha(top_first_parent_history, parent_sha) {
+                break;
+            }
+            cursor = commits_by_sha
+                .get(parent_sha.as_str())
+                .and_then(|parent| parent.parent_shas.first());
+        }
+    }
+
     lane_floors
 }
 
@@ -642,6 +676,83 @@ mod tests {
 
     fn shas(shas: &[&str]) -> Vec<String> {
         shas.iter().map(|sha| sha.to_string()).collect()
+    }
+
+    #[test]
+    fn merge_tip_shares_its_first_parent_chain_lane_and_color() {
+        // Reconstructed from the real humiomanager repo (newest first, real
+        // short shas + authored timestamps). HEAD is 3867c25 on branch
+        // sandersen/redact-tokens-in-error-messages; its first-parent history
+        // owns the trunk (lane 0). Two side branches fork from the shared merge
+        // base 6be57e: the newer merge tip's own first-parent chain
+        // (3e6fbd9 -> 3fe1ec7 -> 7989490 -> 65e1876 -> db6d3d9) and the earlier
+        // pull-request commit 1d65235, which is also the merge tip's second
+        // parent.
+        //
+        // side_branch_lanes reserves lane 1 for the earlier fork (1d65235) and
+        // lane 2 for the later fork chain (db6d3d9's chain). The merge tip must
+        // join its own first-parent chain in lane 2, not steal 1d65235's lane 1.
+        let commits = vec![
+            commit_at("3e6fbd9", 1782911863, &["3fe1ec7", "1d65235"]),
+            commit_at("3fe1ec7", 1782911838, &["7989490"]),
+            commit_at("7989490", 1782911750, &["65e1876"]),
+            commit_at("65e1876", 1782911282, &["db6d3d9"]),
+            commit_at("db6d3d9", 1782910950, &["6be57e"]),
+            commit_at("1d65235", 1782904334, &["6be57e"]),
+            commit_at("3867c25", 1782829140, &["430f1d8"]),
+            commit_at("430f1d8", 1782823416, &["de49298"]),
+            commit_at("de49298", 1782822670, &["17b8af8"]),
+            commit_at("17b8af8", 1782820470, &["06e4f81"]),
+            commit_at("06e4f81", 1782816632, &["634e335"]),
+            commit_at("634e335", 1782738048, &["bfb4c84"]),
+            commit_at("bfb4c84", 1782815130, &["7bd5b27"]),
+            commit_at("7bd5b27", 1782738088, &["e81362f"]),
+            commit_at("e81362f", 1782738048, &["408eab1"]),
+            commit_at("408eab1", 1782737040, &["6be57e"]),
+            commit_at("6be57e", 1782820421, &[]),
+        ];
+
+        let rows = layout_graph_anchored(&commits, Some("3867c25"));
+        let row = |sha: &str| {
+            rows.iter()
+                .find(|row| row.sha == sha)
+                .unwrap_or_else(|| panic!("row {sha} missing"))
+        };
+        let dot_color = |sha: &str| {
+            let row = row(sha);
+            row.lane_colors[row.lane]
+        };
+
+        // The merge tip joins its own first-parent chain in lane 2 instead of
+        // opening a fresh lineage in lane 1.
+        assert_eq!(row("3e6fbd9").lane, 2, "merge tip shares its chain's lane");
+        assert_eq!(row("3fe1ec7").lane, 2);
+        assert_eq!(row("7989490").lane, 2);
+        assert_eq!(row("65e1876").lane, 2);
+        assert_eq!(row("db6d3d9").lane, 2);
+
+        // The merge tip's first-parent edge stays in its own lane.
+        assert_eq!(row("3e6fbd9").parent_lanes.first().copied(), Some(2));
+
+        // The earlier pull-request fork keeps its reserved inner lane.
+        assert_eq!(row("1d65235").lane, 1);
+
+        // The whole first-parent chain is one continuous color, and the tip's
+        // dot matches it rather than showing a separate hue.
+        let chain_color = dot_color("3e6fbd9");
+        assert!(chain_color.is_some());
+        assert_eq!(dot_color("3fe1ec7"), chain_color);
+        assert_eq!(dot_color("7989490"), chain_color);
+        assert_eq!(dot_color("65e1876"), chain_color);
+        assert_eq!(dot_color("db6d3d9"), chain_color);
+
+        // The tip belongs to a different lineage than its second parent.
+        assert_ne!(dot_color("1d65235"), chain_color);
+
+        // The two parents occupy distinct lanes (no double-assignment that
+        // would let the second parent clobber the first).
+        let tip_parent_lanes = &row("3e6fbd9").parent_lanes;
+        assert_eq!(tip_parent_lanes, &vec![2, 1]);
     }
 
     #[test]

@@ -6,7 +6,7 @@ This contract defines the drawing of the commit graph: how commits are assigned 
 
 Every commit occupies exactly one lane — a fixed horizontal position its dot is drawn in. The left-most lane is the trunk: it belongs to the checked-out commit's first-parent history, the chain a reviewer most often follows. The trunk extends upward through fast-forwardable descendants, so a branch tip whose history is a pure first-parent continuation of the checked-out commit draws as more trunk rather than opening a side lane above it. When several tips compete to continue the trunk, the most recently authored chain wins and the rest remain side branches.
 
-Everything off the trunk takes a lane to the trunk's right. A new side branch opens in the nearest free lane and never displaces a lane that is already in use; an occupied lane keeps its horizontal position until the branch it carries ends. When several side branches sprout from the same commit, their lanes are ordered by authored time: the branch with the earliest commits sits innermost (closest to the trunk), and each later sibling takes the next lane outward. Siblings keep their outward lanes until they rejoin the shared parent.
+Everything off the trunk takes a lane to the trunk's right. A new side branch opens in the nearest free lane and never displaces a lane that is already in use; an occupied lane keeps its horizontal position until the branch it carries ends. When several side branches sprout from the same commit, their lanes are ordered by authored time: the branch with the earliest commits sits innermost (closest to the trunk), and each later sibling takes the next lane outward. Siblings keep their outward lanes until they rejoin the shared parent. A sibling's reserved lane covers its whole first-parent chain, not just the commit that touches the shared parent: any commit further up that branch — including a merge whose first-parent history descends into the fork point — draws in the same lane, so the branch reads as one stroke from tip to fork instead of borrowing a neighboring sibling's lane.
 
 **Guaranteed invariants**
 
@@ -14,6 +14,7 @@ Everything off the trunk takes a lane to the trunk's right. A new side branch op
 - A commit that is not part of that history never appears in the left-most lane.
 - A lane keeps its horizontal position from the moment a branch occupies it until that branch ends; new branches never evict it.
 - Sibling branches sharing a parent are ordered inner-to-outer by the authored time of their commits, earliest innermost.
+- A sibling branch occupies one lane for its entire first-parent chain, from its tip down to the fork point, even when its tip is a merge that sits several rows above that fork.
 
 **Edge cases**
 
@@ -46,13 +47,14 @@ When sibling branches share a parent, they share a single edge into it: an inner
 
 ## Color and layering
 
-Each branch edge carries a single color from a repeating palette, assigned when the edge first appears and held end to end — from the commit where the edge starts, down every vertical, around every bend, to the row where it terminates. Color is the second tracing aid after lane position: when lines cross or converge, color tells the reviewer which is which.
+Each branch edge carries a single color from a repeating palette, assigned when the edge first appears and held end to end — from the commit where the edge starts, down every vertical, around every bend, to the row where it terminates. Color is the second tracing aid after lane position: when lines cross or converge, color tells the reviewer which is which. A merge dot takes the color of the branch the merge commit sits on — its own lane. Each edge fanning out to a merged-in parent takes the color of that incoming branch — the lane the edge descends into — so the stroke that carries a merged branch up to the merge dot reads in that branch's color rather than the merge commit's.
 
 Layering resolves the crossings. Lanes paint right to left, so the lanes nearer the trunk — the longer-lived, more permanent lines — draw above branches that are bending in to join them. Where an outer sibling's horizontal run crosses an inner lane that is itself curving to merge, the outer edge keeps its own color visible beneath the inner lane's bend, so neither line appears broken. And where a vertical meets a curve it feeds — the lane above a merge bend, or the continuation below a branch-out — the vertical stops at the curve's tangent point rather than overlapping it, so the joint reads as one continuous stroke rather than two overdrawn lines.
 
 **Guaranteed invariants**
 
 - An edge is one color for its entire length; it never changes color at a bend, a crossing, or a lane boundary.
+- A merge commit's dot is colored by its own lane; each edge fanning out to a merged-in parent is colored by the parent's lane, not the merge commit's.
 - At any crossing, both edges remain traceable: the crossing edge keeps its own color where it passes beneath another lane's bend.
 - Lanes closer to the trunk render above branches joining them.
 - Verticals and the curves they meet join seamlessly, with no visible overlap or gap at the tangent.

@@ -1140,14 +1140,23 @@ pub(crate) fn commit_graph_connector_color(
     row: &graph::GraphRow,
     connector: graph::GraphConnector,
 ) -> gpui::Rgba {
-    commit_graph_lane_color(row, commit_graph_connector_color_lane(connector))
+    commit_graph_lane_color(row, commit_graph_connector_color_lane(connector, row.lane))
 }
 
-pub(crate) fn commit_graph_connector_color_lane(connector: graph::GraphConnector) -> usize {
+pub(crate) fn commit_graph_connector_color_lane(
+    connector: graph::GraphConnector,
+    row_lane: usize,
+) -> usize {
     match connector.kind {
         graph::GraphConnectorKind::BranchOut => connector.to_lane,
-        graph::GraphConnectorKind::MergeIn => connector.from_lane,
         graph::GraphConnectorKind::Straight => connector.to_lane,
+        // A merge commit's additional-parent edges fan out from this commit's
+        // own dot (`from_lane == row_lane`) and descend in the parent's lane,
+        // so they carry the incoming branch's color just like a branch-out to a
+        // higher lane. Every other merge-in is a branch terminating at this
+        // commit's row, which keeps the ending branch's own lane color.
+        graph::GraphConnectorKind::MergeIn if connector.from_lane == row_lane => connector.to_lane,
+        graph::GraphConnectorKind::MergeIn => connector.from_lane,
     }
 }
 
@@ -1993,7 +2002,10 @@ mod tests {
             .copied()
             .find(|connector| connector.kind == GraphConnectorKind::BranchOut)
             .expect("branch-out connector");
-        assert_eq!(commit_graph_connector_color_lane(branch_out), 1);
+        assert_eq!(
+            commit_graph_connector_color_lane(branch_out, rows[0].lane),
+            1
+        );
 
         let merge_in = rows[3]
             .connectors
@@ -2001,7 +2013,44 @@ mod tests {
             .copied()
             .find(|connector| connector.kind == GraphConnectorKind::MergeIn)
             .expect("merge-in connector");
-        assert_eq!(commit_graph_connector_color_lane(merge_in), 1);
+        assert_eq!(commit_graph_connector_color_lane(merge_in, rows[3].lane), 1);
+    }
+
+    #[test]
+    fn merge_second_parent_edge_uses_incoming_parent_lane_color() {
+        // A merge commit sits in lane 2 (its own feature branch). Its second
+        // parent — the branch being merged in — descends in the lower lane 1.
+        // The fan-out edge from the merge dot to that lower lane must carry the
+        // incoming branch's color (lane 1), exactly like a branch-out fan-out
+        // to a higher lane, rather than the merge commit's own lane color.
+        let connector = graph::GraphConnector {
+            from_lane: 2,
+            to_lane: 1,
+            kind: GraphConnectorKind::MergeIn,
+        };
+        let row = graph::GraphRow {
+            sha: "merge".to_string(),
+            lane: 2,
+            lane_count: 3,
+            active_lanes: vec![2],
+            incoming_lanes: Vec::new(),
+            outgoing_lanes: vec![1, 2],
+            parent_lanes: vec![2, 1],
+            connector_lanes: vec![1, 2],
+            connectors: vec![connector],
+            lane_colors: vec![Some(3), Some(1), Some(0)],
+        };
+
+        assert_eq!(
+            commit_graph_connector_color(&row, connector),
+            commit_graph_lane_color(&row, 1),
+            "the merge's second-parent edge should match the incoming branch's lane color",
+        );
+        assert_ne!(
+            commit_graph_connector_color(&row, connector),
+            commit_graph_lane_color(&row, 2),
+            "it must not reuse the merge commit's own lane color",
+        );
     }
 
     #[test]
@@ -2025,7 +2074,7 @@ mod tests {
         };
 
         assert_eq!(commit_graph_connector_for_lane(&row, 1), Some(connector));
-        assert_eq!(commit_graph_connector_color_lane(connector), 2);
+        assert_eq!(commit_graph_connector_color_lane(connector, row.lane), 2);
     }
 
     #[test]
