@@ -1,9 +1,10 @@
 //! Greviewer library entry point.
 
-use gpui::{px, size, App, AppContext, Application, Bounds, WindowBounds, WindowOptions};
+use gpui::{App, AppContext, Application, WindowOptions};
 use gpui_component::{Root, TitleBar};
 
 use crate::assets::Assets;
+use crate::window_placement::{restore_window_options, MIN_WINDOW_SIZE};
 
 pub mod app;
 pub mod assets;
@@ -12,6 +13,7 @@ pub mod graph;
 pub mod icons;
 pub mod repo;
 pub mod settings;
+pub mod window_placement;
 pub mod workspace;
 
 pub fn run() {
@@ -23,10 +25,19 @@ pub fn run() {
         let (menus, _menu_snapshot) = app::build_app_menus();
         cx.set_menus(menus);
 
-        let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
+        let settings_store_path = settings::default_store_path();
+        let settings = settings_store_path
+            .as_deref()
+            .map(settings::load)
+            .unwrap_or_default();
+
+        let (window_bounds, display_id) = restore_window_options(&settings, cx);
+
         cx.open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_bounds: Some(window_bounds),
+                display_id,
+                window_min_size: Some(MIN_WINDOW_SIZE),
                 titlebar: Some(TitleBar::title_bar_options()),
                 ..Default::default()
             },
@@ -34,8 +45,10 @@ pub fn run() {
             // like `Input` reach for it via `Root::read`/`Root::update` during paint
             // (see gpui_component::input), and panic if the window's first layer is
             // not a `Root`. Wrap the `App` view in one so those components work.
-            |window, cx| {
-                let app = cx.new(|cx| app::App::new(window, cx));
+            move |window, cx| {
+                let app = cx.new(|cx| {
+                    app::App::new_with_loaded_settings(window, cx, settings, settings_store_path)
+                });
                 cx.new(|cx| Root::new(app, window, cx))
             },
         )

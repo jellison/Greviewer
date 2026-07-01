@@ -454,6 +454,24 @@ impl App {
         )
     }
 
+    /// Construct the app from settings already loaded by the caller (the app
+    /// entry point loads them before opening the window so the saved geometry
+    /// can be applied). Avoids a second read of the settings file.
+    pub fn new_with_loaded_settings(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        settings: Settings,
+        settings_store_path: Option<PathBuf>,
+    ) -> Self {
+        Self::new_with_picker_settings_and_store_path(
+            window,
+            cx,
+            Box::new(GpuiPathPicker),
+            settings,
+            settings_store_path,
+        )
+    }
+
     pub fn new_with_picker(
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -469,6 +487,7 @@ impl App {
     ) -> Self {
         let settings = Settings {
             recent_repositories,
+            window_state: None,
         };
         Self::new_with_picker_and_settings(window, cx, Box::new(GpuiPathPicker), settings)
     }
@@ -555,6 +574,32 @@ impl App {
                 }
             }
         }
+
+        // Persist window geometry when the window closes. Two hooks cover the
+        // two macOS quit paths, which never both fire for a single window:
+        //   * close button / Cmd+W -> windowShouldClose
+        //   * Cmd+Q / in-app Quit  -> applicationWillTerminate (on_app_quit)
+        // No in-memory cache: each hook reads the live geometry at the moment
+        // it fires.
+        let should_close_entity = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            should_close_entity
+                .update(cx, |app, cx| app.persist_window_state(window, cx))
+                .ok();
+            true
+        });
+
+        gpui::App::on_app_quit(cx, |cx| {
+            for handle in cx.windows() {
+                if let Some(window_handle) = handle.downcast::<Self>() {
+                    window_handle
+                        .update(cx, |app, window, cx| app.persist_window_state(window, cx))
+                        .ok();
+                }
+            }
+            async move {}
+        })
+        .detach();
 
         Self {
             mode,
@@ -743,6 +788,16 @@ impl App {
     fn persist_settings(&self) {
         if let Some(path) = &self.settings_store_path {
             let _ = settings::save(path, &self.settings);
+        }
+    }
+
+    /// Read the live window geometry and monitor, store it, and write settings.
+    /// Called from the window's close hooks; a failed write is swallowed by
+    /// `persist_settings` so it can never block the window from closing.
+    fn persist_window_state(&mut self, window: &Window, cx: &gpui::App) {
+        if let Some(state) = crate::window_placement::capture_window_state(window, cx) {
+            self.settings.window_state = Some(state);
+            self.persist_settings();
         }
     }
 
@@ -3397,13 +3452,38 @@ mod tests {
         Selection, FILE_TREE_ROW_HEIGHT,
     };
     use crate::repo::{ChangeKind, INITIAL_COMMIT_LIMIT};
-    use crate::settings::RecentRepository;
+    use crate::settings::{RecentRepository, WindowMode};
     use crate::workspace::test_util::simulate_double_click;
     use git2::{IndexAddOption, Repository, Signature};
     use gpui::{px, Modifiers, TestAppContext, VisualTestContext};
     use std::{fs, rc::Rc};
 
     use super::test_support::*;
+
+    #[gpui::test]
+    async fn closing_the_window_persists_its_bounds(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store = dir.path().join("settings.json");
+        let window = add_app_window_with_store_path(cx, store.clone());
+
+        let expected = window
+            .update(cx, |_app, window, _cx| window.window_bounds())
+            .expect("read window bounds");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.simulate_close(), "window should accept the close");
+
+        let state = crate::settings::load(&store)
+            .window_state
+            .expect("window state persisted on close");
+        assert_eq!(state.mode, WindowMode::Windowed);
+        let gpui::WindowBounds::Windowed(bounds) = expected else {
+            panic!("test platform always reports windowed bounds");
+        };
+        assert_eq!(state.width, f32::from(bounds.size.width));
+        assert_eq!(state.height, f32::from(bounds.size.height));
+        assert!(!state.display.is_empty());
+    }
 
     #[gpui::test]
     async fn renders_placeholder(cx: &mut TestAppContext) {

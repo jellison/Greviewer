@@ -17,11 +17,14 @@ pub const MAX_RECENT_REPOSITORIES: usize = 10;
 
 /// The complete set of persisted user settings. This is the single value
 /// written to and read from disk; add fields here to persist more state.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Most-recently-opened repositories, newest first.
     pub recent_repositories: Vec<RecentRepository>,
+    /// Persisted geometry of the main window, or `None` when nothing has been
+    /// saved yet. Restored on launch; see the `window_placement` module.
+    pub window_state: Option<WindowState>,
 }
 
 /// A repository the user has opened before, plus whether its folder could still
@@ -46,6 +49,31 @@ impl RecentRepository {
             available: false,
         }
     }
+}
+
+/// How the main window was displayed when it was last closed. The geometry
+/// stored alongside this in [`WindowState`] is the windowed "restore" size for
+/// the maximized and fullscreen variants.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowMode {
+    Windowed,
+    Maximized,
+    Fullscreen,
+}
+
+/// Persisted position, size, mode, and monitor of the main window. Coordinates
+/// and dimensions are in logical pixels. `display` is the stable per-monitor
+/// UUID (string form) the window was on, so restoration can target the same
+/// physical screen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowState {
+    pub display: String,
+    pub mode: WindowMode,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
 }
 
 /// Read settings from `path`. Returns [`Settings::default`] when the file is
@@ -114,6 +142,7 @@ mod tests {
                 // format must survive a JSON round trip untouched.
                 RecentRepository::unavailable(dir.path().join("repo\t\n\r-two")),
             ],
+            window_state: None,
         };
 
         save(&path, &settings).expect("save settings");
@@ -147,5 +176,43 @@ mod tests {
         fs::write(&path, r#"{"future_setting": 42}"#).expect("write file");
 
         assert_eq!(load(&path), Settings::default());
+    }
+
+    #[test]
+    fn window_state_survives_json_round_trip_for_all_modes() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        for mode in [
+            WindowMode::Windowed,
+            WindowMode::Maximized,
+            WindowMode::Fullscreen,
+        ] {
+            let path = dir.path().join(format!("settings-{mode:?}.json"));
+            let settings = Settings {
+                recent_repositories: vec![],
+                window_state: Some(WindowState {
+                    display: "1e2d3c4b-0000-0000-0000-000000000000".to_string(),
+                    mode,
+                    x: 120.5,
+                    y: -40.0,
+                    width: 1440.0,
+                    height: 900.0,
+                }),
+            };
+
+            save(&path, &settings).expect("save settings");
+
+            assert_eq!(load(&path), settings);
+        }
+    }
+
+    #[test]
+    fn settings_without_window_state_load_it_as_none() {
+        // A file written before this field existed must still load cleanly,
+        // with window_state defaulting to None.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"recent_repositories": []}"#).expect("write file");
+
+        assert_eq!(load(&path).window_state, None);
     }
 }

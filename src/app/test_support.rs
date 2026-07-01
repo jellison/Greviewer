@@ -19,6 +19,18 @@ pub(crate) fn add_app_window(cx: &mut TestAppContext) -> WindowHandle<App> {
     cx.add_window(App::new)
 }
 
+/// Open an app window whose settings persist to `store_path`, so close/quit
+/// persistence can be observed by reading the file back.
+pub(crate) fn add_app_window_with_store_path(
+    cx: &mut TestAppContext,
+    store_path: PathBuf,
+) -> WindowHandle<App> {
+    cx.update(gpui_component::init);
+    cx.add_window(move |window, cx| {
+        App::new_with_settings_store_path(window, cx, store_path.clone())
+    })
+}
+
 /// Write a settings file at `path` whose only populated field is the recent
 /// repository list. Mirrors how the storage tests seed state on disk.
 pub(crate) fn seed_recent_repositories(
@@ -29,6 +41,7 @@ pub(crate) fn seed_recent_repositories(
         path,
         &Settings {
             recent_repositories,
+            window_state: None,
         },
     )
     .expect("seed settings store");
