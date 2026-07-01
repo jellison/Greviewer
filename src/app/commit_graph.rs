@@ -4,6 +4,7 @@
 //! the root view module focused. See docs/adr/0002-project-layout.md.
 
 use super::*;
+use crate::theme::palette;
 
 pub(crate) fn commit_row_separator_width() -> f32 {
     0.
@@ -11,9 +12,9 @@ pub(crate) fn commit_row_separator_width() -> f32 {
 
 pub(crate) fn commit_row_separator_color(selected: bool) -> gpui::Rgba {
     if selected {
-        rgb(0x3b82f6)
+        palette().accent.into()
     } else {
-        rgb(0x242424)
+        palette().border.into()
     }
 }
 
@@ -97,9 +98,16 @@ pub(crate) fn render_commit_ref_label(row_index: usize, label: CommitRefLabel) -
         debug_ref_label_fragment(&label.selector_key)
     );
     let (border_color, background, text_color) = match label.kind {
-        CommitRefLabelKind::Head => (rgb(0x0ea5e9), rgb(0x102536), rgb(0x7dd3fc)),
-        CommitRefLabelKind::Branch => (rgb(0x3f6212), rgb(0x17230f), rgb(0xa3e635)),
-        CommitRefLabelKind::RemoteBranch => (rgb(0x475569), rgb(0x1b2430), rgb(REMOTE_BRANCH_TINT)),
+        CommitRefLabelKind::Head => (
+            palette().ref_head_border,
+            palette().ref_head_bg,
+            palette().ref_head_fg,
+        ),
+        CommitRefLabelKind::Branch | CommitRefLabelKind::RemoteBranch => (
+            palette().ref_branch_border,
+            palette().ref_branch_bg,
+            palette().ref_branch_fg,
+        ),
     };
 
     div()
@@ -586,13 +594,14 @@ pub(crate) fn render_commit_graph_lane(
 }
 
 pub(crate) fn commit_graph_lane_color(row: &graph::GraphRow, lane: usize) -> gpui::Rgba {
-    const PALETTE: [u32; 6] = [0x60a5fa, 0xa3e635, 0xfbbf24, 0xf472b6, 0x2dd4bf, 0xc084fc];
+    let lanes = palette().graph_lanes;
 
     row.lane_colors
         .get(lane)
         .and_then(|color| *color)
-        .map(|color| rgb(PALETTE[color % PALETTE.len()]))
-        .unwrap_or_else(|| rgb(0x555555))
+        .map(|color| lanes[color % lanes.len()])
+        .unwrap_or(palette().text_muted)
+        .into()
 }
 
 pub(crate) fn render_commit_graph_vertical_segment(
@@ -1985,6 +1994,27 @@ mod tests {
 
         assert!(visible.contains("root"));
         assert!(!visible.contains("unloaded-parent"));
+    }
+
+    #[test]
+    fn lane_colors_come_from_palette() {
+        use crate::theme::palette;
+        let p = palette();
+        let row = graph::GraphRow {
+            sha: "row".to_string(),
+            lane: 0,
+            lane_count: 5,
+            active_lanes: vec![0, 1, 2, 3, 4],
+            incoming_lanes: Vec::new(),
+            outgoing_lanes: Vec::new(),
+            parent_lanes: Vec::new(),
+            connector_lanes: Vec::new(),
+            connectors: Vec::new(),
+            lane_colors: vec![Some(0), Some(1), Some(2), Some(3), Some(4)],
+        };
+        // Lane color index maps into `graph_lanes`; the function returns `Rgba`.
+        assert_eq!(commit_graph_lane_color(&row, 0), p.graph_lanes[0].into());
+        assert_eq!(commit_graph_lane_color(&row, 4), p.graph_lanes[4].into());
     }
 
     #[test]

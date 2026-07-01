@@ -1,0 +1,29 @@
+{
+  "name": "OpenCode Material Dark",
+  "appearance": "dark",
+  "style": {
+    "editor.foreground": "#eeffff",
+    "syntax": {
+      "comment": { "color": "#546e7a", "font_style": "italic" },
+      "string": { "color": "#c3e88d" },
+      "string.special": { "color": "#c3e88d" },
+      "string.escape": { "color": "#eeffff" },
+      "keyword": { "color": "#c792ea", "font_style": "italic" },
+      "function": { "color": "#82aaff" },
+      "number": { "color": "#f78c6c" },
+      "constant": { "color": "#f78c6c" },
+      "boolean": { "color": "#f78c6c" },
+      "type": { "color": "#ffcb6b" },
+      "constructor": { "color": "#82aaff" },
+      "property": { "color": "#f07178" },
+      "attribute": { "color": "#c792ea" },
+      "variable": { "color": "#eeffff" },
+      "variable.special": { "color": "#f07178" },
+      "operator": { "color": "#89ddff" },
+      "punctuation": { "color": "#89ddff" },
+      "tag": { "color": "#f07178" },
+      "embedded": { "color": "#89ddff" },
+      "title": { "color": "#82aaff", "font_weight": 600 }
+    }
+  }
+}

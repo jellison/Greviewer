@@ -13,12 +13,14 @@ pub mod graph;
 pub mod icons;
 pub mod repo;
 pub mod settings;
+pub mod theme;
 pub mod window_placement;
 pub mod workspace;
 
 pub fn run() {
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         gpui_component::init(cx);
+        crate::theme::apply_to_gpui_component(cx);
 
         app::bind_app_keys(cx);
 

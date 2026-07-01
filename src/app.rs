@@ -27,9 +27,9 @@ pub use path_picker::{repository_prompt_options, GpuiPathPicker, PathPicker, Pat
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, canvas, div, pattern_slash, point, px, rgb, rgba, uniform_list, AnyElement,
-    AppContext, Background, ClickEvent, Context, Entity, EventEmitter, FocusHandle, HighlightStyle,
-    Hsla, InteractiveElement, IntoElement, Modifiers, ParentElement, PathBuilder, Pixels, Render,
+    actions, canvas, div, pattern_slash, point, px, uniform_list, AnyElement, AppContext,
+    Background, ClickEvent, Context, Entity, EventEmitter, FocusHandle, HighlightStyle, Hsla,
+    InteractiveElement, IntoElement, Modifiers, ParentElement, PathBuilder, Pixels, Render,
     ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledText, TextStyle,
     UniformListScrollHandle, Window,
 };
@@ -50,6 +50,7 @@ use std::{
 
 use crate::icons::LucideIcon;
 use crate::settings::{self, RecentRepository, Settings, SidebarWidths, MAX_RECENT_REPOSITORIES};
+use crate::theme::palette;
 use crate::workspace::FileDiffItem;
 use crate::{diff_highlight, graph, repo};
 
@@ -106,19 +107,11 @@ const BRANCH_SIDEBAR_DEFAULT_WIDTH: f32 = 240.;
 /// Height of the graph's contextual selection bar (docked to the bottom of
 /// the history panel while a selection is active).
 const SELECTION_BAR_HEIGHT: f32 = 34.;
-/// Selection-bar surface and hairline: the same slate-blue family as the
-/// selected-row background (`0x223248`), one step darker/lighter so the bar
-/// reads as chrome rather than another row.
-const SELECTION_BAR_BG: u32 = 0x1a2332;
-const SELECTION_BAR_BORDER: u32 = 0x2a3a50;
 const CHANGESET_FILES_DEFAULT_WIDTH: f32 = 340.;
 /// Smallest width a restored sidebar may take, guarding against a corrupt or
 /// degenerate saved value. The resizable widget clamps further to its own
 /// panel minimum and the container size.
 const SIDEBAR_MIN_WIDTH: f32 = 120.;
-/// Background tint painted behind fuzzy-match characters in filtered sidebar
-/// rows. A translucent accent so it reads over both normal and tinted rows.
-const BRANCH_FILTER_MATCH_BG: u32 = 0x3d5a80cc;
 
 pub struct App {
     pub mode: Mode,
@@ -1731,15 +1724,15 @@ impl App {
                     .max_w_full()
                     .mt_6()
                     .border_1()
-                    .border_color(rgb(0x2a2a2a))
-                    .bg(rgb(0x141414))
+                    .border_color(palette().border)
+                    .bg(palette().surface)
                     .child(
                         div()
                             .px_4()
                             .py_2()
                             .border_b_1()
-                            .border_color(rgb(0x242424))
-                            .text_color(rgb(0x999999))
+                            .border_color(palette().border)
+                            .text_color(palette().text_muted)
                             .text_size(px(12.))
                             .child("Recent repositories"),
                     )
@@ -1766,13 +1759,13 @@ impl App {
             .gap_2()
             .child(
                 div()
-                    .text_color(rgb(0xe6e6e6))
+                    .text_color(palette().text)
                     .text_size(px(20.))
                     .child("No repository open"),
             )
             .child(
                 div()
-                    .text_color(rgb(0x999999))
+                    .text_color(palette().text_muted)
                     .text_size(px(14.))
                     .child("Open a repository to start a review."),
             )
@@ -1795,9 +1788,9 @@ impl App {
         };
         let remove_selector = format!("unavailable-recent-repository-remove-{index}");
         let path_color = if recent.available {
-            rgb(0xe6e6e6)
+            palette().text
         } else {
-            rgb(0x777777)
+            palette().text_disabled
         };
 
         div()
@@ -1809,7 +1802,7 @@ impl App {
             .px_4()
             .py_2()
             .border_b_1()
-            .border_color(rgb(0x242424))
+            .border_color(palette().border)
             .cursor_pointer()
             .id(("recent-repository-row", index))
             .debug_selector(move || debug_selector.clone())
@@ -1835,9 +1828,9 @@ impl App {
                                 .px_2()
                                 .py_1()
                                 .border_1()
-                                .border_color(rgb(0x5a2a2a))
-                                .bg(rgb(0x241818))
-                                .text_color(rgb(0xfca5a5))
+                                .border_color(palette().danger_border)
+                                .bg(palette().danger_bg)
+                                .text_color(palette().danger_fg)
                                 .text_size(px(11.))
                                 .child("Unavailable"),
                         )
@@ -1846,9 +1839,9 @@ impl App {
                                 .px_2()
                                 .py_1()
                                 .border_1()
-                                .border_color(rgb(0x3a3a3a))
-                                .bg(rgb(0x1f1f1f))
-                                .text_color(rgb(0xbdbdbd))
+                                .border_color(palette().border)
+                                .bg(palette().element_bg)
+                                .text_color(palette().text)
                                 .text_size(px(11.))
                                 .cursor_pointer()
                                 .id(("unavailable-recent-repository-remove", index))
@@ -1933,7 +1926,7 @@ impl App {
                 .justify_center()
                 .id("commit-history-empty")
                 .debug_selector(|| "commit-history-empty".to_string())
-                .text_color(rgb(0x999999))
+                .text_color(palette().text_muted)
                 .text_size(px(14.))
                 .child("This repository has no commits to review.")
                 .into_any_element()
@@ -1987,7 +1980,7 @@ impl App {
             .flex_col()
             .w_full()
             .h_full()
-            .bg(rgb(0x171717))
+            .bg(palette().background)
             .child(history)
             // Contextual selection bar, docked to the bottom edge of the
             // history panel while a selection is active. It owns the
@@ -2002,7 +1995,7 @@ impl App {
             .w_full()
             .h_full()
             .min_h_0()
-            .bg(rgb(0x171717))
+            .bg(palette().background)
             .child(
                 h_resizable("graph-split")
                     .with_state(&self.graph_resizable)
@@ -2023,15 +2016,15 @@ impl App {
         summary: String,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let keycap = |label: &'static str, border: u32, text: u32| {
+        let keycap = |label: &'static str, border: Hsla, text: Hsla| {
             div()
                 .flex_none()
                 .px(px(4.))
                 .border_1()
-                .border_color(rgb(border))
+                .border_color(border)
                 .rounded(px(3.))
                 .text_size(px(9.))
-                .text_color(rgb(text))
+                .text_color(text)
                 .child(label)
         };
 
@@ -2042,13 +2035,13 @@ impl App {
             .gap_2()
             .h(px(SELECTION_BAR_HEIGHT))
             .px_3()
-            .bg(rgb(SELECTION_BAR_BG))
+            .bg(palette().surface)
             .border_t_1()
-            .border_color(rgb(SELECTION_BAR_BORDER))
+            .border_color(palette().border)
             .text_size(px(12.))
             .id("selection-bar")
             .debug_selector(|| "selection-bar".to_string())
-            .child(div().text_color(rgb(0x8ab4f8)).child(summary))
+            .child(div().text_color(palette().accent).child(summary))
             .child(div().flex_1())
             .child(
                 div()
@@ -2058,16 +2051,16 @@ impl App {
                     .px_2()
                     .py(px(3.))
                     .rounded(px(4.))
-                    .text_color(rgb(0x8b98a9))
+                    .text_color(palette().text_muted)
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x223248)))
+                    .hover(|style| style.bg(palette().element_hover))
                     .id("clear-selection")
                     .debug_selector(|| "clear-selection".to_string())
                     .on_click(cx.listener(|app, _event, _window, cx| {
                         app.clear_selection(cx);
                     }))
                     .child("Clear")
-                    .child(keycap("esc", SELECTION_BAR_BORDER, 0x8b98a9)),
+                    .child(keycap("esc", palette().border, palette().text_muted)),
             )
             .child(
                 div()
@@ -2077,17 +2070,17 @@ impl App {
                     .px_2()
                     .py(px(3.))
                     .rounded(px(4.))
-                    .bg(rgb(0x1d4ed8))
-                    .text_color(rgb(0xdbeafe))
+                    .bg(palette().accent_bg)
+                    .text_color(palette().accent)
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x2563eb)))
+                    .hover(|style| style.bg(palette().accent_bg_hover))
                     .id("open-changeset")
                     .debug_selector(|| "open-changeset".to_string())
                     .on_click(cx.listener(|app, _event, window, cx| {
                         app.open_changeset(window, cx);
                     }))
                     .child("Open changeset")
-                    .child(keycap("\u{23ce}", 0x6b96f0, 0xbfd3fb)),
+                    .child(keycap("\u{23ce}", palette().accent, palette().accent)),
             )
     }
 
@@ -2170,12 +2163,12 @@ impl App {
             .px_3()
             .py_1()
             .border_b_1()
-            .border_color(rgb(0x242424))
+            .border_color(palette().border)
             .id("branch-filter-input")
             .debug_selector(|| "branch-filter-input".to_string())
             .child(
                 Icon::new(LucideIcon::Search)
-                    .text_color(rgb(0x999999))
+                    .text_color(palette().text_muted)
                     .size(px(FILE_TREE_STATUS_ICON_SIZE)),
             )
             .child(
@@ -2201,7 +2194,7 @@ impl App {
                         }))
                         .child(
                             Icon::new(LucideIcon::X)
-                                .text_color(rgb(0x999999))
+                                .text_color(palette().text_muted)
                                 .size(px(FILE_TREE_STATUS_ICON_SIZE)),
                         ),
                 )
@@ -2215,7 +2208,7 @@ impl App {
                 .justify_center()
                 .id("branch-sidebar-empty")
                 .debug_selector(|| "branch-sidebar-empty".to_string())
-                .text_color(rgb(0x999999))
+                .text_color(palette().text_muted)
                 .text_size(px(14.))
                 .child("No branches")
                 .into_any_element()
@@ -2234,7 +2227,7 @@ impl App {
                     .justify_center()
                     .id("branch-filter-empty")
                     .debug_selector(|| "branch-filter-empty".to_string())
-                    .text_color(rgb(0x999999))
+                    .text_color(palette().text_muted)
                     .text_size(px(14.))
                     .child("No matching branches")
                     .into_any_element()
@@ -2282,7 +2275,8 @@ impl App {
             .id("branch-sidebar")
             .debug_selector(|| "branch-sidebar".to_string())
             .border_1()
-            .border_color(rgb(0x242424))
+            .border_color(palette().border)
+            .bg(palette().surface)
             .font_family(MONO_FONT_FAMILY)
             .on_hover(cx.listener(|app, hovered: &bool, _window, cx| {
                 if app.branch_sidebar_hovered != *hovered {
@@ -2348,7 +2342,7 @@ impl App {
             (
                 range,
                 HighlightStyle {
-                    background_color: Some(rgba(BRANCH_FILTER_MATCH_BG).into()),
+                    background_color: Some(palette().match_highlight_bg),
                     ..Default::default()
                 },
             )
@@ -2379,18 +2373,16 @@ impl App {
         // The checked-out branch is marked by a subtle background tint instead
         // of a check icon; an active commit selection still takes precedence.
         let row_bg = if selected {
-            rgb(0x223248)
+            palette().row_selected
         } else if branch.is_head {
-            rgb(CURRENT_BRANCH_BG)
+            palette().current_branch_bg
         } else {
-            rgb(0x171717)
+            palette().surface
         };
         let name_color = if hidden {
-            rgb(0x999999)
-        } else if matches!(branch.kind, repo::BranchKind::Remote { .. }) {
-            rgb(REMOTE_BRANCH_TINT)
+            palette().text_muted
         } else {
-            rgb(0xe6e6e6)
+            palette().text
         };
         let name_fragment = debug_ref_label_fragment(&key);
         let row_selector = if selected {
@@ -2418,7 +2410,7 @@ impl App {
             .group(group_name.clone())
             .debug_selector(move || row_selector.clone())
             .when(!selected && !hidden, |row| {
-                row.hover(|style| style.bg(rgb(0x1f2733)))
+                row.hover(|style| style.bg(palette().element_hover))
             })
             .when(!hidden, |row| {
                 row.cursor_pointer().on_click(cx.listener(
@@ -2462,7 +2454,7 @@ impl App {
                                 .map(|idx| final_segment_highlights(&branch.name, &idx))
                                 .unwrap_or_default()
                         };
-                        self.branch_label(&display_name, &highlight, name_color.into())
+                        self.branch_label(&display_name, &highlight, name_color)
                     }),
             )
             .when(show_toggle, |row| {
@@ -2489,7 +2481,7 @@ impl App {
                             } else {
                                 LucideIcon::Eye
                             })
-                            .text_color(rgb(0x999999))
+                            .text_color(palette().text_muted)
                             .size(px(FILE_TREE_STATUS_ICON_SIZE)),
                         ),
                 )
@@ -2521,14 +2513,14 @@ impl App {
             .py(px(BRANCH_ROW_VERTICAL_PADDING))
             .gap_2()
             .px_3()
-            .bg(rgb(0x171717))
+            .bg(palette().surface)
             .border_b_1()
             .when(section.top_border, |header| header.border_t_1())
-            .border_color(rgb(0x242424))
+            .border_color(palette().border)
             .cursor_pointer()
             .id(("branch-section", index))
             .debug_selector(move || row_selector.clone())
-            .hover(|style| style.bg(rgb(0x1f2733)))
+            .hover(|style| style.bg(palette().element_hover))
             .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
                 app.toggle_branch_section(toggle_key.clone(), cx);
             }))
@@ -2538,7 +2530,7 @@ impl App {
                 } else {
                     LucideIcon::ChevronDown
                 })
-                .text_color(rgb(0x999999))
+                .text_color(palette().text_muted)
                 .size(px(FILE_TREE_STATUS_ICON_SIZE)),
             )
             .child(
@@ -2549,7 +2541,7 @@ impl App {
                     .debug_selector(move || icon_selector.clone())
                     .child(
                         Icon::new(section_icon)
-                            .text_color(rgb(0x999999))
+                            .text_color(palette().text_muted)
                             .size(px(FILE_TREE_STATUS_ICON_SIZE)),
                     ),
             )
@@ -2557,7 +2549,7 @@ impl App {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_color(rgb(0x999999))
+                    .text_color(palette().text_muted)
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .truncate()
                     .child(section.title.to_uppercase()),
@@ -2565,7 +2557,7 @@ impl App {
             .child(
                 div()
                     .flex_shrink_0()
-                    .text_color(rgb(0x999999))
+                    .text_color(palette().text_muted)
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .debug_selector(move || count_selector.clone())
                     .child(section.count.to_string()),
@@ -2584,9 +2576,8 @@ impl App {
         let toggle_selector = format!("branch-folder-visibility-{path_fragment}");
         let collapse_path = folder.path.clone();
         let toggle_path = folder.path.clone();
-        let hidden = folder.visibility == FolderVisibility::Hidden;
         let always_show = folder.visibility != FolderVisibility::Visible;
-        let name_color = if hidden { rgb(0x999999) } else { rgb(0x8aa6bd) };
+        let name_color = palette().text_muted;
         let depth = folder.depth;
         let group_name = format!("branch-folder-group-{path_fragment}");
 
@@ -2598,12 +2589,12 @@ impl App {
             .py(px(BRANCH_ROW_VERTICAL_PADDING))
             .gap_2()
             .px_3()
-            .bg(rgb(0x171717))
+            .bg(palette().surface)
             .cursor_pointer()
             .id(("branch-folder", index))
             .group(group_name.clone())
             .debug_selector(move || row_selector.clone())
-            .hover(|style| style.bg(rgb(0x1f2733)))
+            .hover(|style| style.bg(palette().element_hover))
             .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
                 app.toggle_branch_folder(collapse_path.clone(), cx);
             }))
@@ -2645,7 +2636,7 @@ impl App {
                             let idx = prefix_match_indices(display_path, query);
                             final_segment_highlights(display_path, &idx)
                         };
-                        self.branch_label(&folder.name, &highlight, name_color.into())
+                        self.branch_label(&folder.name, &highlight, name_color)
                     }),
             )
             .child(
@@ -2671,7 +2662,7 @@ impl App {
                         } else {
                             LucideIcon::EyeOff
                         })
-                        .text_color(rgb(0x999999))
+                        .text_color(palette().text_muted)
                         .size(px(FILE_TREE_STATUS_ICON_SIZE)),
                     ),
             )
@@ -2715,7 +2706,7 @@ impl App {
             .flex_col()
             .w_full()
             .h_full()
-            .bg(rgb(0x171717))
+            .bg(palette().background)
             .child(body)
     }
 
@@ -2766,7 +2757,7 @@ impl App {
                 .justify_center()
                 .id("changed-files-empty")
                 .debug_selector(|| "changed-files-empty".to_string())
-                .text_color(rgb(0x999999))
+                .text_color(palette().text_muted)
                 .text_size(px(14.))
                 .child("This changeset has no net file changes.")
                 .into_any_element()
@@ -2852,7 +2843,8 @@ impl App {
             .id("changed-files")
             .debug_selector(|| "changed-files".to_string())
             .border_1()
-            .border_color(rgb(0x242424))
+            .border_color(palette().border)
+            .bg(palette().surface)
             .on_hover(cx.listener(|app, hovered: &bool, _window, cx| {
                 if app.file_tree_hovered != *hovered {
                     app.file_tree_hovered = *hovered;
@@ -2952,20 +2944,20 @@ impl App {
             .min_h(px(FILE_TREE_ROW_HEIGHT))
             .gap_2()
             .px_2()
-            .bg(rgb(0x171717))
+            .bg(palette().surface)
             .debug_selector(|| "file-tree-repo-root".to_string())
             .child(render_file_tree_indent_guides(0, "repo-root"))
             .child(render_file_tree_folder_icon(
                 "repo-root",
                 false,
-                rgb(0x8aa6bd),
+                palette().text_muted.into(),
             ))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
-                    .text_color(rgb(0x8aa6bd))
+                    .text_color(palette().text_muted)
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
                     .font_family(MONO_FONT_FAMILY)
@@ -3029,8 +3021,16 @@ impl App {
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let background = if active { rgb(0x1d283a) } else { rgb(0x202020) };
-        let text_color = if active { rgb(0xdbeafe) } else { rgb(0x999999) };
+        let background = if active {
+            palette().accent_bg
+        } else {
+            palette().element_bg
+        };
+        let text_color = if active {
+            palette().accent
+        } else {
+            palette().text_muted
+        };
 
         div()
             .id(selector)
@@ -3043,7 +3043,11 @@ impl App {
             .bg(background)
             .text_color(text_color)
             .cursor_pointer()
-            .hover(|style| style.bg(rgb(0x2c3a4f)).text_color(rgb(0xdbeafe)))
+            .hover(|style| {
+                style
+                    .bg(palette().accent_bg_hover)
+                    .text_color(palette().accent)
+            })
             .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
             .on_click(cx.listener(move |app, _event, window, cx| on_click(app, window, cx)))
             .child(
@@ -3100,9 +3104,9 @@ impl App {
                 .min_h(px(FILE_TREE_ROW_HEIGHT))
                 .px_2()
                 .bg(if selected {
-                    rgb(0x223248)
+                    palette().row_selected
                 } else {
-                    rgb(0x171717)
+                    palette().surface
                 })
         };
 
@@ -3154,7 +3158,7 @@ impl App {
             .min_h(px(FILE_TREE_ROW_HEIGHT))
             .gap_2()
             .px_2()
-            .bg(rgb(0x171717))
+            .bg(palette().surface)
             .cursor_pointer()
             .id(("file-tree-folder", index))
             .debug_selector(move || debug_selector.clone())
@@ -3165,12 +3169,12 @@ impl App {
             .child(render_file_tree_folder_icon(
                 &path_fragment,
                 collapsed,
-                rgb(0x8aa6bd),
+                palette().text_muted.into(),
             ))
             .child(
                 div()
                     .flex_1()
-                    .text_color(rgb(0x8aa6bd))
+                    .text_color(palette().text_muted)
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
                     .font_family(MONO_FONT_FAMILY)
@@ -3190,9 +3194,9 @@ impl App {
     ) -> impl IntoElement {
         let path = file.path.clone();
         let row_bg = if selected {
-            rgb(0x223248)
+            palette().row_selected
         } else {
-            rgb(0x171717)
+            palette().surface
         };
         let debug_selector = if selected {
             format!("selected-changed-file-row-{index}")
@@ -3249,9 +3253,9 @@ impl App {
                                 .px_1()
                                 .py_0p5()
                                 .border_1()
-                                .border_color(rgb(0x525252))
-                                .bg(rgb(0x242424))
-                                .text_color(rgb(0xbdbdbd))
+                                .border_color(palette().border)
+                                .bg(palette().element_bg)
+                                .text_color(palette().text)
                                 .text_size(px(FILE_TREE_BADGE_TEXT_SIZE))
                                 .font_family(MONO_FONT_FAMILY)
                                 .debug_selector(move || binary_selector.clone())
@@ -3261,7 +3265,7 @@ impl App {
                     .when_some(file.old_path.clone(), |row, old_path| {
                         row.child(
                             div()
-                                .text_color(rgb(0x8a8a8a))
+                                .text_color(palette().text_muted)
                                 .text_size(px(FILE_TREE_SECONDARY_TEXT_SIZE))
                                 .font_family(MONO_FONT_FAMILY)
                                 .whitespace_nowrap()
@@ -3283,9 +3287,9 @@ impl App {
     ) -> impl IntoElement {
         let path = file.path.clone();
         let row_bg = if selected {
-            rgb(0x223248)
+            palette().row_selected
         } else {
-            rgb(0x171717)
+            palette().surface
         };
         let debug_selector = if selected {
             format!("selected-unchanged-file-row-{index}")
@@ -3317,12 +3321,12 @@ impl App {
             ))
             .child(render_file_tree_file_icon(
                 format!("unchanged-file-icon-{}", debug_path_fragment(&file.path)),
-                rgb(0x6f7d87),
+                palette().text_muted.into(),
             ))
             .child(
                 div()
                     .flex_1()
-                    .text_color(rgb(0xb8c0c7))
+                    .text_color(palette().text)
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
                     .font_family(MONO_FONT_FAMILY)
@@ -3355,7 +3359,7 @@ impl App {
                 .debug_selector(|| "file-detail-empty".to_string())
                 .items_center()
                 .justify_center()
-                .text_color(rgb(0x999999))
+                .text_color(palette().text_muted)
                 .text_size(px(14.))
                 .child("Select a file to inspect its diff.")
                 .into_any_element(),
@@ -3441,8 +3445,8 @@ impl App {
                         .px_3()
                         .py_1()
                         .border_b_1()
-                        .border_color(rgb(0x2a2a2a))
-                        .text_color(rgb(0x999999))
+                        .border_color(palette().border)
+                        .text_color(palette().text_muted)
                         .text_size(px(12.))
                         .font_family(MONO_FONT_FAMILY)
                         .debug_selector(move || rename_source_selector.clone())
@@ -3493,9 +3497,9 @@ impl App {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let row_bg = if selected {
-            rgb(0x223248)
+            palette().row_selected
         } else {
-            rgb(0x171717)
+            palette().background
         };
         let debug_selector = if selected {
             format!("selected-commit-row-{index}")
@@ -3539,7 +3543,7 @@ impl App {
                 div()
                     .w(px(COMMIT_HASH_WIDTH))
                     .flex_shrink_0()
-                    .text_color(rgb(0xa3e635))
+                    .text_color(palette().commit_hash_fg)
                     .text_size(px(12.))
                     .font_family(MONO_FONT_FAMILY)
                     .debug_selector(move || format!("commit-hash-{index}"))
@@ -3549,7 +3553,7 @@ impl App {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_color(rgb(0xe6e6e6))
+                    .text_color(palette().text)
                     .text_size(px(14.))
                     .truncate()
                     .debug_selector(move || format!("commit-summary-{index}"))
@@ -3560,7 +3564,7 @@ impl App {
                     .w(px(COMMIT_AUTHOR_WIDTH))
                     .flex_shrink_0()
                     .min_w_0()
-                    .text_color(rgb(0xa3a3a3))
+                    .text_color(palette().text_muted)
                     .text_size(px(12.))
                     .truncate()
                     .debug_selector(move || format!("commit-author-{index}"))
@@ -3570,7 +3574,7 @@ impl App {
                 div()
                     .w(px(COMMIT_TIME_WIDTH))
                     .flex_shrink_0()
-                    .text_color(rgb(0x8a8a8a))
+                    .text_color(palette().text_muted)
                     .text_size(px(12.))
                     .debug_selector(move || format!("commit-time-{index}"))
                     .child(commit.authored_date.clone()),
@@ -3582,16 +3586,6 @@ impl App {
             ))
     }
 }
-
-/// Text tint shared by remote branch rows in the sidebar and remote ref
-/// label pills in the graph, so the two surfaces read as one family.
-const REMOTE_BRANCH_TINT: u32 = 0x94a3b8;
-
-/// Background marking the checked-out branch's sidebar row: a bright slate blue
-/// for clear contrast against the dark sidebar, in the spirit of GitKraken's
-/// current-branch highlight. The darker selection blue still takes precedence
-/// when a row is both current and selected.
-const CURRENT_BRANCH_BG: u32 = 0x34426a;
 
 const COMMIT_ROW_HEIGHT: f32 = 44.;
 const COMMIT_HASH_WIDTH: f32 = 72.;

@@ -12,19 +12,18 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, relative, rgb, AnyElement, AppContext, Context, DragMoveEvent, Empty,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window,
+    div, px, relative, AnyElement, AppContext, Context, DragMoveEvent, Empty, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window,
 };
 
 use super::tab_bar::DraggedTab;
 use super::{AxisNode, PaneGroup, PaneId, SplitAxis, SplitDirection};
 use crate::app::App;
 use crate::repo;
+use crate::theme::palette;
 
 const DIVIDER_THICKNESS: f32 = 4.;
-const DIVIDER_COLOR: u32 = 0x2a2a2a;
-const DIVIDER_HOVER_COLOR: u32 = 0x7da4ff;
 
 /// Dragging the divider after child `divider` of axis node `axis_id`.
 #[derive(Clone)]
@@ -93,7 +92,6 @@ fn render_pane(
 /// Fraction of the content area's width/height that counts as an edge band
 /// for drag-to-split.
 const EDGE_ZONE_FRACTION: f32 = 0.25;
-const EDGE_HIGHLIGHT_COLOR: u32 = 0x7da4ff;
 
 /// A pane's diff content plus tab-drag edge zones. While a tab drag hovers
 /// the left/right/top/bottom band of the content area, the corresponding
@@ -128,7 +126,9 @@ fn render_pane_content(
         .overflow_hidden()
         .when(pane_is_empty, |content| {
             // Whole-pane hover feedback for the move-into-empty-pane drop.
-            content.drag_over::<DraggedTab>(|style, _drag, _window, _cx| style.bg(rgb(0x1d2733)))
+            content.drag_over::<DraggedTab>(|style, _drag, _window, _cx| {
+                style.bg(palette().drop_target)
+            })
         })
         .on_drag_move(
             cx.listener(move |app, event: &DragMoveEvent<DraggedTab>, _window, cx| {
@@ -188,7 +188,7 @@ fn render_pane_content(
                 div()
                     .debug_selector(move || selector.clone())
                     .absolute()
-                    .bg(rgb(EDGE_HIGHLIGHT_COLOR))
+                    .bg(palette().accent)
                     .opacity(0.18)
                     .map(|half| match direction {
                         SplitDirection::Left => half.left_0().top_0().bottom_0().w(relative(0.5)),
@@ -268,8 +268,8 @@ fn render_divider(axis_id: usize, direction: SplitAxis, divider: usize) -> AnyEl
             SplitAxis::Horizontal => handle.w(px(DIVIDER_THICKNESS)).h_full().cursor_col_resize(),
             SplitAxis::Vertical => handle.h(px(DIVIDER_THICKNESS)).w_full().cursor_row_resize(),
         })
-        .bg(rgb(DIVIDER_COLOR))
-        .hover(|handle| handle.bg(rgb(DIVIDER_HOVER_COLOR)))
+        .bg(palette().border)
+        .hover(|handle| handle.bg(palette().accent))
         .on_drag(
             DraggedDivider { axis_id, divider },
             |_drag, _offset, _window, cx| cx.new(|_| EmptyDragPreview),

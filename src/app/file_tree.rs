@@ -5,21 +5,25 @@
 
 use super::*;
 
-pub(crate) fn change_kind_border(kind: repo::ChangeKind) -> gpui::Rgba {
+use crate::theme::palette;
+
+pub(crate) fn change_kind_border(kind: repo::ChangeKind) -> Hsla {
+    let p = palette();
     match kind {
-        repo::ChangeKind::Added => rgb(0xb8f77a),
-        repo::ChangeKind::Modified => rgb(0x7da4ff),
-        repo::ChangeKind::Deleted => rgb(0xff5f78),
-        repo::ChangeKind::Renamed => rgb(0xf3d36b),
+        repo::ChangeKind::Added => p.change_added,
+        repo::ChangeKind::Modified => p.change_modified,
+        repo::ChangeKind::Deleted => p.change_deleted,
+        repo::ChangeKind::Renamed => p.change_renamed,
     }
 }
 
-pub(crate) fn change_kind_text(kind: repo::ChangeKind) -> gpui::Rgba {
+pub(crate) fn change_kind_text(kind: repo::ChangeKind) -> Hsla {
+    let p = palette();
     match kind {
-        repo::ChangeKind::Added => rgb(0xb8f77a),
-        repo::ChangeKind::Modified => rgb(0x7da4ff),
-        repo::ChangeKind::Deleted => rgb(0xff5f78),
-        repo::ChangeKind::Renamed => rgb(0xf3d36b),
+        repo::ChangeKind::Added => p.change_added,
+        repo::ChangeKind::Modified => p.change_modified,
+        repo::ChangeKind::Deleted => p.change_deleted,
+        repo::ChangeKind::Renamed => p.change_renamed,
     }
 }
 
@@ -173,7 +177,7 @@ pub(crate) fn render_file_tree_indent_guides(depth: usize, path_fragment: &str) 
                 .top_0()
                 .w(px(FILE_TREE_INDENT_GUIDE_WIDTH))
                 .h(px(FILE_TREE_ROW_HEIGHT))
-                .bg(rgb(0x2b383f))
+                .bg(palette().border)
                 .debug_selector(move || selector.clone())
         })
         .collect::<Vec<_>>();
@@ -205,7 +209,7 @@ pub(crate) fn render_file_tree_file_name(
         .relative()
         .flex()
         .items_center()
-        .text_color(rgb(0xe6eef0))
+        .text_color(palette().text)
         .text_size(px(FILE_TREE_TEXT_SIZE))
         .line_height(px(FILE_TREE_ROW_TEXT_LINE_HEIGHT))
         .font_family(MONO_FONT_FAMILY)
@@ -220,7 +224,7 @@ pub(crate) fn render_file_tree_file_name(
                     .right_0()
                     .top(px(10.))
                     .h(px(1.))
-                    .bg(rgb(0xe6eef0))
+                    .bg(palette().text)
                     .debug_selector(move || deleted_strike_selector.clone()),
             )
         })
@@ -294,12 +298,12 @@ pub(crate) fn render_file_diff_stat(selector: String, stats: repo::LineStats) ->
         .debug_selector(move || selector.clone())
         .child(
             div()
-                .text_color(rgb(0xb8f77a))
+                .text_color(palette().diff_added_fg)
                 .child(format!("+ {}", stats.added)),
         )
         .child(
             div()
-                .text_color(rgb(0xff5f78))
+                .text_color(palette().diff_removed_fg)
                 .child(format!("- {}", stats.removed)),
         )
 }
@@ -874,6 +878,17 @@ mod tests {
             !stat_bounds.intersects(&toggle_bounds),
             "diff stats must not collide with the tree controls"
         );
+    }
+
+    #[test]
+    fn change_kind_colors_come_from_palette() {
+        use crate::repo::ChangeKind;
+        use crate::theme::palette;
+        let p = palette();
+        assert_eq!(change_kind_text(ChangeKind::Added), p.change_added);
+        assert_eq!(change_kind_text(ChangeKind::Modified), p.change_modified);
+        assert_eq!(change_kind_text(ChangeKind::Deleted), p.change_deleted);
+        assert_eq!(change_kind_text(ChangeKind::Renamed), p.change_renamed);
     }
 
     #[test]

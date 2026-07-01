@@ -8,7 +8,7 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, rgb, AnyElement, AppContext, ClickEvent, Context, InteractiveElement, IntoElement,
+    div, px, AnyElement, AppContext, ClickEvent, Context, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, ParentElement, ScrollHandle, SharedString,
     StatefulInteractiveElement, Styled,
 };
@@ -18,16 +18,11 @@ use super::{PaneId, SplitDirection, Workspace};
 use crate::app::{change_kind_text, App, MONO_FONT_FAMILY};
 use crate::icons::LucideIcon;
 use crate::repo;
+use crate::theme::palette;
 
 const TAB_BAR_HEIGHT: f32 = 32.;
 const TAB_TEXT_SIZE: f32 = 13.;
 const TAB_DIR_HINT_TEXT_SIZE: f32 = 10.;
-const TAB_BAR_BG: u32 = 0x111111;
-const TAB_ACTIVE_BG: u32 = 0x171717;
-const TAB_BORDER: u32 = 0x2a2a2a;
-const TAB_ACCENT: u32 = 0x7da4ff;
-const TAB_MUTED_TEXT: u32 = 0x8a8a8a;
-const TAB_DEFAULT_TEXT: u32 = 0xe6eef0;
 const TAB_CLOSE_HIT_SIZE: f32 = 16.;
 const TAB_CLOSE_ICON_SIZE: f32 = 12.;
 const TAB_INACTIVE_OPACITY: f32 = 0.75;
@@ -55,13 +50,13 @@ impl gpui::Render for TabDragPreview {
             .items_center()
             .h(px(TAB_BAR_HEIGHT - 6.))
             .px_3()
-            .bg(rgb(TAB_ACTIVE_BG))
+            .bg(palette().background)
             .border_1()
-            .border_color(rgb(TAB_ACCENT))
+            .border_color(palette().accent)
             .rounded(px(3.))
             .text_size(px(TAB_TEXT_SIZE))
             .font_family(MONO_FONT_FAMILY)
-            .text_color(rgb(TAB_DEFAULT_TEXT))
+            .text_color(palette().text)
             .opacity(0.9)
             .child(self.title.clone())
     }
@@ -104,7 +99,7 @@ pub fn render_tab_bar(
         .h_full()
         .overflow_x_scroll()
         .track_scroll(scroll)
-        .drag_over::<DraggedTab>(|style, _drag, _window, _cx| style.bg(rgb(0x1d2733)))
+        .drag_over::<DraggedTab>(|style, _drag, _window, _cx| style.bg(palette().drop_target))
         .on_drop(cx.listener(move |app, drag: &DraggedTab, _window, cx| {
             let end = app.workspace.tabs(pane).len();
             app.move_workspace_tab(drag.pane, drag.index, pane, end, cx);
@@ -127,7 +122,7 @@ pub fn render_tab_bar(
             .iter()
             .find(|file| file.path == item.path())
             .map(|file| change_kind_text(file.kind))
-            .unwrap_or(rgb(TAB_DEFAULT_TEXT));
+            .unwrap_or(palette().text);
         let tab_selector = format!("workspace-tab-{pane}-{index}");
         let close_selector = format!("workspace-tab-close-{pane}-{index}");
         let group_name = format!("workspace-tab-{pane}-{index}");
@@ -146,7 +141,7 @@ pub fn render_tab_bar(
                     .opacity(0.)
                     .group_hover(group_name.clone(), |button| button.opacity(1.))
             })
-            .hover(|button| button.bg(rgb(TAB_BORDER)))
+            .hover(|button| button.bg(palette().border))
             .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
                 cx.stop_propagation();
                 app.close_workspace_tab(pane, index, cx);
@@ -154,7 +149,7 @@ pub fn render_tab_bar(
             .child(
                 Icon::new(LucideIcon::X)
                     .size(px(TAB_CLOSE_ICON_SIZE))
-                    .text_color(rgb(TAB_MUTED_TEXT)),
+                    .text_color(palette().text_muted),
             );
 
         let tab = div()
@@ -170,16 +165,16 @@ pub fn render_tab_bar(
             .flex_none()
             .cursor_pointer()
             .border_r_1()
-            .border_color(rgb(TAB_BORDER))
+            .border_color(palette().border)
             .when(active, |tab| {
-                tab.bg(rgb(TAB_ACTIVE_BG)).child(
+                tab.bg(palette().background).child(
                     div()
                         .absolute()
                         .top_0()
                         .left_0()
                         .right_0()
                         .h(px(2.))
-                        .bg(rgb(TAB_ACCENT)),
+                        .bg(palette().accent),
                 )
             })
             .when(!active, |tab| tab.opacity(TAB_INACTIVE_OPACITY))
@@ -214,7 +209,7 @@ pub fn render_tab_bar(
                 },
             )
             .drag_over::<DraggedTab>(|style, _drag, _window, _cx| {
-                style.border_l_2().border_color(rgb(TAB_ACCENT))
+                style.border_l_2().border_color(palette().accent)
             })
             .on_drop(cx.listener(move |app, drag: &DraggedTab, _window, cx| {
                 cx.stop_propagation();
@@ -234,7 +229,7 @@ pub fn render_tab_bar(
                     div()
                         .text_size(px(TAB_DIR_HINT_TEXT_SIZE))
                         .font_family(MONO_FONT_FAMILY)
-                        .text_color(rgb(TAB_MUTED_TEXT))
+                        .text_color(palette().text_muted)
                         .whitespace_nowrap()
                         .child(hint),
                 )
@@ -252,9 +247,9 @@ pub fn render_tab_bar(
         .w_full()
         .h(px(TAB_BAR_HEIGHT))
         .flex_none()
-        .bg(rgb(TAB_BAR_BG))
+        .bg(palette().surface)
         .border_b_1()
-        .border_color(rgb(TAB_BORDER))
+        .border_color(palette().border)
         .when(!pane_active, |bar| {
             bar.opacity(TAB_BAR_INACTIVE_PANE_OPACITY)
         })
@@ -303,14 +298,14 @@ fn split_control(
         .h(px(SPLIT_CONTROL_SIZE))
         .rounded(px(2.))
         .cursor_pointer()
-        .hover(|button| button.bg(rgb(TAB_BORDER)))
+        .hover(|button| button.bg(palette().border))
         .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
             app.split_workspace_pane(pane, direction, cx);
         }))
         .child(
             Icon::new(icon)
                 .size(px(SPLIT_CONTROL_ICON_SIZE))
-                .text_color(rgb(TAB_MUTED_TEXT)),
+                .text_color(palette().text_muted),
         )
 }
 

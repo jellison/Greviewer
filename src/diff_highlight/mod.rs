@@ -1,8 +1,8 @@
 //! Syntax highlighting and word-level diff emphasis for the file-diff view.
 //!
-//! Pure logic only: no gpui rendering. The One Dark palette is authored from
-//! Atom's MIT-licensed one-dark-syntax; per ADR-0001 nothing here may be
-//! copied from Zed's GPL repository.
+//! Pure logic only: no gpui rendering. The Material palette is authored
+//! from the user's OpenCode Material Dark Zed theme; per ADR-0001 nothing
+//! here is copied from Zed's GPL repository.
 
 use std::ops::Range;
 use std::sync::OnceLock;
@@ -12,13 +12,13 @@ use gpui_component::highlighter::{HighlightTheme, SyntaxHighlighter};
 use ropey::Rope;
 use similar::{DiffTag, TextDiff};
 
-static ONE_DARK: OnceLock<HighlightTheme> = OnceLock::new();
+static MATERIAL: OnceLock<HighlightTheme> = OnceLock::new();
 
-/// The One Dark highlight theme used by the diff view.
-pub fn one_dark_theme() -> &'static HighlightTheme {
-    ONE_DARK.get_or_init(|| {
-        serde_json::from_str(include_str!("one_dark.json"))
-            .expect("embedded One Dark theme JSON is valid")
+/// The OpenCode Material Dark highlight theme used by the diff view.
+pub fn material_theme() -> &'static HighlightTheme {
+    MATERIAL.get_or_init(|| {
+        serde_json::from_str(include_str!("material.json"))
+            .expect("embedded Material theme JSON is valid")
     })
 }
 
@@ -31,7 +31,7 @@ pub fn one_dark_theme() -> &'static HighlightTheme {
 /// the plain-text grammar, which emits a single default-style run per line
 /// (no colors), so callers need no special plain-text path.
 pub fn line_highlight_runs(text: &str, language: &str) -> Vec<Vec<(Range<usize>, HighlightStyle)>> {
-    let theme = one_dark_theme();
+    let theme = material_theme();
     let rope = Rope::from_str(text);
     let mut highlighter = SyntaxHighlighter::new(language);
     highlighter.update(None, &rope);
@@ -192,9 +192,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_dark_theme_parses_from_embedded_json() {
-        let theme = one_dark_theme();
-        assert_eq!(theme.name, "One Dark");
+    fn material_theme_parses_from_embedded_json() {
+        let theme = material_theme();
+        assert_eq!(theme.name, "OpenCode Material Dark");
         assert!(
             theme.style.editor_foreground.is_some(),
             "editor.foreground should deserialize"

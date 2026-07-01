@@ -5,10 +5,13 @@
 
 use super::*;
 
+use crate::theme::palette;
+
 pub(crate) fn render_prepared_file_diff(
     prepared: &PreparedFileDiff,
     scroll: &FileDiffScroll,
 ) -> AnyElement {
+    let p = palette();
     match prepared {
         PreparedFileDiff::Single { side, rows, .. } => {
             let side = *side;
@@ -40,7 +43,7 @@ pub(crate) fn render_prepared_file_diff(
                     old_cells,
                     scroll.side_by_side.clone(),
                 ))
-                .child(div().w(px(1.)).flex_none().bg(rgb(0x2a2a2a)))
+                .child(div().w(px(1.)).flex_none().bg(p.border))
                 .child(render_file_diff_side(
                     "file-diff-side-new",
                     new_cells,
@@ -225,6 +228,7 @@ pub(crate) fn render_change_block_footer(
 ) -> Option<AnyElement> {
     let total = prepared.blocks().len();
     let current = current_change_block(prepared, scroll)?;
+    let p = palette();
 
     Some(
         div()
@@ -236,13 +240,13 @@ pub(crate) fn render_change_block_footer(
             .h(px(CHANGE_BLOCK_FOOTER_HEIGHT))
             .px_2()
             .border_t_1()
-            .border_color(rgb(0x2a2a2a))
-            .bg(rgb(0x1d1d1d))
+            .border_color(p.border)
+            .bg(p.surface)
             .id("change-block-footer")
             .debug_selector(|| "change-block-footer".to_string())
             .child(
                 div()
-                    .text_color(rgb(0x999999))
+                    .text_color(p.text_muted)
                     .text_size(px(12.))
                     .font_family(MONO_FONT_FAMILY)
                     .debug_selector(|| "change-block-label".to_string())
@@ -270,6 +274,7 @@ fn change_block_button(
     icon: LucideIcon,
     dispatch: impl Fn(&mut Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
+    let p = palette();
     div()
         .id(selector)
         .debug_selector(move || selector.to_string())
@@ -280,25 +285,26 @@ fn change_block_button(
         .h(px(CHANGE_BLOCK_BUTTON_SIZE))
         .rounded(px(2.))
         .cursor_pointer()
-        .hover(|button| button.bg(rgb(0x2a2a2a)))
+        .hover(|button| button.bg(p.element_hover))
         .on_click(move |_event: &gpui::ClickEvent, window, cx| dispatch(window, cx))
         .child(
             Icon::new(icon)
                 .size(px(CHANGE_BLOCK_ICON_SIZE))
-                .text_color(rgb(0x999999)),
+                .text_color(p.text_muted),
         )
 }
 
 pub(crate) fn render_binary_diff_placeholder() -> AnyElement {
+    let p = palette();
     div()
         .flex()
         .flex_1()
         .items_center()
         .justify_center()
-        .bg(rgb(0x171717))
+        .bg(p.background)
         .id("file-diff-binary")
         .debug_selector(|| "file-diff-binary".to_string())
-        .text_color(rgb(0x999999))
+        .text_color(p.text_muted)
         .text_size(px(14.))
         .child("No textual diff is available for this file.")
         .into_any_element()
@@ -332,15 +338,16 @@ pub(crate) fn render_file_content(
 }
 
 pub(crate) fn render_file_diff_error(message: String) -> AnyElement {
+    let p = palette();
     div()
         .flex()
         .flex_1()
         .items_center()
         .justify_center()
-        .bg(rgb(0x171717))
+        .bg(p.background)
         .id("file-diff-error")
         .debug_selector(|| "file-diff-error".to_string())
-        .text_color(rgb(0xfca5a5))
+        .text_color(p.danger_fg)
         .text_size(px(14.))
         .child(message)
         .into_any_element()
@@ -581,10 +588,6 @@ pub(crate) fn side_by_side_diff_rows(old_text: &str, new_text: &str) -> Vec<Diff
     rows
 }
 
-/// Emphasis colors for word-level changes (One Dark red/green at ~25% alpha).
-pub(crate) const DIFF_REMOVED_EMPHASIS: u32 = 0xe06c7540;
-pub(crate) const DIFF_ADDED_EMPHASIS: u32 = 0x98c37940;
-
 pub(crate) fn attach_line_runs(
     cell: &mut DiffLineCell,
     runs: &[Vec<(Range<usize>, HighlightStyle)>],
@@ -602,6 +605,7 @@ pub(crate) fn attach_diff_highlights(
 ) {
     let old_runs = diff_highlight::line_highlight_runs(old_text, language);
     let new_runs = diff_highlight::line_highlight_runs(new_text, language);
+    let p = palette();
 
     for row in rows.iter_mut() {
         attach_line_runs(&mut row.old, &old_runs);
@@ -618,12 +622,12 @@ pub(crate) fn attach_diff_highlights(
                 row.old.highlights = diff_highlight::merge_emphasis(
                     &row.old.highlights,
                     &old_emphasis,
-                    rgba(DIFF_REMOVED_EMPHASIS).into(),
+                    p.diff_removed_emphasis,
                 );
                 row.new.highlights = diff_highlight::merge_emphasis(
                     &row.new.highlights,
                     &new_emphasis,
-                    rgba(DIFF_ADDED_EMPHASIS).into(),
+                    p.diff_added_emphasis,
                 );
             }
         }
@@ -684,6 +688,7 @@ pub(crate) fn render_file_diff_side(
     cells: Vec<DiffLineCell>,
     scroll_handle: UniformListScrollHandle,
 ) -> impl IntoElement {
+    let p = palette();
     uniform_list(selector, cells.len(), move |range, _window, _cx| {
         range
             .map(|index| render_file_diff_line(selector, index, cells[index].clone()))
@@ -693,7 +698,7 @@ pub(crate) fn render_file_diff_side(
     .h_full()
     .min_h_0()
     .min_w_0()
-    .bg(rgb(0x171717))
+    .bg(p.background)
     // Reserve the same 12px right gutter the pre-virtualization scroll area
     // held via `scrollbar_width`. `UniformList` does not implement
     // `StatefulInteractiveElement`, so that modifier is unavailable; right
@@ -708,6 +713,7 @@ pub(crate) fn render_file_diff_line(
     row_index: usize,
     cell: DiffLineCell,
 ) -> impl IntoElement {
+    let p = palette();
     let line_number = cell
         .line_number
         .map(|line_number| line_number.to_string())
@@ -751,7 +757,7 @@ pub(crate) fn render_file_diff_line(
                 .w(px(48.))
                 .pr_2()
                 .flex_none()
-                .text_color(rgb(0x666666))
+                .text_color(p.text_muted)
                 .text_size(px(DIFF_TEXT_SIZE))
                 .line_height(px(DIFF_LINE_HEIGHT))
                 .font_family(MONO_FONT_FAMILY)
@@ -814,8 +820,9 @@ pub(crate) const DIFF_TEXT_SIZE: f32 = 14.;
 /// and `DIFF_LINE_HEIGHT` for documentation, but the values that actually
 /// drive layout are set on the code-cell div in `render_file_diff_line`.
 pub(crate) fn diff_text_style() -> TextStyle {
+    let p = palette();
     TextStyle {
-        color: Hsla::from(rgb(0xabb2bf)),
+        color: p.code_text,
         font_family: MONO_FONT_FAMILY.into(),
         font_size: px(DIFF_TEXT_SIZE).into(),
         line_height: px(DIFF_LINE_HEIGHT).into(),
@@ -823,23 +830,22 @@ pub(crate) fn diff_text_style() -> TextStyle {
     }
 }
 
-/// One Dark red/green at ~9% alpha over the 0x171717 chrome; alignment gaps
-/// hatch with a diagonal pattern like Zed's. The hatch uses 2px strokes every
-/// 11px in a light grey at ~80% alpha so the slashes read clearly against the
-/// dark chrome instead of blending into it.
+/// Material red/green at ~15% alpha over the editor background; alignment gaps
+/// hatch with a diagonal pattern like Zed's, using 2px strokes every 11px in a
+/// light theme grey so the slashes read clearly against the dark background.
 pub(crate) fn diff_line_fill(status: DiffLineStatus) -> Background {
     match status {
-        DiffLineStatus::Unchanged => Hsla::from(rgb(0x171717)).into(),
-        DiffLineStatus::Added => Hsla::from(rgba(0x98c37918)).into(),
-        DiffLineStatus::Removed => Hsla::from(rgba(0xe06c7518)).into(),
-        DiffLineStatus::Empty => pattern_slash(Hsla::from(rgba(0x4a4a4acc)), 2., 11.),
+        DiffLineStatus::Unchanged => palette().background.into(),
+        DiffLineStatus::Added => palette().diff_added_bg.into(),
+        DiffLineStatus::Removed => palette().diff_removed_bg.into(),
+        DiffLineStatus::Empty => pattern_slash(palette().diff_empty_hatch, 2., 11.),
     }
 }
 
-pub(crate) fn diff_line_accent(status: DiffLineStatus) -> Option<(gpui::Rgba, &'static str)> {
+pub(crate) fn diff_line_accent(status: DiffLineStatus) -> Option<(Hsla, &'static str)> {
     match status {
-        DiffLineStatus::Added => Some((rgb(0x98c379), "file-diff-accent-added")),
-        DiffLineStatus::Removed => Some((rgb(0xe06c75), "file-diff-accent-removed")),
+        DiffLineStatus::Added => Some((palette().diff_added_fg, "file-diff-accent-added")),
+        DiffLineStatus::Removed => Some((palette().diff_removed_fg, "file-diff-accent-removed")),
         DiffLineStatus::Unchanged | DiffLineStatus::Empty => None,
     }
 }
@@ -1171,6 +1177,24 @@ mod tests {
         assert!(!emphasis_is_subtle(&[r(0, 7)], 10));
         assert!(emphasis_is_subtle(&[], 0));
         assert!(!emphasis_is_subtle(&[r(0, 1)], 0));
+    }
+
+    #[test]
+    fn diff_line_fill_uses_palette_diff_backgrounds() {
+        use crate::theme::palette;
+        let p = palette();
+        assert_eq!(
+            diff_line_fill(DiffLineStatus::Added),
+            p.diff_added_bg.into()
+        );
+        assert_eq!(
+            diff_line_fill(DiffLineStatus::Removed),
+            p.diff_removed_bg.into()
+        );
+        assert_eq!(
+            diff_line_fill(DiffLineStatus::Unchanged),
+            p.background.into()
+        );
     }
 
     #[gpui::test]

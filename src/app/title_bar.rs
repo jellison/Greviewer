@@ -4,13 +4,14 @@
 //! docs/superpowers/specs/2026-06-07-titlebar-context-switcher-design.md.
 
 use gpui::{
-    div, px, rgb, AnyElement, Context, Div, InteractiveElement, IntoElement, ParentElement,
+    div, px, AnyElement, Context, Div, Hsla, InteractiveElement, IntoElement, ParentElement,
     Stateful, StatefulInteractiveElement as _, Styled,
 };
 use gpui_component::{TitleBar, TITLE_BAR_HEIGHT};
 
 use super::{App, Mode, ReviewScreen, Selection, MONO_FONT_FAMILY};
 use crate::repo::{ChangeKind, ChangeSet, CommitInfo};
+use crate::theme::palette;
 
 /// First seven characters of a full commit sha, matching the short form the
 /// graph and the removed diff header used.
@@ -123,15 +124,15 @@ fn changeset_line_totals(changeset: &ChangeSet) -> (usize, usize) {
 /// At rest the switcher is plain text; on hover a subtle neutral pill appears,
 /// and while its popover is `open` a stronger fill marks it as pressed. The
 /// caller adds its own `on_click` handler and child label.
-fn switcher_pill(id: &'static str, text_color: u32, open: bool) -> Stateful<Div> {
-    let hover_bg = rgb(0x2a2a2a);
-    let active_bg = rgb(0x3a3a3a);
+fn switcher_pill(id: &'static str, text_color: Hsla, open: bool) -> Stateful<Div> {
+    let hover_bg = palette().element_hover;
+    let active_bg = palette().element_bg;
     let pill = div()
         .id(id)
         .debug_selector(move || id.to_string())
         .font_family(MONO_FONT_FAMILY)
         .text_size(px(13.))
-        .text_color(rgb(text_color))
+        .text_color(text_color)
         .px_2()
         .py_0p5()
         .rounded_md()
@@ -152,7 +153,7 @@ impl App {
             Mode::RepoOpen { repo } => {
                 let repo_name = super::repository_title(&repo.path);
                 let mut row = div().flex().items_center().child(
-                    switcher_pill("title-bar-repo", 0xe6e6e6, self.repo_switcher_open)
+                    switcher_pill("title-bar-repo", palette().text, self.repo_switcher_open)
                         .on_click(cx.listener(|app, _event, _window, cx| {
                             app.repo_switcher_open = !app.repo_switcher_open;
                             app.context_popover_open = false;
@@ -168,17 +169,21 @@ impl App {
                             div()
                                 .mx_2()
                                 .text_size(px(13.))
-                                .text_color(rgb(0x5a5a5a))
+                                .text_color(palette().text_muted)
                                 .child("/"),
                         )
                         .child(
-                            switcher_pill("title-bar-context", 0xdbeafe, self.context_popover_open)
-                                .on_click(cx.listener(|app, _event, _window, cx| {
-                                    app.context_popover_open = !app.context_popover_open;
-                                    app.repo_switcher_open = false;
-                                    cx.notify();
-                                }))
-                                .child(label),
+                            switcher_pill(
+                                "title-bar-context",
+                                palette().accent,
+                                self.context_popover_open,
+                            )
+                            .on_click(cx.listener(|app, _event, _window, cx| {
+                                app.context_popover_open = !app.context_popover_open;
+                                app.repo_switcher_open = false;
+                                cx.notify();
+                            }))
+                            .child(label),
                         );
                 }
 
@@ -229,7 +234,7 @@ impl App {
         let mut header = div().flex().flex_col().gap_1().p_3().child(
             div()
                 .text_size(px(13.))
-                .text_color(rgb(0xededed))
+                .text_color(palette().text)
                 .child(title),
         );
         if let Some((oldest, newest)) = endpoints {
@@ -237,7 +242,7 @@ impl App {
                 div()
                     .font_family(MONO_FONT_FAMILY)
                     .text_size(px(12.))
-                    .text_color(rgb(0x8a8a93))
+                    .text_color(palette().text_muted)
                     .child(format!("{oldest} \u{2026} {newest}")),
             );
         }
@@ -250,14 +255,18 @@ impl App {
                 .px_3()
                 .py_2()
                 .text_size(px(12.))
-                .child(div().text_color(rgb(0x8a8a93)).child(label.to_string()))
+                .child(
+                    div()
+                        .text_color(palette().text_muted)
+                        .child(label.to_string()),
+                )
                 .child(value)
         };
 
         let files_row = stat_row(
             "Files changed",
             div()
-                .text_color(rgb(0xc7c7cf))
+                .text_color(palette().text)
                 .child(file_count.to_string())
                 .into_any_element(),
         );
@@ -266,10 +275,14 @@ impl App {
             div()
                 .flex()
                 .gap_2()
-                .child(div().text_color(rgb(0x7ee787)).child(format!("+{added}")))
                 .child(
                     div()
-                        .text_color(rgb(0xf08a8a))
+                        .text_color(palette().diff_added_fg)
+                        .child(format!("+{added}")),
+                )
+                .child(
+                    div()
+                        .text_color(palette().diff_removed_fg)
                         .child(format!("\u{2212}{removed}")),
                 )
                 .into_any_element(),
@@ -285,10 +298,10 @@ impl App {
             .py_2()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x5a2a2a))
-            .bg(rgb(0x2a1818))
+            .border_color(palette().danger_border)
+            .bg(palette().danger_bg)
             .text_size(px(12.))
-            .text_color(rgb(0xf3b4b4))
+            .text_color(palette().danger_fg)
             .cursor_pointer()
             .on_click(cx.listener(|app, _event, _window, cx| {
                 app.close_changeset(cx);
@@ -300,9 +313,9 @@ impl App {
                 .px_3()
                 .py_2()
                 .border_t_1()
-                .border_color(rgb(0x26262c))
+                .border_color(palette().border)
                 .text_size(px(12.))
-                .text_color(rgb(0x8a8a93))
+                .text_color(palette().text_muted)
                 .child(kind_parts.join(" \u{00b7} "))
         });
 
@@ -317,7 +330,7 @@ impl App {
                 .max_h(px(168.))
                 .overflow_y_scroll()
                 .border_t_1()
-                .border_color(rgb(0x26262c));
+                .border_color(palette().border);
             for (index, (sha, summary)) in commit_rows.iter().enumerate() {
                 list = list.child(
                     div()
@@ -331,14 +344,14 @@ impl App {
                         .child(
                             div()
                                 .font_family(MONO_FONT_FAMILY)
-                                .text_color(rgb(0x7aa2f7))
+                                .text_color(palette().accent)
                                 .child(sha.clone()),
                         )
                         .child(
                             div()
                                 .flex_1()
                                 .overflow_hidden()
-                                .text_color(rgb(0xc7c7cf))
+                                .text_color(palette().text)
                                 .child(summary.clone()),
                         ),
                 );
@@ -352,9 +365,9 @@ impl App {
             .left(px(80.))
             .occlude()
             .w(px(380.))
-            .bg(rgb(0x141417))
+            .bg(palette().surface)
             .border_1()
-            .border_color(rgb(0x34343a))
+            .border_color(palette().border)
             .rounded_lg()
             .debug_selector(|| "title-bar-context-popover".to_string())
             .child(header)
@@ -409,10 +422,10 @@ impl App {
             .px_3()
             .py_2()
             .border_b_1()
-            .border_color(rgb(0x26262c))
+            .border_color(palette().border)
             .font_family(MONO_FONT_FAMILY)
             .text_size(px(12.))
-            .text_color(rgb(0x8a8a93))
+            .text_color(palette().text_muted)
             .child(parent_label);
 
         let body = if other_count == 0 {
@@ -422,7 +435,7 @@ impl App {
                 .px_3()
                 .py_2()
                 .text_size(px(12.))
-                .text_color(rgb(0x8a8a93))
+                .text_color(palette().text_muted)
                 .child("No other repositories in this folder.")
                 .into_any_element()
         } else {
@@ -443,7 +456,7 @@ impl App {
                     .child(
                         div()
                             .font_family(MONO_FONT_FAMILY)
-                            .text_color(rgb(0xc7c7cf))
+                            .text_color(palette().text)
                             .child(name),
                     );
 
@@ -452,7 +465,7 @@ impl App {
                         div()
                             .debug_selector(|| "title-bar-repo-current".to_string())
                             .text_size(px(11.))
-                            .text_color(rgb(0x8a8a93))
+                            .text_color(palette().text_muted)
                             .child("current"),
                     );
                 } else {
@@ -475,9 +488,9 @@ impl App {
             .px_3()
             .py_2()
             .border_t_1()
-            .border_color(rgb(0x26262c))
+            .border_color(palette().border)
             .text_size(px(12.))
-            .text_color(rgb(0xdbeafe))
+            .text_color(palette().accent)
             .cursor_pointer()
             .on_click(cx.listener(|app, _event, window, cx| {
                 app.repo_switcher_open = false;
@@ -491,9 +504,9 @@ impl App {
             .left(px(8.))
             .occlude()
             .w(px(320.))
-            .bg(rgb(0x141417))
+            .bg(palette().surface)
             .border_1()
-            .border_color(rgb(0x34343a))
+            .border_color(palette().border)
             .rounded_lg()
             .debug_selector(|| "title-bar-repo-switcher".to_string())
             .child(header)
