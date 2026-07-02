@@ -104,7 +104,7 @@ const FILE_TREE_CONTROL_ICON_SIZE: f32 = 15.;
 const FILE_TREE_DIFF_STAT_WIDTH: f32 = 68.;
 const FILE_TREE_STAT_GUTTER_WIDTH: f32 = 84.; // diff-stat width + horizontal cell padding
 const BRANCH_SIDEBAR_DEFAULT_WIDTH: f32 = 240.;
-/// Height of the graph's contextual selection bar (docked to the bottom of
+/// Height of the graph's contextual selection bar (docked to the top of
 /// the history panel while a selection is active).
 const SELECTION_BAR_HEIGHT: f32 = 34.;
 const CHANGESET_FILES_DEFAULT_WIDTH: f32 = 340.;
@@ -116,6 +116,14 @@ const SIDEBAR_MIN_WIDTH: f32 = 120.;
 pub struct App {
     pub mode: Mode,
     pub selection: Selection,
+    /// The commit under the most recent single click in the graph. A
+    /// double-click's first click can add or remove the selection bar above
+    /// the graph, shifting every row mid-gesture, so the second click may
+    /// land on a neighboring row or on the bar itself. gpui only reports
+    /// `click_count >= 2` when both clicks land at nearly the same point, so
+    /// this anchor is exactly the commit the user double-clicked. Cleared by
+    /// a single click on the bar (the only other surface that consumes it).
+    double_click_anchor: Option<String>,
     pub review_screen: ReviewScreen,
     /// Open diff tabs. Source of truth for what the detail area shows.
     pub workspace: crate::workspace::Workspace,
@@ -666,6 +674,7 @@ impl App {
         Self {
             mode,
             selection: Selection::None,
+            double_click_anchor: None,
             review_screen: ReviewScreen::Graph,
             workspace: crate::workspace::Workspace::new(),
             file_tree_highlight_path: None,
@@ -1981,14 +1990,15 @@ impl App {
             .w_full()
             .h_full()
             .bg(palette().background)
-            .child(history)
-            // Contextual selection bar, docked to the bottom edge of the
-            // history panel while a selection is active. It owns the
-            // open-changeset affordance; enter/escape drive the same
-            // transitions through the OpenChangeset/ClearSelection actions.
+            // Contextual selection bar, docked to the top edge of the
+            // history panel while a selection is active (near the cursor,
+            // pushing the graph down). It owns the open-changeset
+            // affordance; enter/escape drive the same transitions through
+            // the OpenChangeset/ClearSelection actions.
             .when_some(selection_summary(&self.selection), |screen, summary| {
                 screen.child(self.render_selection_bar(summary, cx))
-            });
+            })
+            .child(history);
 
         div()
             .flex()
@@ -2036,11 +2046,26 @@ impl App {
             .h(px(SELECTION_BAR_HEIGHT))
             .px_3()
             .bg(palette().surface)
-            .border_t_1()
+            .border_b_1()
             .border_color(palette().border)
             .text_size(px(12.))
             .id("selection-bar")
             .debug_selector(|| "selection-bar".to_string())
+            // A double-click on the top commit row makes the bar appear
+            // under the cursor after the first click, so the second click
+            // lands here. Complete that gesture from the anchor; a plain
+            // click on the bar instead invalidates the anchor so a later
+            // double-click on the bar cannot resurrect a stale one.
+            .on_click(cx.listener(|app, event: &ClickEvent, window, cx| {
+                if event.click_count() >= 2 {
+                    if let Some(sha) = app.double_click_anchor.take() {
+                        app.selection = Selection::Single { sha };
+                        app.open_changeset(window, cx);
+                    }
+                } else {
+                    app.double_click_anchor = None;
+                }
+            }))
             .child(div().text_color(palette().accent).child(summary))
             .child(div().flex_1())
             .child(
@@ -3526,9 +3551,18 @@ impl App {
             .debug_selector(move || debug_selector.clone())
             .on_click(cx.listener(move |app, event: &ClickEvent, window, cx| {
                 if event.click_count() >= 2 {
-                    app.selection = Selection::Single { sha: sha.clone() };
+                    // The first click may have shifted the rows (selection
+                    // bar appearing/disappearing above the graph), so this
+                    // row may not be the one the gesture started on; the
+                    // anchor is (see its field doc).
+                    let sha = app
+                        .double_click_anchor
+                        .take()
+                        .unwrap_or_else(|| sha.clone());
+                    app.selection = Selection::Single { sha };
                     app.open_changeset(window, cx);
                 } else {
+                    app.double_click_anchor = Some(sha.clone());
                     app.select_commit(sha.clone(), event.modifiers(), window, cx);
                 }
             }))
@@ -4891,6 +4925,50 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn double_clicking_the_top_commit_opens_its_changeset_despite_the_bar(
+        cx: &mut TestAppContext,
+    ) {
+        // The selection bar appears above the graph after the first click,
+        // pushing every row down. For the top row the second click of the
+        // double-click lands on the bar itself; the gesture must still open
+        // the changeset of the commit that was under the first click.
+        let (dir, shas) = init_repo_with_three_commits();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row_bounds = visual
+            .debug_bounds("commit-row-0")
+            .expect("tip commit row debug bounds");
+        simulate_double_click(&mut visual, row_bounds.center());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: shas[0].clone()
+                    },
+                    "double-click selects the commit under the first click"
+                );
+                match &app.review_screen {
+                    ReviewScreen::Changeset { sha, .. } => assert_eq!(sha, &shas[0]),
+                    ReviewScreen::Graph => {
+                        panic!("double-clicking the top commit must open its changeset")
+                    }
+                }
+            })
+            .expect("read review screen");
+    }
+
+    #[gpui::test]
     async fn double_clicking_inside_a_range_opens_the_single_commit(cx: &mut TestAppContext) {
         let (dir, shas) = init_repo_with_three_commits();
         let path = dir.path().to_path_buf();
@@ -5677,6 +5755,11 @@ mod tests {
             })
             .expect("read selected state");
 
+        // The selection bar appeared above the graph and pushed the row
+        // down, so re-resolve its bounds before clicking it again.
+        let row_bounds = visual
+            .debug_bounds("selected-commit-row-0")
+            .expect("selected commit row debug bounds");
         visual.simulate_click(row_bounds.center(), Modifiers::none());
 
         window
@@ -5778,6 +5861,37 @@ mod tests {
         visual
             .debug_bounds("clear-selection")
             .expect("clear-selection affordance lives in the selection bar");
+    }
+
+    #[gpui::test]
+    async fn selection_bar_renders_above_the_commit_history(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+            })
+            .expect("open repo and select commit");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let bar_bounds = visual
+            .debug_bounds("selection-bar")
+            .expect("selection-bar debug bounds");
+        let history_bounds = visual
+            .debug_bounds("commit-history")
+            .expect("commit-history debug bounds");
+        assert!(
+            bar_bounds.bottom() <= history_bounds.top(),
+            "the selection bar docks to the top of the history panel, pushing the \
+             graph down (bar bottom {:?} vs history top {:?})",
+            bar_bounds.bottom(),
+            history_bounds.top(),
+        );
     }
 
     #[gpui::test]
