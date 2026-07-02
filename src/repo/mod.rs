@@ -156,6 +156,7 @@ pub enum OpenError {
 pub enum ChangeSetError {
     Open(OpenError),
     Git(git2::Error),
+    NoMergeBase,
 }
 
 impl fmt::Display for OpenError {
@@ -183,6 +184,9 @@ impl fmt::Display for ChangeSetError {
         match self {
             ChangeSetError::Open(err) => write!(f, "{err}"),
             ChangeSetError::Git(err) => write!(f, "Couldn't read that changeset: {err}."),
+            ChangeSetError::NoMergeBase => {
+                write!(f, "Those commits share no common history to compare.")
+            }
         }
     }
 }
@@ -192,6 +196,7 @@ impl std::error::Error for ChangeSetError {
         match self {
             ChangeSetError::Open(err) => Some(err),
             ChangeSetError::Git(err) => Some(err),
+            ChangeSetError::NoMergeBase => None,
         }
     }
 }
@@ -332,6 +337,84 @@ pub fn changeset_for_commit_range(
         base_tree.as_ref(),
         &newest_tree,
     )
+}
+
+/// Merge base of two commits, or `None` when they share no history.
+pub fn merge_base_sha(
+    path: &Path,
+    first_sha: &str,
+    second_sha: &str,
+) -> Result<Option<String>, ChangeSetError> {
+    let repo = open_changeset_repository(path)?;
+    let first = git2::Oid::from_str(first_sha).map_err(ChangeSetError::Git)?;
+    let second = git2::Oid::from_str(second_sha).map_err(ChangeSetError::Git)?;
+
+    Ok(merge_base_oid(&repo, first, second)?.map(|oid| oid.to_string()))
+}
+
+fn merge_base_oid(
+    repo: &git2::Repository,
+    first: git2::Oid,
+    second: git2::Oid,
+) -> Result<Option<git2::Oid>, ChangeSetError> {
+    match repo.merge_base(first, second) {
+        Ok(oid) => Ok(Some(oid)),
+        Err(err) if err.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(err) => Err(ChangeSetError::Git(err)),
+    }
+}
+
+/// The merge-preview changeset: diff(merge-base(base, target) tree -> target
+/// tree), i.e. `git diff base...target` — what merging the target into the
+/// base would introduce. `commit_sha` is the target; `base_sha` is the merge
+/// base.
+pub fn changeset_for_comparison(
+    path: &Path,
+    base_sha: &str,
+    target_sha: &str,
+) -> Result<ChangeSet, ChangeSetError> {
+    let repo = open_changeset_repository(path)?;
+    let base_oid = git2::Oid::from_str(base_sha).map_err(ChangeSetError::Git)?;
+    let target_oid = git2::Oid::from_str(target_sha).map_err(ChangeSetError::Git)?;
+
+    let Some(merge_base) = merge_base_oid(&repo, base_oid, target_oid)? else {
+        return Err(ChangeSetError::NoMergeBase);
+    };
+    let merge_base_commit = repo.find_commit(merge_base).map_err(ChangeSetError::Git)?;
+    let merge_base_tree = merge_base_commit.tree().map_err(ChangeSetError::Git)?;
+    let target_commit = repo.find_commit(target_oid).map_err(ChangeSetError::Git)?;
+    let target_tree = target_commit.tree().map_err(ChangeSetError::Git)?;
+
+    changeset_between_trees(
+        &repo,
+        target_commit.id().to_string(),
+        Some(merge_base.to_string()),
+        Some(&merge_base_tree),
+        &target_tree,
+    )
+}
+
+/// Shas of the commits a merge of `target` into `base` would introduce
+/// (`git rev-list base..target`), newest first, capped at `limit`.
+pub fn commit_shas_introduced_by(
+    path: &Path,
+    base_sha: &str,
+    target_sha: &str,
+    limit: usize,
+) -> Result<Vec<String>, ChangeSetError> {
+    let repo = open_changeset_repository(path)?;
+    let base_oid = git2::Oid::from_str(base_sha).map_err(ChangeSetError::Git)?;
+    let target_oid = git2::Oid::from_str(target_sha).map_err(ChangeSetError::Git)?;
+
+    let mut walk = repo.revwalk().map_err(ChangeSetError::Git)?;
+    walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)
+        .map_err(ChangeSetError::Git)?;
+    walk.push(target_oid).map_err(ChangeSetError::Git)?;
+    walk.hide(base_oid).map_err(ChangeSetError::Git)?;
+
+    walk.take(limit)
+        .map(|oid| oid.map(|oid| oid.to_string()).map_err(ChangeSetError::Git))
+        .collect()
 }
 
 fn changeset_between_trees(
@@ -1029,7 +1112,19 @@ mod tests {
     }
 
     fn commit_workdir(repo: &Repository, message: &str, parent_oids: &[git2::Oid]) -> String {
+        commit_workdir_to_ref(repo, Some("HEAD"), message, parent_oids)
+    }
+
+    /// Stage the whole working directory and commit it to `reference` (or to
+    /// no ref when `None`), so branch-shaped fixtures can carry distinct trees.
+    fn commit_workdir_to_ref(
+        repo: &Repository,
+        reference: Option<&str>,
+        message: &str,
+        parent_oids: &[git2::Oid],
+    ) -> String {
         let mut index = repo.index().expect("open index");
+        index.clear().expect("clear index");
         index
             .add_all(["*"], IndexAddOption::DEFAULT, None)
             .expect("stage files");
@@ -1047,7 +1142,7 @@ mod tests {
 
         let oid = repo
             .commit(
-                Some("HEAD"),
+                reference,
                 &signature,
                 &signature,
                 message,
@@ -1057,6 +1152,57 @@ mod tests {
             .expect("create commit");
 
         oid.to_string()
+    }
+
+    /// A root commit with two diverged branches: `left` carries one exclusive
+    /// commit adding `left.txt`; `right` carries two exclusive commits adding
+    /// `right.txt` then `right-more.txt`. HEAD stays on the root's branch.
+    /// Returns (dir, root_sha, left_sha, right_shas_newest_first).
+    fn init_diverged_repo() -> (TempDir, String, String, Vec<String>) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("base.txt"), "base\n").expect("write base file");
+        let root_sha = commit_workdir(&repo, "Root", &[]);
+        let root_oid = git2::Oid::from_str(&root_sha).expect("parse root oid");
+
+        fs::write(dir.path().join("left.txt"), "left\n").expect("write left file");
+        let left_sha = commit_workdir_to_ref(&repo, Some("refs/heads/left"), "Left", &[root_oid]);
+
+        fs::remove_file(dir.path().join("left.txt")).expect("remove left file");
+        fs::write(dir.path().join("right.txt"), "right\n").expect("write right file");
+        let right_first =
+            commit_workdir_to_ref(&repo, Some("refs/heads/right"), "Right", &[root_oid]);
+        let right_first_oid = git2::Oid::from_str(&right_first).expect("parse right oid");
+
+        fs::write(dir.path().join("right-more.txt"), "more\n").expect("write right-more file");
+        let right_tip = commit_workdir_to_ref(
+            &repo,
+            Some("refs/heads/right"),
+            "Right more",
+            &[right_first_oid],
+        );
+
+        drop(repo);
+        (dir, root_sha, left_sha, vec![right_tip, right_first])
+    }
+
+    /// Two parentless commits on unrelated refs: HEAD's root and an orphan
+    /// root that shares no history with it. Returns (dir, master_sha, orphan_sha).
+    fn init_disjoint_repo() -> (TempDir, String, String) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        fs::write(dir.path().join("master.txt"), "master\n").expect("write master file");
+        let master_sha = commit_workdir(&repo, "Master root", &[]);
+
+        fs::remove_file(dir.path().join("master.txt")).expect("remove master file");
+        fs::write(dir.path().join("orphan.txt"), "orphan\n").expect("write orphan file");
+        let orphan_sha =
+            commit_workdir_to_ref(&repo, Some("refs/heads/orphan"), "Orphan root", &[]);
+
+        drop(repo);
+        (dir, master_sha, orphan_sha)
     }
 
     /// Commits the current index tree to `reference` (or to no ref when
@@ -1586,6 +1732,135 @@ mod tests {
                 new_text: "after\n".to_string(),
             },
         );
+    }
+
+    #[test]
+    fn merge_base_sha_finds_the_fork_point() {
+        let (dir, root_sha, left_sha, right_shas) = init_diverged_repo();
+
+        let merge_base = merge_base_sha(dir.path(), &left_sha, &right_shas[0]).expect("merge base");
+
+        assert_eq!(merge_base, Some(root_sha));
+    }
+
+    #[test]
+    fn merge_base_sha_is_none_for_disjoint_roots() {
+        let (dir, master_sha, orphan_sha) = init_disjoint_repo();
+
+        let merge_base = merge_base_sha(dir.path(), &master_sha, &orphan_sha).expect("merge base");
+
+        assert_eq!(merge_base, None);
+    }
+
+    #[test]
+    fn changeset_for_comparison_diffs_merge_base_to_target() {
+        let (dir, root_sha, left_sha, right_shas) = init_diverged_repo();
+
+        let changeset = changeset_for_comparison(dir.path(), &left_sha, &right_shas[0])
+            .expect("comparison changeset");
+
+        assert_eq!(changeset.commit_sha, right_shas[0]);
+        assert_eq!(changeset.base_sha, Some(root_sha));
+        let paths = changeset
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                ("right-more.txt", ChangeKind::Added),
+                ("right.txt", ChangeKind::Added),
+            ],
+            "only the target side's changes appear; the base side's left.txt does not",
+        );
+    }
+
+    #[test]
+    fn changeset_for_comparison_is_directional() {
+        let (dir, root_sha, left_sha, right_shas) = init_diverged_repo();
+
+        let changeset = changeset_for_comparison(dir.path(), &right_shas[0], &left_sha)
+            .expect("comparison changeset");
+
+        assert_eq!(changeset.commit_sha, left_sha);
+        assert_eq!(changeset.base_sha, Some(root_sha));
+        let paths = changeset
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec!["left.txt"],
+            "swapping base and target flips the changeset to the other side",
+        );
+    }
+
+    #[test]
+    fn changeset_for_comparison_with_linear_ancestry_matches_the_range_rollup() {
+        let (dir, shas) = init_repo_with_linear_history(3);
+        let (tip_sha, middle_sha, root_sha) = (&shas[0], &shas[1], &shas[2]);
+
+        let comparison =
+            changeset_for_comparison(dir.path(), root_sha, tip_sha).expect("comparison changeset");
+        let rollup =
+            changeset_for_commit_range(dir.path(), middle_sha, tip_sha).expect("range changeset");
+
+        assert_eq!(comparison.commit_sha, rollup.commit_sha);
+        assert_eq!(comparison.base_sha, Some(root_sha.clone()));
+        assert_eq!(comparison.files, rollup.files);
+    }
+
+    #[test]
+    fn changeset_for_comparison_when_target_is_an_ancestor_is_empty() {
+        let (dir, shas) = init_repo_with_linear_history(3);
+        let (tip_sha, root_sha) = (&shas[0], &shas[2]);
+
+        let changeset =
+            changeset_for_comparison(dir.path(), tip_sha, root_sha).expect("comparison changeset");
+
+        assert_eq!(changeset.commit_sha, *root_sha);
+        assert_eq!(changeset.base_sha, Some(root_sha.clone()));
+        assert!(
+            changeset.files.is_empty(),
+            "a target already contained in the base introduces nothing",
+        );
+    }
+
+    #[test]
+    fn changeset_for_comparison_without_common_history_errors() {
+        let (dir, master_sha, orphan_sha) = init_disjoint_repo();
+
+        let error = changeset_for_comparison(dir.path(), &master_sha, &orphan_sha)
+            .expect_err("comparison must fail without a merge base");
+
+        assert!(matches!(error, ChangeSetError::NoMergeBase));
+        assert_eq!(
+            error.to_string(),
+            "Those commits share no common history to compare."
+        );
+    }
+
+    #[test]
+    fn commit_shas_introduced_by_lists_only_the_target_side_newest_first() {
+        let (dir, _root_sha, left_sha, right_shas) = init_diverged_repo();
+
+        let introduced =
+            commit_shas_introduced_by(dir.path(), &left_sha, &right_shas[0], INITIAL_COMMIT_LIMIT)
+                .expect("introduced commits");
+
+        assert_eq!(introduced, right_shas);
+    }
+
+    #[test]
+    fn commit_shas_introduced_by_respects_the_limit() {
+        let (dir, _root_sha, left_sha, right_shas) = init_diverged_repo();
+
+        let introduced = commit_shas_introduced_by(dir.path(), &left_sha, &right_shas[0], 1)
+            .expect("introduced commits");
+
+        assert_eq!(introduced, vec![right_shas[0].clone()]);
     }
 
     #[test]

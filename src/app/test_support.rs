@@ -560,6 +560,27 @@ pub(crate) fn init_repo_with_diverged_history() -> (tempfile::TempDir, String, S
     (dir, left_oid.to_string(), right_oid.to_string())
 }
 
+/// Two commits that share no history at all: a root on the checked-out
+/// master and a parentless commit on `refs/heads/orphan`. Comparing them has
+/// no merge base. Returns (dir, master_sha, orphan_sha).
+pub(crate) fn init_repo_with_disjoint_roots() -> (tempfile::TempDir, String, String) {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let repo = Repository::init(dir.path()).expect("init repo");
+
+    fs::write(dir.path().join("master.txt"), "master\n").expect("write master file");
+    let master_oid = commit_all_to_ref_at_time(&repo, Some("HEAD"), "Master root", &[], 10);
+
+    fs::remove_file(dir.path().join("master.txt")).expect("remove master file");
+    fs::write(dir.path().join("orphan.txt"), "orphan\n").expect("write orphan file");
+    let orphan_oid =
+        commit_all_to_ref_at_time(&repo, Some("refs/heads/orphan"), "Orphan root", &[], 20);
+
+    fs::write(dir.path().join("master.txt"), "master\n").expect("restore master file");
+    drop(repo);
+
+    (dir, master_oid.to_string(), orphan_oid.to_string())
+}
+
 pub(crate) fn commit_info_for_graph_at(
     sha: &str,
     authored_timestamp: i64,

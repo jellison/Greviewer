@@ -284,7 +284,9 @@ shows every branch. Remote-tracking branches hide and show exactly like local on
 
 ## Selecting commits to review
 
-The user stages a review by selecting either a single commit or a contiguous sequential range from the graph. Selection is tentative: no review activity begins until the user explicitly opens the changeset (described below). Clicking a commit selects it. Shift-clicking a second commit extends the selection to a range, provided the two commits lie on a single ancestry path (one is an ancestor of the other). The selection is the inclusive set of commits between the two endpoints along that path. Double-clicking bypasses tentative selection entirely; it is specified under "Opening the changeset" below.
+The user stages a review by selecting a single commit, a contiguous sequential range, or a two-commit comparison from the graph. Selection is tentative: no review activity begins until the user explicitly opens the changeset (described below). Clicking a commit selects it. Shift-clicking a second commit extends the selection to a range, provided the two commits lie on a single ancestry path (one is an ancestor of the other). The selection is the inclusive set of commits between the two endpoints along that path. Double-clicking bypasses tentative selection entirely; it is specified under "Opening the changeset" below.
+
+A comparison stages a merge preview between two commits that need not share a linear ancestry — for example, a feature branch tip against the trunk tip. The current selection's anchor commit is the merge source: clicking another commit while holding the platform's primary modifier previews merging that source into the clicked commit, provided the two share any common history. To preview merging a feature branch into the trunk, the user selects the feature tip, then modifier-clicks the trunk tip. The comparison is directional — it shows what the merge would introduce into the clicked destination — and the selection summary states that direction, with a swap affordance beside it that reverses it. Modifier-clicking a further commit re-aims the preview at a new destination while the source stays anchored; modifier-clicking either commit of the pending comparison leaves it unchanged. A plain click replaces the comparison with a single-commit selection, exactly as it replaces a range.
 
 The graph always carries a selection: opening a repository selects its checked-out tip, and any change that would otherwise leave nothing selected returns to that default instead. Clicking the selected commit keeps it selected. There is no affordance for clearing the selection — the user moves it by selecting something else. The only state with no selection is a graph with no commits at all.
 
@@ -293,18 +295,24 @@ The graph always carries a selection: opening a repository selects its checked-o
 - A repository opens (its checked-out tip becomes the selection).
 - The user clicks a commit in the graph.
 - The user shift-clicks a second commit while a single-commit selection is active.
+- The user modifier-clicks a commit while any selection is active.
+- The user activates the swap affordance while a comparison is staged.
 
 **Observable outcomes**
 
-- The selected commit or range is visually distinct in the graph.
-- While a selection is active — which, because a selection always exists, is whenever the graph shows any commits — the graph shows how many commits the selection covers, alongside the open-changeset affordance.
+- The selected commit or range is visually distinct in the graph; a comparison renders both of its commits with the same selected treatment.
+- While a selection is active — which, because a selection always exists, is whenever the graph shows any commits — the graph shows how many commits the selection covers, alongside the open-changeset affordance. A staged comparison shows the merge-preview direction in place of a commit count, plus the swap affordance.
 - Clicking the already-selected commit leaves it selected.
+- Activating the swap affordance reverses the comparison's base and target, and the stated direction updates to match.
 
 **Edge cases**
 
-- If the two endpoints do not share a linear ancestry — they lie on diverged branches — the second click is rejected with a message explaining why, and the original selection is preserved.
+- If the two endpoints of a shift-click do not share a linear ancestry — they lie on diverged branches — the second click is rejected with a message explaining why, and the original selection is preserved.
+- If the two commits of a comparison share no common history at all, the modifier-click is rejected with a message explaining why, and the original selection is preserved.
+- Modifier-clicking with a range selection active starts the comparison from the range's first-selected endpoint.
 - Merge commits inside a selected range are included in the range and contribute to the rollup.
 - When there is no checked-out tip to select — the checked-out branch has no commits yet, or no branch is checked out at all — the newest visible commit is selected in its place.
+- Hiding a branch that removes either commit of a comparison from the graph resets the selection to the checked-out tip, as with any selection (see "Hiding branches from the graph").
 - A repository with no commits at all has no selection, and the selection summary and its affordance are absent.
 
 ## Opening the changeset
@@ -322,6 +330,7 @@ With a valid selection in place, the user opens the changeset to begin reviewing
 
 - Activating the open-changeset affordance transitions the window into review mode and renders the change set for the current selection.
 - The open-changeset affordance is unavailable when no selection is active or when the selection is not a valid contiguous range.
+- Opening a comparison renders the merge preview's change set: every file that differs between the two commits' common ancestor and the target commit — exactly what merging the target into the base would introduce. Changes present only on the base side do not appear.
 - Double-clicking a commit transitions the window into review mode showing that single commit's changeset, regardless of the prior selection.
 - Closing the changeset returns the window to graph mode with the prior selection preserved.
 - Review mode does not move HEAD or modify the repository.
@@ -329,6 +338,7 @@ With a valid selection in place, the user opens the changeset to begin reviewing
 **Edge cases**
 
 - Opening a changeset whose net effect is no change still transitions to review mode; the change set view shows the empty-state message described in the next section.
+- Opening a comparison whose target is already contained in the base yields an empty change set with the same empty-state message: there is nothing the merge would introduce.
 - Double-clicking a commit inside a selected range opens that single commit's changeset, not the range's.
 - Pressing enter while a changeset is already open has no effect: the open changeset and any tab or split layout the user has built are unchanged.
 - Pressing enter while typing in the branch filter does not open a changeset.
@@ -338,7 +348,8 @@ With a valid selection in place, the user opens the changeset to begin reviewing
 While a changeset is open, the window bar shows the open diff's context next to the
 repository name, in the form `{repository} / {commit identifier}`. For a single-commit
 changeset the commit identifier is the commit's short identifier; for a range it is the
-newest commit's short identifier followed by the number of commits in the range. The
+newest commit's short identifier followed by the number of commits in the range; for a
+comparison it is the base and target short identifiers joined in git's three-dot form. The
 identifier is an affordance: activating it opens a popover describing the open changeset and
 offering a control to close it. Graph mode shows only the repository name, with no context
 identifier.
@@ -354,7 +365,9 @@ identifier.
 - In changeset mode the window bar shows the repository name and the changeset's commit
   identifier; in graph mode it shows only the repository name.
 - Activating the identifier opens a popover that shows, for a range, the oldest and newest
-  short identifiers and the commit count, and for a single commit, the commit summary.
+  short identifiers and the commit count; for a single commit, the commit summary; and for a
+  comparison, the merge-preview direction and the short identifier of the two commits'
+  common ancestor.
 - The popover shows the number of changed files and the total added and removed line counts
   for the changeset.
 - The popover shows a breakdown of the changed files by how they changed (added, modified,
@@ -362,6 +375,9 @@ identifier.
 - For a range, the popover lists the commits in the changeset, newest first, each with its
   short identifier and summary; the list scrolls when it exceeds the popover's height. A
   single-commit changeset omits the list because its summary already appears in the header.
+- For a comparison, the popover lists the commits the merge would introduce — those reachable
+  from the target but not the base — newest first, in the same form as a range's list. A
+  comparison introducing a single commit omits the list, like a single-commit changeset.
 - The popover offers a control that closes the changeset, returning the window to graph mode
   with the prior selection preserved.
 - Dismissing the popover by activating outside it leaves the changeset open.
@@ -377,7 +393,7 @@ identifier.
 
 ## Reviewing the change set
 
-With a changeset open, the user sees the rollup change set: a file tree containing every file whose content differs between the state immediately before the oldest selected commit and the state at the newest selected commit. The tree shows each file's path and an indicator of how it changed (added, modified, deleted, renamed). Selecting a file in the tree opens that file's diff (described below).
+With a changeset open, the user sees the rollup change set: a file tree containing every file whose content differs between the state immediately before the oldest selected commit and the state at the newest selected commit. For a comparison, the two states are instead the commits' common ancestor and the target commit, and everywhere the changeset otherwise refers to the newest selected commit, a comparison means its target. The tree shows each file's path and an indicator of how it changed (added, modified, deleted, renamed). Selecting a file in the tree opens that file's diff (described below).
 
 **Triggering conditions**
 

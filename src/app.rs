@@ -129,6 +129,12 @@ pub struct App {
     /// a single click on the bar (the only other surface that consumes it).
     double_click_anchor: Option<String>,
     pub review_screen: ReviewScreen,
+    /// While a comparison changeset is open, the commits a merge of the
+    /// target into the base would introduce (base..target), newest first.
+    /// Computed once when the changeset opens — the title-bar popover renders
+    /// on every notify and must not re-walk history. None for single/range
+    /// changesets and outside review mode.
+    comparison_commit_shas: Option<Vec<String>>,
     /// Open diff tabs. Source of truth for what the detail area shows.
     pub workspace: crate::workspace::Workspace,
     /// Last file row the user clicked. Drives the tree highlight only; tab
@@ -339,6 +345,19 @@ pub enum Selection {
         end_sha: String,
         shas: Vec<String>,
     },
+    /// A merge preview between two commits that need not share a linear
+    /// ancestry: the changeset is what merging `target_sha` into `base_sha`
+    /// would introduce (diff from their merge base to the target).
+    Compare {
+        base_sha: String,
+        target_sha: String,
+    },
+}
+
+/// First seven characters of a full commit sha — the short form shown across
+/// the graph, selection bar, and title bar.
+pub(crate) fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
 }
 
 /// The graph's default selection: the checked-out (HEAD) commit when one is
@@ -366,6 +385,14 @@ fn selection_summary(selection: &Selection) -> Option<String> {
         Selection::None => None,
         Selection::Single { .. } => Some("1 commit selected".to_string()),
         Selection::Range { shas, .. } => Some(format!("{} commits selected", shas.len())),
+        Selection::Compare {
+            base_sha,
+            target_sha,
+        } => Some(format!(
+            "Merge preview: {} into {}",
+            short_sha(target_sha),
+            short_sha(base_sha)
+        )),
     }
 }
 
@@ -720,6 +747,7 @@ impl App {
             selection,
             double_click_anchor: None,
             review_screen: ReviewScreen::Graph,
+            comparison_commit_shas: None,
             workspace: crate::workspace::Workspace::new(),
             file_tree_highlight_path: None,
             pane_scrolls: RefCell::new(HashMap::new()),
@@ -842,6 +870,7 @@ impl App {
         self.mode = Mode::RepoOpen { repo };
         self.selection = selection;
         self.review_screen = ReviewScreen::Graph;
+        self.comparison_commit_shas = None;
         self.workspace = crate::workspace::Workspace::new();
         self.pane_scrolls.borrow_mut().clear();
         self.diff_row_cache.borrow_mut().clear();
@@ -1048,6 +1077,10 @@ impl App {
             Selection::None => false,
             Selection::Single { sha } => !visible.contains(sha),
             Selection::Range { shas, .. } => shas.iter().any(|sha| !visible.contains(sha)),
+            Selection::Compare {
+                base_sha,
+                target_sha,
+            } => !visible.contains(base_sha) || !visible.contains(target_sha),
         };
         if selection_hidden {
             self.selection = default_selection(repo, &self.hidden_branches);
@@ -1139,6 +1172,13 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The secondary (cmd/ctrl) modifier wins over shift, so a
+        // cmd+shift-click reads as a comparison rather than a range.
+        if modifiers.secondary() {
+            self.compare_with_commit(sha, window, cx);
+            return;
+        }
+
         if !modifiers.shift {
             self.select_single_commit(sha, cx);
             return;
@@ -1169,6 +1209,101 @@ impl App {
                 cx,
             ),
             Err(err) => self.push_open_failed(err.to_string(), window, cx),
+        }
+    }
+
+    /// Turn the current selection into a merge-preview comparison whose merge
+    /// destination is `sha`. The selection's anchor commit is the merge
+    /// source — the side whose changes the preview shows — and each cmd-click
+    /// picks where it would merge into: first select the branch under review,
+    /// then cmd-click the branch it would land on. The anchor is a Single's
+    /// commit, a Range's first-clicked endpoint, or an active comparison's
+    /// source (so a third cmd-click re-aims the preview at a new destination
+    /// while the source stays put). Cmd-clicking either endpoint of the
+    /// pending comparison is a no-op, mirroring the shift-click same-commit
+    /// no-op.
+    fn compare_with_commit(&mut self, sha: String, window: &mut Window, cx: &mut Context<Self>) {
+        let target_sha = match &self.selection {
+            Selection::Single { sha } => sha.clone(),
+            Selection::Range { start_sha, .. } => start_sha.clone(),
+            Selection::Compare {
+                base_sha,
+                target_sha,
+            } => {
+                if *base_sha == sha {
+                    return;
+                }
+                target_sha.clone()
+            }
+            Selection::None => {
+                self.select_single_commit(sha, cx);
+                return;
+            }
+        };
+
+        if target_sha == sha {
+            return;
+        }
+
+        match self.comparison_base_exists(&sha, &target_sha) {
+            Ok(true) => {
+                self.selection = Selection::Compare {
+                    base_sha: sha,
+                    target_sha,
+                };
+                cx.notify();
+            }
+            Ok(false) => self.push_open_failed(
+                "Those commits share no common history to compare.".to_string(),
+                window,
+                cx,
+            ),
+            Err(err) => self.push_open_failed(err.to_string(), window, cx),
+        }
+    }
+
+    /// Whether a comparison between two loaded commits has a merge base.
+    /// Mirrors `range_shas_between`: both endpoints must be in the loaded
+    /// history, and the repository must report a common ancestor.
+    fn comparison_base_exists(
+        &self,
+        base_sha: &str,
+        target_sha: &str,
+    ) -> Result<bool, repo::ChangeSetError> {
+        let open_repo = match &self.mode {
+            Mode::RepoOpen { repo } => repo,
+            Mode::NoRepo => return Ok(false),
+        };
+
+        if !open_repo
+            .commits
+            .iter()
+            .any(|commit| commit.sha == base_sha)
+        {
+            return Ok(false);
+        }
+        if !open_repo
+            .commits
+            .iter()
+            .any(|commit| commit.sha == target_sha)
+        {
+            return Ok(false);
+        }
+
+        Ok(repo::merge_base_sha(&open_repo.path, base_sha, target_sha)?.is_some())
+    }
+
+    /// Reverse the pending comparison's direction. The merge base is
+    /// symmetric, so no revalidation is needed. No-ops unless a comparison
+    /// is the current selection.
+    fn swap_comparison(&mut self, cx: &mut Context<Self>) {
+        if let Selection::Compare {
+            base_sha,
+            target_sha,
+        } = &mut self.selection
+        {
+            std::mem::swap(base_sha, target_sha);
+            cx.notify();
         }
     }
 
@@ -1229,11 +1364,32 @@ impl App {
                 };
                 repo::changeset_for_commit_range(&repo_path, oldest_sha, newest_sha)
             }
+            Selection::Compare {
+                base_sha,
+                target_sha,
+            } => repo::changeset_for_comparison(&repo_path, base_sha, target_sha),
             Selection::None => return,
+        };
+
+        // The title-bar popover lists the commits a comparison would merge in;
+        // walk them once here rather than on every popover render.
+        let comparison_commit_shas = match &self.selection {
+            Selection::Compare {
+                base_sha,
+                target_sha,
+            } if changeset.is_ok() => repo::commit_shas_introduced_by(
+                &repo_path,
+                base_sha,
+                target_sha,
+                repo::INITIAL_COMMIT_LIMIT,
+            )
+            .ok(),
+            _ => None,
         };
 
         match changeset {
             Ok(changeset) => {
+                self.comparison_commit_shas = comparison_commit_shas;
                 // Each changeset starts with the default single-pane layout;
                 // splits last only while the changeset stays open.
                 self.workspace = crate::workspace::Workspace::new();
@@ -1255,6 +1411,7 @@ impl App {
 
     fn close_changeset(&mut self, cx: &mut Context<Self>) {
         self.review_screen = ReviewScreen::Graph;
+        self.comparison_commit_shas = None;
         self.context_popover_open = false;
         self.workspace.clear();
         self.file_tree_highlight_path = None;
@@ -1725,6 +1882,10 @@ impl App {
         match &self.selection {
             Selection::Single { sha: selected_sha } => selected_sha == sha,
             Selection::Range { shas, .. } => shas.iter().any(|selected_sha| selected_sha == sha),
+            Selection::Compare {
+                base_sha,
+                target_sha,
+            } => base_sha == sha || target_sha == sha,
             Selection::None => false,
         }
     }
@@ -2116,6 +2277,28 @@ impl App {
                 }
             }))
             .child(div().text_color(palette().accent).child(summary))
+            // A pending comparison is directional; the swap control reverses
+            // which endpoint the merge preview targets.
+            .when(matches!(self.selection, Selection::Compare { .. }), |bar| {
+                bar.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .px_2()
+                        .py(px(3.))
+                        .rounded(px(4.))
+                        .bg(palette().accent_bg)
+                        .text_color(palette().accent)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(palette().accent_bg_hover))
+                        .id("swap-comparison")
+                        .debug_selector(|| "swap-comparison".to_string())
+                        .on_click(cx.listener(|app, _event, _window, cx| {
+                            app.swap_comparison(cx);
+                        }))
+                        .child("\u{21c4}"),
+                )
+            })
             .child(div().flex_1())
             .child(
                 div()
@@ -5208,6 +5391,348 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn cmd_clicking_a_second_commit_creates_a_comparison_anchored_at_the_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, left_sha, right_sha) = init_repo_with_diverged_history();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+        cx.run_until_parked();
+
+        let (left_index, right_index) = window
+            .read_with(cx, |app, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected repo open mode");
+                };
+                let position = |sha: &str| {
+                    repo.commits
+                        .iter()
+                        .position(|commit| commit.sha == sha)
+                        .expect("commit row")
+                };
+                (position(&left_sha), position(&right_sha))
+            })
+            .expect("read commit row indexes");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let left_bounds = visual
+            .debug_bounds(test_debug_selector(format!("commit-row-{left_index}")))
+            .expect("left commit row debug bounds");
+        visual.simulate_click(left_bounds.center(), Modifiers::none());
+        let right_bounds = visual
+            .debug_bounds(test_debug_selector(format!("commit-row-{right_index}")))
+            .expect("right commit row debug bounds");
+        visual.simulate_click(right_bounds.center(), Modifiers::secondary_key());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.selection,
+                    Selection::Compare {
+                        base_sha: right_sha.clone(),
+                        target_sha: left_sha.clone(),
+                    },
+                    "cmd-click previews merging the anchored commit into the clicked one"
+                );
+            })
+            .expect("read comparison selection");
+
+        for index in [left_index, right_index] {
+            assert!(
+                visual
+                    .debug_bounds(test_debug_selector(format!("selected-commit-row-{index}")))
+                    .is_some(),
+                "both comparison endpoints must render as selected rows"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn cmd_clicking_with_a_range_selection_uses_the_anchor_as_the_source(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, shas) = init_repo_with_three_commits();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_commit(shas[0].clone(), Modifiers::none(), window, cx);
+                app.select_commit(shas[2].clone(), Modifiers::shift(), window, cx);
+                app.select_commit(shas[1].clone(), Modifiers::secondary_key(), window, cx);
+
+                assert_eq!(
+                    app.selection,
+                    Selection::Compare {
+                        base_sha: shas[1].clone(),
+                        target_sha: shas[0].clone(),
+                    },
+                    "the range's first-clicked endpoint is the merge source"
+                );
+            })
+            .expect("compare from a range selection");
+    }
+
+    #[gpui::test]
+    async fn cmd_clicking_retargets_an_active_comparison_keeping_the_source(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, left_sha, right_sha) = init_repo_with_diverged_history();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                let root_sha = match &app.mode {
+                    Mode::RepoOpen { repo } => repo
+                        .commits
+                        .iter()
+                        .find(|commit| commit.parent_shas.is_empty())
+                        .expect("root commit")
+                        .sha
+                        .clone(),
+                    Mode::NoRepo => panic!("expected repo open mode"),
+                };
+                app.select_commit(left_sha.clone(), Modifiers::none(), window, cx);
+                app.select_commit(right_sha, Modifiers::secondary_key(), window, cx);
+                app.select_commit(root_sha.clone(), Modifiers::secondary_key(), window, cx);
+
+                assert_eq!(
+                    app.selection,
+                    Selection::Compare {
+                        base_sha: root_sha,
+                        target_sha: left_sha.clone(),
+                    },
+                    "a third cmd-click re-aims the preview while the source stays put"
+                );
+            })
+            .expect("retarget comparison");
+    }
+
+    #[gpui::test]
+    async fn cmd_clicking_the_base_or_target_leaves_the_comparison_unchanged(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, left_sha, right_sha) = init_repo_with_diverged_history();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_commit(left_sha.clone(), Modifiers::none(), window, cx);
+                app.select_commit(right_sha.clone(), Modifiers::secondary_key(), window, cx);
+                let comparison = app.selection.clone();
+
+                app.select_commit(left_sha.clone(), Modifiers::secondary_key(), window, cx);
+                assert_eq!(
+                    app.selection, comparison,
+                    "cmd-clicking the base is a no-op"
+                );
+
+                app.select_commit(right_sha.clone(), Modifiers::secondary_key(), window, cx);
+                assert_eq!(
+                    app.selection, comparison,
+                    "cmd-clicking the target is a no-op"
+                );
+            })
+            .expect("cmd-click comparison endpoints");
+    }
+
+    #[gpui::test]
+    async fn cmd_clicking_disjoint_commits_preserves_selection_and_explains_why(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, master_sha, orphan_sha) = init_repo_with_disjoint_roots();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_commit(master_sha.clone(), Modifiers::none(), window, cx);
+                app.select_commit(orphan_sha, Modifiers::secondary_key(), window, cx);
+
+                assert_eq!(
+                    app.selection,
+                    Selection::Single { sha: master_sha },
+                    "a comparison without common history is rejected, keeping the selection"
+                );
+            })
+            .expect("attempt disjoint comparison");
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, cx| {
+                assert_eq!(
+                    app.notification_count(cx),
+                    1,
+                    "the rejection surfaces an explanatory message"
+                );
+            })
+            .expect("read notification count");
+    }
+
+    #[gpui::test]
+    async fn plain_clicking_while_comparing_collapses_to_a_single_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, left_sha, right_sha) = init_repo_with_diverged_history();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_commit(left_sha.clone(), Modifiers::none(), window, cx);
+                app.select_commit(right_sha.clone(), Modifiers::secondary_key(), window, cx);
+                app.select_commit(right_sha.clone(), Modifiers::none(), window, cx);
+
+                assert_eq!(
+                    app.selection,
+                    Selection::Single { sha: right_sha },
+                    "a plain click replaces the comparison with a single selection"
+                );
+            })
+            .expect("collapse comparison with a plain click");
+    }
+
+    #[gpui::test]
+    async fn swap_control_reverses_the_comparison_direction(cx: &mut TestAppContext) {
+        let (dir, left_sha, right_sha) = init_repo_with_diverged_history();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_commit(left_sha.clone(), Modifiers::none(), window, cx);
+                app.select_commit(right_sha.clone(), Modifiers::secondary_key(), window, cx);
+            })
+            .expect("stage a comparison");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let swap_bounds = visual
+            .debug_bounds("swap-comparison")
+            .expect("swap control must be visible while a comparison is staged");
+        visual.simulate_click(swap_bounds.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.selection,
+                    Selection::Compare {
+                        base_sha: left_sha.clone(),
+                        target_sha: right_sha.clone(),
+                    },
+                    "the swap control reverses the merge-preview direction"
+                );
+            })
+            .expect("read swapped comparison");
+    }
+
+    #[gpui::test]
+    async fn opening_a_comparison_shows_the_merge_base_diff(cx: &mut TestAppContext) {
+        let (dir, left_sha, right_sha) = init_repo_with_diverged_history();
+        let path = dir.path().to_path_buf();
+        let merge_base = crate::repo::merge_base_sha(dir.path(), &left_sha, &right_sha)
+            .expect("merge base lookup")
+            .expect("diverged branches share a fork point");
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_commit(left_sha.clone(), Modifiers::none(), window, cx);
+                app.select_commit(right_sha.clone(), Modifiers::secondary_key(), window, cx);
+            })
+            .expect("stage a comparison");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let open_bounds = visual
+            .debug_bounds("open-changeset")
+            .expect("open changeset debug bounds");
+        visual.simulate_click(open_bounds.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                match &app.review_screen {
+                    ReviewScreen::Changeset { changeset, .. } => {
+                        assert_eq!(
+                            changeset.commit_sha, left_sha,
+                            "the first-selected commit is the side whose changes are shown"
+                        );
+                        assert_eq!(changeset.base_sha, Some(merge_base.clone()));
+                        let paths = changeset
+                            .files
+                            .iter()
+                            .map(|file| file.path.as_str())
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            paths,
+                            vec!["left.txt"],
+                            "only what merging the first-selected commit would introduce appears"
+                        );
+                    }
+                    ReviewScreen::Graph => panic!("expected changeset review screen"),
+                }
+                assert_eq!(
+                    app.comparison_commit_shas,
+                    Some(vec![left_sha.clone()]),
+                    "the commits the merge would introduce are captured at open time"
+                );
+            })
+            .expect("read comparison changeset");
+    }
+
+    #[gpui::test]
+    async fn hiding_a_branch_that_removes_a_comparison_endpoint_resets_to_the_checked_out_tip(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, main_tip_sha, feature_tip_sha) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_commit(main_tip_sha.clone(), Modifiers::none(), window, cx);
+                app.select_commit(
+                    feature_tip_sha.clone(),
+                    Modifiers::secondary_key(),
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    app.selection,
+                    Selection::Compare {
+                        base_sha: feature_tip_sha.clone(),
+                        target_sha: main_tip_sha.clone(),
+                    },
+                );
+
+                app.toggle_branch_visibility("heads/feature".to_string(), cx);
+
+                assert_eq!(
+                    app.selection,
+                    Selection::Single { sha: main_tip_sha },
+                    "hiding an endpoint's branch resets the selection to the checked-out tip"
+                );
+            })
+            .expect("hide comparison endpoint");
+    }
+
+    #[gpui::test]
     async fn selecting_merge_to_second_parent_uses_that_ancestry_path_and_rolls_up_merge_files(
         cx: &mut TestAppContext,
     ) {
@@ -5936,6 +6461,13 @@ mod tests {
                 shas: vec!["c".to_string(), "b".to_string(), "a".to_string()],
             }),
             Some("3 commits selected".to_string()),
+        );
+        assert_eq!(
+            selection_summary(&Selection::Compare {
+                base_sha: "0123456789abcdef".to_string(),
+                target_sha: "fedcba9876543210".to_string(),
+            }),
+            Some("Merge preview: fedcba9 into 0123456".to_string()),
         );
     }
 

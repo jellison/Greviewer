@@ -9,27 +9,30 @@ use gpui::{
 };
 use gpui_component::{TitleBar, TITLE_BAR_HEIGHT};
 
-use super::{App, Mode, ReviewScreen, Selection, MONO_FONT_FAMILY};
+use super::{short_sha, App, Mode, ReviewScreen, Selection, MONO_FONT_FAMILY};
 use crate::repo::{ChangeKind, ChangeSet, CommitInfo};
 use crate::theme::palette;
 
-/// First seven characters of a full commit sha, matching the short form the
-/// graph and the removed diff header used.
-fn short_sha(sha: &str) -> String {
-    sha.chars().take(7).collect()
-}
-
 /// Label for the title-bar pill. A single-commit changeset shows just the
-/// short sha; a range shows the newest short sha plus the commit count.
+/// short sha; a range shows the newest short sha plus the commit count; a
+/// comparison shows both endpoints in git's three-dot notation.
 fn context_pill_label(selection: &Selection, changeset: &ChangeSet) -> String {
-    // In a well-formed call `changeset.commit_sha` is the newest commit, i.e.
-    // `shas[0]` for a range, so the pill always shows the newest short sha.
-    let newest = short_sha(&changeset.commit_sha);
     match selection {
         Selection::Range { shas, .. } if shas.len() > 1 => {
-            format!("{newest} · {} commits", shas.len())
+            format!(
+                "{} · {} commits",
+                short_sha(&changeset.commit_sha),
+                shas.len()
+            )
         }
-        _ => newest,
+        Selection::Compare {
+            base_sha,
+            target_sha,
+        } => format!("{}...{}", short_sha(base_sha), short_sha(target_sha)),
+        // In a well-formed call `changeset.commit_sha` is the newest commit,
+        // i.e. `shas[0]` for a range, so the pill always shows the newest
+        // short sha.
+        _ => short_sha(&changeset.commit_sha),
     }
 }
 
@@ -46,9 +49,10 @@ fn range_endpoints(selection: &Selection) -> Option<(String, String)> {
     }
 }
 
-/// Popover header title. A range reads "Reviewing N commits"; a single commit
-/// reads the commit summary, falling back to its short sha when the commit is
-/// not in the loaded window.
+/// Popover header title. A range reads "Reviewing N commits"; a comparison
+/// states the merge-preview direction; a single commit reads the commit
+/// summary, falling back to its short sha when the commit is not in the
+/// loaded window.
 fn popover_header_title(
     selection: &Selection,
     changeset: &ChangeSet,
@@ -58,11 +62,32 @@ fn popover_header_title(
         Selection::Range { shas, .. } if shas.len() > 1 => {
             format!("Reviewing {} commits", shas.len())
         }
+        Selection::Compare {
+            base_sha,
+            target_sha,
+        } => format!(
+            "Merge preview: {} into {}",
+            short_sha(target_sha),
+            short_sha(base_sha)
+        ),
         _ => commits
             .iter()
             .find(|commit| commit.sha == changeset.commit_sha)
             .map(|commit| commit.summary.clone())
             .unwrap_or_else(|| short_sha(&changeset.commit_sha)),
+    }
+}
+
+/// The comparison's common-ancestor line for the popover header; `None` for
+/// non-comparison changesets. An opened comparison always carries the merge
+/// base as its `base_sha`.
+fn comparison_merge_base_line(selection: &Selection, changeset: &ChangeSet) -> Option<String> {
+    match selection {
+        Selection::Compare { .. } => changeset
+            .base_sha
+            .as_deref()
+            .map(|base| format!("vs merge base {}", short_sha(base))),
+        _ => None,
     }
 }
 
@@ -82,17 +107,22 @@ fn changeset_kind_counts(changeset: &ChangeSet) -> (usize, usize, usize, usize) 
 
 /// Short sha + summary for each commit in the changeset, newest first. The
 /// summary is empty when the commit is not in the loaded history window.
+/// `comparison_shas` is the commits a comparison would merge in, captured
+/// when the changeset opened.
 fn popover_commit_rows(
     selection: &Selection,
     changeset: &ChangeSet,
     commits: &[CommitInfo],
+    comparison_shas: Option<&[String]>,
 ) -> Vec<(String, String)> {
     let shas: Vec<String> = match selection {
         Selection::Range { shas, .. } if shas.len() > 1 => shas.clone(),
         Selection::Single { sha } => vec![sha.clone()],
-        // Unreachable from render_context_popover (a changeset always implies a
-        // Single or Range selection); handled defensively. The single-element
-        // result is suppressed by the `> 1` gate at the call site.
+        Selection::Compare { .. } => comparison_shas.map(<[String]>::to_vec).unwrap_or_default(),
+        // Unreachable from render_context_popover (a changeset always implies
+        // a Single, Range, or Compare selection); handled defensively. The
+        // single-element result is suppressed by the `> 1` gate at the call
+        // site.
         _ => vec![changeset.commit_sha.clone()],
     };
     shas.into_iter()
@@ -229,7 +259,13 @@ impl App {
         if renamed_files > 0 {
             kind_parts.push(format!("{renamed_files} renamed"));
         }
-        let commit_rows = popover_commit_rows(&self.selection, changeset, &repo.commits);
+        let merge_base_line = comparison_merge_base_line(&self.selection, changeset);
+        let commit_rows = popover_commit_rows(
+            &self.selection,
+            changeset,
+            &repo.commits,
+            self.comparison_commit_shas.as_deref(),
+        );
 
         let mut header = div().flex().flex_col().gap_1().p_3().child(
             div()
@@ -244,6 +280,16 @@ impl App {
                     .text_size(px(12.))
                     .text_color(palette().text_muted)
                     .child(format!("{oldest} \u{2026} {newest}")),
+            );
+        }
+        if let Some(merge_base_line) = merge_base_line {
+            header = header.child(
+                div()
+                    .font_family(MONO_FONT_FAMILY)
+                    .text_size(px(12.))
+                    .text_color(palette().text_muted)
+                    .debug_selector(|| "title-bar-context-merge-base".to_string())
+                    .child(merge_base_line),
             );
         }
 
@@ -868,7 +914,7 @@ mod tests {
             commit_with("ccccccc3333333", "chore: oldest"),
         ];
         assert_eq!(
-            popover_commit_rows(&selection, &changeset, &commits),
+            popover_commit_rows(&selection, &changeset, &commits, None),
             vec![
                 ("aaaaaaa".to_string(), "feat: newest".to_string()),
                 ("bbbbbbb".to_string(), "fix: middle".to_string()),
@@ -888,7 +934,70 @@ mod tests {
         // Only the newest commit is loaded.
         let commits = vec![commit_with("aaaaaaa1111111", "feat: newest")];
         assert_eq!(
-            popover_commit_rows(&selection, &changeset, &commits),
+            popover_commit_rows(&selection, &changeset, &commits, None),
+            vec![
+                ("aaaaaaa".to_string(), "feat: newest".to_string()),
+                ("bbbbbbb".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn pill_label_for_comparison_reads_base_dots_target() {
+        let changeset = changeset_with("fedcba9876543210", vec![]);
+        let selection = Selection::Compare {
+            base_sha: "0123456789abcdef".to_string(),
+            target_sha: "fedcba9876543210".to_string(),
+        };
+        assert_eq!(
+            context_pill_label(&selection, &changeset),
+            "0123456...fedcba9"
+        );
+    }
+
+    #[test]
+    fn header_title_for_comparison_states_direction() {
+        let changeset = changeset_with("fedcba9876543210", vec![]);
+        let selection = Selection::Compare {
+            base_sha: "0123456789abcdef".to_string(),
+            target_sha: "fedcba9876543210".to_string(),
+        };
+        assert_eq!(
+            popover_header_title(&selection, &changeset, &[]),
+            "Merge preview: fedcba9 into 0123456"
+        );
+    }
+
+    #[test]
+    fn merge_base_line_names_the_common_ancestor_only_for_comparisons() {
+        let mut changeset = changeset_with("fedcba9876543210", vec![]);
+        changeset.base_sha = Some("9999999888888888".to_string());
+        let comparison = Selection::Compare {
+            base_sha: "0123456789abcdef".to_string(),
+            target_sha: "fedcba9876543210".to_string(),
+        };
+        assert_eq!(
+            comparison_merge_base_line(&comparison, &changeset),
+            Some("vs merge base 9999999".to_string())
+        );
+
+        let single = Selection::Single {
+            sha: "fedcba9876543210".to_string(),
+        };
+        assert_eq!(comparison_merge_base_line(&single, &changeset), None);
+    }
+
+    #[test]
+    fn commit_rows_for_comparison_use_the_captured_introduced_commits() {
+        let changeset = changeset_with("aaaaaaa1111111", vec![]);
+        let selection = Selection::Compare {
+            base_sha: "ccccccc3333333".to_string(),
+            target_sha: "aaaaaaa1111111".to_string(),
+        };
+        let commits = vec![commit_with("aaaaaaa1111111", "feat: newest")];
+        let introduced = vec!["aaaaaaa1111111".to_string(), "bbbbbbb2222222".to_string()];
+        assert_eq!(
+            popover_commit_rows(&selection, &changeset, &commits, Some(&introduced)),
             vec![
                 ("aaaaaaa".to_string(), "feat: newest".to_string()),
                 ("bbbbbbb".to_string(), String::new()),
@@ -928,6 +1037,55 @@ mod tests {
         cx.run_until_parked();
         let mut visual = VisualTestContext::from_window(*window, cx);
         assert!(visual.debug_bounds("title-bar-context-popover").is_some());
+        assert!(visual.debug_bounds("title-bar-context-commit-0").is_some());
+        assert!(visual.debug_bounds("title-bar-context-commit-1").is_some());
+    }
+
+    #[gpui::test]
+    async fn popover_for_comparison_names_the_merge_base_and_lists_introduced_commits(
+        cx: &mut TestAppContext,
+    ) {
+        let window = app_window(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                let mut changeset = changeset_with("aaaaaaa1111111", vec![file_with(3, 1)]);
+                changeset.base_sha = Some("ddddddd4444444".to_string());
+                app.mode = Mode::RepoOpen {
+                    repo: repo_named(
+                        "Demo",
+                        vec![
+                            commit_with("aaaaaaa1111111", "feat: newest"),
+                            commit_with("bbbbbbb2222222", "fix: oldest"),
+                            commit_with("ccccccc3333333", "base tip"),
+                        ],
+                    ),
+                };
+                app.review_screen = ReviewScreen::Changeset {
+                    sha: "aaaaaaa1111111".to_string(),
+                    changeset,
+                };
+                app.selection = Selection::Compare {
+                    base_sha: "ccccccc3333333".to_string(),
+                    target_sha: "aaaaaaa1111111".to_string(),
+                };
+                app.comparison_commit_shas = Some(vec![
+                    "aaaaaaa1111111".to_string(),
+                    "bbbbbbb2222222".to_string(),
+                ]);
+                app.context_popover_open = true;
+                cx.notify();
+            })
+            .expect("set comparison changeset state");
+
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds("title-bar-context-popover").is_some());
+        assert!(
+            visual
+                .debug_bounds("title-bar-context-merge-base")
+                .is_some(),
+            "the popover names the comparison's merge base"
+        );
         assert!(visual.debug_bounds("title-bar-context-commit-0").is_some());
         assert!(visual.debug_bounds("title-bar-context-commit-1").is_some());
     }
