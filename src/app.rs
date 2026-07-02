@@ -2828,7 +2828,7 @@ impl App {
                 .map(|(index, row)| self.render_file_tree_gutter_cell(index, row, cx))
                 .collect::<Vec<_>>();
 
-            div()
+            let mut scroll_container = div()
                 .flex()
                 .flex_col()
                 .flex_1()
@@ -2836,7 +2836,34 @@ impl App {
                 .id("changed-files-scroll")
                 .debug_selector(|| "changed-files-scroll".to_string())
                 .overflow_y_scroll()
-                .track_scroll(&self.file_tree_scroll)
+                .track_scroll(&self.file_tree_scroll);
+            // Without this, gpui redirects a *horizontal* wheel gesture onto
+            // this vertical-only container (an unused axis delta falls through
+            // to the scrollable axis), fighting the path pane's own pan.
+            scroll_container
+                .interactivity()
+                .base_style
+                .restrict_scroll_to_axis = Some(true);
+
+            // Path pane: only this column scrolls horizontally.
+            // items_start() prevents cross-axis stretch, allowing
+            // the flex_none inner wrapper to exceed the viewport width.
+            let mut path_pane = div()
+                .id("changed-files-path-pane")
+                .debug_selector(|| "changed-files-path-pane".to_string())
+                .flex()
+                .flex_col()
+                .items_start()
+                .flex_1()
+                .min_w_0()
+                .overflow_x_scroll()
+                .track_scroll(&self.file_tree_hscroll);
+            // Without this, gpui redirects a *vertical* wheel gesture onto this
+            // horizontal-only pane, so a plain mouse wheel panned the paths
+            // sideways while the outer container scrolled the rows.
+            path_pane.interactivity().base_style.restrict_scroll_to_axis = Some(true);
+
+            scroll_container
                 .child(
                     // Two columns share this one vertical scroll, so they scroll
                     // vertically together. min_w_full pins the gutter to the
@@ -2846,33 +2873,20 @@ impl App {
                         .flex_row()
                         .min_w_full()
                         .child(
-                            // Path pane: only this column scrolls horizontally.
-                            // items_start() prevents cross-axis stretch, allowing
-                            // the flex_none inner wrapper to exceed the viewport width.
-                            div()
-                                .id("changed-files-path-pane")
-                                .debug_selector(|| "changed-files-path-pane".to_string())
-                                .flex()
-                                .flex_col()
-                                .items_start()
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_x_scroll()
-                                .track_scroll(&self.file_tree_hscroll)
-                                .child(
-                                    // flex_none inner column sizes to the widest
-                                    // path so long paths scroll; min_w_full keeps
-                                    // it at least the pane's width when the pane
-                                    // is wider than the content, so rows (w_full)
-                                    // fill the pane and the selection background
-                                    // has no trailing gap.
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .flex_none()
-                                        .min_w_full()
-                                        .children(path_cells),
-                                ),
+                            path_pane.child(
+                                // flex_none inner column sizes to the widest
+                                // path so long paths scroll; min_w_full keeps
+                                // it at least the pane's width when the pane
+                                // is wider than the content, so rows (w_full)
+                                // fill the pane and the selection background
+                                // has no trailing gap.
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_none()
+                                    .min_w_full()
+                                    .children(path_cells),
+                            ),
                         )
                         .child(
                             // Frozen stat gutter: explicit width so w_full cells have

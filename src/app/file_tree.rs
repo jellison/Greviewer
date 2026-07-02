@@ -481,6 +481,84 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn wheel_gestures_scroll_one_file_tree_axis_at_a_time(cx: &mut TestAppContext) {
+        use gpui::{point, px, ScrollDelta, ScrollWheelEvent};
+
+        let (window, mut visual) = open_deeply_nested_changeset_at_360x200(cx);
+
+        // The pane's layout bounds cover the full scrolled content — taller
+        // than the 200px viewport and, in this narrow fixture, only a few
+        // pixels wide — so a hand-picked offset from its origin easily lands
+        // off screen or in the frozen stat gutter. Anchor the x coordinate to
+        // the pane and the y coordinate to the scroll viewport to get a point
+        // that is genuinely over the paths.
+        let viewport = visual
+            .debug_bounds("changed-files-scroll")
+            .expect("scroll viewport bounds");
+        let pane = visual
+            .debug_bounds("changed-files-path-pane")
+            .expect("path pane bounds");
+        let wheel_position = point(
+            pane.origin.x + pane.size.width / 2.,
+            viewport.origin.y + px(10.),
+        );
+
+        // A purely vertical wheel gesture scrolls the rows and must not pan
+        // the paths sideways. Without restrict_scroll_to_axis, gpui redirects
+        // the unused vertical delta onto the horizontal-only path pane.
+        visual.simulate_event(ScrollWheelEvent {
+            position: wheel_position,
+            delta: ScrollDelta::Pixels(point(px(0.), px(-60.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+
+        let (v_offset, h_offset) = window
+            .read_with(cx, |app, _cx| {
+                (
+                    app.file_tree_scroll.offset(),
+                    app.file_tree_hscroll.offset(),
+                )
+            })
+            .expect("read offsets after vertical wheel");
+        assert!(
+            v_offset.y < px(0.),
+            "vertical wheel should scroll the rows; v_offset {v_offset:?}"
+        );
+        assert_eq!(
+            h_offset.x,
+            px(0.),
+            "vertical wheel must not pan the paths sideways"
+        );
+
+        // A purely horizontal gesture pans the paths and must not scroll the rows.
+        let v_before = v_offset;
+        visual.simulate_event(ScrollWheelEvent {
+            position: wheel_position,
+            delta: ScrollDelta::Pixels(point(px(-60.), px(0.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+
+        let (v_offset, h_offset) = window
+            .read_with(cx, |app, _cx| {
+                (
+                    app.file_tree_scroll.offset(),
+                    app.file_tree_hscroll.offset(),
+                )
+            })
+            .expect("read offsets after horizontal wheel");
+        assert!(
+            h_offset.x < px(0.),
+            "horizontal wheel should pan the paths; h_offset {h_offset:?}"
+        );
+        assert_eq!(
+            v_offset.y, v_before.y,
+            "horizontal wheel must not scroll the rows"
+        );
+    }
+
+    #[gpui::test]
     async fn file_tree_rows_are_uniform_width(cx: &mut TestAppContext) {
         use gpui::px;
 

@@ -393,6 +393,7 @@ With a changeset open, the user sees the rollup change set: a file tree containi
 - Changed entries show added and removed line counts so the user can estimate review size before opening a file.
 - When the tree's contents exceed the visible area, the user can scroll it both vertically and horizontally; long or deeply nested paths are shown in full and reached by scrolling rather than being abbreviated.
 - Only the file's path scrolls horizontally; each entry's change details (its added and removed line counts) stay pinned in view at the trailing edge so the user can always read them, even while scrolling a long path. Vertical scrolling moves a row's path and its change details together.
+- A purely vertical scroll gesture never pans the paths horizontally, and a purely horizontal one never scrolls the rows.
 - The highlighted row's background spans the full width of the tree. Widening the tree past its longest entry stretches the highlight to the new edge rather than leaving a gap; narrowing it below the longest entry keeps the highlight filling the visible width as the path scrolls.
 - A scrollbar appears while the user's pointer is over the tree and lets the user drag to scroll; it stays out of the way otherwise. An axis with nothing off-screen shows no scrollbar.
 - Selecting a file opens it for inspection in a tab above the diff area (see "Holding files open in tabs").
