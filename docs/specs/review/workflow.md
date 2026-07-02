@@ -347,8 +347,8 @@ With a valid selection in place, the user opens the changeset to begin reviewing
 
 While a changeset is open, the window bar shows the open diff's context next to the
 repository name, in the form `{repository} / {commit identifier}`. For a single-commit
-changeset the commit identifier is the commit's short identifier; for a range it is the
-newest commit's short identifier followed by the number of commits in the range; for a
+changeset and for a range alike, the commit identifier is the newest commit's short
+identifier followed by the number of commits reviewed ("1 commit", "3 commits"); for a
 comparison it is the base and target short identifiers joined in git's three-dot form. The
 identifier is an affordance: activating it opens a popover describing the open changeset and
 offering a control to close it. Graph mode shows only the repository name, with no context
@@ -364,20 +364,21 @@ identifier.
 
 - In changeset mode the window bar shows the repository name and the changeset's commit
   identifier; in graph mode it shows only the repository name.
-- Activating the identifier opens a popover that shows, for a range, the oldest and newest
-  short identifiers and the commit count; for a single commit, the commit summary; and for a
-  comparison, the merge-preview direction and the short identifier of the two commits'
-  common ancestor.
+- Activating the identifier opens a popover whose header shows, for a single commit or a
+  range, "Reviewing" plus the commit count, above an identifier line: the oldest and newest
+  short identifiers for a range, or the commit's short identifier alone for a single commit.
+  For a comparison, the header shows the merge-preview direction and the short identifier of
+  the two commits' common ancestor.
 - The popover shows the number of changed files and the total added and removed line counts
   for the changeset.
 - The popover shows a breakdown of the changed files by how they changed (added, modified,
   deleted, renamed), listing only the kinds that are present.
-- For a range, the popover lists the commits in the changeset, newest first, each with its
-  short identifier and summary; the list scrolls when it exceeds the popover's height. A
-  single-commit changeset omits the list because its summary already appears in the header.
+- The popover lists the reviewed commits, newest first, each with its short identifier and
+  summary; the list scrolls when it exceeds the popover's height. A single-commit changeset
+  lists its one commit.
 - For a comparison, the popover lists the commits the merge would introduce — those reachable
-  from the target but not the base — newest first, in the same form as a range's list. A
-  comparison introducing a single commit omits the list, like a single-commit changeset.
+  from the target but not the base — newest first, in the same form, including when only one
+  commit would be introduced.
 - The popover offers a control that closes the changeset, returning the window to graph mode
   with the prior selection preserved.
 - Dismissing the popover by activating outside it leaves the changeset open.
@@ -386,10 +387,8 @@ identifier.
 
 - A changeset whose net effect is no change shows zero changed files, `+0 / −0` lines, and no
   kind breakdown in the popover; the close control still returns to graph mode.
-- A single-commit changeset whose commit is not in the loaded history window falls back to
-  showing the commit's short identifier in place of a summary.
-- A range commit that is not yet in the loaded history window appears in the commit list with
-  its short identifier and no summary.
+- A commit that is not yet in the loaded history window appears in the commit list with its
+  short identifier and no summary.
 
 ## Reviewing the change set
 
