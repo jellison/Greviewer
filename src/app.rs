@@ -100,6 +100,11 @@ const FILE_TREE_INDENT_GUIDE_WIDTH: f32 = 1.;
 const FILE_TREE_GUIDE_TO_ITEM_GAP: f32 = 4.;
 const FILE_TREE_CONTROL_BUTTON_SIZE: f32 = 22.;
 const FILE_TREE_CONTROL_ICON_SIZE: f32 = 15.;
+/// Inset between the control-button group and the container's top and right
+/// edges. The header derives its height from this so the group stays
+/// equidistant from both edges.
+const FILE_TREE_HEADER_INSET: f32 = 8.;
+const FILE_TREE_HEADER_HEIGHT: f32 = FILE_TREE_CONTROL_BUTTON_SIZE + 2. * FILE_TREE_HEADER_INSET;
 const FILE_TREE_DIFF_STAT_WIDTH: f32 = 68.;
 const FILE_TREE_STAT_GUTTER_WIDTH: f32 = 84.; // diff-stat width + horizontal cell padding
 const BRANCH_SIDEBAR_DEFAULT_WIDTH: f32 = 240.;
@@ -2907,7 +2912,7 @@ impl App {
                 container.child(
                     div()
                         .absolute()
-                        .top(px(FILE_TREE_ROW_HEIGHT))
+                        .top(px(FILE_TREE_HEADER_HEIGHT))
                         .left_0()
                         .right_0()
                         .bottom_0()
@@ -2991,9 +2996,9 @@ impl App {
             .flex_none()
             .items_center()
             .w_full()
-            .min_h(px(FILE_TREE_ROW_HEIGHT))
+            .h(px(FILE_TREE_HEADER_HEIGHT))
             .gap_2()
-            .px_2()
+            .px(px(FILE_TREE_HEADER_INSET))
             .bg(palette().surface)
             .debug_selector(|| "file-tree-repo-root".to_string())
             .child(render_file_tree_indent_guides(0, "repo-root"))
@@ -3071,15 +3076,18 @@ impl App {
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let background = if active {
-            palette().accent_bg
-        } else {
-            palette().element_bg
-        };
+        // Ghost buttons, matching Zed's panel toolbars: no background at
+        // rest, a subtle fill on hover. The active toggle keeps an accent
+        // tint so its on/off state stays visible.
         let text_color = if active {
             palette().accent
         } else {
-            palette().text_muted
+            palette().icon_muted
+        };
+        let hover_bg = if active {
+            palette().accent_bg_hover
+        } else {
+            palette().ghost_element_hover
         };
 
         div()
@@ -3090,14 +3098,10 @@ impl App {
             .justify_center()
             .size(px(FILE_TREE_CONTROL_BUTTON_SIZE))
             .rounded(px(4.))
-            .bg(background)
+            .when(active, |button| button.bg(palette().accent_bg))
             .text_color(text_color)
             .cursor_pointer()
-            .hover(|style| {
-                style
-                    .bg(palette().accent_bg_hover)
-                    .text_color(palette().accent)
-            })
+            .hover(move |style| style.bg(hover_bg))
             .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
             .on_click(cx.listener(move |app, _event, window, cx| on_click(app, window, cx)))
             .child(

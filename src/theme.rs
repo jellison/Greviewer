@@ -20,10 +20,12 @@ pub struct Palette {
     pub surface: Hsla,
     pub element_bg: Hsla,
     pub element_hover: Hsla,
+    pub ghost_element_hover: Hsla,
     pub border: Hsla,
     // Text.
     pub text: Hsla,
     pub text_muted: Hsla,
+    pub icon_muted: Hsla,
     pub text_disabled: Hsla,
     // Accent and interaction.
     pub accent: Hsla,
@@ -70,9 +72,11 @@ impl Palette {
             surface: Hsla::from(rgb(0x1e272c)),
             element_bg: Hsla::from(rgb(0x37474f)),
             element_hover: Hsla::from(rgba(0x37474fcc)),
+            ghost_element_hover: Hsla::from(rgba(0x37474f80)),
             border: Hsla::from(rgb(0x37474f)),
             text: Hsla::from(rgb(0xeeffff)),
             text_muted: Hsla::from(rgb(0x546e7a)),
+            icon_muted: Hsla::from(rgb(0x718ca1)),
             text_disabled: Hsla::from(rgba(0x546e7a80)),
             accent: Hsla::from(rgb(0x82aaff)),
             accent_bg: Hsla::from(rgba(0x82aaff26)),
@@ -168,6 +172,8 @@ mod tests {
         assert_eq!(p.border, Hsla::from(rgb(0x37474f)));
         assert_eq!(p.text, Hsla::from(rgb(0xeeffff)));
         assert_eq!(p.text_muted, Hsla::from(rgb(0x546e7a)));
+        assert_eq!(p.icon_muted, Hsla::from(rgb(0x718ca1)));
+        assert_eq!(p.ghost_element_hover, Hsla::from(rgba(0x37474f80)));
         assert_eq!(p.accent, Hsla::from(rgb(0x82aaff)));
         assert_eq!(p.diff_added_bg, Hsla::from(rgba(0xc3e88d26)));
         assert_eq!(p.diff_removed_bg, Hsla::from(rgba(0xf0717826)));

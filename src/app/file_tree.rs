@@ -878,6 +878,22 @@ mod tests {
             !stat_bounds.intersects(&toggle_bounds),
             "diff stats must not collide with the tree controls"
         );
+
+        // As a group the controls sit equidistant from the container's top
+        // and right edges.
+        let container_bounds = visual
+            .debug_bounds("changed-files")
+            .expect("file tree container debug bounds");
+        let expand_bounds = visual
+            .debug_bounds("file-tree-expand-all")
+            .expect("expand-all debug bounds");
+        let top_inset = toggle_bounds.origin.y - container_bounds.origin.y;
+        let right_inset = (container_bounds.origin.x + container_bounds.size.width)
+            - (expand_bounds.origin.x + expand_bounds.size.width);
+        assert_eq!(
+            top_inset, right_inset,
+            "controls should sit equidistant from the container's top and right edges"
+        );
     }
 
     #[test]
