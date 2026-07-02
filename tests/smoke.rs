@@ -83,7 +83,13 @@ async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
                 assert_eq!(repo.commits[0].summary, "Update hello.txt");
                 assert_eq!(repo.commits[1].summary, "Add hello.txt");
                 assert!(repo.commits[0].is_head);
-                assert_eq!(app.selection, Selection::None);
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: repo.commits[0].sha.clone()
+                    },
+                    "the checked-out tip is selected as soon as the repository opens",
+                );
                 assert_eq!(app.review_screen, ReviewScreen::Graph);
             }
             Mode::NoRepo => panic!("expected RepoOpen, got NoRepo"),
@@ -91,8 +97,10 @@ async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
         .expect("read window");
 
     let mut visual = VisualTestContext::from_window(*window, cx);
+    // The tip is the checked-out commit, selected by default on open; clicking
+    // it keeps the selection.
     let row_bounds = visual
-        .debug_bounds("commit-row-0")
+        .debug_bounds("selected-commit-row-0")
         .expect("commit row debug bounds");
     visual.simulate_click(row_bounds.center(), Modifiers::none());
 

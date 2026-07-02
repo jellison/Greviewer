@@ -3,9 +3,9 @@
 use gpui::{Action, App as GpuiApp, KeyBinding, Menu, MenuItem, SharedString};
 
 use super::{
-    ActivateNextTab, ActivatePreviousTab, ClearSelection, CloseActivePane, CloseActiveTab,
-    NextChangeBlock, OpenChangeset, OpenRepository, PreviousChangeBlock, QuitApplication,
-    SplitPaneDown, SplitPaneLeft, SplitPaneRight, SplitPaneUp,
+    ActivateNextTab, ActivatePreviousTab, CloseActivePane, CloseActiveTab, NextChangeBlock,
+    OpenChangeset, OpenRepository, PreviousChangeBlock, QuitApplication, SplitPaneDown,
+    SplitPaneLeft, SplitPaneRight, SplitPaneUp,
 };
 
 pub const GREVIEWER_MENU_LABEL: &str = "Greviewer";
@@ -20,12 +20,11 @@ pub const SPLIT_PANE_RIGHT_KEYSTROKE: &str = "cmd-k right";
 pub const SPLIT_PANE_UP_KEYSTROKE: &str = "cmd-k up";
 pub const SPLIT_PANE_DOWN_KEYSTROKE: &str = "cmd-k down";
 pub const CLOSE_ACTIVE_PANE_KEYSTROKE: &str = "cmd-k w";
-/// Graph-screen selection shortcuts: enter opens the changeset for the
-/// current selection, escape clears it. Both are app-level bindings; the
-/// action handlers no-op outside graph mode, and focused components (such as
-/// the branch-filter input) bind these keys in their own context and win.
+/// Graph-screen selection shortcut: enter opens the changeset for the
+/// current selection. An app-level binding; the action handler no-ops
+/// outside graph mode, and focused components (such as the branch-filter
+/// input) bind this key in their own context and win.
 pub const OPEN_CHANGESET_KEYSTROKE: &str = "enter";
-pub const CLEAR_SELECTION_KEYSTROKE: &str = "escape";
 pub const NEXT_CHANGE_BLOCK_KEYSTROKE: &str = "cmd-down";
 pub const PREVIOUS_CHANGE_BLOCK_KEYSTROKE: &str = "cmd-up";
 
@@ -81,7 +80,6 @@ pub fn bind_app_keys(cx: &mut GpuiApp) {
         KeyBinding::new(SPLIT_PANE_DOWN_KEYSTROKE, SplitPaneDown, None),
         KeyBinding::new(CLOSE_ACTIVE_PANE_KEYSTROKE, CloseActivePane, None),
         KeyBinding::new(OPEN_CHANGESET_KEYSTROKE, OpenChangeset, None),
-        KeyBinding::new(CLEAR_SELECTION_KEYSTROKE, ClearSelection, None),
         KeyBinding::new(NEXT_CHANGE_BLOCK_KEYSTROKE, NextChangeBlock, None),
         KeyBinding::new(PREVIOUS_CHANGE_BLOCK_KEYSTROKE, PreviousChangeBlock, None),
     ]);

@@ -265,12 +265,16 @@ mod tests {
         visual.simulate_resize(size(px(900.), px(400.)));
 
         // Branch names are zero-padded so row order is deterministic; an early
-        // row is on screen, a far one is culled.
+        // row is on screen, a far one is culled. Every branch tips the root
+        // commit, which is the default selection on open, so every branch row
+        // renders with the selected treatment.
         visual
-            .debug_bounds("branch-row-heads-branch-000")
+            .debug_bounds("selected-branch-row-heads-branch-000")
             .expect("first branch row should be materialized");
         assert!(
-            visual.debug_bounds("branch-row-heads-branch-150").is_none(),
+            visual
+                .debug_bounds("selected-branch-row-heads-branch-150")
+                .is_none(),
             "row 150 is far below the viewport and must not be materialized"
         );
     }
@@ -1010,8 +1014,10 @@ mod tests {
         let beta = visual
             .debug_bounds("branch-row-heads-features-beta")
             .expect("sibling nested branch row renders");
+        // Master's tip is the default selection on open, so its row renders
+        // with the selected treatment.
         let master = visual
-            .debug_bounds("branch-row-heads-master")
+            .debug_bounds("selected-branch-row-heads-master")
             .expect("flat branch row renders");
         assert!(
             folder.origin.y < alpha.origin.y
@@ -1146,14 +1152,16 @@ mod tests {
         visual
             .debug_bounds("branch-folder-remotes-origin-feature")
             .expect("slash-named remote branches nest in subfolders");
+        // The checked-out tip is the default selection on open; both master
+        // rows point at it, so both render with the selected treatment.
         visual
-            .debug_bounds("branch-row-remotes-origin-master")
+            .debug_bounds("selected-branch-row-remotes-origin-master")
             .expect("remote branch row renders, keyed by namespaced name");
         visual
             .debug_bounds("branch-row-remotes-origin-feature-x")
             .expect("nested remote branch row renders");
         let local_row = visual
-            .debug_bounds("branch-row-heads-master")
+            .debug_bounds("selected-branch-row-heads-master")
             .expect("local branch row renders under the Local section");
         assert!(
             local_section.origin.y < local_row.origin.y
@@ -1278,8 +1286,8 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn hiding_a_folder_clears_a_selection_inside_it(cx: &mut TestAppContext) {
-        let (dir, _master_tip, alpha_tip) = init_repo_with_slash_named_branches();
+    async fn hiding_a_folder_resets_a_selection_inside_it(cx: &mut TestAppContext) {
+        let (dir, master_tip, alpha_tip) = init_repo_with_slash_named_branches();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
 
@@ -1293,8 +1301,10 @@ mod tests {
                 app.toggle_folder_visibility("heads/features", cx);
                 assert_eq!(
                     app.selection,
-                    Selection::None,
-                    "hiding the folder removed the selected commit, so the selection clears"
+                    Selection::Single {
+                        sha: master_tip.clone(),
+                    },
+                    "hiding the folder removed the selected commit, so the selection resets to the checked-out tip"
                 );
             })
             .expect("hide folder containing the selection");
@@ -1376,7 +1386,7 @@ mod tests {
 
     #[gpui::test]
     async fn clicking_the_eye_icon_hides_the_branch(cx: &mut TestAppContext) {
-        let (dir, _main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let (dir, main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
 
@@ -1404,7 +1414,9 @@ mod tests {
                 );
                 assert_eq!(
                     app.selection,
-                    Selection::None,
+                    Selection::Single {
+                        sha: main_tip.clone(),
+                    },
                     "visibility toggle click must not focus the branch"
                 );
                 let Mode::RepoOpen { repo } = &app.mode else {
@@ -1474,7 +1486,7 @@ mod tests {
 
     #[gpui::test]
     async fn clicking_a_hidden_branch_row_does_not_focus_it(cx: &mut TestAppContext) {
-        let (dir, _main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let (dir, main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
 
@@ -1506,7 +1518,13 @@ mod tests {
 
         window
             .update(cx, |app, _window, _cx| {
-                assert_eq!(app.selection, Selection::None);
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: main_tip.clone(),
+                    },
+                    "clicking a hidden branch row must leave the default selection in place"
+                );
             })
             .expect("read selection");
     }
@@ -1645,8 +1663,10 @@ mod tests {
         let feature = visual
             .debug_bounds("branch-row-heads-feature")
             .expect("the feature branch row renders");
+        // Master's tip is the default selection on open, so its row renders
+        // with the selected treatment.
         let master = visual
-            .debug_bounds("branch-row-heads-master")
+            .debug_bounds("selected-branch-row-heads-master")
             .expect("the master branch row renders");
 
         // The breathing room is padding inside each row's border + background:
@@ -1781,7 +1801,7 @@ mod tests {
         // `.hover(...)` styling, independent of any `cx.notify()` in our code,
         // so a render-count probe cannot isolate a re-introduced notify here.)
         let row = visual
-            .debug_bounds("branch-row-heads-master")
+            .debug_bounds("selected-branch-row-heads-master")
             .expect("branch row renders");
         visual.simulate_mouse_move(row.center(), None, Modifiers::none());
         cx.run_until_parked();

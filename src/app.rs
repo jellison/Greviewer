@@ -60,7 +60,6 @@ actions!(
         OpenRepository,
         OpenChangeset,
         CloseChangeset,
-        ClearSelection,
         QuitApplication,
         CloseActiveTab,
         ActivateNextTab,
@@ -335,6 +334,23 @@ pub enum Selection {
         end_sha: String,
         shas: Vec<String>,
     },
+}
+
+/// The graph's default selection: the checked-out (HEAD) commit when one is
+/// loaded, otherwise the newest visible commit. `Selection::None` only when
+/// the graph shows no commits at all — the graph is meant to always carry a
+/// selection, so the selection bar is a permanent fixture rather than an
+/// occasional overlay.
+fn default_selection(repo: &repo::OpenRepository, hidden_branches: &BTreeSet<String>) -> Selection {
+    let visible = visible_commits(repo, hidden_branches);
+    visible
+        .iter()
+        .find(|commit| commit.is_head)
+        .or_else(|| visible.first())
+        .map(|commit| Selection::Single {
+            sha: commit.sha.clone(),
+        })
+        .unwrap_or(Selection::None)
 }
 
 /// Human-readable label for the graph's selection bar: how many commits the
@@ -687,9 +703,16 @@ impl App {
         })
         .detach();
 
+        // No branches are hidden at construction, so the default selection is
+        // computed against the fully visible graph.
+        let selection = match &mode {
+            Mode::RepoOpen { repo } => default_selection(repo, &BTreeSet::new()),
+            Mode::NoRepo => Selection::None,
+        };
+
         Self {
             mode,
-            selection: Selection::None,
+            selection,
             double_click_anchor: None,
             review_screen: ReviewScreen::Graph,
             workspace: crate::workspace::Workspace::new(),
@@ -808,8 +831,11 @@ impl App {
         window.set_window_title(&repository_title(&repo.path));
         let recent_path = repo.path.clone();
 
+        // Hidden branches are reset below, so the default selection is
+        // computed against the fully visible graph.
+        let selection = default_selection(&repo, &BTreeSet::new());
         self.mode = Mode::RepoOpen { repo };
-        self.selection = Selection::None;
+        self.selection = selection;
         self.review_screen = ReviewScreen::Graph;
         self.workspace = crate::workspace::Workspace::new();
         self.pane_scrolls.borrow_mut().clear();
@@ -918,24 +944,25 @@ impl App {
         }
     }
 
+    /// Make `sha` the single selected commit. Clicking the already-selected
+    /// commit keeps it selected: the graph always carries a selection (see
+    /// `default_selection`), so nothing ever toggles back to no selection.
     pub(crate) fn select_single_commit(&mut self, sha: String, cx: &mut Context<Self>) {
-        self.selection = match &self.selection {
-            Selection::Single { sha: selected_sha } if selected_sha == &sha => Selection::None,
-            _ => Selection::Single { sha },
-        };
+        self.selection = Selection::Single { sha };
         cx.notify();
     }
 
     /// Flip a branch's graph visibility. Hiding may make the selected
-    /// commit(s) invisible, in which case the selection is cleared. The HEAD
-    /// branch never reaches this path: its sidebar row renders no toggle.
+    /// commit(s) invisible, in which case the selection resets to the
+    /// default. The HEAD branch never reaches this path: its sidebar row
+    /// renders no toggle.
     pub(crate) fn toggle_branch_visibility(&mut self, name: String, cx: &mut Context<Self>) {
         if self.hidden_branches.remove(&name) {
             cx.notify();
             return;
         }
         self.hidden_branches.insert(name);
-        self.clear_selection_if_hidden();
+        self.reset_selection_if_hidden();
         cx.notify();
     }
 
@@ -984,7 +1011,7 @@ impl App {
             .any(|name| !self.hidden_branches.contains(name));
         if any_visible {
             self.hidden_branches.extend(descendants);
-            self.clear_selection_if_hidden();
+            self.reset_selection_if_hidden();
         } else {
             for name in &descendants {
                 self.hidden_branches.remove(name);
@@ -993,10 +1020,11 @@ impl App {
         cx.notify();
     }
 
-    /// Reset the selection when hiding a branch removed any selected commit
-    /// from the visible graph. No-ops outside `Mode::RepoOpen` or when the
-    /// selection is already visible.
-    fn clear_selection_if_hidden(&mut self) {
+    /// Reset the selection to the default when hiding a branch removed any
+    /// selected commit from the visible graph. The checked-out branch can
+    /// never be hidden, so the default stays visible. No-ops outside
+    /// `Mode::RepoOpen` or when the selection is already visible.
+    fn reset_selection_if_hidden(&mut self) {
         let Mode::RepoOpen { repo } = &self.mode else {
             return;
         };
@@ -1017,7 +1045,7 @@ impl App {
             Selection::Range { shas, .. } => shas.iter().any(|sha| !visible.contains(sha)),
         };
         if selection_hidden {
-            self.selection = Selection::None;
+            self.selection = default_selection(repo, &self.hidden_branches);
         }
     }
 
@@ -1139,26 +1167,12 @@ impl App {
         }
     }
 
-    /// True while the branch-filter input owns keyboard focus. The enter and
-    /// escape bindings are app-global and would otherwise fire while the user
-    /// is typing a filter query (the input's own bindings do not consume
-    /// them), so the selection action handlers bail out in that state.
+    /// True while the branch-filter input owns keyboard focus. The enter
+    /// binding is app-global and would otherwise fire while the user is
+    /// typing a filter query (the input's own bindings do not consume it),
+    /// so the open-changeset action handler bails out in that state.
     fn branch_filter_has_focus(&self, window: &Window, cx: &Context<Self>) -> bool {
         gpui::Focusable::focus_handle(&self.filter_input, cx).is_focused(window)
-    }
-
-    /// Clears the graph's tentative selection. A no-op while a changeset is
-    /// open: the spec preserves the prior selection so it can be adjusted and
-    /// re-opened after closing.
-    fn clear_selection(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.review_screen, ReviewScreen::Graph) {
-            return;
-        }
-        if matches!(self.selection, Selection::None) {
-            return;
-        }
-        self.selection = Selection::None;
-        cx.notify();
     }
 
     fn range_shas_between(
@@ -2021,8 +2035,10 @@ impl App {
             // Contextual selection bar, docked to the top edge of the
             // history panel while a selection is active (near the cursor,
             // pushing the graph down). It owns the open-changeset
-            // affordance; enter/escape drive the same transitions through
-            // the OpenChangeset/ClearSelection actions.
+            // affordance; enter drives the same transition through the
+            // OpenChangeset action. A selection always exists in a
+            // non-empty graph, so the bar is effectively a permanent
+            // fixture there.
             .when_some(selection_summary(&self.selection), |screen, summary| {
                 screen.child(self.render_selection_bar(summary, cx))
             })
@@ -2047,8 +2063,8 @@ impl App {
     }
 
     /// The graph's contextual selection bar: selection count on the left,
-    /// clear and open-changeset affordances (with their keyboard hints) on
-    /// the right. Rendered only while a selection is active.
+    /// the open-changeset affordance (with its keyboard hint) on the right.
+    /// Rendered only while a selection is active.
     fn render_selection_bar(
         &self,
         summary: String,
@@ -2096,25 +2112,6 @@ impl App {
             }))
             .child(div().text_color(palette().accent).child(summary))
             .child(div().flex_1())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py(px(3.))
-                    .rounded(px(4.))
-                    .text_color(palette().text_muted)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(palette().element_hover))
-                    .id("clear-selection")
-                    .debug_selector(|| "clear-selection".to_string())
-                    .on_click(cx.listener(|app, _event, _window, cx| {
-                        app.clear_selection(cx);
-                    }))
-                    .child("Clear")
-                    .child(keycap("esc", palette().border, palette().text_muted)),
-            )
             .child(
                 div()
                     .flex()
@@ -3684,12 +3681,6 @@ impl Render for App {
             .on_action(cx.listener(|app, _: &CloseChangeset, _window, cx| {
                 app.close_changeset(cx);
             }))
-            .on_action(cx.listener(|app, _: &ClearSelection, window, cx| {
-                if app.branch_filter_has_focus(window, cx) {
-                    return;
-                }
-                app.clear_selection(cx);
-            }))
             .on_action(cx.listener(|app, _: &QuitApplication, _window, cx| {
                 app.quit_application(cx);
             }))
@@ -4171,8 +4162,10 @@ mod tests {
         visual
             .debug_bounds("branch-row-heads-feature")
             .expect("feature branch row renders");
+        // The checked-out branch's tip is the default selection on open, so
+        // its row renders with the selected treatment.
         visual
-            .debug_bounds("branch-row-heads-master")
+            .debug_bounds("selected-branch-row-heads-master")
             .expect("master branch row renders");
         // The checked-out branch is now distinguished by its row background
         // rather than a check icon, so no marker element renders for it.
@@ -4670,7 +4663,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn selecting_commits_toggles_single_selection(cx: &mut TestAppContext) {
+    async fn selecting_the_selected_commit_again_keeps_it_selected(cx: &mut TestAppContext) {
         let window = add_app_window(cx);
 
         window
@@ -4692,14 +4685,64 @@ mod tests {
                 );
 
                 app.select_single_commit("second-sha".to_string(), cx);
-                assert_eq!(app.selection, Selection::None);
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: "second-sha".to_string(),
+                    },
+                    "re-selecting the selected commit must not clear the selection",
+                );
             })
             .expect("update window");
     }
 
     #[gpui::test]
-    async fn hiding_a_branch_clears_a_selection_it_made_invisible(cx: &mut TestAppContext) {
-        let (dir, _main_tip, feature_tip) = init_repo_with_unmerged_branch_commit();
+    async fn opening_a_repository_selects_the_checked_out_tip(cx: &mut TestAppContext) {
+        let (dir, main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: main_tip.clone()
+                    },
+                    "opening a repository must select the checked-out tip by default",
+                );
+            })
+            .expect("update window");
+    }
+
+    #[gpui::test]
+    async fn restoring_a_repository_at_startup_selects_the_checked_out_tip(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
+        let window = add_app_window_with_recent_and_widths(
+            cx,
+            vec![RecentRepository::available(dir.path().to_path_buf())],
+            SidebarWidths::default(),
+        );
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: main_tip.clone()
+                    },
+                    "restoring the most recent repository at startup must select its checked-out tip",
+                );
+            })
+            .expect("read startup selection");
+    }
+
+    #[gpui::test]
+    async fn hiding_a_branch_resets_a_selection_it_made_invisible(cx: &mut TestAppContext) {
+        let (dir, main_tip, feature_tip) = init_repo_with_unmerged_branch_commit();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
 
@@ -4708,7 +4751,13 @@ mod tests {
                 app.open_repository_at(path, window, cx);
                 app.select_single_commit(feature_tip.clone(), cx);
                 app.toggle_branch_visibility("heads/feature".to_string(), cx);
-                assert_eq!(app.selection, Selection::None);
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: main_tip.clone()
+                    },
+                    "hiding the selection's branch must reset the selection to the checked-out tip",
+                );
             })
             .expect("update window");
     }
@@ -4860,8 +4909,10 @@ mod tests {
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);
+        // Master's tip is the default selection on open, so its sidebar row
+        // already renders with the selected treatment.
         let master_row = visual
-            .debug_bounds("branch-row-heads-master")
+            .debug_bounds("selected-branch-row-heads-master")
             .expect("master branch row renders");
         visual.simulate_click(master_row.center(), Modifiers::none());
 
@@ -4886,8 +4937,9 @@ mod tests {
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);
+        // The tip is the checked-out commit, selected by default on open.
         let tip_bounds = visual
-            .debug_bounds("commit-row-0")
+            .debug_bounds("selected-commit-row-0")
             .expect("tip commit row debug bounds");
         visual.simulate_click(tip_bounds.center(), Modifiers::none());
 
@@ -4960,10 +5012,11 @@ mod tests {
     async fn double_clicking_the_top_commit_opens_its_changeset_despite_the_bar(
         cx: &mut TestAppContext,
     ) {
-        // The selection bar appears above the graph after the first click,
-        // pushing every row down. For the top row the second click of the
-        // double-click lands on the bar itself; the gesture must still open
-        // the changeset of the commit that was under the first click.
+        // The selection bar sits above the graph; historically it appeared
+        // after the first click and pushed the top row down so the second
+        // click landed on the bar itself. The bar now renders from the
+        // moment the repository opens, but the gesture must still open the
+        // changeset of the commit under the first click.
         let (dir, shas) = init_repo_with_three_commits();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
@@ -4976,8 +5029,9 @@ mod tests {
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);
+        // The tip is the checked-out commit, selected by default on open.
         let row_bounds = visual
-            .debug_bounds("commit-row-0")
+            .debug_bounds("selected-commit-row-0")
             .expect("tip commit row debug bounds");
         simulate_double_click(&mut visual, row_bounds.center());
 
@@ -5014,8 +5068,9 @@ mod tests {
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);
+        // The tip is the checked-out commit, selected by default on open.
         let tip_bounds = visual
-            .debug_bounds("commit-row-0")
+            .debug_bounds("selected-commit-row-0")
             .expect("tip commit row debug bounds");
         visual.simulate_click(tip_bounds.center(), Modifiers::none());
         let root_bounds = visual
@@ -5152,8 +5207,11 @@ mod tests {
             .expect("read commit row indexes");
 
         let mut visual = VisualTestContext::from_window(*window, cx);
+        // The merge commit is the checked-out tip, selected by default on open.
         let merge_bounds = visual
-            .debug_bounds(test_debug_selector(format!("commit-row-{merge_index}")))
+            .debug_bounds(test_debug_selector(format!(
+                "selected-commit-row-{merge_index}"
+            )))
             .expect("merge commit row debug bounds");
         visual.simulate_click(merge_bounds.center(), Modifiers::none());
 
@@ -5321,8 +5379,9 @@ mod tests {
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);
+        // The tip is the checked-out commit, selected by default on open.
         let tip_bounds = visual
-            .debug_bounds("commit-row-0")
+            .debug_bounds("selected-commit-row-0")
             .expect("tip commit row debug bounds");
         visual.simulate_click(tip_bounds.center(), Modifiers::none());
 
@@ -5370,8 +5429,9 @@ mod tests {
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);
+        // The revert commit is the checked-out tip, selected by default on open.
         let revert_bounds = visual
-            .debug_bounds("commit-row-0")
+            .debug_bounds("selected-commit-row-0")
             .expect("revert commit row debug bounds");
         visual.simulate_click(revert_bounds.center(), Modifiers::none());
 
@@ -5756,7 +5816,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn clicking_a_commit_row_toggles_selection(cx: &mut TestAppContext) {
+    async fn clicking_the_selected_commit_row_keeps_the_selection(cx: &mut TestAppContext) {
         let (dir, oid_hex) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
@@ -5769,10 +5829,12 @@ mod tests {
 
         cx.run_until_parked();
 
+        // The checked-out tip is selected on open, so its row renders with
+        // the selected treatment straight away.
         let mut visual = VisualTestContext::from_window(*window, cx);
         let row_bounds = visual
-            .debug_bounds("commit-row-0")
-            .expect("commit row debug bounds");
+            .debug_bounds("selected-commit-row-0")
+            .expect("selected commit row debug bounds");
 
         visual.simulate_click(row_bounds.center(), Modifiers::none());
 
@@ -5783,22 +5845,10 @@ mod tests {
                     Selection::Single {
                         sha: oid_hex.clone(),
                     },
+                    "clicking the selected commit must keep it selected",
                 );
             })
             .expect("read selected state");
-
-        // The selection bar appeared above the graph and pushed the row
-        // down, so re-resolve its bounds before clicking it again.
-        let row_bounds = visual
-            .debug_bounds("selected-commit-row-0")
-            .expect("selected commit row debug bounds");
-        visual.simulate_click(row_bounds.center(), Modifiers::none());
-
-        window
-            .read_with(cx, |app, _cx| {
-                assert_eq!(app.selection, Selection::None);
-            })
-            .expect("read cleared state");
     }
 
     #[gpui::test]
@@ -5848,14 +5898,19 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn selection_bar_is_absent_without_a_selection(cx: &mut TestAppContext) {
-        let (dir, _oid_hex) = init_repo_with_one_commit();
+    async fn selection_bar_is_absent_only_when_the_graph_has_no_commits(cx: &mut TestAppContext) {
+        let dir = init_repo_with_no_commits();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
+                assert_eq!(
+                    app.selection,
+                    Selection::None,
+                    "an empty graph is the only state without a selection",
+                );
             })
             .expect("open repo");
 
@@ -5869,7 +5924,29 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn selecting_a_commit_shows_the_selection_bar_with_both_actions(cx: &mut TestAppContext) {
+    async fn selection_bar_renders_on_open_for_the_default_selection(cx: &mut TestAppContext) {
+        let (dir, _oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("selection-bar")
+            .expect("the selection bar renders on open for the default checked-out-tip selection");
+    }
+
+    #[gpui::test]
+    async fn selecting_a_commit_shows_the_selection_bar_with_the_open_action(
+        cx: &mut TestAppContext,
+    ) {
         let (dir, oid_hex) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
@@ -5890,9 +5967,11 @@ mod tests {
         visual
             .debug_bounds("open-changeset")
             .expect("open-changeset affordance lives in the selection bar");
-        visual
-            .debug_bounds("clear-selection")
-            .expect("clear-selection affordance lives in the selection bar");
+        assert!(
+            visual.debug_bounds("reset-selection").is_none(),
+            "the bar carries no reset affordance: a selection always exists, so \
+             there is nothing to reset to",
+        );
     }
 
     #[gpui::test]
@@ -5927,59 +6006,6 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn clicking_clear_selection_clears_the_selection_and_hides_the_bar(
-        cx: &mut TestAppContext,
-    ) {
-        let (dir, oid_hex) = init_repo_with_one_commit();
-        let path = dir.path().to_path_buf();
-        let window = add_app_window(cx);
-
-        window
-            .update(cx, |app, window, cx| {
-                app.open_repository_at(path, window, cx);
-                app.select_single_commit(oid_hex, cx);
-            })
-            .expect("open repo and select commit");
-
-        cx.run_until_parked();
-
-        let mut visual = VisualTestContext::from_window(*window, cx);
-        let clear_bounds = visual
-            .debug_bounds("clear-selection")
-            .expect("clear-selection debug bounds");
-        let open_bounds = visual
-            .debug_bounds("open-changeset")
-            .expect("open-changeset debug bounds");
-
-        visual.simulate_click(clear_bounds.center(), Modifiers::none());
-        cx.run_until_parked();
-
-        window
-            .read_with(cx, |app, _cx| {
-                assert_eq!(app.selection, Selection::None);
-            })
-            .expect("read cleared selection");
-
-        // `debug_bounds` accumulates for the life of the window in gpui
-        // 0.2.2 (`Frame::clear` misses it), so asserting the selector is
-        // gone would pass against a stale frame. Assert behaviorally
-        // instead: with the bar dismissed, a click where the open-changeset
-        // affordance used to be must not open a changeset.
-        visual.simulate_click(open_bounds.center(), Modifiers::none());
-        cx.run_until_parked();
-
-        window
-            .read_with(cx, |app, _cx| {
-                assert_eq!(
-                    app.review_screen,
-                    ReviewScreen::Graph,
-                    "clearing the selection dismisses the open-changeset affordance",
-                );
-            })
-            .expect("read review screen after clicking dismissed bar");
-    }
-
-    #[gpui::test]
     async fn pressing_enter_opens_the_changeset_for_the_selection(cx: &mut TestAppContext) {
         cx.update(crate::app::bind_app_keys);
         let (dir, oid_hex) = init_repo_with_one_commit();
@@ -6006,18 +6032,18 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn pressing_escape_clears_the_selection(cx: &mut TestAppContext) {
+    async fn pressing_escape_leaves_the_selection_untouched(cx: &mut TestAppContext) {
         cx.update(crate::app::bind_app_keys);
-        let (dir, oid_hex) = init_repo_with_one_commit();
+        let (dir, _main_tip, feature_tip) = init_repo_with_unmerged_branch_commit();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
 
         window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
-                app.select_single_commit(oid_hex, cx);
+                app.select_single_commit(feature_tip.clone(), cx);
             })
-            .expect("open repo and select commit");
+            .expect("open repo and select the feature tip");
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);
@@ -6025,9 +6051,15 @@ mod tests {
 
         window
             .read_with(cx, |app, _cx| {
-                assert_eq!(app.selection, Selection::None);
+                assert_eq!(
+                    app.selection,
+                    Selection::Single {
+                        sha: feature_tip.clone()
+                    },
+                    "escape is not bound to any selection action",
+                );
             })
-            .expect("read cleared selection after escape");
+            .expect("read selection after escape");
     }
 
     #[gpui::test]
@@ -6071,44 +6103,6 @@ mod tests {
                 );
             })
             .expect("read workspace after enter in changeset mode");
-    }
-
-    #[gpui::test]
-    async fn pressing_escape_while_a_changeset_is_open_preserves_the_selection(
-        cx: &mut TestAppContext,
-    ) {
-        cx.update(crate::app::bind_app_keys);
-        let (dir, oid_hex) = init_repo_with_one_commit();
-        let path = dir.path().to_path_buf();
-        let window = add_app_window(cx);
-
-        window
-            .update(cx, |app, window, cx| {
-                app.open_repository_at(path, window, cx);
-                app.select_single_commit(oid_hex.clone(), cx);
-                app.open_changeset(window, cx);
-            })
-            .expect("open changeset");
-        cx.run_until_parked();
-
-        let mut visual = VisualTestContext::from_window(*window, cx);
-        visual.simulate_keystrokes("escape");
-
-        window
-            .read_with(cx, |app, _cx| {
-                assert!(
-                    matches!(app.review_screen, ReviewScreen::Changeset { .. }),
-                    "escape must not leave changeset mode",
-                );
-                assert_eq!(
-                    app.selection,
-                    Selection::Single {
-                        sha: oid_hex.clone()
-                    },
-                    "the spec preserves the selection while a changeset is open",
-                );
-            })
-            .expect("read selection after escape in changeset mode");
     }
 
     #[gpui::test]

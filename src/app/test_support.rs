@@ -70,6 +70,14 @@ pub(crate) fn load_recent_repositories(path: &std::path::Path) -> Vec<RecentRepo
     settings::load(path).recent_repositories
 }
 
+/// A freshly initialized repository with zero commits (unborn HEAD): the one
+/// state in which the graph is empty and no default selection exists.
+pub(crate) fn init_repo_with_no_commits() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    Repository::init(dir.path()).expect("init repo");
+    dir
+}
+
 pub(crate) fn init_repo_with_one_commit() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().expect("create tempdir");
     let repo = Repository::init(dir.path()).expect("init repo");

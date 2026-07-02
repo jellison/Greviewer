@@ -14,7 +14,8 @@ The user opens a local Git repository through a folder picker. The application r
 
 **Observable outcomes**
 
-- The window displays the commit graph of the chosen repository.
+- The window displays the commit graph of the chosen repository with its checked-out tip
+  selected (see "Selecting commits to review").
 - The window bar identifies the open repository by name.
 - The chosen repository is added to (or moved to the top of) the recently opened list, and that ordering is retained for future launches.
 - On launch, when a most-recently-opened repository can be opened, the window comes up showing that repository's commit graph without any further action.
@@ -47,9 +48,9 @@ mode, since the repository name is always shown.
 
 - Activating the repository name opens a switcher listing the sibling repositories in the
   parent folder, ordered by folder name, with the open repository marked as current.
-- Selecting another repository opens it: the window shows that repository's commit graph, the
-  prior selection and changeset are cleared, and the repository is moved to the top of the
-  recently opened list.
+- Selecting another repository opens it: the window shows that repository's commit graph with
+  its checked-out tip selected (see "Selecting commits to review"), any open changeset is
+  closed, and the repository is moved to the top of the recently opened list.
 - The open-repository control launches the folder picker.
 - Dismissing the switcher by activating outside it leaves the open repository unchanged.
 - Opening the switcher dismisses the diff-context popover, and vice versa; the two are never
@@ -197,8 +198,8 @@ normal color but also keeps its toggle visible.
   activating it again restores them. Graph contents are unchanged either way.
 - Activating a folder's visibility toggle hides all its branches from the
   graph, skipping the checked-out branch, or shows them all when none are
-  visible. A selection that becomes invisible clears, as with single-branch
-  hiding.
+  visible. A selection that becomes invisible resets to the checked-out tip,
+  as with single-branch hiding.
 - A fully hidden folder renders muted with its toggle always shown; a
   partially hidden folder keeps its toggle shown without muting.
 - Reopening a repository expands all folders and shows all branches.
@@ -265,7 +266,8 @@ its row; a hidden branch's control is always visible and its name renders
 muted. Activating a hidden branch's row does not focus it; the branch must be
 shown again first. The checked-out branch offers no toggle. If hiding a
 branch removes the selected commit — or any commit in a selected range — the
-selection clears. Visibility choices are not persisted: opening a repository
+selection resets to the checked-out tip, which can never be hidden.
+Visibility choices are not persisted: opening a repository
 shows every branch. Remote-tracking branches hide and show exactly like local ones; remote-tracking branches are visible by default. A local branch and a remote-tracking branch that share a display name are independent: hiding, showing, or collapsing one never affects the other.
 
 **Observable outcomes**
@@ -276,31 +278,34 @@ shows every branch. Remote-tracking branches hide and show exactly like local on
   the graph; toggling it back on restores them.
 - A hidden branch's row is muted, keeps its toggle visible, and does not
   focus its tip when activated.
-- Hiding a branch that makes the current selection invisible clears the
-  selection.
+- Hiding a branch that makes the current selection invisible resets the
+  selection to the checked-out tip.
 - Reopening a repository resets all branches to visible.
 
 ## Selecting commits to review
 
-The user stages a review by selecting either a single commit or a contiguous sequential range from the graph. Selection is tentative: no review activity begins until the user explicitly opens the changeset (described below). Clicking a commit selects it. Shift-clicking a second commit extends the selection to a range, provided the two commits lie on a single ancestry path (one is an ancestor of the other). The selection is the inclusive set of commits between the two endpoints along that path. Clicking the selected commit again clears the selection, as does a dedicated clear-selection affordance and the escape key. Double-clicking bypasses tentative selection entirely; it is specified under "Opening the changeset" below.
+The user stages a review by selecting either a single commit or a contiguous sequential range from the graph. Selection is tentative: no review activity begins until the user explicitly opens the changeset (described below). Clicking a commit selects it. Shift-clicking a second commit extends the selection to a range, provided the two commits lie on a single ancestry path (one is an ancestor of the other). The selection is the inclusive set of commits between the two endpoints along that path. Double-clicking bypasses tentative selection entirely; it is specified under "Opening the changeset" below.
+
+The graph always carries a selection: opening a repository selects its checked-out tip, and any change that would otherwise leave nothing selected returns to that default instead. Clicking the selected commit keeps it selected. There is no affordance for clearing the selection — the user moves it by selecting something else. The only state with no selection is a graph with no commits at all.
 
 **Triggering conditions**
 
+- A repository opens (its checked-out tip becomes the selection).
 - The user clicks a commit in the graph.
 - The user shift-clicks a second commit while a single-commit selection is active.
-- The user clicks the selected commit again.
-- The user activates the clear-selection affordance or presses escape while a selection is active.
 
 **Observable outcomes**
 
 - The selected commit or range is visually distinct in the graph.
-- While a selection is active, the graph shows how many commits the selection covers, alongside the open-changeset and clear-selection affordances. All of it disappears when the selection clears.
+- While a selection is active — which, because a selection always exists, is whenever the graph shows any commits — the graph shows how many commits the selection covers, alongside the open-changeset affordance.
+- Clicking the already-selected commit leaves it selected.
 
 **Edge cases**
 
 - If the two endpoints do not share a linear ancestry — they lie on diverged branches — the second click is rejected with a message explaining why, and the original selection is preserved.
 - Merge commits inside a selected range are included in the range and contribute to the rollup.
-- Escape does not clear the selection while a changeset is open (the selection is preserved for adjustment after closing) or while the user is typing in the branch filter.
+- When there is no checked-out tip to select — the checked-out branch has no commits yet, or no branch is checked out at all — the newest visible commit is selected in its place.
+- A repository with no commits at all has no selection, and the selection summary and its affordance are absent.
 
 ## Opening the changeset
 

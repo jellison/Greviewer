@@ -2509,8 +2509,9 @@ mod tests {
         let branch_out_horizontal_bounds = visual
             .debug_bounds("commit-graph-branch-out-horizontal-0-1")
             .expect("merge commit branch-out horizontal debug bounds");
+        // The merge commit is the checked-out tip, selected by default on open.
         let merge_commit_row = visual
-            .debug_bounds("commit-row-0")
+            .debug_bounds("selected-commit-row-0")
             .expect("merge commit row debug bounds");
         assert_eq!(
             branch_out_horizontal_bounds.origin.y + px(commit_graph_line_width() / 2.),
@@ -3085,8 +3086,9 @@ mod tests {
         let second_row_top = visual
             .debug_bounds("commit-graph-vertical-1-0-top")
             .expect("second row incoming vertical debug bounds");
+        // The tip is the checked-out commit, selected by default on open.
         let first_row = visual
-            .debug_bounds("commit-row-0")
+            .debug_bounds("selected-commit-row-0")
             .expect("first commit row debug bounds");
         let second_row = visual
             .debug_bounds("commit-row-1")
@@ -3323,8 +3325,10 @@ mod tests {
             .expect("read detached HEAD repo");
 
         let mut visual = VisualTestContext::from_window(*window, cx);
+        // With no checked-out branch, the default selection falls back to
+        // the newest commit, so the tip row renders selected.
         visual
-            .debug_bounds("commit-row-0")
+            .debug_bounds("selected-commit-row-0")
             .expect("tip commit row debug bounds");
         visual
             .debug_bounds(test_debug_selector(format!(
@@ -3426,8 +3430,9 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         visual.simulate_resize(size(px(700.), px(320.)));
+        // The tip is the checked-out commit, selected by default on open.
         let first_row_bounds = visual
-            .debug_bounds("commit-row-0")
+            .debug_bounds("selected-commit-row-0")
             .expect("first commit row debug bounds");
         let before_scroll = window
             .read_with(cx, |app, _cx| {
@@ -3505,8 +3510,9 @@ mod tests {
         // 44px rows; a 400px-tall viewport shows ~9 rows.
         visual.simulate_resize(size(px(900.), px(400.)));
 
+        // The tip is the checked-out commit, selected by default on open.
         visual
-            .debug_bounds("commit-row-0")
+            .debug_bounds("selected-commit-row-0")
             .expect("first commit row should be materialized");
         visual
             .debug_bounds("commit-graph-gutter-0")
