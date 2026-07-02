@@ -830,15 +830,30 @@ pub(crate) fn diff_text_style() -> TextStyle {
     }
 }
 
+/// Stroke width and spacing, in device pixels, of the alignment-gap hatch.
+///
+/// gpui's slash shader phases the stripes from each quad's own origin, and
+/// every diff row is its own quad — so a multi-line gap, drawn as a stack of
+/// `Empty` rows, only reads as one continuous hatched block when the pattern
+/// period (stroke + interval) divides the row height in device pixels.
+/// Otherwise the diagonals shear at every row seam. 2 + 9 = 11 divides the
+/// 22px row at 1x, 1.5x, and 2x backing scales; a test guards the invariant.
+pub(crate) const DIFF_HATCH_STROKE: f32 = 2.;
+pub(crate) const DIFF_HATCH_INTERVAL: f32 = 9.;
+
 /// Material red/green at ~15% alpha over the editor background; alignment gaps
-/// hatch with a diagonal pattern like Zed's, using 2px strokes every 11px in a
-/// light theme grey so the slashes read clearly against the dark background.
+/// hatch with a diagonal pattern like Zed's, in a light theme grey so the
+/// slashes read clearly against the dark background.
 pub(crate) fn diff_line_fill(status: DiffLineStatus) -> Background {
     match status {
         DiffLineStatus::Unchanged => palette().background.into(),
         DiffLineStatus::Added => palette().diff_added_bg.into(),
         DiffLineStatus::Removed => palette().diff_removed_bg.into(),
-        DiffLineStatus::Empty => pattern_slash(palette().diff_empty_hatch, 2., 11.),
+        DiffLineStatus::Empty => pattern_slash(
+            palette().diff_empty_hatch,
+            DIFF_HATCH_STROKE,
+            DIFF_HATCH_INTERVAL,
+        ),
     }
 }
 
@@ -1195,6 +1210,34 @@ mod tests {
             diff_line_fill(DiffLineStatus::Unchanged),
             p.background.into()
         );
+    }
+
+    #[test]
+    fn empty_hatch_tiles_seamlessly_across_stacked_gap_rows() {
+        use crate::theme::palette;
+
+        assert_eq!(
+            diff_line_fill(DiffLineStatus::Empty),
+            pattern_slash(
+                palette().diff_empty_hatch,
+                DIFF_HATCH_STROKE,
+                DIFF_HATCH_INTERVAL
+            )
+        );
+
+        // gpui's slash pattern restarts at each row quad's own origin, so a
+        // multi-row alignment gap shears at every row seam unless the pattern
+        // period divides the row height in device pixels at every backing
+        // scale the app renders at.
+        let period = DIFF_HATCH_STROKE + DIFF_HATCH_INTERVAL;
+        for scale in [1.0_f32, 1.5, 2.0] {
+            assert_eq!(
+                (DIFF_LINE_HEIGHT * scale) % period,
+                0.0,
+                "hatch period {period} must divide the device-pixel row height \
+                 at {scale}x so stacked gap rows tile without a seam"
+            );
+        }
     }
 
     #[gpui::test]
