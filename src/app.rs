@@ -3202,7 +3202,31 @@ impl App {
                     .child(render_file_diff_stat(diff_stat_selector, file.line_stats))
                     .into_any_element()
             }
-            _ => base(false).into_any_element(),
+            FileTreeRow::File {
+                entry: FileListEntry::Unchanged(file),
+                ..
+            } => {
+                let selected = self.is_file_path_highlighted(row.path());
+                let path = file.path.clone();
+                let gutter_selector = if selected {
+                    format!("selected-unchanged-file-gutter-{index}")
+                } else {
+                    format!("unchanged-file-gutter-{index}")
+                };
+                base(selected)
+                    .cursor_pointer()
+                    .id(("unchanged-file-gutter", index))
+                    .debug_selector(move || gutter_selector.clone())
+                    .on_click(cx.listener(move |app, event: &ClickEvent, _window, cx| {
+                        if event.click_count() >= 2 {
+                            app.open_file_pinned(path.clone(), cx);
+                        } else {
+                            app.open_file_preview(path.clone(), cx);
+                        }
+                    }))
+                    .into_any_element()
+            }
+            FileTreeRow::Folder { .. } => base(false).into_any_element(),
         }
     }
 

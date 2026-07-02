@@ -753,6 +753,90 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn selecting_unchanged_file_highlights_its_gutter_cell(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_changed_and_context_files();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open changeset");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let all_files_bounds = visual
+            .debug_bounds("file-list-mode-toggle")
+            .expect("all files toggle debug bounds");
+        visual.simulate_click(all_files_bounds.center(), Modifiers::none());
+
+        // Before selection the unchanged row's gutter cell renders unselected.
+        visual
+            .debug_bounds("unchanged-file-gutter-1")
+            .expect("unselected unchanged gutter cell debug bounds");
+
+        let unchanged_bounds = visual
+            .debug_bounds("unchanged-file-row-1")
+            .expect("unchanged file row debug bounds");
+        visual.simulate_click(unchanged_bounds.center(), Modifiers::none());
+
+        // The frozen stat gutter shares the row's selection background, so the
+        // highlight spans the panel's full width (spec: review/workflow.md,
+        // "The highlighted row's background spans the full width of the tree").
+        visual
+            .debug_bounds("selected-unchanged-file-row-1")
+            .expect("selected unchanged file row debug bounds");
+        visual
+            .debug_bounds("selected-unchanged-file-gutter-1")
+            .expect("selected unchanged gutter cell debug bounds");
+    }
+
+    #[gpui::test]
+    async fn clicking_unchanged_file_gutter_cell_selects_the_file(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_changed_and_context_files();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+            })
+            .expect("open changeset");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let all_files_bounds = visual
+            .debug_bounds("file-list-mode-toggle")
+            .expect("all files toggle debug bounds");
+        visual.simulate_click(all_files_bounds.center(), Modifiers::none());
+
+        let gutter_bounds = visual
+            .debug_bounds("unchanged-file-gutter-1")
+            .expect("unchanged gutter cell debug bounds");
+        visual.simulate_click(gutter_bounds.center(), Modifiers::none());
+
+        visual
+            .debug_bounds("file-read-only-content")
+            .expect("read-only file content debug bounds");
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.file_tree_highlight_path,
+                    Some("context.txt".to_string()),
+                );
+            })
+            .expect("read selected context file");
+    }
+
+    #[gpui::test]
     async fn all_files_mode_aligns_unchanged_and_changed_file_icons_at_the_same_depth(
         cx: &mut TestAppContext,
     ) {
