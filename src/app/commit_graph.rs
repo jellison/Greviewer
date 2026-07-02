@@ -543,7 +543,6 @@ pub(crate) fn render_commit_graph_lane(
                 .min_by_key(|connector| connector.from_lane)
         })
         .flatten();
-
     div()
         .relative()
         .flex()
@@ -3062,6 +3061,105 @@ mod tests {
         assert!(
             source_elbow.origin.x > trunk_mid_dot.origin.x,
             "the merge source elbow should curve up in the outer branch lane",
+        );
+    }
+
+    #[gpui::test]
+    async fn commit_rows_do_not_occlude_the_previous_row_fan_out_bend(cx: &mut TestAppContext) {
+        // A merge on the trunk fans out to a second parent in lane 2, crossing
+        // the occupied lane 1. The fan-out's descending quarter-arc is drawn by
+        // the merge row's bend overlay but lies below the merge row's bottom
+        // border, inside the next row. Commit rows therefore must not paint
+        // opaque backgrounds of their own — the selection highlight paints
+        // from an underlay behind the whole list — or the next row would erase
+        // the arc, collapsing the bend into a square corner with a gap above
+        // the inset vertical.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, _window, cx| {
+                let mut head_commit =
+                    commit_info_for_graph_at("merge", 50, &["trunk-2", "orange-tip"]);
+                head_commit.is_head = true;
+                seed_repo_open_mode_with_commits(
+                    app,
+                    dir.path().to_path_buf(),
+                    vec![
+                        commit_info_for_graph_at("blue-tip", 60, &["blue-base"]),
+                        head_commit,
+                        commit_info_for_graph_at("trunk-2", 40, &["blue-base"]),
+                        commit_info_for_graph_at("orange-tip", 30, &["orange-base"]),
+                        commit_info_for_graph_at("blue-base", 20, &["orange-base"]),
+                        commit_info_for_graph_at("orange-base", 10, &[]),
+                    ],
+                );
+                cx.notify();
+            })
+            .expect("seed open repository");
+
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected repo open mode");
+                };
+                let graph_commits = repo
+                    .commits
+                    .iter()
+                    .map(|commit| graph::GraphCommit {
+                        sha: commit.sha.clone(),
+                        authored_timestamp: commit.authored_timestamp,
+                        parent_shas: commit.parent_shas.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let rows = graph::layout_graph_anchored(&graph_commits, Some("merge"));
+                assert_eq!(rows[1].lane, 0, "the merge sits on the trunk");
+                assert!(
+                    rows[1].connectors.contains(&graph::GraphConnector {
+                        from_lane: 0,
+                        to_lane: 2,
+                        kind: GraphConnectorKind::BranchOut,
+                    }),
+                    "the merge fans out to its second parent across the occupied lane 1",
+                );
+            })
+            .expect("inspect graph layout");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let merge_row = visual
+            .debug_bounds("commit-row-1")
+            .or_else(|| visual.debug_bounds("selected-commit-row-1"))
+            .expect("merge commit row debug bounds");
+        let merge_row_elbow = visual
+            .debug_bounds("commit-graph-rounded-branch-out-elbow-1-2")
+            .expect("the merge row draws the fan-out bend overlay");
+        let inset_vertical = visual
+            .debug_bounds("commit-graph-vertical-2-2-top")
+            .expect("the incoming vertical below the merge row");
+        let history_container = visual
+            .debug_bounds("commit-history-container")
+            .expect("the history list wraps the selection underlay behind the rows");
+        let history_list = visual
+            .debug_bounds("commit-history")
+            .expect("commit history list debug bounds");
+
+        assert_eq!(
+            history_container.origin, history_list.origin,
+            "the selection underlay must cover the same area as the list it paints behind",
+        );
+        assert!(
+            merge_row_elbow.origin.y + merge_row_elbow.size.height
+                > merge_row.origin.y + merge_row.size.height,
+            "the fan-out bend overlay should extend below the merge row's bottom border",
+        );
+        assert_eq!(
+            inset_vertical.origin.y,
+            merge_row.origin.y
+                + merge_row.size.height
+                + px(commit_graph_bend_radius() - commit_graph_line_width()),
+            "the incoming vertical should stop at the fan-out arc's tangent",
         );
     }
 

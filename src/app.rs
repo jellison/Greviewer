@@ -2130,6 +2130,51 @@ impl App {
         self.graph_layout_recompute_count.get()
     }
 
+    fn render_commit_history_list(
+        &self,
+        item_count: usize,
+        scroll_handle: UniformListScrollHandle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        uniform_list(
+            "commit-history",
+            item_count,
+            cx.processor(move |app, range: std::ops::Range<usize>, _window, cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    return Vec::new();
+                };
+                // Cheap O(loaded-commits) filter of references (no heavy
+                // clones); recomputed per frame intentionally. The
+                // expensive O(n^2) DAG layout it feeds is memoized by
+                // `graph_layout`.
+                let visible_commits = visible_commits(repo, &app.hidden_branches);
+                let layout = app.graph_layout(repo);
+                range
+                    .map(|index| {
+                        app.render_commit_row(
+                            index,
+                            visible_commits[index],
+                            &layout.rows,
+                            layout.max_lanes,
+                            app.is_commit_selected(&visible_commits[index].sha),
+                            cx,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .size_full()
+        .min_h_0()
+        .min_w_0()
+        .pr(px(COMMIT_HISTORY_SCROLLBAR_GUTTER))
+        .track_scroll(scroll_handle)
+        .on_scroll_wheel(cx.listener(|app, event, window, cx| {
+            app.load_older_commits_after_scroll(event, window, cx);
+        }))
+        .debug_selector(|| "commit-history".to_string())
+        .into_any_element()
+    }
+
     fn render_graph_screen(
         &self,
         repo: &repo::OpenRepository,
@@ -2151,44 +2196,49 @@ impl App {
             let layout = self.graph_layout(repo);
             let item_count = layout.rows.len();
             let scroll_handle = self.commit_history_scroll.clone();
-            uniform_list(
-                "commit-history",
-                item_count,
-                cx.processor(move |app, range: std::ops::Range<usize>, _window, cx| {
-                    let Mode::RepoOpen { repo } = &app.mode else {
-                        return Vec::new();
-                    };
-                    // Cheap O(loaded-commits) filter of references (no heavy
-                    // clones); recomputed per frame intentionally. The
-                    // expensive O(n^2) DAG layout it feeds is memoized by
-                    // `graph_layout`.
-                    let visible_commits = visible_commits(repo, &app.hidden_branches);
-                    let layout = app.graph_layout(repo);
-                    range
-                        .map(|index| {
-                            app.render_commit_row(
-                                index,
-                                visible_commits[index],
-                                &layout.rows,
-                                layout.max_lanes,
-                                app.is_commit_selected(&visible_commits[index].sha),
-                                cx,
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                }),
+            // Selection highlight, painted behind the rows. Commit rows carry
+            // no background of their own: the graph gutter's bend overlays
+            // deliberately spill across row borders (curves are centered on
+            // the boundary between rows), and rows paint top to bottom, so an
+            // opaque background on a row would erase whatever the row above
+            // drew below the border. The highlight therefore lives in this
+            // canvas underlay, which reads the scroll offset at paint time so
+            // it can never lag the rows during a scroll.
+            let selected_indices: Vec<usize> = visible_commits(repo, &self.hidden_branches)
+                .iter()
+                .enumerate()
+                .filter(|(_, commit)| self.is_commit_selected(&commit.sha))
+                .map(|(index, _)| index)
+                .collect();
+            let underlay_scroll = self.commit_history_scroll.clone();
+            let selection_underlay = canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let scroll_offset = underlay_scroll.0.borrow().base_handle.offset();
+                    for rect in commit_history_selection_underlay_rects(
+                        bounds,
+                        scroll_offset.y,
+                        &selected_indices,
+                    ) {
+                        window.paint_quad(gpui::fill(rect, palette().row_selected));
+                    }
+                },
             )
-            .flex_1()
-            .h_full()
-            .min_h_0()
-            .min_w_0()
-            .pr(px(12.))
-            .track_scroll(scroll_handle)
-            .on_scroll_wheel(cx.listener(|app, event, window, cx| {
-                app.load_older_commits_after_scroll(event, window, cx);
-            }))
-            .debug_selector(|| "commit-history".to_string())
-            .into_any_element()
+            .absolute()
+            .left_0()
+            .top_0()
+            .size_full();
+
+            div()
+                .relative()
+                .flex_1()
+                .h_full()
+                .min_h_0()
+                .min_w_0()
+                .debug_selector(|| "commit-history-container".to_string())
+                .child(selection_underlay)
+                .child(self.render_commit_history_list(item_count, scroll_handle, cx))
+                .into_any_element()
         };
 
         let history_panel = div()
@@ -3775,11 +3825,6 @@ impl App {
         selected: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let row_bg = if selected {
-            palette().row_selected
-        } else {
-            palette().background
-        };
         let debug_selector = if selected {
             format!("selected-commit-row-{index}")
         } else {
@@ -3795,7 +3840,10 @@ impl App {
             .font_family(MONO_FONT_FAMILY)
             .gap_3()
             .px_4()
-            .bg(row_bg)
+            // No background: the selection highlight paints from the list's
+            // underlay canvas (see `render_graph_screen`), and an opaque row
+            // background here would erase the graph bend overlays the row
+            // above draws across the shared border.
             .when(commit_row_separator_width() > 0., |row| {
                 row.border_b(px(commit_row_separator_width()))
                     .border_color(commit_row_separator_color(selected))
@@ -3879,6 +3927,34 @@ const COMMIT_ROW_HEIGHT: f32 = 44.;
 const COMMIT_HASH_WIDTH: f32 = 72.;
 const COMMIT_AUTHOR_WIDTH: f32 = 168.;
 const COMMIT_TIME_WIDTH: f32 = 96.;
+
+/// Width reserved on the right edge of the history list for the scrollbar;
+/// the commit rows and the selection underlay both stop short of it.
+const COMMIT_HISTORY_SCROLLBAR_GUTTER: f32 = 12.;
+
+/// The rectangles the selection underlay paints behind the selected commit
+/// rows: one row-sized rect per selected index, shifted by the list's current
+/// scroll offset and clipped to the list bounds so nothing paints outside the
+/// visible list.
+pub(crate) fn commit_history_selection_underlay_rects(
+    bounds: gpui::Bounds<gpui::Pixels>,
+    scroll_offset_y: gpui::Pixels,
+    selected_indices: &[usize],
+) -> Vec<gpui::Bounds<gpui::Pixels>> {
+    let width = (bounds.size.width - px(COMMIT_HISTORY_SCROLLBAR_GUTTER)).max(px(0.));
+    selected_indices
+        .iter()
+        .filter_map(|index| {
+            let top = bounds.origin.y + scroll_offset_y + px(*index as f32 * COMMIT_ROW_HEIGHT);
+            let row = gpui::Bounds::new(
+                point(bounds.origin.x, top),
+                gpui::size(width, px(COMMIT_ROW_HEIGHT)),
+            );
+            let clipped = row.intersect(&bounds);
+            (clipped.size.height > px(0.)).then_some(clipped)
+        })
+        .collect()
+}
 
 impl Render for App {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4052,6 +4128,52 @@ mod tests {
     use std::{fs, rc::Rc};
 
     use super::test_support::*;
+
+    #[test]
+    fn selection_underlay_rects_follow_scroll_and_clip_to_the_list() {
+        use super::{
+            commit_history_selection_underlay_rects, COMMIT_HISTORY_SCROLLBAR_GUTTER,
+            COMMIT_ROW_HEIGHT,
+        };
+        use gpui::{point, size, Bounds};
+
+        let bounds = Bounds::new(point(px(100.), px(50.)), size(px(500.), px(200.)));
+
+        // Unscrolled, row 1 sits one row height below the list top and stops
+        // short of the scrollbar gutter.
+        let rects = commit_history_selection_underlay_rects(bounds, px(0.), &[1]);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(
+            rects[0].origin,
+            point(px(100.), px(50. + COMMIT_ROW_HEIGHT))
+        );
+        assert_eq!(
+            rects[0].size,
+            size(
+                px(500. - COMMIT_HISTORY_SCROLLBAR_GUTTER),
+                px(COMMIT_ROW_HEIGHT)
+            ),
+        );
+
+        // Scrolling up by half a row shifts the highlight with the rows.
+        let rects =
+            commit_history_selection_underlay_rects(bounds, px(-COMMIT_ROW_HEIGHT / 2.), &[1]);
+        assert_eq!(
+            rects[0].origin.y,
+            px(50. + COMMIT_ROW_HEIGHT - COMMIT_ROW_HEIGHT / 2.)
+        );
+
+        // A row scrolled partly above the list clips to the list's top edge...
+        let rects =
+            commit_history_selection_underlay_rects(bounds, px(-COMMIT_ROW_HEIGHT / 2.), &[0]);
+        assert_eq!(rects[0].origin.y, px(50.));
+        assert_eq!(rects[0].size.height, px(COMMIT_ROW_HEIGHT / 2.));
+
+        // ...and rows entirely outside the list paint nothing.
+        let rects =
+            commit_history_selection_underlay_rects(bounds, px(-COMMIT_ROW_HEIGHT), &[0, 40]);
+        assert!(rects.is_empty());
+    }
 
     #[test]
     fn restored_width_uses_default_when_unset_and_clamps_bad_values() {
