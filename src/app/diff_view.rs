@@ -10,8 +10,10 @@ use crate::theme::palette;
 pub(crate) fn render_prepared_file_diff(
     prepared: &PreparedFileDiff,
     scroll: &FileDiffScroll,
+    hovered: bool,
 ) -> AnyElement {
     let p = palette();
+    let max_line_chars = prepared.max_line_chars();
     match prepared {
         PreparedFileDiff::Single { side, rows, .. } => {
             let side = *side;
@@ -27,8 +29,15 @@ pub(crate) fn render_prepared_file_diff(
                 })
                 .collect::<Vec<_>>();
 
-            render_file_diff_side(selector, cells, scroll.handle_for(side).clone())
-                .into_any_element()
+            render_file_diff_side(
+                selector,
+                cells,
+                scroll.handle_for(side).clone(),
+                scroll.hscroll.clone(),
+                max_line_chars,
+                hovered,
+            )
+            .into_any_element()
         }
         PreparedFileDiff::SideBySide { rows, .. } => {
             let old_cells = rows.iter().map(|row| row.old.clone()).collect::<Vec<_>>();
@@ -42,12 +51,18 @@ pub(crate) fn render_prepared_file_diff(
                     "file-diff-side-old",
                     old_cells,
                     scroll.side_by_side.clone(),
+                    scroll.hscroll.clone(),
+                    max_line_chars,
+                    hovered,
                 ))
                 .child(div().w(px(1.)).flex_none().bg(p.border))
                 .child(render_file_diff_side(
                     "file-diff-side-new",
                     new_cells,
                     scroll.side_by_side.clone(),
+                    scroll.hscroll.clone(),
+                    max_line_chars,
+                    hovered,
                 ))
                 .into_any_element()
         }
@@ -314,6 +329,7 @@ pub(crate) fn render_file_content(
     content: repo::FileContentBody,
     scroll: &FileDiffScroll,
     language: &str,
+    hovered: bool,
 ) -> AnyElement {
     match content {
         repo::FileContentBody::Text(text) => {
@@ -326,10 +342,19 @@ pub(crate) fn render_file_content(
                 })
                 .collect::<Vec<_>>();
 
+            let max_line_chars = cells
+                .iter()
+                .map(|cell| cell.text.chars().count())
+                .max()
+                .unwrap_or(0);
+
             render_file_diff_side(
                 "file-read-only-content",
                 cells,
                 scroll.handle_for(repo::DiffSide::New).clone(),
+                scroll.hscroll.clone(),
+                max_line_chars,
+                hovered,
             )
             .into_any_element()
         }
@@ -432,6 +457,24 @@ pub(crate) fn change_blocks(rows: &[DiffRow], max_gap: usize) -> Vec<ChangeBlock
     blocks
 }
 
+/// The widest line in the diff, in characters, across both sides. Drives the
+/// shared horizontal scroll range: every code cell advertises this width so
+/// all cells clamp the shared horizontal offset identically (a gpui
+/// scrollable clamps a shared handle to its own content each frame). Tabs
+/// count as one character — an accepted imprecision for a monospace layout.
+pub(crate) fn widest_line_chars(rows: &[DiffRow]) -> usize {
+    rows.iter()
+        .map(|row| {
+            row.old
+                .text
+                .chars()
+                .count()
+                .max(row.new.text.chars().count())
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Identifies a cached diff: the changed file's path plus the commit and base
 /// shas it was diffed against. Two changesets that touch the same path produce
 /// different keys, so a stale entry is never served.
@@ -453,10 +496,12 @@ pub(crate) enum PreparedFileDiff {
         side: repo::DiffSide,
         rows: Vec<DiffRow>,
         blocks: Vec<ChangeBlock>,
+        max_line_chars: usize,
     },
     SideBySide {
         rows: Vec<DiffRow>,
         blocks: Vec<ChangeBlock>,
+        max_line_chars: usize,
     },
     Binary,
 }
@@ -474,13 +519,24 @@ impl PreparedFileDiff {
                     }
                 }
                 let blocks = change_blocks(&rows, CHANGE_BLOCK_MAX_GAP);
-                PreparedFileDiff::Single { side, rows, blocks }
+                let max_line_chars = widest_line_chars(&rows);
+                PreparedFileDiff::Single {
+                    side,
+                    rows,
+                    blocks,
+                    max_line_chars,
+                }
             }
             repo::FileDiffContent::SideBySide { old_text, new_text } => {
                 let mut rows = side_by_side_diff_rows(&old_text, &new_text);
                 attach_diff_highlights(&mut rows, &old_text, &new_text, language);
                 let blocks = change_blocks(&rows, CHANGE_BLOCK_MAX_GAP);
-                PreparedFileDiff::SideBySide { rows, blocks }
+                let max_line_chars = widest_line_chars(&rows);
+                PreparedFileDiff::SideBySide {
+                    rows,
+                    blocks,
+                    max_line_chars,
+                }
             }
             repo::FileDiffContent::Binary => PreparedFileDiff::Binary,
         }
@@ -493,6 +549,16 @@ impl PreparedFileDiff {
             PreparedFileDiff::Single { blocks, .. }
             | PreparedFileDiff::SideBySide { blocks, .. } => blocks,
             PreparedFileDiff::Binary => &[],
+        }
+    }
+
+    /// The widest line of this diff in characters, across both sides. Zero
+    /// for a binary diff, which has no lines to pan.
+    pub(crate) fn max_line_chars(&self) -> usize {
+        match self {
+            PreparedFileDiff::Single { max_line_chars, .. }
+            | PreparedFileDiff::SideBySide { max_line_chars, .. } => *max_line_chars,
+            PreparedFileDiff::Binary => 0,
         }
     }
 }
@@ -683,15 +749,45 @@ pub(crate) fn read_only_file_cells(text: &str) -> Vec<DiffLineCell> {
         .collect()
 }
 
+/// Minimum width of every code cell's inner content: the diff's widest line
+/// at the monospace advance width, plus the cell padding. Every cell
+/// advertising the same content width keeps the shared pan's clamp identical
+/// across rows and panes — a gpui scrollable clamps a shared handle to its
+/// own content each frame, so a narrower cell would zero the pan.
+fn code_cell_min_width(max_line_chars: usize, window: &gpui::Window) -> Pixels {
+    let text_system = window.text_system();
+    let font_id = text_system.resolve_font(&gpui::font(MONO_FONT_FAMILY));
+    let advance = text_system
+        .advance(font_id, px(DIFF_TEXT_SIZE), '0')
+        .map(|size| size.width)
+        // A missing glyph metric only mis-sizes the scroll range; 0.6em is a
+        // reasonable monospace advance.
+        .unwrap_or(px(DIFF_TEXT_SIZE * 0.6));
+    advance * max_line_chars as f32 + px(2. * DIFF_CODE_CELL_PADDING)
+}
+
 pub(crate) fn render_file_diff_side(
     selector: &'static str,
     cells: Vec<DiffLineCell>,
     scroll_handle: UniformListScrollHandle,
+    hscroll: ScrollHandle,
+    max_line_chars: usize,
+    hovered: bool,
 ) -> impl IntoElement {
     let p = palette();
-    uniform_list(selector, cells.len(), move |range, _window, _cx| {
+    let list_hscroll = hscroll.clone();
+    let mut list = uniform_list(selector, cells.len(), move |range, window, _cx| {
+        let code_min_width = code_cell_min_width(max_line_chars, window);
         range
-            .map(|index| render_file_diff_line(selector, index, cells[index].clone()))
+            .map(|index| {
+                render_file_diff_line(
+                    selector,
+                    index,
+                    cells[index].clone(),
+                    &list_hscroll,
+                    code_min_width,
+                )
+            })
             .collect::<Vec<_>>()
     })
     .flex_1()
@@ -705,13 +801,46 @@ pub(crate) fn render_file_diff_side(
     // padding insets the rows identically and keeps the diff's appearance.
     .pr(px(12.))
     .track_scroll(scroll_handle)
-    .debug_selector(move || selector.to_string())
+    .debug_selector(move || selector.to_string());
+    // Without this, gpui redirects a *horizontal* wheel gesture onto this
+    // vertical-only list (an unused axis delta falls through to the scrollable
+    // axis), fighting the code cells' pan.
+    list.interactivity().base_style.restrict_scroll_to_axis = Some(true);
+
+    // `max_offset` reads the clamp the code cells wrote on the last paint, so
+    // the bar appears only when the content actually overflows.
+    let show_scrollbar = hovered && hscroll.max_offset().width > px(0.);
+
+    div()
+        .relative()
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .min_h_0()
+        .child(list)
+        .when(show_scrollbar, |side| {
+            side.child(
+                // The overlay spans only the panning code region: inset past
+                // the frozen gutter on the left and the reserved 12px row
+                // gutter on the right, mirroring the file tree's arrangement.
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(DIFF_GUTTER_WIDTH))
+                    .right(px(12.))
+                    .debug_selector(move || format!("{selector}-hscrollbar"))
+                    .child(Scrollbar::horizontal(&hscroll).scrollbar_show(ScrollbarShow::Always)),
+            )
+        })
 }
 
 pub(crate) fn render_file_diff_line(
     pane_selector: &'static str,
     row_index: usize,
     cell: DiffLineCell,
+    hscroll: &ScrollHandle,
+    code_min_width: Pixels,
 ) -> impl IntoElement {
     let p = palette();
     let line_number = cell
@@ -732,29 +861,30 @@ pub(crate) fn render_file_diff_line(
         .flex()
         .h(px(DIFF_LINE_HEIGHT))
         // `uniform_list` lays each row out with the pane's width as the
-        // available space, but a bare flex row sizes to its content. Without
-        // this the status fill and the empty-gap hatch stop at the code text
-        // instead of spanning the row. `min_w_full` fills at least the pane
-        // width while still letting a long line grow past it.
-        .min_w_full()
+        // available space, but a bare flex row sizes to its content.
+        // `w_full` pins the row to that width so the status fill and the
+        // empty-gap hatch span it; a `min_w_full` (a lower bound, not a cap)
+        // let the code cell's huge min-content width balloon the row itself,
+        // stretching the scrollable code cell to its content and zeroing the
+        // pan's clamp. Long code no longer widens the row — it pans inside
+        // the code cell instead.
+        .w_full()
         .bg(diff_line_fill(cell.status))
         .id(("file-diff-line", id_index))
         .debug_selector(move || row_selector.to_string())
-        .child(
-            div()
-                .w(px(3.))
-                .flex_none()
-                .when_some(accent, |bar, (color, accent_selector)| {
-                    bar.bg(color)
-                        .debug_selector(move || accent_selector.to_string())
-                }),
-        )
+        .child(div().w(px(DIFF_ACCENT_WIDTH)).flex_none().when_some(
+            accent,
+            |bar, (color, accent_selector)| {
+                bar.bg(color)
+                    .debug_selector(move || accent_selector.to_string())
+            },
+        ))
         .child(
             div()
                 .flex()
                 .items_center()
                 .justify_end()
-                .w(px(48.))
+                .w(px(DIFF_LINE_NUMBER_WIDTH))
                 .pr_2()
                 .flex_none()
                 .text_color(p.text_muted)
@@ -764,29 +894,61 @@ pub(crate) fn render_file_diff_line(
                 .debug_selector(move || diff_line_index_selector(pane_selector, row_index))
                 .child(line_number),
         )
-        .child(
-            div()
+        .child({
+            let mut code_cell = div()
+                .id(("file-diff-code", id_index))
                 .flex()
-                .items_center()
                 .flex_1()
-                .px_2()
                 .min_w_0()
+                .overflow_x_scroll()
+                .track_scroll(hscroll)
                 // gpui's `StyledText` takes its font size and line height from
                 // the ambient `window.text_style()` (the cascade of `.text_size`
                 // / `.line_height` from ancestor divs), NOT from the `TextStyle`
                 // passed to `with_default_highlights` — that style only supplies
                 // per-run font family, weight, and color. So the authoritative
-                // sizing for the code text lives here on the parent div; changing
-                // the fields in `diff_text_style()` alone has no visual effect.
+                // sizing for the code text lives here, not in `diff_text_style()`.
                 .text_size(px(DIFF_TEXT_SIZE))
                 .line_height(px(DIFF_LINE_HEIGHT))
-                .when(has_text, |content| {
-                    content.child(
-                        StyledText::new(cell.text)
-                            .with_default_highlights(&diff_text_style(), cell.highlights),
-                    )
-                }),
-        )
+                .child(
+                    // Every cell's content advertises the same minimum width
+                    // (see `code_cell_min_width`), keeping the shared pan's
+                    // clamp identical across rows and panes.
+                    div()
+                        .flex()
+                        .items_center()
+                        .h_full()
+                        .px(px(DIFF_CODE_CELL_PADDING))
+                        .min_w(code_min_width)
+                        .whitespace_nowrap()
+                        .debug_selector(move || {
+                            diff_code_content_selector(pane_selector, row_index)
+                        })
+                        .when(has_text, |content| {
+                            content.child(
+                                StyledText::new(cell.text)
+                                    .with_default_highlights(&diff_text_style(), cell.highlights),
+                            )
+                        }),
+                );
+            // Without this, gpui redirects a *vertical* wheel gesture onto
+            // this horizontal-only cell, panning when the user meant to
+            // scroll the rows.
+            code_cell.interactivity().base_style.restrict_scroll_to_axis = Some(true);
+            code_cell
+        })
+}
+
+/// Per-row debug selector for the panning code content, e.g.
+/// `file-diff-code-new-12`. Its painted origin shifts with the shared pan,
+/// which is what lets a test prove the code moved while the gutter did not.
+pub(crate) fn diff_code_content_selector(pane_selector: &str, row_index: usize) -> String {
+    let side = match pane_selector {
+        "file-diff-side-old" => "old",
+        "file-diff-side-new" => "new",
+        _ => "single",
+    };
+    format!("file-diff-code-{side}-{row_index}")
 }
 
 /// Per-row debug selector encoding the column side and row index, e.g.
@@ -806,6 +968,20 @@ pub(crate) fn diff_line_index_selector(pane_selector: &str, row_index: usize) ->
 /// glyphs without clipping, with extra vertical padding around them, and the
 /// shared box that vertically centers the gutter number against its code line.
 pub(crate) const DIFF_LINE_HEIGHT: f32 = 22.;
+
+/// Width of the status accent bar at a row's left edge.
+pub(crate) const DIFF_ACCENT_WIDTH: f32 = 3.;
+
+/// Width of the line-number cell.
+pub(crate) const DIFF_LINE_NUMBER_WIDTH: f32 = 48.;
+
+/// The frozen gutter: accent bar plus line numbers. Code cells pan to its
+/// right; the horizontal scrollbar overlay is inset by this much so it spans
+/// only the panning region.
+pub(crate) const DIFF_GUTTER_WIDTH: f32 = DIFF_ACCENT_WIDTH + DIFF_LINE_NUMBER_WIDTH;
+
+/// Horizontal padding inside a code cell, each side.
+pub(crate) const DIFF_CODE_CELL_PADDING: f32 = 8.;
 
 /// Font size for diff gutter numbers and code lines. Kept in one place so the
 /// gutter and the code text always render at the same scale.
@@ -1238,6 +1414,58 @@ mod tests {
                  at {scale}x so stacked gap rows tile without a seam"
             );
         }
+    }
+
+    #[test]
+    fn widest_line_chars_spans_both_sides() {
+        let rows = side_by_side_diff_rows("short\n", "a much longer replacement line\n");
+        assert_eq!(
+            widest_line_chars(&rows),
+            "a much longer replacement line".chars().count()
+        );
+    }
+
+    #[test]
+    fn widest_line_chars_of_no_rows_is_zero() {
+        assert_eq!(widest_line_chars(&[]), 0);
+    }
+
+    #[test]
+    fn prepared_diff_exposes_its_widest_line() {
+        let content = repo::FileDiffContent::SideBySide {
+            old_text: "tiny\n".to_string(),
+            new_text: "a considerably wider line\n".to_string(),
+        };
+        let prepared = PreparedFileDiff::from_content(content, "");
+        assert_eq!(
+            prepared.max_line_chars(),
+            "a considerably wider line".chars().count()
+        );
+    }
+
+    #[test]
+    fn single_side_prepared_diff_exposes_its_widest_line() {
+        let content = repo::FileDiffContent::Single {
+            side: repo::DiffSide::New,
+            text: "short\na much longer added line\n".to_string(),
+        };
+        let prepared = PreparedFileDiff::from_content(content, "");
+        assert_eq!(
+            prepared.max_line_chars(),
+            "a much longer added line".chars().count()
+        );
+    }
+
+    #[test]
+    fn widest_line_chars_breaks_ties_between_equal_sides() {
+        let rows = side_by_side_diff_rows("same width A\n", "same width B\n");
+        assert_eq!(widest_line_chars(&rows), "same width A".chars().count());
+    }
+
+    #[test]
+    fn binary_prepared_diff_has_no_line_width() {
+        let prepared = PreparedFileDiff::from_content(repo::FileDiffContent::Binary, "");
+        assert_eq!(prepared.max_line_chars(), 0);
     }
 
     #[gpui::test]
@@ -1768,6 +1996,229 @@ mod tests {
         (dir, window, visual)
     }
 
+    /// Open the wide-lined modified file in a single pane, returning the temp
+    /// repo (kept alive by the caller), the window, and its visual context.
+    fn open_wide_diff(
+        cx: &mut TestAppContext,
+    ) -> (tempfile::TempDir, WindowHandle<App>, VisualTestContext) {
+        use gpui::{px, size};
+
+        let (dir, oid_hex) = init_repo_with_long_lines();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.open_file_preview("wide.txt".to_string(), cx);
+            })
+            .expect("open wide diff");
+
+        cx.run_until_parked();
+
+        let visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(320.)));
+        cx.run_until_parked();
+
+        (dir, window, visual)
+    }
+
+    #[gpui::test]
+    async fn horizontal_wheel_pans_the_diff_through_the_shared_offset(cx: &mut TestAppContext) {
+        use gpui::{point, px, ScrollDelta, ScrollWheelEvent};
+
+        let (_dir, window, mut visual) = open_wide_diff(cx);
+
+        let side = visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new file diff side debug bounds");
+        let before = window
+            .read_with(cx, |app, _cx| app.file_diff_hscroll_offset())
+            .expect("read pan offset before wheel");
+        assert_eq!(before.x, px(0.), "a fresh diff starts unpanned");
+
+        visual.simulate_event(ScrollWheelEvent {
+            position: side.origin + point(px(100.), px(30.)),
+            delta: ScrollDelta::Pixels(point(px(-240.), px(0.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+
+        let after = window
+            .read_with(cx, |app, _cx| app.file_diff_hscroll_offset())
+            .expect("read pan offset after wheel");
+        assert!(after.x < before.x, "horizontal wheel should pan the diff");
+    }
+
+    #[gpui::test]
+    async fn panning_keeps_the_gutter_frozen_while_code_shifts(cx: &mut TestAppContext) {
+        use gpui::{point, px, ScrollDelta, ScrollWheelEvent};
+
+        let (_dir, _window, mut visual) = open_wide_diff(cx);
+
+        let side = visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new file diff side debug bounds");
+        let number_before = visual
+            .debug_bounds("file-diff-line-new-1")
+            .expect("number cell before pan");
+        let code_before = visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("code content before pan");
+        let old_code_before = visual
+            .debug_bounds("file-diff-code-old-1")
+            .expect("old-side code content before pan");
+
+        visual.simulate_event(ScrollWheelEvent {
+            position: side.origin + point(px(100.), px(30.)),
+            delta: ScrollDelta::Pixels(point(px(-240.), px(0.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+
+        let number_after = visual
+            .debug_bounds("file-diff-line-new-1")
+            .expect("number cell after pan");
+        let code_after = visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("code content after pan");
+
+        assert_eq!(
+            number_after.origin.x, number_before.origin.x,
+            "line numbers stay frozen at the left edge"
+        );
+        assert!(
+            code_after.origin.x < code_before.origin.x,
+            "code content pans under the gutter"
+        );
+
+        let old_code_after = visual
+            .debug_bounds("file-diff-code-old-1")
+            .expect("old-side code content after pan");
+        assert_eq!(
+            old_code_after.origin.x - old_code_before.origin.x,
+            code_after.origin.x - code_before.origin.x,
+            "the old side pans in lockstep with the new side"
+        );
+    }
+
+    #[gpui::test]
+    async fn short_lines_do_not_pan(cx: &mut TestAppContext) {
+        use gpui::{point, px, size, ScrollDelta, ScrollWheelEvent};
+
+        let (dir, oid_hex) = init_repo_with_long_lines();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.open_file_preview("narrow.txt".to_string(), cx);
+            })
+            .expect("open narrow diff");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(320.)));
+        cx.run_until_parked();
+
+        let side = visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new file diff side debug bounds");
+        visual.simulate_event(ScrollWheelEvent {
+            position: side.origin + point(px(100.), px(10.)),
+            delta: ScrollDelta::Pixels(point(px(-240.), px(0.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+
+        let offset = window
+            .read_with(cx, |app, _cx| app.file_diff_hscroll_offset())
+            .expect("read pan offset");
+        assert_eq!(
+            offset.x,
+            px(0.),
+            "a diff whose lines fit clamps the pan back to zero"
+        );
+    }
+
+    #[gpui::test]
+    async fn vertical_wheel_scrolls_rows_without_panning(cx: &mut TestAppContext) {
+        use gpui::{point, px, ScrollDelta, ScrollWheelEvent};
+
+        let (_dir, window, mut visual) = open_wide_diff(cx);
+
+        let side = visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new file diff side debug bounds");
+        let vertical_before = window
+            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .expect("read vertical offset before wheel");
+
+        visual.simulate_event(ScrollWheelEvent {
+            position: side.origin + point(px(100.), px(30.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+
+        let vertical_after = window
+            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .expect("read vertical offset after wheel");
+        let pan = window
+            .read_with(cx, |app, _cx| app.file_diff_hscroll_offset())
+            .expect("read pan offset");
+
+        assert!(
+            vertical_after.y < vertical_before.y,
+            "vertical wheel over a code cell still scrolls the rows"
+        );
+        assert_eq!(
+            pan.x,
+            px(0.),
+            "a purely vertical wheel must not leak into a horizontal pan"
+        );
+    }
+
+    #[gpui::test]
+    async fn opening_another_file_resets_the_pan(cx: &mut TestAppContext) {
+        use gpui::{point, px, ScrollDelta, ScrollWheelEvent};
+
+        let (_dir, window, mut visual) = open_wide_diff(cx);
+
+        let side = visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new file diff side debug bounds");
+        visual.simulate_event(ScrollWheelEvent {
+            position: side.origin + point(px(100.), px(30.)),
+            delta: ScrollDelta::Pixels(point(px(-240.), px(0.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+
+        let panned = window
+            .read_with(cx, |app, _cx| app.file_diff_hscroll_offset())
+            .expect("read pan offset while panned");
+        assert!(panned.x < px(0.), "the wide diff panned");
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.open_file_preview("narrow.txt".to_string(), cx);
+            })
+            .expect("open narrow file");
+        cx.run_until_parked();
+
+        let reset = window
+            .read_with(cx, |app, _cx| app.file_diff_hscroll_offset())
+            .expect("read pan offset after switching files");
+        assert_eq!(reset.x, px(0.), "opening a file starts it unpanned");
+    }
+
     #[gpui::test]
     async fn change_block_footer_reports_the_current_position(cx: &mut TestAppContext) {
         let (_dir, window, mut visual) = open_multi_block_diff(cx);
@@ -1957,6 +2408,94 @@ mod tests {
         assert!(
             visual.debug_bounds("change-block-footer").is_none(),
             "a binary diff has no change blocks and shows no footer"
+        );
+    }
+
+    #[gpui::test]
+    async fn hovering_a_wide_diff_reveals_the_horizontal_scrollbar(cx: &mut TestAppContext) {
+        use gpui::{point, px};
+
+        let (_dir, _window, mut visual) = open_wide_diff(cx);
+
+        assert!(
+            visual
+                .debug_bounds("file-diff-side-new-hscrollbar")
+                .is_none(),
+            "no scrollbar before the pointer enters the pane"
+        );
+
+        let side = visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new file diff side debug bounds");
+        visual.simulate_mouse_move(
+            side.origin + point(px(100.), px(30.)),
+            None,
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+
+        assert!(
+            visual
+                .debug_bounds("file-diff-side-new-hscrollbar")
+                .is_some(),
+            "hovering the pane reveals the new side's scrollbar"
+        );
+        assert!(
+            visual
+                .debug_bounds("file-diff-side-old-hscrollbar")
+                .is_some(),
+            "both sides reveal their bars together"
+        );
+
+        visual.simulate_mouse_move(point(px(-10.), px(-10.)), None, Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(
+            visual
+                .debug_bounds("file-diff-side-new-hscrollbar")
+                .is_none(),
+            "leaving the pane hides the scrollbar"
+        );
+    }
+
+    #[gpui::test]
+    async fn short_diff_shows_no_horizontal_scrollbar_on_hover(cx: &mut TestAppContext) {
+        use gpui::{point, px, size};
+
+        let (dir, oid_hex) = init_repo_with_long_lines();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.open_file_preview("narrow.txt".to_string(), cx);
+            })
+            .expect("open narrow diff");
+
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(320.)));
+        cx.run_until_parked();
+
+        let side = visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new file diff side debug bounds");
+        visual.simulate_mouse_move(
+            side.origin + point(px(100.), px(10.)),
+            None,
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+
+        assert!(
+            visual
+                .debug_bounds("file-diff-side-new-hscrollbar")
+                .is_none(),
+            "a diff with no horizontal overflow never shows the bar"
         );
     }
 }

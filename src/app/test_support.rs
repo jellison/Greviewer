@@ -658,6 +658,37 @@ pub(crate) fn init_repo_with_long_diff() -> (tempfile::TempDir, String) {
     (dir, update_oid.to_string())
 }
 
+/// A two-file changeset for horizontal-scroll tests. `wide.txt` is 40 short
+/// lines whose second line becomes ~400 characters wide, so its diff
+/// overflows any reasonable pane while staying vertically scrollable; the old
+/// side keeps only short lines, exercising the equal-width invariant across
+/// sides. `narrow.txt` changes but keeps every line short.
+pub(crate) fn init_repo_with_long_lines() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let repo = Repository::init(dir.path()).expect("init repo");
+
+    let base = (1..=40)
+        .map(|line| format!("short {line:03}\n"))
+        .collect::<String>();
+    fs::write(dir.path().join("wide.txt"), &base).expect("write old wide file");
+    fs::write(dir.path().join("narrow.txt"), "narrow\n").expect("write old narrow file");
+    let root_oid = commit_all(&repo, "Add wide and narrow files", &[]);
+
+    let long_line = "wide ".repeat(80);
+    let mut lines = (1..=40)
+        .map(|line| format!("short {line:03}"))
+        .collect::<Vec<_>>();
+    lines[1] = long_line;
+    let updated = lines.join("\n") + "\n";
+    fs::write(dir.path().join("wide.txt"), updated).expect("write new wide file");
+    fs::write(dir.path().join("narrow.txt"), "narrow changed\n").expect("write new narrow file");
+    let update_oid = commit_all(&repo, "Widen wide.txt", &[root_oid]);
+
+    drop(repo);
+
+    (dir, update_oid.to_string())
+}
+
 /// A modified file with three well-separated change blocks: a 60-line file
 /// whose lines 5, 30, and 55 change, leaving far more than the merge gap of
 /// unchanged context between each change. Exercises multi-block navigation.

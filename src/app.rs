@@ -165,6 +165,10 @@ pub struct App {
     /// True while the cursor is anywhere over the file-tree panel; gates the
     /// hover-revealed scrollbar overlay.
     file_tree_hovered: bool,
+    /// Which workspace pane's diff content the pointer is over, if any.
+    /// Drives that pane's hover-revealed horizontal scrollbar overlay,
+    /// mirroring the file tree's hover-revealed scrollbars.
+    pub(crate) hovered_diff_pane: Option<crate::workspace::PaneId>,
     changeset_resizable: Entity<ResizableState>,
     graph_resizable: Entity<ResizableState>,
     branch_sidebar_scroll: UniformListScrollHandle,
@@ -208,6 +212,11 @@ pub(crate) struct FileDiffScroll {
     old: UniformListScrollHandle,
     new: UniformListScrollHandle,
     side_by_side: UniformListScrollHandle,
+    /// One horizontal pan offset for every code cell this pane's diff shows,
+    /// shared across rows and — in a side-by-side diff — across both sides,
+    /// so the whole surface pans in lockstep. The gutter cells do not track
+    /// it, which is what keeps them frozen.
+    hscroll: ScrollHandle,
     /// Set when the shown file changes (via `reset`); consumed on the next
     /// render to scroll the diff to its first change block exactly once per
     /// open. Shared across clones so every reference to a pane's scroll sees
@@ -237,6 +246,7 @@ impl FileDiffScroll {
             old: UniformListScrollHandle::new(),
             new: UniformListScrollHandle::new(),
             side_by_side: UniformListScrollHandle::new(),
+            hscroll: ScrollHandle::new(),
             pending_focus: Rc::new(Cell::new(false)),
         }
     }
@@ -253,6 +263,7 @@ impl FileDiffScroll {
         self.old.0.borrow().base_handle.set_offset(origin);
         self.new.0.borrow().base_handle.set_offset(origin);
         self.side_by_side.0.borrow().base_handle.set_offset(origin);
+        self.hscroll.set_offset(origin);
         // A newly shown diff should land on its first change; the next render
         // consumes this to scroll there.
         self.pending_focus.set(true);
@@ -267,6 +278,11 @@ impl FileDiffScroll {
     #[cfg(test)]
     fn side_by_side_offset(&self) -> gpui::Point<gpui::Pixels> {
         self.side_by_side.0.borrow().base_handle.offset()
+    }
+
+    #[cfg(test)]
+    fn hscroll_offset(&self) -> gpui::Point<gpui::Pixels> {
+        self.hscroll.offset()
     }
 
     #[cfg(test)]
@@ -694,6 +710,7 @@ impl App {
             file_tree_scroll: ScrollHandle::new(),
             file_tree_hscroll: ScrollHandle::new(),
             file_tree_hovered: false,
+            hovered_diff_pane: None,
             changeset_resizable,
             graph_resizable,
             branch_sidebar_scroll: UniformListScrollHandle::new(),
@@ -825,6 +842,7 @@ impl App {
             .set(self.branches_generation.get() + 1);
         self.sidebar_rows_cache.borrow_mut().take();
         self.file_tree_hovered = false;
+        self.hovered_diff_pane = None;
         self.context_popover_open = false;
         self.repo_switcher_open = false;
         cx.notify();
@@ -1206,6 +1224,7 @@ impl App {
                 self.file_tree_scroll.set_offset(point(px(0.), px(0.)));
                 self.file_tree_hscroll.set_offset(point(px(0.), px(0.)));
                 self.file_tree_hovered = false;
+                self.hovered_diff_pane = None;
                 let sha = changeset.commit_sha.clone();
                 self.review_screen = ReviewScreen::Changeset { sha, changeset };
                 self.context_popover_open = false;
@@ -1220,6 +1239,8 @@ impl App {
         self.context_popover_open = false;
         self.workspace.clear();
         self.file_tree_highlight_path = None;
+        self.file_tree_hovered = false;
+        self.hovered_diff_pane = None;
         self.reset_pane_scrolls();
         self.diff_row_cache.borrow_mut().clear();
         cx.notify();
@@ -1719,6 +1740,13 @@ impl App {
         self.pane_scroll(self.workspace.active_pane())
             .diff
             .side_by_side_max_offset()
+    }
+
+    #[cfg(test)]
+    fn file_diff_hscroll_offset(&self) -> gpui::Point<gpui::Pixels> {
+        self.pane_scroll(self.workspace.active_pane())
+            .diff
+            .hscroll_offset()
     }
 
     fn render_no_repo(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -3366,14 +3394,15 @@ impl App {
         changeset: &repo::ChangeSet,
         selected_path: Option<&str>,
         scroll: &FileDiffScroll,
+        hovered: bool,
     ) -> AnyElement {
         match selected_path {
             Some(path) => {
                 if let Some(file) = changeset.files.iter().find(|file| file.path == path) {
-                    return self.render_changed_file_detail(repo, changeset, file, scroll);
+                    return self.render_changed_file_detail(repo, changeset, file, scroll, hovered);
                 }
 
-                self.render_read_only_file_detail(repo, changeset, path, scroll)
+                self.render_read_only_file_detail(repo, changeset, path, scroll, hovered)
             }
             None => div()
                 .flex()
@@ -3435,6 +3464,7 @@ impl App {
         changeset: &repo::ChangeSet,
         file: &repo::ChangedFile,
         scroll: &FileDiffScroll,
+        hovered: bool,
     ) -> AnyElement {
         let rename_source_selector = format!(
             "file-detail-rename-source-{}",
@@ -3451,7 +3481,7 @@ impl App {
             .ok()
             .and_then(|prepared| render_change_block_footer(prepared, scroll));
         let content = match prepared {
-            Ok(prepared) => render_prepared_file_diff(&prepared, scroll),
+            Ok(prepared) => render_prepared_file_diff(&prepared, scroll, hovered),
             Err(err) => render_file_diff_error(err),
         };
 
@@ -3489,12 +3519,14 @@ impl App {
         changeset: &repo::ChangeSet,
         path: &str,
         scroll: &FileDiffScroll,
+        hovered: bool,
     ) -> AnyElement {
         let content = match repo::file_content_at_commit(&repo.path, &changeset.commit_sha, path) {
             Ok(content) => render_file_content(
                 content.content,
                 scroll,
                 diff_highlight::language_for_path(path),
+                hovered,
             ),
             Err(err) => render_file_diff_error(err.to_string()),
         };

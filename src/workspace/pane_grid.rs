@@ -124,6 +124,18 @@ fn render_pane_content(
         .flex_1()
         .min_h_0()
         .overflow_hidden()
+        .on_hover(cx.listener(move |app, hovered: &bool, _window, cx| {
+            if *hovered {
+                if app.hovered_diff_pane != Some(pane) {
+                    app.hovered_diff_pane = Some(pane);
+                    cx.notify();
+                }
+            } else if app.hovered_diff_pane == Some(pane) {
+                // Only clear a hover this pane owns; other panes manage theirs.
+                app.hovered_diff_pane = None;
+                cx.notify();
+            }
+        }))
         .when(pane_is_empty, |content| {
             // Whole-pane hover feedback for the move-into-empty-pane drop.
             content.drag_over::<DraggedTab>(|style, _drag, _window, _cx| {
@@ -181,7 +193,13 @@ fn render_pane_content(
                 app.set_tab_drop_zone(None, cx);
             }
         }))
-        .child(app.render_file_detail(repo, changeset, active_path.as_deref(), &scrolls.diff))
+        .child(app.render_file_detail(
+            repo,
+            changeset,
+            active_path.as_deref(),
+            &scrolls.diff,
+            app.hovered_diff_pane == Some(pane),
+        ))
         .when_some(highlight, |content, direction| {
             let selector = format!("workspace-drop-half-{pane}");
             content.child(

@@ -501,7 +501,7 @@ Tabs answer to the mouse: a reviewer can drag one along its own row to reorder, 
 
 ## Inspecting a file's diff
 
-Opening a file in the change set presents its diff. The diff fills the pane edge to edge below the tab bar; the tab itself names the file and colors it by change kind, so the pane adds no header of its own. For files that exist on both sides of the selection (modified or renamed files), the diff is shown side-by-side: the "before" state on the left, the "after" state on the right, with corresponding lines aligned and the two sides separated by a thin divider. The user can scroll both sides; the alignment is preserved as they scroll. Line numbers are shown for each side.
+Opening a file in the change set presents its diff. The diff fills the pane edge to edge below the tab bar; the tab itself names the file and colors it by change kind, so the pane adds no header of its own. For files that exist on both sides of the selection (modified or renamed files), the diff is shown side-by-side: the "before" state on the left, the "after" state on the right, with corresponding lines aligned and the two sides separated by a thin divider. The user can scroll both sides; the alignment is preserved as they scroll. Line numbers are shown for each side. Lines longer than the pane extend past its edge; the user scrolls the diff horizontally to read them, and both sides of a side-by-side diff pan together. The line numbers and change accents stay in place at the left edge while the code pans beneath them. While the pointer is over the pane, a horizontal scrollbar appears along the bottom of each side whose content overflows; dragging it pans the diff.
 
 Code is syntax-highlighted when the file's type is recognized; unrecognized types render as plain text. Changed lines read as color blocks: removed lines carry a red row tint and a red accent bar at the row's left edge, added lines the same in green. Within a modified line pair, the specific tokens that changed carry a stronger tint than the rest of the line, except when the pair differs almost entirely — a near-total rewrite reads as a whole-line change. Alignment gaps, where one side has no counterpart lines, render as a hatched region rather than blank space.
 
@@ -523,6 +523,12 @@ For files that exist on only one side of the selection — added or deleted file
 - Rows with no counterpart line on the other side render as a hatched region. A gap spanning several lines reads as one continuous hatched block: the diagonal stripes flow across it unbroken rather than restarting at each line.
 - Files with a recognized type render syntax-highlighted; unrecognized types render as plain text.
 - Line numbers appear for each side of a side-by-side diff and for the single side of a full-width view.
+- Code wider than the pane is reachable by horizontal scrolling: trackpad panning, shift+wheel, and dragging the horizontal scrollbar all pan the code region.
+- Both sides of a side-by-side diff pan horizontally in lockstep.
+- The accent bar and line-number gutter stay fixed at the pane's left edge while the code pans; panned code slides under the gutter's edge.
+- A horizontal scrollbar overlays the bottom of a side only while the pointer is over the pane and that diff's content overflows horizontally.
+- A purely vertical scroll gesture never pans the diff horizontally, and a purely horizontal one never scrolls the rows.
+- Opening a file shows its diff unpanned; stepping between change blocks preserves the current pan.
 
 **Edge cases**
 
