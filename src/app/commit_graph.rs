@@ -209,12 +209,22 @@ pub(crate) fn visible_commits<'a>(
         .collect()
 }
 
+/// How a row's commit dot renders: solid for a real commit, hollow (an
+/// outlined ring) for the synthetic pending-changes row, which visually
+/// distinguishes it from committed rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitDotStyle {
+    Solid,
+    Hollow,
+}
+
 pub(crate) fn render_commit_graph_gutter(
     row_index: usize,
     row: &graph::GraphRow,
     previous_row: Option<&graph::GraphRow>,
     next_row: Option<&graph::GraphRow>,
     max_lanes: usize,
+    dot_style: CommitDotStyle,
 ) -> impl IntoElement {
     let lane_count = max_lanes.max(1);
     let debug_selector = format!("commit-graph-gutter-{row_index}");
@@ -249,6 +259,7 @@ pub(crate) fn render_commit_graph_gutter(
                                 previous: previous_row,
                                 next: next_row,
                             },
+                            dot_style,
                         ))
                 })
                 .collect::<Vec<_>>(),
@@ -545,6 +556,7 @@ pub(crate) fn render_commit_graph_lane(
     lane: usize,
     row: &graph::GraphRow,
     neighbors: CommitGraphNeighborRows<'_>,
+    dot_style: CommitDotStyle,
 ) -> gpui::Div {
     let has_incoming = row.incoming_lanes.contains(&lane);
     let has_outgoing = row.outgoing_lanes.contains(&lane);
@@ -595,7 +607,7 @@ pub(crate) fn render_commit_graph_lane(
             lane_color,
         ))
         .child(render_commit_graph_middle_segment(
-            row_index, lane, row, lane_color,
+            row_index, lane, row, lane_color, dot_style,
         ))
         .child(render_commit_graph_vertical_segment(
             row_index,
@@ -822,6 +834,7 @@ pub(crate) fn render_commit_graph_middle_segment(
     lane: usize,
     row: &graph::GraphRow,
     color: gpui::Rgba,
+    dot_style: CommitDotStyle,
 ) -> gpui::Div {
     let is_commit = lane == row.lane;
     let has_connector = row.connector_lanes.contains(&lane);
@@ -988,14 +1001,20 @@ pub(crate) fn render_commit_graph_middle_segment(
                             commit_graph_connector_color(row, connector),
                         ))
                     })
-                    .child(
-                        div()
+                    .child({
+                        let dot = div()
                             .w(px(COMMIT_GRAPH_DOT_SIZE))
                             .h(px(COMMIT_GRAPH_DOT_SIZE))
                             .rounded_full()
-                            .bg(color)
-                            .debug_selector(move || dot_selector.clone()),
-                    )
+                            .debug_selector(move || dot_selector.clone());
+                        match dot_style {
+                            CommitDotStyle::Solid => dot.bg(color),
+                            CommitDotStyle::Hollow => dot
+                                .border_2()
+                                .border_color(color)
+                                .bg(palette().background),
+                        }
+                    })
                     .child(
                         div()
                             .w(px(commit_graph_dot_side_line_width()))
@@ -2551,34 +2570,34 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         visual
-            .debug_bounds("commit-graph-gutter-0")
+            .debug_bounds("commit-graph-gutter-1")
             .expect("merge commit graph gutter debug bounds");
         visual
-            .debug_bounds("commit-graph-dot-0")
+            .debug_bounds("commit-graph-dot-1")
             .expect("merge commit graph dot debug bounds");
         let merge_commit_dot = visual
-            .debug_bounds("commit-graph-dot-0")
+            .debug_bounds("commit-graph-dot-1")
             .expect("merge commit graph dot debug bounds");
         let merge_commit_bottom_gap = visual
-            .debug_bounds("commit-graph-dot-bottom-gap-0-0")
+            .debug_bounds("commit-graph-dot-bottom-gap-1-0")
             .expect("merge commit bottom dot gap debug bounds");
         visual
-            .debug_bounds("commit-graph-lane-0-1")
+            .debug_bounds("commit-graph-lane-1-1")
             .expect("merge commit second parent lane debug bounds");
         let branch_out_connector_bounds = visual
-            .debug_bounds("commit-graph-connector-0-1")
+            .debug_bounds("commit-graph-connector-1-1")
             .expect("merge commit second parent connector debug bounds");
         visual
-            .debug_bounds("commit-graph-branch-out-0-1")
+            .debug_bounds("commit-graph-branch-out-1-1")
             .expect("merge commit branch-out connector debug bounds");
         let branch_out_elbow_bounds = visual
-            .debug_bounds("commit-graph-branch-out-elbow-0-1")
+            .debug_bounds("commit-graph-branch-out-elbow-1-1")
             .expect("merge commit branch-out elbow debug bounds");
         let rounded_branch_out_elbow_bounds = visual
-            .debug_bounds("commit-graph-rounded-branch-out-elbow-0-1")
+            .debug_bounds("commit-graph-rounded-branch-out-elbow-1-1")
             .expect("merge commit rounded branch-out elbow debug bounds");
         let merge_target_commit_bend_bounds = visual
-            .debug_bounds("commit-graph-rounded-merge-target-commit-elbow-0-0")
+            .debug_bounds("commit-graph-rounded-merge-target-commit-elbow-1-0")
             .expect("merge target rounded commit bend debug bounds");
         assert!(
             rounded_branch_out_elbow_bounds.origin.y < branch_out_connector_bounds.origin.y,
@@ -2591,14 +2610,14 @@ mod tests {
             "rounded branch-out elbow should draw outside the compact middle band below the connector",
         );
         let branch_out_middle_vertical_bounds = visual
-            .debug_bounds("commit-graph-middle-vertical-0-1")
+            .debug_bounds("commit-graph-middle-vertical-1-1")
             .expect("merge commit branch-out middle vertical debug bounds");
         let branch_out_horizontal_bounds = visual
-            .debug_bounds("commit-graph-branch-out-horizontal-0-1")
+            .debug_bounds("commit-graph-branch-out-horizontal-1-1")
             .expect("merge commit branch-out horizontal debug bounds");
         // The merge commit is the checked-out tip, selected by default on open.
         let merge_commit_row = visual
-            .debug_bounds("selected-commit-row-0")
+            .debug_bounds("selected-commit-row-1")
             .expect("merge commit row debug bounds");
         assert_eq!(
             branch_out_horizontal_bounds.origin.y + px(commit_graph_line_width() / 2.),
@@ -2617,7 +2636,7 @@ mod tests {
             "branch-out middle vertical should not protrude above the horizontal turn",
         );
         let branch_out_vertical_bounds = visual
-            .debug_bounds("commit-graph-vertical-0-1-bottom")
+            .debug_bounds("commit-graph-vertical-1-1-bottom")
             .expect("merge commit second parent outgoing vertical debug bounds");
         assert_eq!(
             branch_out_elbow_bounds.origin.x, branch_out_vertical_bounds.origin.x,
@@ -2630,7 +2649,7 @@ mod tests {
             "branch-out outgoing vertical should not pull the branch turn above the row border",
         );
         let merge_commit_bottom_bounds = visual
-            .debug_bounds("commit-graph-vertical-0-0-bottom")
+            .debug_bounds("commit-graph-vertical-1-0-bottom")
             .expect("merge commit trunk outgoing vertical debug bounds");
         assert_eq!(
             merge_commit_dot.origin.y + merge_commit_dot.size.height,
@@ -2648,19 +2667,19 @@ mod tests {
             "merge target commit bend should have room below the trunk commit dot",
         );
         visual
-            .debug_bounds("commit-graph-vertical-0-1-bottom")
+            .debug_bounds("commit-graph-vertical-1-1-bottom")
             .expect("merge commit second parent outgoing vertical debug bounds");
         let continued_lane_top_bounds = visual
-            .debug_bounds("commit-graph-vertical-1-1-top")
+            .debug_bounds("commit-graph-vertical-2-1-top")
             .expect("continued second lane incoming vertical debug bounds");
         let continued_lane_row = visual
-            .debug_bounds("commit-row-1")
+            .debug_bounds("commit-row-2")
             .expect("continued second lane row debug bounds");
         let continued_lane_middle_bounds = visual
-            .debug_bounds("commit-graph-middle-vertical-1-1")
+            .debug_bounds("commit-graph-middle-vertical-2-1")
             .expect("continued second lane middle vertical debug bounds");
         let continued_lane_bottom_bounds = visual
-            .debug_bounds("commit-graph-vertical-1-1-bottom")
+            .debug_bounds("commit-graph-vertical-2-1-bottom")
             .expect("continued second lane outgoing vertical debug bounds");
         assert_eq!(
             continued_lane_top_bounds.origin.y,
@@ -2683,37 +2702,37 @@ mod tests {
             "continued lane middle vertical should connect to the outgoing vertical",
         );
         assert!(
-            visual.debug_bounds("commit-graph-merge-in-2-0").is_none()
+            visual.debug_bounds("commit-graph-merge-in-3-0").is_none()
                 && visual
-                    .debug_bounds("commit-graph-rounded-merge-in-commit-elbow-2-1")
+                    .debug_bounds("commit-graph-rounded-merge-in-commit-elbow-3-1")
                     .is_none(),
             "the right branch commit should sit on a straight vertical instead of bending on its own row",
         );
         let right_branch_top_vertical = visual
-            .debug_bounds("commit-graph-vertical-2-1-top")
+            .debug_bounds("commit-graph-vertical-3-1-top")
             .expect("right branch incoming vertical debug bounds");
         let right_branch_bottom_vertical = visual
-            .debug_bounds("commit-graph-vertical-2-1-bottom")
+            .debug_bounds("commit-graph-vertical-3-1-bottom")
             .expect("right branch outgoing vertical debug bounds");
         assert_eq!(
             right_branch_top_vertical.origin.x, right_branch_bottom_vertical.origin.x,
             "right branch edge should continue straight through its commit row",
         );
         let merge_in_source_elbow_bounds = visual
-            .debug_bounds("commit-graph-rounded-merge-in-source-elbow-3-1")
+            .debug_bounds("commit-graph-rounded-merge-in-source-elbow-4-1")
             .expect("base row merge-in source elbow debug bounds");
         let upper_merge_target_elbow_bounds = visual
-            .debug_bounds("commit-graph-rounded-upper-merge-target-elbow-3-0")
+            .debug_bounds("commit-graph-rounded-upper-merge-target-elbow-4-0")
             .expect("base row upper merge target elbow debug bounds");
         let base_dot_bounds = visual
-            .debug_bounds("commit-graph-dot-3")
+            .debug_bounds("commit-graph-dot-4")
             .expect("base commit dot debug bounds");
         let base_row_bounds = visual
-            .debug_bounds("commit-row-3")
+            .debug_bounds("commit-row-4")
             .expect("base commit row debug bounds");
         assert!(
             visual
-                .debug_bounds("commit-graph-merge-in-horizontal-3-0")
+                .debug_bounds("commit-graph-merge-in-horizontal-4-0")
                 .is_none(),
             "the merge should join the trunk vertical above the dot, not tee into the dot",
         );
@@ -2740,7 +2759,7 @@ mod tests {
         );
         assert!(
             visual
-                .debug_bounds("commit-graph-vertical-3-1-bottom")
+                .debug_bounds("commit-graph-vertical-4-1-bottom")
                 .is_none(),
             "the branch edge should end at the base row",
         );
@@ -2755,11 +2774,14 @@ mod tests {
 
         window
             .update(cx, |app, _window, cx| {
+                let mut head_commit =
+                    commit_info_for_graph_at("merge-lfs", 50, &["merge-docs", "lfs-tip"]);
+                head_commit.is_head = true;
                 seed_repo_open_mode_with_commits(
                     app,
                     dir.path().to_path_buf(),
                     vec![
-                        commit_info_for_graph_at("merge-lfs", 50, &["merge-docs", "lfs-tip"]),
+                        head_commit,
                         commit_info_for_graph_at("lfs-tip", 40, &["trunk-base"]),
                         commit_info_for_graph_at("merge-docs", 30, &["trunk-base", "docs-tip"]),
                         commit_info_for_graph_at("docs-tip", 20, &["trunk-base"]),
@@ -2786,7 +2808,7 @@ mod tests {
                         parent_shas: commit.parent_shas.clone(),
                     })
                     .collect::<Vec<_>>();
-                let rows = graph::layout_graph(&graph_commits);
+                let rows = graph::layout_graph_anchored(&graph_commits, Some("merge-lfs"));
 
                 assert_eq!(rows[0].parent_lanes, vec![0, 2]);
                 assert_eq!(rows[0].connector_lanes, vec![0, 1, 2]);
@@ -2856,56 +2878,56 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let side_top = visual
-            .debug_bounds("commit-graph-vertical-2-2-top")
+            .debug_bounds("commit-graph-vertical-3-2-top")
             .expect("side lane top vertical through merge row");
         let side_middle = visual
-            .debug_bounds("commit-graph-middle-vertical-2-2")
+            .debug_bounds("commit-graph-middle-vertical-3-2")
             .expect("side lane middle vertical through merge row");
         let side_bottom = visual
-            .debug_bounds("commit-graph-vertical-2-2-bottom")
+            .debug_bounds("commit-graph-vertical-3-2-bottom")
             .expect("side lane bottom vertical through merge row");
 
         assert!(
             visual
-                .debug_bounds("commit-graph-rounded-spanning-branch-end-elbow-2-2")
+                .debug_bounds("commit-graph-rounded-spanning-branch-end-elbow-3-2")
                 .is_none(),
             "the side lane should pass through the merge row instead of joining the docs branch",
         );
         visual
-            .debug_bounds("commit-graph-rounded-branch-out-elbow-0-2")
+            .debug_bounds("commit-graph-rounded-branch-out-elbow-1-2")
             .expect("lfs side branch should open directly into lane 2");
         assert!(
             visual
-                .debug_bounds("commit-graph-rounded-branch-out-elbow-1-2")
+                .debug_bounds("commit-graph-rounded-branch-out-elbow-2-2")
                 .is_none(),
             "lfs side branch should not hop from lane 1 to lane 2 at its commit row",
         );
         assert!(
             visual
-                .debug_bounds("commit-graph-spanning-horizontal-through-target-2-1")
+                .debug_bounds("commit-graph-spanning-horizontal-through-target-3-1")
                 .is_none(),
             "lfs side branch should not draw a horizontal connector on the docs merge row",
         );
         visual
-            .debug_bounds("commit-graph-rounded-branch-out-elbow-2-1")
+            .debug_bounds("commit-graph-rounded-branch-out-elbow-3-1")
             .expect("docs side branch should occupy the first side lane");
         assert!(
             visual
-                .debug_bounds("commit-graph-rounded-merge-in-commit-elbow-3-1")
+                .debug_bounds("commit-graph-rounded-merge-in-commit-elbow-4-1")
                 .is_none()
                 && visual
-                    .debug_bounds("commit-graph-rounded-merge-target-commit-elbow-3-1")
+                    .debug_bounds("commit-graph-rounded-merge-target-commit-elbow-4-1")
                     .is_none(),
             "the docs commit should sit on a straight vertical instead of bending on its own row",
         );
         let docs_row_lfs_top = visual
-            .debug_bounds("commit-graph-vertical-3-2-top")
+            .debug_bounds("commit-graph-vertical-4-2-top")
             .expect("lfs edge incoming vertical through the docs row");
         let docs_row_lfs_middle = visual
-            .debug_bounds("commit-graph-middle-vertical-3-2")
+            .debug_bounds("commit-graph-middle-vertical-4-2")
             .expect("lfs edge middle vertical through the docs row");
         let docs_row_lfs_bottom = visual
-            .debug_bounds("commit-graph-vertical-3-2-bottom")
+            .debug_bounds("commit-graph-vertical-4-2-bottom")
             .expect("lfs edge outgoing vertical through the docs row");
         assert_eq!(
             docs_row_lfs_top.origin.y + docs_row_lfs_top.size.height,
@@ -2918,23 +2940,23 @@ mod tests {
             "lfs edge should pass the docs row without a gap below the middle segment",
         );
         let docs_merge_source_elbow = visual
-            .debug_bounds("commit-graph-rounded-merge-in-source-elbow-4-1")
+            .debug_bounds("commit-graph-rounded-merge-in-source-elbow-5-1")
             .expect("docs edge should curve into the shared parent on its row");
         let lfs_merge_source_elbow = visual
-            .debug_bounds("commit-graph-rounded-merge-in-source-elbow-4-2")
+            .debug_bounds("commit-graph-rounded-merge-in-source-elbow-5-2")
             .expect("lfs edge should curve into the shared parent on its row");
         let upper_merge_target_elbow = visual
-            .debug_bounds("commit-graph-rounded-upper-merge-target-elbow-4-0")
+            .debug_bounds("commit-graph-rounded-upper-merge-target-elbow-5-0")
             .expect("shared parent should curve the merge into its trunk vertical");
         let lfs_crossing_underlay = visual
-            .debug_bounds("commit-graph-upper-merge-crossing-4-1")
+            .debug_bounds("commit-graph-upper-merge-crossing-5-1")
             .expect("lfs edge should keep its own horizontal underneath the docs bend");
         let parent_row = visual
-            .debug_bounds("commit-row-4")
+            .debug_bounds("commit-row-5")
             .expect("shared parent commit row debug bounds");
         assert!(
             visual
-                .debug_bounds("commit-graph-merge-in-horizontal-4-0")
+                .debug_bounds("commit-graph-merge-in-horizontal-5-0")
                 .is_none(),
             "the merges should join the trunk vertical above the dot, not tee into the dot",
         );
@@ -2956,7 +2978,7 @@ mod tests {
             "the docs elbow should sit in the inner lane, the lfs elbow in the outer lane",
         );
         let docs_row_lfs_bottom_inset = visual
-            .debug_bounds("commit-graph-vertical-3-2-bottom")
+            .debug_bounds("commit-graph-vertical-4-2-bottom")
             .expect("lfs edge outgoing vertical above the shared parent row");
         assert_eq!(
             docs_row_lfs_bottom_inset.size.height,
@@ -3003,13 +3025,13 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let feature_dot = visual
-            .debug_bounds("commit-graph-dot-0")
+            .debug_bounds("commit-graph-dot-1")
             .expect("unmerged branch tip renders a commit dot");
         let head_dot = visual
-            .debug_bounds("commit-graph-dot-1")
+            .debug_bounds("commit-graph-dot-2")
             .expect("HEAD commit renders a commit dot");
         let fork_dot = visual
-            .debug_bounds("commit-graph-dot-2")
+            .debug_bounds("commit-graph-dot-3")
             .expect("fork commit renders a commit dot");
 
         assert!(
@@ -3020,17 +3042,14 @@ mod tests {
             head_dot.origin.x, fork_dot.origin.x,
             "HEAD's first-parent history should keep the trunk lane",
         );
-        assert!(
-            visual
-                .debug_bounds("commit-graph-vertical-0-0-top")
-                .is_none()
-                && visual
-                    .debug_bounds("commit-graph-middle-vertical-0-0")
-                    .is_none(),
-            "the trunk lane should stay empty above the HEAD row",
-        );
+        // Row 0 (the pending row) extends the trunk lane down into HEAD, so
+        // the trunk lane now runs through row 1 (the unmerged branch tip)
+        // too, even though that row's own commit sits in a side lane.
         visual
-            .debug_bounds("commit-graph-vertical-2-1-top")
+            .debug_bounds("commit-graph-middle-vertical-1-0")
+            .expect("the trunk lane should pass through the row above HEAD via the pending edge");
+        visual
+            .debug_bounds("commit-graph-vertical-3-1-top")
             .expect("the branch lane should run into its fork row");
     }
 
@@ -3045,11 +3064,13 @@ mod tests {
         // merges into trunk-mid from lane 2, crossing the occupied lane.
         window
             .update(cx, |app, _window, cx| {
+                let mut head_commit = commit_info_for_graph_at("trunk-tip", 60, &["trunk-mid"]);
+                head_commit.is_head = true;
                 seed_repo_open_mode_with_commits(
                     app,
                     dir.path().to_path_buf(),
                     vec![
-                        commit_info_for_graph_at("trunk-tip", 60, &["trunk-mid"]),
+                        head_commit,
                         commit_info_for_graph_at("feature-x", 50, &["trunk-base"]),
                         commit_info_for_graph_at("feature-y", 40, &["trunk-mid"]),
                         commit_info_for_graph_at("trunk-mid", 30, &["trunk-base"]),
@@ -3076,7 +3097,7 @@ mod tests {
                         parent_shas: commit.parent_shas.clone(),
                     })
                     .collect::<Vec<_>>();
-                let rows = graph::layout_graph(&graph_commits);
+                let rows = graph::layout_graph_anchored(&graph_commits, Some("trunk-tip"));
                 assert_eq!(rows[1].lane, 1);
                 assert_eq!(rows[2].lane, 2);
                 assert_eq!(rows[3].lane, 0);
@@ -3093,33 +3114,33 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let spanning_left = visual
-            .debug_bounds("commit-graph-spanning-horizontal-left-3-1")
+            .debug_bounds("commit-graph-spanning-horizontal-left-4-1")
             .expect("occupied intermediate lane left merge-in horizontal debug bounds");
         let spanning_right = visual
-            .debug_bounds("commit-graph-spanning-horizontal-right-3-1")
+            .debug_bounds("commit-graph-spanning-horizontal-right-4-1")
             .expect("occupied intermediate lane right merge-in horizontal debug bounds");
         let source_elbow = visual
-            .debug_bounds("commit-graph-rounded-merge-in-source-elbow-3-2")
+            .debug_bounds("commit-graph-rounded-merge-in-source-elbow-4-2")
             .expect("source-side merge-in elbow debug bounds");
         let target_elbow = visual
-            .debug_bounds("commit-graph-rounded-upper-merge-target-elbow-3-0")
+            .debug_bounds("commit-graph-rounded-upper-merge-target-elbow-4-0")
             .expect("trunk-side merge curve debug bounds");
         let trunk_mid_dot = visual
-            .debug_bounds("commit-graph-dot-3")
+            .debug_bounds("commit-graph-dot-4")
             .expect("trunk-mid commit dot debug bounds");
         let trunk_mid_row = visual
-            .debug_bounds("commit-row-3")
+            .debug_bounds("commit-row-4")
             .expect("trunk-mid commit row debug bounds");
         let occupied_lane_above = visual
-            .debug_bounds("commit-graph-vertical-2-1-bottom")
+            .debug_bounds("commit-graph-vertical-3-1-bottom")
             .expect("occupied lane outgoing vertical above the merge row");
         let occupied_lane_top = visual
-            .debug_bounds("commit-graph-vertical-3-1-top")
+            .debug_bounds("commit-graph-vertical-4-1-top")
             .expect("occupied lane incoming vertical through the merge row");
 
         assert!(
             visual
-                .debug_bounds("commit-graph-merge-in-horizontal-3-0")
+                .debug_bounds("commit-graph-merge-in-horizontal-4-0")
                 .is_none(),
             "the merge should join the trunk vertical above the dot, not tee into the dot",
         );
@@ -3217,14 +3238,14 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let merge_row = visual
-            .debug_bounds("commit-row-1")
-            .or_else(|| visual.debug_bounds("selected-commit-row-1"))
+            .debug_bounds("commit-row-2")
+            .or_else(|| visual.debug_bounds("selected-commit-row-2"))
             .expect("merge commit row debug bounds");
         let merge_row_elbow = visual
-            .debug_bounds("commit-graph-rounded-branch-out-elbow-1-2")
+            .debug_bounds("commit-graph-rounded-branch-out-elbow-2-2")
             .expect("the merge row draws the fan-out bend overlay");
         let inset_vertical = visual
-            .debug_bounds("commit-graph-vertical-2-2-top")
+            .debug_bounds("commit-graph-vertical-3-2-top")
             .expect("the incoming vertical below the merge row");
         let history_container = visual
             .debug_bounds("commit-history-container")
@@ -3267,29 +3288,29 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let first_row_bottom = visual
-            .debug_bounds("commit-graph-vertical-0-0-bottom")
+            .debug_bounds("commit-graph-vertical-1-0-bottom")
             .expect("first row outgoing vertical debug bounds");
         let second_row_top = visual
-            .debug_bounds("commit-graph-vertical-1-0-top")
+            .debug_bounds("commit-graph-vertical-2-0-top")
             .expect("second row incoming vertical debug bounds");
         // The tip is the checked-out commit, selected by default on open.
         let first_row = visual
-            .debug_bounds("selected-commit-row-0")
+            .debug_bounds("selected-commit-row-1")
             .expect("first commit row debug bounds");
         let second_row = visual
-            .debug_bounds("commit-row-1")
+            .debug_bounds("commit-row-2")
             .expect("second commit row debug bounds");
         let first_dot = visual
-            .debug_bounds("commit-graph-dot-0")
+            .debug_bounds("commit-graph-dot-1")
             .expect("first commit dot debug bounds");
         let second_dot = visual
-            .debug_bounds("commit-graph-dot-1")
+            .debug_bounds("commit-graph-dot-2")
             .expect("second commit dot debug bounds");
         let first_bottom_gap = visual
-            .debug_bounds("commit-graph-dot-bottom-gap-0-0")
+            .debug_bounds("commit-graph-dot-bottom-gap-1-0")
             .expect("first commit bottom dot gap debug bounds");
         let second_top_gap = visual
-            .debug_bounds("commit-graph-dot-top-gap-1-0")
+            .debug_bounds("commit-graph-dot-top-gap-2-0")
             .expect("second commit top dot gap debug bounds");
 
         assert_eq!(
@@ -3319,10 +3340,10 @@ mod tests {
         );
         assert!(
             visual
-                .debug_bounds("commit-graph-commit-vertical-0-0")
+                .debug_bounds("commit-graph-commit-vertical-1-0")
                 .is_none()
                 && visual
-                    .debug_bounds("commit-graph-commit-vertical-1-0")
+                    .debug_bounds("commit-graph-commit-vertical-2-0")
                     .is_none(),
             "commit dots should not get full-height through-lines that protrude beyond the dot",
         );
@@ -3369,25 +3390,25 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let row = visual
-            .debug_bounds("commit-row-0")
+            .debug_bounds("commit-row-1")
             .expect("commit row debug bounds");
         let graph = visual
-            .debug_bounds("commit-graph-gutter-0")
+            .debug_bounds("commit-graph-gutter-1")
             .expect("graph gutter debug bounds");
         let hash = visual
-            .debug_bounds("commit-hash-0")
+            .debug_bounds("commit-hash-1")
             .expect("commit hash debug bounds");
         let summary = visual
-            .debug_bounds("commit-summary-0")
+            .debug_bounds("commit-summary-1")
             .expect("commit summary debug bounds");
         let author = visual
-            .debug_bounds("commit-author-0")
+            .debug_bounds("commit-author-1")
             .expect("commit author debug bounds");
         let time = visual
-            .debug_bounds("commit-time-0")
+            .debug_bounds("commit-time-1")
             .expect("commit time debug bounds");
         let labels = visual
-            .debug_bounds("commit-ref-labels-0")
+            .debug_bounds("commit-ref-labels-1")
             .expect("commit labels debug bounds");
 
         assert!(
@@ -3423,6 +3444,8 @@ mod tests {
             .expect("open repo");
         cx.run_until_parked();
 
+        // Row 0 is always the pending row, so a commit's graph row is one
+        // past its position in `repo.commits`.
         let tag_row = window
             .read_with(cx, |app, _cx| {
                 let Mode::RepoOpen { repo } = &app.mode else {
@@ -3432,6 +3455,7 @@ mod tests {
                     .iter()
                     .position(|commit| commit.sha == tip_sha)
                     .expect("tagged commit row")
+                    + 1
             })
             .expect("read tag row");
 
@@ -3456,6 +3480,8 @@ mod tests {
 
         cx.run_until_parked();
 
+        // Row 0 is always the pending row, so a commit's graph row is one
+        // past its position in `repo.commits`.
         let (head_row, master_row, left_row, right_row) = window
             .read_with(cx, |app, _cx| {
                 let Mode::RepoOpen { repo } = &app.mode else {
@@ -3471,13 +3497,15 @@ mod tests {
                                 .any(|label| label.name == branch_name)
                         })
                         .expect("branch row")
+                        + 1
                 };
 
                 (
                     repo.commits
                         .iter()
                         .position(|commit| commit.is_head)
-                        .expect("head row"),
+                        .expect("head row")
+                        + 1,
                     row_for_branch("master"),
                     row_for_branch("left"),
                     row_for_branch("right"),
@@ -3544,17 +3572,19 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         // With no checked-out branch, the default selection falls back to
-        // the newest commit, so the tip row renders selected.
+        // the newest commit, so the tip row renders selected. Row 0 is always
+        // the pending row, so the tip sits at row 1.
         visual
-            .debug_bounds("selected-commit-row-0")
+            .debug_bounds("selected-commit-row-1")
             .expect("tip commit row debug bounds");
         visual
             .debug_bounds(test_debug_selector(format!(
-                "commit-ref-label-{master_row}-heads-master"
+                "commit-ref-label-{}-heads-master",
+                master_row + 1
             )))
             .expect("master branch label debug bounds");
         assert!(
-            visual.debug_bounds("commit-ref-label-0-head").is_none(),
+            visual.debug_bounds("commit-ref-label-1-head").is_none(),
             "detached HEAD should not render a HEAD label"
         );
     }
@@ -3565,7 +3595,7 @@ mod tests {
         let branch_name = "not-merged-branch-with-a-name-that-would-cover-the-graph".to_string();
         let label_selector = Box::leak(
             format!(
-                "commit-ref-label-0-heads-{}",
+                "commit-ref-label-1-heads-{}",
                 debug_ref_label_fragment(&branch_name)
             )
             .into_boxed_str(),
@@ -3611,7 +3641,7 @@ mod tests {
             .debug_bounds(label_selector)
             .expect("long branch label debug bounds");
         let graph_bounds = visual
-            .debug_bounds("commit-graph-gutter-0")
+            .debug_bounds("commit-graph-gutter-1")
             .expect("commit graph gutter debug bounds");
 
         assert!(
@@ -3649,8 +3679,9 @@ mod tests {
         let mut visual = VisualTestContext::from_window(*window, cx);
         visual.simulate_resize(size(px(700.), px(320.)));
         // The tip is the checked-out commit, selected by default on open.
+        // Row 0 is always the pending row, so the tip sits at row 1.
         let first_row_bounds = visual
-            .debug_bounds("selected-commit-row-0")
+            .debug_bounds("selected-commit-row-1")
             .expect("first commit row debug bounds");
         let before_scroll = window
             .read_with(cx, |app, _cx| {
@@ -3699,7 +3730,7 @@ mod tests {
             .expect("read loaded commit page");
 
         let oldest_row_selector =
-            Box::leak(format!("commit-row-{}", INITIAL_COMMIT_LIMIT + 1).into_boxed_str())
+            Box::leak(format!("commit-row-{}", INITIAL_COMMIT_LIMIT + 2).into_boxed_str())
                 as &'static str;
         visual
             .debug_bounds(oldest_row_selector)
@@ -3729,11 +3760,16 @@ mod tests {
         visual.simulate_resize(size(px(900.), px(400.)));
 
         // The tip is the checked-out commit, selected by default on open.
+        // Row 0 is always the pending row (always materialized as the first
+        // row), so the tip sits at row 1.
         visual
-            .debug_bounds("selected-commit-row-0")
+            .debug_bounds("pending-row")
+            .expect("pending row should be materialized");
+        visual
+            .debug_bounds("selected-commit-row-1")
             .expect("first commit row should be materialized");
         visual
-            .debug_bounds("commit-graph-gutter-0")
+            .debug_bounds("commit-graph-gutter-1")
             .expect("first row's gutter should be materialized");
         assert!(
             visual.debug_bounds("commit-row-150").is_none(),

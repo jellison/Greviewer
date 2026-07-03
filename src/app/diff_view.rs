@@ -581,8 +581,11 @@ pub(crate) fn widest_line_chars(rows: &[DiffRow]) -> usize {
 }
 
 /// Identifies a cached diff: the changed file's path plus the commit and base
-/// shas it was diffed against. Two changesets that touch the same path produce
-/// different keys, so a stale entry is never served.
+/// shas it was diffed against. For committed changesets, the key's shas make
+/// entries immutable — different changesets produce different keys. For the
+/// pending sentinel sha, the worktree can change under the key; an open pending
+/// changeset deliberately caches the first-viewed state as a snapshot, and
+/// clearing happens on changeset open/close or repository close.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct DiffCacheKey {
     pub(crate) path: String,

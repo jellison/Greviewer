@@ -1252,16 +1252,17 @@ mod tests {
                 && local_row.origin.y < remote_section.origin.y,
             "sections order: Local header, local rows, Remote header"
         );
-        // Row 0 is the remote-only tip (origin/feature/x at time 200, newest).
-        // Row 1 is the root commit (master + origin/master at time 100).
+        // Row 0 is always the pending row. Row 1 is the remote-only tip
+        // (origin/feature/x at time 200, newest). Row 2 is the root commit
+        // (master + origin/master at time 100).
         visual
-            .debug_bounds("commit-ref-label-0-remotes-origin-feature-x")
+            .debug_bounds("commit-ref-label-1-remotes-origin-feature-x")
             .expect("remote ref label pill renders in the graph with its namespaced selector");
         visual
-            .debug_bounds("commit-ref-label-1-remotes-origin-master")
+            .debug_bounds("commit-ref-label-2-remotes-origin-master")
             .expect("remote ref label pill renders in the graph with its namespaced selector");
         visual
-            .debug_bounds("commit-ref-label-1-heads-master")
+            .debug_bounds("commit-ref-label-2-heads-master")
             .expect("local ref label pill renders on the shared-tip commit row");
     }
 

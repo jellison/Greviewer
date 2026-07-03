@@ -98,9 +98,10 @@ async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
 
     let mut visual = VisualTestContext::from_window(*window, cx);
     // The tip is the checked-out commit, selected by default on open; clicking
-    // it keeps the selection.
+    // it keeps the selection. Row 0 is always the pending row, so the tip
+    // sits at row 1.
     let row_bounds = visual
-        .debug_bounds("selected-commit-row-0")
+        .debug_bounds("selected-commit-row-1")
         .expect("commit row debug bounds");
     visual.simulate_click(row_bounds.center(), Modifiers::none());
 

@@ -5,13 +5,17 @@
 //! open time; live updates come in a later slice.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs, io,
     path::{Path, PathBuf},
     str,
 };
 
 pub const INITIAL_COMMIT_LIMIT: usize = 200;
+
+/// Sentinel identifying the synthetic pending-changes item. The all-zero sha
+/// is reserved by git and can never name a real commit.
+pub const PENDING_SHA: &str = "0000000000000000000000000000000000000000";
 
 #[derive(Debug, Clone)]
 pub struct OpenRepository {
@@ -100,6 +104,20 @@ pub struct ChangedFile {
 pub struct LineStats {
     pub added: usize,
     pub removed: usize,
+}
+
+/// Roll-up of the pending working-tree state for the graph row: how many
+/// files differ from HEAD and the total added/removed line counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PendingSummary {
+    pub file_count: usize,
+    pub line_stats: LineStats,
+}
+
+impl PendingSummary {
+    pub fn is_dirty(&self) -> bool {
+        self.file_count > 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -395,6 +413,218 @@ pub fn changeset_for_comparison(
         Some(&merge_base_tree),
         &target_tree,
     )
+}
+
+/// The pending changeset: HEAD's tree diffed against the working directory
+/// with the index — staged, unstaged, and untracked work combined, each file
+/// once as its net change vs HEAD. `commit_sha` is [`PENDING_SHA`]; `base_sha`
+/// is HEAD (or `None` on an unborn branch, diffing against the empty tree).
+pub fn changeset_for_pending(path: &Path) -> Result<ChangeSet, ChangeSetError> {
+    let repo = open_changeset_repository(path)?;
+    let head_commit = read_head_commit(&repo).map_err(ChangeSetError::Open)?;
+    let head_sha = head_commit.as_ref().map(|commit| commit.id().to_string());
+    let head_tree = head_commit
+        .as_ref()
+        .map(|commit| commit.tree())
+        .transpose()
+        .map_err(ChangeSetError::Git)?;
+
+    let mut diff_options = git2::DiffOptions::new();
+    diff_options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true)
+        .ignore_submodules(true);
+    let mut diff = repo
+        .diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut diff_options))
+        .map_err(ChangeSetError::Git)?;
+    let mut find_options = git2::DiffFindOptions::new();
+    find_options.renames(true);
+    diff.find_similar(Some(&mut find_options))
+        .map_err(ChangeSetError::Git)?;
+
+    let mut files = Vec::new();
+    for (delta_index, delta) in diff.deltas().enumerate() {
+        let Some(mut file) = changed_file_from_delta(delta) else {
+            continue;
+        };
+        file.is_binary = pending_file_is_binary(&repo, head_tree.as_ref(), &file)?;
+        file.line_stats = line_stats_for_delta(&diff, delta_index)?;
+        files.push(file);
+    }
+    files.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.old_path.cmp(&right.old_path))
+    });
+
+    Ok(ChangeSet {
+        commit_sha: PENDING_SHA.to_string(),
+        base_sha: head_sha,
+        files,
+    })
+}
+
+pub fn read_pending_summary(path: &Path) -> Result<PendingSummary, ChangeSetError> {
+    let changeset = changeset_for_pending(path)?;
+    let line_stats = changeset
+        .files
+        .iter()
+        .fold(LineStats::default(), |acc, file| LineStats {
+            added: acc.added + file.line_stats.added,
+            removed: acc.removed + file.line_stats.removed,
+        });
+
+    Ok(PendingSummary {
+        file_count: changeset.files.len(),
+        line_stats,
+    })
+}
+
+/// Binary check for a pending file: the old side reads from HEAD's tree, the
+/// new side from disk. Mirrors `changed_file_is_binary`.
+fn pending_file_is_binary(
+    repo: &git2::Repository,
+    head_tree: Option<&git2::Tree<'_>>,
+    file: &ChangedFile,
+) -> Result<bool, ChangeSetError> {
+    match file.kind {
+        ChangeKind::Added => Ok(read_text_worktree_file(repo, &file.path)?.is_none()),
+        ChangeKind::Deleted => {
+            let head_tree = required_base_tree(head_tree)?;
+            let old_path = file.old_path.as_deref().unwrap_or(&file.path);
+            blob_has_text(repo, head_tree, old_path).map(|has_text| !has_text)
+        }
+        ChangeKind::Modified | ChangeKind::Renamed => {
+            let head_tree = required_base_tree(head_tree)?;
+            let old_path = file.old_path.as_deref().unwrap_or(&file.path);
+            let old_has_text = blob_has_text(repo, head_tree, old_path)?;
+            let new_has_text = read_text_worktree_file(repo, &file.path)?.is_some();
+            Ok(!old_has_text || !new_has_text)
+        }
+    }
+}
+
+/// Reads a working-tree file as text; `None` when the file is binary
+/// (contains NUL or is not UTF-8). Mirrors `read_text_blob` for disk files.
+fn read_text_worktree_file(
+    repo: &git2::Repository,
+    path: &str,
+) -> Result<Option<String>, ChangeSetError> {
+    let workdir = repo.workdir().ok_or_else(|| {
+        ChangeSetError::Git(git2::Error::from_str("Repository has no working directory"))
+    })?;
+    let bytes =
+        fs::read(workdir.join(path)).map_err(|err| ChangeSetError::Open(OpenError::Io(err)))?;
+
+    if bytes.contains(&0) {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(bytes).ok())
+}
+
+/// A pending file's diff content: the old side from HEAD's tree, the new
+/// side from the working directory. Mirrors `file_diff_for_changed_file_in_repo`.
+pub fn file_diff_for_pending_file(
+    path: &Path,
+    file: &ChangedFile,
+) -> Result<FileDiff, ChangeSetError> {
+    let repo = open_changeset_repository(path)?;
+    let head_commit = read_head_commit(&repo).map_err(ChangeSetError::Open)?;
+    let head_tree = head_commit
+        .as_ref()
+        .map(|commit| commit.tree())
+        .transpose()
+        .map_err(ChangeSetError::Git)?;
+
+    let content = match file.kind {
+        ChangeKind::Added => {
+            let text = read_text_worktree_file(&repo, &file.path)?;
+            single_file_content(DiffSide::New, text)
+        }
+        ChangeKind::Deleted => {
+            let head_tree = required_base_tree(head_tree.as_ref())?;
+            let old_path = file.old_path.as_deref().unwrap_or(&file.path);
+            let text = read_text_blob(&repo, head_tree, old_path)?;
+            single_file_content(DiffSide::Old, text)
+        }
+        ChangeKind::Modified => {
+            let head_tree = required_base_tree(head_tree.as_ref())?;
+            let old_text = read_text_blob(&repo, head_tree, &file.path)?;
+            let new_text = read_text_worktree_file(&repo, &file.path)?;
+            side_by_side_file_content(old_text, new_text)
+        }
+        ChangeKind::Renamed => {
+            let head_tree = required_base_tree(head_tree.as_ref())?;
+            let old_path = file.old_path.as_deref().ok_or_else(|| {
+                ChangeSetError::Git(git2::Error::from_str("Missing rename source path"))
+            })?;
+            let old_text = read_text_blob(&repo, head_tree, old_path)?;
+            let new_text = read_text_worktree_file(&repo, &file.path)?;
+            side_by_side_file_content(old_text, new_text)
+        }
+    };
+
+    Ok(FileDiff {
+        path: file.path.clone(),
+        old_path: file.old_path.clone(),
+        kind: file.kind,
+        content,
+    })
+}
+
+/// A file's content as it sits on disk, for read-only viewing in the
+/// pending all-files view.
+pub fn file_content_in_worktree(
+    path: &Path,
+    file_path: &str,
+) -> Result<FileContent, ChangeSetError> {
+    let repo = open_changeset_repository(path)?;
+    let content = match read_text_worktree_file(&repo, file_path)? {
+        Some(text) => FileContentBody::Text(text),
+        None => FileContentBody::Binary,
+    };
+
+    Ok(FileContent {
+        path: file_path.to_string(),
+        content,
+    })
+}
+
+/// Every file at the pending state: HEAD's file list adjusted by the pending
+/// changeset. Derived from the changeset rather than a filesystem walk so
+/// .gitignore and submodule handling stay identical to the changeset itself.
+pub fn files_for_pending(path: &Path) -> Result<Vec<RepositoryFile>, ChangeSetError> {
+    let changeset = changeset_for_pending(path)?;
+    let mut paths: BTreeSet<String> = match changeset.base_sha.as_deref() {
+        Some(head_sha) => files_at_commit(path, head_sha)?
+            .into_iter()
+            .map(|file| file.path)
+            .collect(),
+        None => BTreeSet::new(),
+    };
+
+    for file in &changeset.files {
+        match file.kind {
+            ChangeKind::Added | ChangeKind::Modified => {
+                paths.insert(file.path.clone());
+            }
+            ChangeKind::Deleted => {
+                paths.remove(&file.path);
+            }
+            ChangeKind::Renamed => {
+                if let Some(old_path) = &file.old_path {
+                    paths.remove(old_path);
+                }
+                paths.insert(file.path.clone());
+            }
+        }
+    }
+
+    Ok(paths
+        .into_iter()
+        .map(|path| RepositoryFile { path })
+        .collect())
 }
 
 /// Shas of the commits a merge of `target` into `base` would introduce
@@ -1020,7 +1250,7 @@ fn short_sha(oid: git2::Oid) -> String {
 
 fn changed_file_from_delta(delta: git2::DiffDelta<'_>) -> Option<ChangedFile> {
     match delta.status() {
-        git2::Delta::Added | git2::Delta::Copied => Some(ChangedFile {
+        git2::Delta::Added | git2::Delta::Copied | git2::Delta::Untracked => Some(ChangedFile {
             path: diff_path(delta.new_file())?,
             old_path: None,
             kind: ChangeKind::Added,
@@ -1050,7 +1280,6 @@ fn changed_file_from_delta(delta: git2::DiffDelta<'_>) -> Option<ChangedFile> {
         }),
         git2::Delta::Unmodified
         | git2::Delta::Ignored
-        | git2::Delta::Untracked
         | git2::Delta::Unreadable
         | git2::Delta::Conflicted => None,
     }

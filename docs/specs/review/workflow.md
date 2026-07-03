@@ -89,6 +89,7 @@ The user sees a graphical history of the repository's commits with branch lanes 
 **Observable outcomes**
 
 - Commits appear in graphical order with branch lanes and merge connectors.
+- The graph's top-most item is always the repository's pending changes (see "Reviewing pending changes"), above every commit, whether or not the working tree has any uncommitted difference from HEAD.
 - Commits reachable only from unmerged local branches, remote-tracking branches, or tags appear
   interleaved with the checked-out history; each such branch or tag renders as its own lane that
   ends at its tip.
@@ -319,6 +320,41 @@ The graph always carries a selection: opening a repository selects its checked-o
 - When there is no checked-out tip to select — the checked-out branch has no commits yet, or no branch is checked out at all — the newest visible commit is selected in its place.
 - Hiding a branch that removes either commit of a comparison from the graph resets the selection to the checked-out tip, as with any selection (see "Hiding branches from the graph").
 - A repository with no commits at all has no selection, and the selection summary and its affordance are absent.
+- Gestures that would extend a range or stage a comparison to or from the pending-changes row are handled separately; see "Reviewing pending changes" below.
+
+## Reviewing pending changes
+
+Above every commit, the graph always carries one more item: the repository's pending changes, the work that has not yet been committed. It sits at the top of the graph with an edge connecting it down to the checked-out commit, so it reads as the newest revision in the history rather than a separate list. It renders with a distinct hollow dot in place of a commit's filled one, the text "Pending changes", and either a count of changed files with their added and removed line totals, or a muted "No pending changes" when the working tree matches HEAD exactly.
+
+Pending changes behave like any other item for plain selection: clicking the row selects it, and the selection summary reads "Pending changes selected". Enter, the open-changeset affordance, and double-clicking all open its changeset, the same as for a commit. What pending changes cannot do is join a range or a comparison — a shift-click or a modifier-click that would pair the pending row with a commit, in either direction, is rejected with a message explaining that pending changes can only be reviewed on their own, and the selection beforehand is left exactly as it was.
+
+Opening the pending changeset shows every uncommitted difference against the checked-out commit: staged changes, unstaged changes, and untracked files, combined into one changeset where each file appears once for its net change. Untracked files appear as added, with their on-disk content as the new side. Files or folders matched by `.gitignore` are excluded, and submodules are skipped, exactly as they are for any other diff. The window bar reads `{repository} / pending`, and the popover opened from it is headed "Reviewing pending changes" with the changeset's file count, line totals, and kind breakdown — it carries no commit list and no identifier line, since there is no fixed set of commits to enumerate.
+
+The file list shown when the changeset opens, and the summary shown in the graph row, are both a snapshot taken at that moment — open, activate the window, or close a changeset elsewhere in the app, and the list is recomputed. An individual file's diff content, though, is only read the first time that file is viewed: once read, it is held fixed for as long as the changeset stays open, even if the file changes on disk again in the meantime, so a reviewer's read never shifts underfoot mid-review.
+
+**Triggering conditions**
+
+- A repository is open — the pending row is always present, alongside every commit.
+- The user clicks the pending row, presses enter while it is selected, activates the open-changeset affordance, or double-clicks the row.
+- The user attempts a shift-click or modifier-click that would pair the pending row with a commit.
+- The repository is opened, the window is activated, or an open changeset is closed.
+
+**Observable outcomes**
+
+- The pending row appears above every commit, connected to the checked-out commit by an edge, showing a hollow dot, "Pending changes", and either the file/line summary or "No pending changes".
+- Clicking the row selects it and shows "Pending changes selected" in the selection summary.
+- Enter, the open-changeset affordance, and double-clicking open the pending changeset.
+- Opening it shows the combined staged, unstaged, and untracked difference against HEAD, one entry per file; the window bar reads `{repository} / pending`; the popover header reads "Reviewing pending changes" with counts and a kind breakdown, and no commit list or identifier line.
+- The row's summary and the changeset's file list refresh on repository open, on the window regaining focus, and when any open changeset closes.
+
+**Edge cases**
+
+- A shift-click or modifier-click that would pair the pending row with a commit, in either direction, is rejected with a message explaining that pending changes can only be reviewed on their own; the prior selection is preserved.
+- An empty repository still shows the pending row on its own; the "no commits to review" message appears alongside it only when the working tree is also clean.
+- In a detached-HEAD repository, pending changes diff against the checked-out commit, whatever it is.
+- Hiding branches never removes the pending row; it is not a branch and is unaffected by branch visibility.
+- Binary files in the pending changeset show the same explanatory placeholder as binary files anywhere else.
+- A file viewed while the changeset is open keeps showing what it read at that first view, even if the file changes on disk again before the changeset is closed.
 
 ## Opening the changeset
 

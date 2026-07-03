@@ -8,6 +8,8 @@ Every commit occupies exactly one lane — a fixed horizontal position its dot i
 
 Everything off the trunk takes a lane to the trunk's right. A new side branch opens in the nearest free lane and never displaces a lane that is already in use; an occupied lane keeps its horizontal position until the branch it carries ends. When several side branches sprout from the same commit, their lanes are ordered by authored time: the branch with the earliest commits sits innermost (closest to the trunk), and each later sibling takes the next lane outward. Siblings keep their outward lanes until they rejoin the shared parent. A sibling's reserved lane covers its whole first-parent chain, not just the commit that touches the shared parent: any commit further up that branch — including a merge whose first-parent history descends into the fork point — draws in the same lane, so the branch reads as one stroke from tip to fork instead of borrowing a neighboring sibling's lane.
 
+The repository's pending changes (see the review workflow spec) sit above the graph as a synthetic top node rather than a commit, but they participate in lane layout exactly like one: their first parent is the checked-out commit, and their timestamp outranks every commit in the graph. That makes them, by the trunk-extension rule above, the newest first-parent continuation of the checked-out history — they always win the trunk, extending the left-most lane one row further. A consequence follows for any fast-forwardable branch tip that would otherwise have continued the trunk: with pending changes occupying that continuation instead, the tip takes a side lane of its own above the checked-out commit's row rather than drawing as trunk.
+
 **Guaranteed invariants**
 
 - The checked-out commit's first-parent history, extended through fast-forwardable descendants, occupies the left-most lane for its entire visible length.
@@ -15,6 +17,7 @@ Everything off the trunk takes a lane to the trunk's right. A new side branch op
 - A lane keeps its horizontal position from the moment a branch occupies it until that branch ends; new branches never evict it.
 - Sibling branches sharing a parent are ordered inner-to-outer by the authored time of their commits, earliest innermost.
 - A sibling branch occupies one lane for its entire first-parent chain, from its tip down to the fork point, even when its tip is a merge that sits several rows above that fork.
+- Exception to the trunk-extension rule: the pending-changes node always wins the trunk over any competing fast-forwardable tip, regardless of that tip's own authored time, because it is defined to outrank every commit.
 
 **Edge cases**
 

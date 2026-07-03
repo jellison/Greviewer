@@ -278,6 +278,11 @@ pub struct App {
     context_popover_open: bool,
     /// Whether the title-bar repo switcher (sibling-repository list) is open.
     repo_switcher_open: bool,
+    /// Roll-up of the pending working-tree state, rendered as the graph's
+    /// synthetic top row. Recomputed by `refresh_pending_summary` on
+    /// repository open (and, in a later slice, window activation and
+    /// changeset close); no filesystem watcher in v1.
+    pub(crate) pending_summary: repo::PendingSummary,
 }
 
 #[derive(Clone)]
@@ -470,6 +475,9 @@ pub enum Mode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
     None,
+    /// The synthetic pending-changes item. Only viewable on its own: range
+    /// and comparison gestures to or from it are rejected.
+    Pending,
     Single {
         sha: String,
     },
@@ -516,6 +524,7 @@ fn default_selection(repo: &repo::OpenRepository, hidden_branches: &BTreeSet<Str
 fn selection_summary(selection: &Selection) -> Option<String> {
     match selection {
         Selection::None => None,
+        Selection::Pending => Some("Pending changes selected".to_string()),
         Selection::Single { .. } => Some("1 commit selected".to_string()),
         Selection::Range { shas, .. } => Some(format!("{} commits selected", shas.len())),
         Selection::Compare {
@@ -868,11 +877,30 @@ impl App {
         })
         .detach();
 
+        // The pending summary is event-driven, not watched: recompute it when
+        // the window regains focus so edits made in another app show up.
+        cx.observe_window_activation(window, |app, window, cx| {
+            if window.is_window_active() {
+                let before = app.pending_summary;
+                app.refresh_pending_summary();
+                if app.pending_summary != before {
+                    cx.notify();
+                }
+            }
+        })
+        .detach();
+
         // No branches are hidden at construction, so the default selection is
         // computed against the fully visible graph.
         let selection = match &mode {
             Mode::RepoOpen { repo } => default_selection(repo, &BTreeSet::new()),
             Mode::NoRepo => Selection::None,
+        };
+        // Read errors degrade to a clean summary rather than surfacing; see
+        // `refresh_pending_summary`, which this construction-time read mirrors.
+        let pending_summary = match &mode {
+            Mode::RepoOpen { repo } => repo::read_pending_summary(&repo.path).unwrap_or_default(),
+            Mode::NoRepo => repo::PendingSummary::default(),
         };
 
         Self {
@@ -920,6 +948,7 @@ impl App {
             focus_handle,
             context_popover_open: false,
             repo_switcher_open: false,
+            pending_summary,
         }
     }
 
@@ -1007,6 +1036,7 @@ impl App {
         let selection = default_selection(&repo, &BTreeSet::new());
         self.mode = Mode::RepoOpen { repo };
         self.selection = selection;
+        self.refresh_pending_summary();
         self.review_screen = ReviewScreen::Graph;
         self.comparison_commit_shas = None;
         self.workspace = crate::workspace::Workspace::new();
@@ -1047,6 +1077,16 @@ impl App {
         self.context_popover_open = false;
         self.repo_switcher_open = false;
         cx.notify();
+    }
+
+    /// Recompute the pending working-tree summary. Called on repository open,
+    /// window activation, and changeset close — no filesystem watcher in v1.
+    /// Read errors degrade to a clean summary rather than surfacing.
+    fn refresh_pending_summary(&mut self) {
+        self.pending_summary = match &self.mode {
+            Mode::RepoOpen { repo } => repo::read_pending_summary(&repo.path).unwrap_or_default(),
+            Mode::NoRepo => repo::PendingSummary::default(),
+        };
     }
 
     fn record_recent_repository(&mut self, path: PathBuf) {
@@ -1216,6 +1256,9 @@ impl App {
         );
         let selection_hidden = match &self.selection {
             Selection::None => false,
+            // The pending selection is not tied to any branch or commit, so
+            // hiding branches never affects it.
+            Selection::Pending => false,
             Selection::Single { sha } => !visible.contains(sha),
             Selection::Range { shas, .. } => shas.iter().any(|sha| !visible.contains(sha)),
             Selection::Compare {
@@ -1267,7 +1310,9 @@ impl App {
         };
 
         self.selection = Selection::Single { sha: tip_sha };
-        self.scroll_commit_row_into_view(commit_index, commit_count);
+        // Row 0 is always the pending row, so commit `commit_index` sits at
+        // graph row `commit_index + 1`, and the total row count grows by one.
+        self.scroll_commit_row_into_view(commit_index + 1, commit_count + 1);
         cx.notify();
     }
 
@@ -1313,6 +1358,29 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let pending_gesture = sha == repo::PENDING_SHA;
+        let pending_selected = self.selection == Selection::Pending;
+        if (pending_gesture || pending_selected) && (modifiers.secondary() || modifiers.shift) {
+            // Exception: a shift/cmd click on the pending row while pending is
+            // already selected is a no-op, mirroring same-commit gestures.
+            if pending_gesture && pending_selected {
+                return;
+            }
+            self.push_open_failed(
+                "Pending changes can only be reviewed on their own.".to_string(),
+                window,
+                cx,
+            );
+            return;
+        }
+        if pending_gesture {
+            if !pending_selected {
+                self.selection = Selection::Pending;
+                cx.notify();
+            }
+            return;
+        }
+
         // The secondary (cmd/ctrl) modifier wins over shift, so a
         // cmd+shift-click reads as a comparison rather than a range.
         if modifiers.secondary() {
@@ -1380,6 +1448,9 @@ impl App {
                 self.select_single_commit(sha, cx);
                 return;
             }
+            // Unreachable: select_commit intercepts every secondary-modifier
+            // gesture to or from the pending selection before calling here.
+            Selection::Pending => return,
         };
 
         if target_sha == sha {
@@ -1498,6 +1569,7 @@ impl App {
         };
 
         let changeset = match &self.selection {
+            Selection::Pending => repo::changeset_for_pending(&repo_path),
             Selection::Single { sha } => repo::changeset_for_single_commit(&repo_path, sha),
             Selection::Range { shas, .. } => {
                 let (Some(newest_sha), Some(oldest_sha)) = (shas.first(), shas.last()) else {
@@ -1566,6 +1638,7 @@ impl App {
         self.stop_caret_blink();
         self.diff_row_cache.borrow_mut().clear();
         self.read_only_cell_cache.borrow_mut().clear();
+        self.refresh_pending_summary();
         cx.notify();
     }
 
@@ -2242,8 +2315,12 @@ impl App {
         if let Some(cached) = self.read_only_cell_cache.borrow().get(&key) {
             return Some(cached.clone());
         }
-        let file_content =
-            repo::file_content_at_commit(&repo.path, &changeset.commit_sha, path).ok()?;
+        let file_content = if changeset.commit_sha == repo::PENDING_SHA {
+            repo::file_content_in_worktree(&repo.path, path)
+        } else {
+            repo::file_content_at_commit(&repo.path, &changeset.commit_sha, path)
+        }
+        .ok()?;
         let repo::FileContentBody::Text(text) = file_content.content else {
             return None;
         };
@@ -2682,6 +2759,9 @@ impl App {
 
     fn is_commit_selected(&self, sha: &str) -> bool {
         match &self.selection {
+            // The pending row is not a commit; no commit row reads as
+            // selected while it is active.
+            Selection::Pending => false,
             Selection::Single { sha: selected_sha } => selected_sha == sha,
             Selection::Range { shas, .. } => shas.iter().any(|selected_sha| selected_sha == sha),
             Selection::Compare {
@@ -2907,14 +2987,20 @@ impl App {
             }
         }
 
-        let graph_commits = visible_commits
-            .iter()
-            .map(|commit| graph::GraphCommit {
-                sha: commit.sha.clone(),
-                authored_timestamp: commit.authored_timestamp,
-                parent_shas: commit.parent_shas.clone(),
-            })
-            .collect::<Vec<_>>();
+        let mut graph_commits = Vec::with_capacity(visible_commits.len() + 1);
+        // The synthetic pending-changes node: newest possible timestamp so the
+        // trunk-extension rule keeps it in lane 0 as HEAD's continuation, with
+        // HEAD as its only parent (parentless on an unborn branch).
+        graph_commits.push(graph::GraphCommit {
+            sha: repo::PENDING_SHA.to_string(),
+            authored_timestamp: i64::MAX,
+            parent_shas: head_sha.iter().cloned().collect(),
+        });
+        graph_commits.extend(visible_commits.iter().map(|commit| graph::GraphCommit {
+            sha: commit.sha.clone(),
+            authored_timestamp: commit.authored_timestamp,
+            parent_shas: commit.parent_shas.clone(),
+        }));
         let rows = graph::layout_graph_anchored(&graph_commits, head_sha.as_deref());
         let max_lanes = rows.iter().map(|row| row.lane_count).max().unwrap_or(1);
         let layout = Rc::new(GraphLayout { rows, max_lanes });
@@ -2953,14 +3039,25 @@ impl App {
                 let layout = app.graph_layout(repo);
                 range
                     .map(|index| {
-                        app.render_commit_row(
-                            index,
-                            visible_commits[index],
-                            &layout.rows,
-                            layout.max_lanes,
-                            app.is_commit_selected(&visible_commits[index].sha),
-                            cx,
-                        )
+                        if index == 0 {
+                            app.render_pending_row(
+                                &layout.rows,
+                                layout.max_lanes,
+                                app.selection == Selection::Pending,
+                                cx,
+                            )
+                            .into_any_element()
+                        } else {
+                            app.render_commit_row(
+                                index,
+                                visible_commits[index - 1],
+                                &layout.rows,
+                                layout.max_lanes,
+                                app.is_commit_selected(&visible_commits[index - 1].sha),
+                                cx,
+                            )
+                            .into_any_element()
+                        }
                     })
                     .collect::<Vec<_>>()
             }),
@@ -2982,66 +3079,84 @@ impl App {
         repo: &repo::OpenRepository,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let history = if repo.commits.is_empty() {
-            div()
-                .flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .id("commit-history-empty")
-                .debug_selector(|| "commit-history-empty".to_string())
-                .text_color(palette().text_muted)
-                .text_size(px(14.))
-                .child("This repository has no commits to review.")
-                .into_any_element()
-        } else {
-            let layout = self.graph_layout(repo);
-            let item_count = layout.rows.len();
-            let scroll_handle = self.commit_history_scroll.clone();
-            // Selection highlight, painted behind the rows. Commit rows carry
-            // no background of their own: the graph gutter's bend overlays
-            // deliberately spill across row borders (curves are centered on
-            // the boundary between rows), and rows paint top to bottom, so an
-            // opaque background on a row would erase whatever the row above
-            // drew below the border. The highlight therefore lives in this
-            // canvas underlay, which reads the scroll offset at paint time so
-            // it can never lag the rows during a scroll.
-            let selected_indices: Vec<usize> = visible_commits(repo, &self.hidden_branches)
-                .iter()
-                .enumerate()
-                .filter(|(_, commit)| self.is_commit_selected(&commit.sha))
-                .map(|(index, _)| index)
-                .collect();
-            let underlay_scroll = self.commit_history_scroll.clone();
-            let selection_underlay = canvas(
-                |_, _, _| {},
-                move |bounds, _, window, _| {
-                    let scroll_offset = underlay_scroll.0.borrow().base_handle.offset();
-                    for rect in commit_history_selection_underlay_rects(
-                        bounds,
-                        scroll_offset.y,
-                        &selected_indices,
-                    ) {
-                        window.paint_quad(gpui::fill(rect, palette().row_selected));
-                    }
-                },
-            )
-            .absolute()
-            .left_0()
-            .top_0()
-            .size_full();
+        // The pending row always occupies row 0, so the list renders even when
+        // the repository has no commits; the "no commits" message becomes a
+        // sibling below the pending row rather than replacing the list.
+        let layout = self.graph_layout(repo);
+        let item_count = layout.rows.len();
+        let scroll_handle = self.commit_history_scroll.clone();
+        // Selection highlight, painted behind the rows. Commit rows carry
+        // no background of their own: the graph gutter's bend overlays
+        // deliberately spill across row borders (curves are centered on
+        // the boundary between rows), and rows paint top to bottom, so an
+        // opaque background on a row would erase whatever the row above
+        // drew below the border. The highlight therefore lives in this
+        // canvas underlay, which reads the scroll offset at paint time so
+        // it can never lag the rows during a scroll.
+        let mut selected_indices: Vec<usize> = visible_commits(repo, &self.hidden_branches)
+            .iter()
+            .enumerate()
+            .filter(|(_, commit)| self.is_commit_selected(&commit.sha))
+            .map(|(index, _)| index + 1)
+            .collect();
+        if self.selection == Selection::Pending {
+            selected_indices.insert(0, 0);
+        }
+        let underlay_scroll = self.commit_history_scroll.clone();
+        let selection_underlay = canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                let scroll_offset = underlay_scroll.0.borrow().base_handle.offset();
+                for rect in commit_history_selection_underlay_rects(
+                    bounds,
+                    scroll_offset.y,
+                    &selected_indices,
+                ) {
+                    window.paint_quad(gpui::fill(rect, palette().row_selected));
+                }
+            },
+        )
+        .absolute()
+        .left_0()
+        .top_0()
+        .size_full();
 
-            div()
-                .relative()
-                .flex_1()
-                .h_full()
-                .min_h_0()
-                .min_w_0()
-                .debug_selector(|| "commit-history-container".to_string())
-                .child(selection_underlay)
-                .child(self.render_commit_history_list(item_count, scroll_handle, cx))
-                .into_any_element()
-        };
+        let history = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .h_full()
+            .min_h_0()
+            .min_w_0()
+            .debug_selector(|| "commit-history-container".to_string())
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(selection_underlay)
+                    .child(self.render_commit_history_list(item_count, scroll_handle, cx)),
+            )
+            .when(
+                repo.commits.is_empty() && !self.pending_summary.is_dirty(),
+                |history| {
+                    history.child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .py_4()
+                            .id("commit-history-empty")
+                            .debug_selector(|| "commit-history-empty".to_string())
+                            .text_color(palette().text_muted)
+                            .text_size(px(14.))
+                            .child("This repository has no commits to review."),
+                    )
+                },
+            );
 
         let history_panel = div()
             .relative()
@@ -3819,7 +3934,12 @@ impl App {
                 .map(FileListEntry::Changed)
                 .collect()),
             FileListMode::All => {
-                repo::files_at_commit(&repo.path, &changeset.commit_sha).map(|files| {
+                let files = if changeset.commit_sha == repo::PENDING_SHA {
+                    repo::files_for_pending(&repo.path)
+                } else {
+                    repo::files_at_commit(&repo.path, &changeset.commit_sha)
+                };
+                files.map(|files| {
                     files
                         .into_iter()
                         .map(|file| {
@@ -4548,12 +4668,16 @@ impl App {
             return Ok(cached.clone());
         }
 
-        let diff = repo::file_diff_for_changed_file_between(
-            &repo.path,
-            &changeset.commit_sha,
-            changeset.base_sha.as_deref(),
-            file,
-        )
+        let diff = if changeset.commit_sha == repo::PENDING_SHA {
+            repo::file_diff_for_pending_file(&repo.path, file)
+        } else {
+            repo::file_diff_for_changed_file_between(
+                &repo.path,
+                &changeset.commit_sha,
+                changeset.base_sha.as_deref(),
+                file,
+            )
+        }
         .map_err(|err| err.to_string())?;
 
         let prepared = Rc::new(PreparedFileDiff::from_content(
@@ -4643,7 +4767,12 @@ impl App {
             hovered,
         } = pane_render;
         let selection_ctx = self.diff_selection_context(pane, path, cx);
-        let content = match repo::file_content_at_commit(&repo.path, &changeset.commit_sha, path) {
+        let content = if changeset.commit_sha == repo::PENDING_SHA {
+            repo::file_content_in_worktree(&repo.path, path)
+        } else {
+            repo::file_content_at_commit(&repo.path, &changeset.commit_sha, path)
+        };
+        let content = match content {
             Ok(content) => render_file_content(
                 content.content,
                 scroll,
@@ -4725,6 +4854,7 @@ impl App {
                 index.checked_sub(1).and_then(|prev| graph_rows.get(prev)),
                 graph_rows.get(index + 1),
                 max_graph_lanes,
+                CommitDotStyle::Solid,
             ))
             .child(
                 div()
@@ -4771,6 +4901,83 @@ impl App {
                 commit,
                 &self.hidden_branches,
             ))
+    }
+
+    /// Render the synthetic pending-changes row that always tops the graph
+    /// (row 0). Mirrors `render_commit_row`'s shell (height, gap, padding,
+    /// click gesture) but has no commit metadata of its own; its gutter dot
+    /// renders hollow to read as distinct from committed rows.
+    fn render_pending_row(
+        &self,
+        graph_rows: &[graph::GraphRow],
+        max_graph_lanes: usize,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let debug_selector = if selected {
+            "selected-pending-row".to_string()
+        } else {
+            "pending-row".to_string()
+        };
+        let summary = self.pending_summary;
+        let summary_text = if summary.is_dirty() {
+            format!(
+                "{} file{} changed   +{} \u{2212}{}",
+                summary.file_count,
+                if summary.file_count == 1 { "" } else { "s" },
+                summary.line_stats.added,
+                summary.line_stats.removed,
+            )
+        } else {
+            "No pending changes".to_string()
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(COMMIT_ROW_HEIGHT))
+            .font_family(MONO_FONT_FAMILY)
+            .gap_3()
+            .px_4()
+            .cursor_pointer()
+            .id("pending-row")
+            .debug_selector(move || debug_selector.clone())
+            .on_click(cx.listener(|app, event: &ClickEvent, window, cx| {
+                if event.click_count() >= 2 {
+                    app.double_click_anchor = None;
+                    app.selection = Selection::Pending;
+                    app.open_changeset(window, cx);
+                } else {
+                    app.select_commit(repo::PENDING_SHA.to_string(), event.modifiers(), window, cx);
+                }
+            }))
+            .child(render_commit_graph_gutter(
+                0,
+                &graph_rows[0],
+                None,
+                graph_rows.get(1),
+                max_graph_lanes,
+                CommitDotStyle::Hollow,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_color(palette().text)
+                    .text_size(px(14.))
+                    .truncate()
+                    .debug_selector(|| "pending-title".to_string())
+                    .child("Pending changes"),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(palette().text_muted)
+                    .text_size(px(12.))
+                    .debug_selector(|| "pending-summary".to_string())
+                    .child(summary_text),
+            )
     }
 }
 
@@ -4968,9 +5175,9 @@ fn restored_width(saved: Option<f32>, default: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        restored_width, selection_summary, App, CloseChangeset, DiffDrag, DiffDragMode, Mode,
-        OpenChangeset, OpenFailed, PreparedFileDiff, ReviewScreen, Selection, FILE_TREE_ROW_HEIGHT,
-        SIDEBAR_MIN_WIDTH,
+        restored_width, selection_summary, App, CloseChangeset, DiffDrag, DiffDragMode,
+        FileListMode, Mode, OpenChangeset, OpenFailed, PreparedFileDiff, ReviewScreen, Selection,
+        FILE_TREE_ROW_HEIGHT, SIDEBAR_MIN_WIDTH,
     };
     use crate::repo::{ChangeKind, INITIAL_COMMIT_LIMIT};
     use crate::settings::{RecentRepository, Settings, SidebarWidths, WindowMode};
@@ -6174,14 +6381,15 @@ mod tests {
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);
-        // Three commits loaded, one (the feature-exclusive commit) hidden.
-        assert!(visual.debug_bounds("commit-row-1").is_some());
+        // Three commits loaded (rows 1..4, row 0 is the pending row), one
+        // (the feature-exclusive commit) hidden.
+        assert!(visual.debug_bounds("commit-row-2").is_some());
         assert!(
-            visual.debug_bounds("commit-row-2").is_none(),
+            visual.debug_bounds("commit-row-3").is_none(),
             "the feature-exclusive commit must not render"
         );
         // The feature ref label is gone from every remaining row.
-        for row in 0..2usize {
+        for row in 1..3usize {
             let selector = test_debug_selector(format!("commit-ref-label-{row}-heads-feature"));
             assert!(
                 visual.debug_bounds(selector).is_none(),
@@ -6207,8 +6415,9 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         // Hide-then-show must round-trip to the identical render: all three
-        // rows back, the feature label on exactly one of them.
-        for row in 0..3 {
+        // commit rows back (rows 1..4, row 0 is the pending row), the feature
+        // label on exactly one of them.
+        for row in 1..4 {
             assert!(
                 visual
                     .debug_bounds(test_debug_selector(format!("commit-row-{row}")))
@@ -6219,7 +6428,7 @@ mod tests {
                 "row {row} must render after re-showing the branch"
             );
         }
-        let feature_label_rows = (0..3)
+        let feature_label_rows = (1..4)
             .filter(|row| {
                 visual
                     .debug_bounds(test_debug_selector(format!(
@@ -6237,7 +6446,8 @@ mod tests {
     #[gpui::test]
     async fn focusing_a_branch_targets_its_visible_row_index(cx: &mut TestAppContext) {
         // Hiding `feature` removes row 1, shifting root from index 2 to 1.
-        // Focusing master must select the row at its *visible* index.
+        // Focusing master must select the row at its *visible* index. Row 0 is
+        // always the pending row, so visible commit indices shift by one.
         let (dir, _main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
@@ -6258,9 +6468,10 @@ mod tests {
             .expect("master branch row renders");
         visual.simulate_click(master_row.center(), Modifiers::none());
 
-        // With feature hidden the visible order is: master tip (0), root (1).
+        // With feature hidden the visible order is: pending (0), master tip
+        // (1), root (2).
         visual
-            .debug_bounds("selected-commit-row-0")
+            .debug_bounds("selected-commit-row-1")
             .expect("master tip is the selected visible row");
     }
 
@@ -6280,13 +6491,14 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         // The tip is the checked-out commit, selected by default on open.
+        // Row 0 is always the pending row, so the tip sits at row 1.
         let tip_bounds = visual
-            .debug_bounds("selected-commit-row-0")
+            .debug_bounds("selected-commit-row-1")
             .expect("tip commit row debug bounds");
         visual.simulate_click(tip_bounds.center(), Modifiers::none());
 
         let root_bounds = visual
-            .debug_bounds("commit-row-2")
+            .debug_bounds("commit-row-3")
             .expect("root commit row debug bounds");
         visual.simulate_click(root_bounds.center(), Modifiers::shift());
 
@@ -6304,13 +6516,13 @@ mod tests {
             .expect("read range selection");
 
         visual
-            .debug_bounds("selected-commit-row-0")
+            .debug_bounds("selected-commit-row-1")
             .expect("selected tip row debug bounds");
         visual
-            .debug_bounds("selected-commit-row-1")
+            .debug_bounds("selected-commit-row-2")
             .expect("selected middle row debug bounds");
         visual
-            .debug_bounds("selected-commit-row-2")
+            .debug_bounds("selected-commit-row-3")
             .expect("selected root row debug bounds");
     }
 
@@ -6329,7 +6541,7 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let row_bounds = visual
-            .debug_bounds("commit-row-1")
+            .debug_bounds("commit-row-2")
             .expect("middle commit row debug bounds");
         simulate_double_click(&mut visual, row_bounds.center());
 
@@ -6373,7 +6585,7 @@ mod tests {
         let mut visual = VisualTestContext::from_window(*window, cx);
         // The tip is the checked-out commit, selected by default on open.
         let row_bounds = visual
-            .debug_bounds("selected-commit-row-0")
+            .debug_bounds("selected-commit-row-1")
             .expect("tip commit row debug bounds");
         simulate_double_click(&mut visual, row_bounds.center());
 
@@ -6412,17 +6624,17 @@ mod tests {
         let mut visual = VisualTestContext::from_window(*window, cx);
         // The tip is the checked-out commit, selected by default on open.
         let tip_bounds = visual
-            .debug_bounds("selected-commit-row-0")
+            .debug_bounds("selected-commit-row-1")
             .expect("tip commit row debug bounds");
         visual.simulate_click(tip_bounds.center(), Modifiers::none());
         let root_bounds = visual
-            .debug_bounds("commit-row-2")
+            .debug_bounds("commit-row-3")
             .expect("root commit row debug bounds");
         visual.simulate_click(root_bounds.center(), Modifiers::shift());
 
         // Range tip..root is selected; double-click the middle commit.
         let middle_bounds = visual
-            .debug_bounds("selected-commit-row-1")
+            .debug_bounds("selected-commit-row-2")
             .expect("middle commit row debug bounds");
         simulate_double_click(&mut visual, middle_bounds.center());
 
@@ -6460,12 +6672,12 @@ mod tests {
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         let row_bounds = visual
-            .debug_bounds("commit-row-1")
+            .debug_bounds("commit-row-2")
             .expect("middle commit row debug bounds");
         visual.simulate_click(row_bounds.center(), Modifiers::none());
 
         let selected_bounds = visual
-            .debug_bounds("selected-commit-row-1")
+            .debug_bounds("selected-commit-row-2")
             .expect("selected middle commit row debug bounds");
         simulate_double_click(&mut visual, selected_bounds.center());
 
@@ -6486,6 +6698,227 @@ mod tests {
                 }
             })
             .expect("read review screen");
+    }
+
+    #[gpui::test]
+    async fn plain_click_gesture_selects_pending(cx: &mut TestAppContext) {
+        let (dir, _sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_commit(
+                    crate::repo::PENDING_SHA.to_string(),
+                    Modifiers::none(),
+                    window,
+                    cx,
+                );
+
+                assert_eq!(app.selection, Selection::Pending);
+                assert_eq!(
+                    selection_summary(&app.selection).as_deref(),
+                    Some("Pending changes selected")
+                );
+            })
+            .expect("select the pending row");
+    }
+
+    #[gpui::test]
+    async fn range_and_compare_gestures_involving_pending_are_rejected(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let (dir, sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+        let app_entity = window.entity(cx).expect("get app entity");
+
+        let captured: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let _subscription = app_entity.update(cx, |_, cx| {
+            cx.subscribe(&app_entity, move |_, _, event: &OpenFailed, _| {
+                captured_clone.borrow_mut().push(event.0.clone());
+            })
+        });
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+
+                // Shift-click onto the pending row from a commit selection.
+                app.selection = Selection::Single { sha: sha.clone() };
+                app.select_commit(
+                    crate::repo::PENDING_SHA.to_string(),
+                    Modifiers::shift(),
+                    window,
+                    cx,
+                );
+                assert_eq!(app.selection, Selection::Single { sha: sha.clone() });
+
+                // Shift-click onto a commit while pending is selected.
+                app.selection = Selection::Pending;
+                app.select_commit(sha.clone(), Modifiers::shift(), window, cx);
+                assert_eq!(app.selection, Selection::Pending);
+
+                // Cmd-click both directions.
+                app.select_commit(sha.clone(), Modifiers::secondary_key(), window, cx);
+                assert_eq!(app.selection, Selection::Pending);
+
+                app.selection = Selection::Single { sha: sha.clone() };
+                app.select_commit(
+                    crate::repo::PENDING_SHA.to_string(),
+                    Modifiers::secondary_key(),
+                    window,
+                    cx,
+                );
+                assert_eq!(app.selection, Selection::Single { sha: sha.clone() });
+            })
+            .expect("attempt gestures involving pending");
+
+        cx.run_until_parked();
+
+        let events = captured.borrow();
+        assert_eq!(events.len(), 4, "exactly four rejections emitted");
+        assert!(
+            events
+                .iter()
+                .all(|message| message == "Pending changes can only be reviewed on their own."),
+            "unexpected rejection message(s): {:?}",
+            events
+        );
+    }
+
+    #[gpui::test]
+    async fn pending_row_tops_the_graph_with_an_edge_to_head(cx: &mut TestAppContext) {
+        let (dir, _sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        fs::write(dir.path().join("dirty.txt"), "dirt\n").expect("write dirty file");
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+
+        let pending = visual
+            .debug_bounds("pending-row")
+            .expect("pending row renders");
+        let head_row = visual
+            .debug_bounds("selected-commit-row-1")
+            .expect("HEAD commit row sits below the pending row");
+        assert!(pending.origin.y < head_row.origin.y);
+        // The pending summary shows the dirty state.
+        assert!(visual.debug_bounds("pending-summary").is_some());
+        // The synthetic edge descends from the pending row to HEAD in lane 0:
+        // the pending row has an outgoing lane-0 vertical.
+        assert!(visual
+            .debug_bounds("commit-graph-vertical-0-0-bottom")
+            .is_some());
+    }
+
+    #[gpui::test]
+    async fn clean_tree_pending_row_reads_no_pending_changes(cx: &mut TestAppContext) {
+        let (dir, _sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                assert!(!app.pending_summary.is_dirty());
+            })
+            .expect("open repo");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds("pending-row").is_some());
+    }
+
+    #[gpui::test]
+    async fn clicking_the_pending_row_selects_it(cx: &mut TestAppContext) {
+        let (dir, _sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+
+        let pending = visual.debug_bounds("pending-row").expect("pending row");
+        visual.simulate_click(pending.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(app.selection, Selection::Pending);
+            })
+            .expect("read selection");
+        assert!(visual.debug_bounds("selected-pending-row").is_some());
+    }
+
+    #[gpui::test]
+    async fn double_clicking_pending_opens_the_pending_changeset(cx: &mut TestAppContext) {
+        let (repo_dir, _sha) = init_repo_with_one_commit();
+        fs::write(repo_dir.path().join("dirty.txt"), "dirt\n").expect("write dirty file");
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(repo_dir.path().to_path_buf(), window, cx);
+            })
+            .expect("open repo");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let pending = visual.debug_bounds("pending-row").expect("pending row");
+        simulate_double_click(&mut visual, pending.center());
+
+        window
+            .read_with(cx, |app, _cx| {
+                let ReviewScreen::Changeset { sha, changeset } = &app.review_screen else {
+                    panic!("double-clicking the pending row must open the pending changeset");
+                };
+                assert_eq!(sha, crate::repo::PENDING_SHA);
+                assert!(changeset.files.iter().any(|file| file.path == "dirty.txt"));
+            })
+            .expect("read review screen");
+    }
+
+    #[gpui::test]
+    async fn pending_changeset_renders_a_worktree_file_diff(cx: &mut TestAppContext) {
+        let (repo_dir, _sha) = init_repo_with_one_commit();
+        // Modify the fixture's tracked file so the pending diff is
+        // side-by-side: old side from HEAD, new side from the worktree.
+        fs::write(repo_dir.path().join("hello.txt"), "changed\n").expect("modify tracked file");
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(repo_dir.path().to_path_buf(), window, cx);
+                app.selection = Selection::Pending;
+                app.open_changeset(window, cx);
+            })
+            .expect("open pending changeset");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let file_row = visual
+            .debug_bounds("changed-file-name-hello.txt")
+            .expect("changed file row");
+        visual.simulate_click(file_row.center(), Modifiers::none());
+
+        assert!(visual.debug_bounds("file-detail-shell").is_some());
+        assert!(
+            visual.debug_bounds("file-diff-error").is_none(),
+            "pending file diff must read from the worktree, not a commit lookup"
+        );
     }
 
     #[gpui::test]
@@ -6527,11 +6960,14 @@ mod tests {
                 let Mode::RepoOpen { repo } = &app.mode else {
                     panic!("expected repo open mode");
                 };
+                // Row 0 is always the pending row, so a commit's graph row is
+                // one past its position in `repo.commits`.
                 let position = |sha: &str| {
                     repo.commits
                         .iter()
                         .position(|commit| commit.sha == sha)
                         .expect("commit row")
+                        + 1
                 };
                 (position(&left_sha), position(&right_sha))
             })
@@ -6865,6 +7301,8 @@ mod tests {
 
         cx.run_until_parked();
 
+        // Row 0 is always the pending row, so a commit's graph row is one past
+        // its position in `repo.commits`.
         let (merge_index, main_index, side_index) = window
             .read_with(cx, |app, _cx| {
                 let Mode::RepoOpen { repo } = &app.mode else {
@@ -6874,17 +7312,20 @@ mod tests {
                     .commits
                     .iter()
                     .position(|commit| commit.sha == merge_sha)
-                    .expect("merge commit row");
+                    .expect("merge commit row")
+                    + 1;
                 let main_index = repo
                     .commits
                     .iter()
                     .position(|commit| commit.sha == main_sha)
-                    .expect("main commit row");
+                    .expect("main commit row")
+                    + 1;
                 let side_index = repo
                     .commits
                     .iter()
                     .position(|commit| commit.sha == side_sha)
-                    .expect("side commit row");
+                    .expect("side commit row")
+                    + 1;
 
                 (merge_index, main_index, side_index)
             })
@@ -7065,12 +7506,12 @@ mod tests {
         let mut visual = VisualTestContext::from_window(*window, cx);
         // The tip is the checked-out commit, selected by default on open.
         let tip_bounds = visual
-            .debug_bounds("selected-commit-row-0")
+            .debug_bounds("selected-commit-row-1")
             .expect("tip commit row debug bounds");
         visual.simulate_click(tip_bounds.center(), Modifiers::none());
 
         let root_bounds = visual
-            .debug_bounds("commit-row-2")
+            .debug_bounds("commit-row-3")
             .expect("root commit row debug bounds");
         visual.simulate_click(root_bounds.center(), Modifiers::shift());
 
@@ -7115,12 +7556,12 @@ mod tests {
         let mut visual = VisualTestContext::from_window(*window, cx);
         // The revert commit is the checked-out tip, selected by default on open.
         let revert_bounds = visual
-            .debug_bounds("selected-commit-row-0")
+            .debug_bounds("selected-commit-row-1")
             .expect("revert commit row debug bounds");
         visual.simulate_click(revert_bounds.center(), Modifiers::none());
 
         let change_bounds = visual
-            .debug_bounds("commit-row-1")
+            .debug_bounds("commit-row-2")
             .expect("change commit row debug bounds");
         visual.simulate_click(change_bounds.center(), Modifiers::shift());
 
@@ -7307,6 +7748,42 @@ mod tests {
                 );
             })
             .expect("verify invalidation");
+    }
+
+    #[gpui::test]
+    async fn read_only_cells_read_pending_worktree_content(cx: &mut TestAppContext) {
+        let (dir, _oid_hex) = init_repo_with_one_commit();
+        // Dirty the tree with an unrelated new file so pending is non-empty;
+        // hello.txt itself stays unchanged and opens read-only in the
+        // all-files view.
+        fs::write(dir.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.selection = Selection::Pending;
+                app.open_changeset(window, cx);
+                app.file_list_mode = FileListMode::All;
+
+                let repo = match &app.mode {
+                    Mode::RepoOpen { repo } => repo,
+                    Mode::NoRepo => panic!("expected an open repository"),
+                };
+                let changeset = match &app.review_screen {
+                    ReviewScreen::Changeset { changeset, .. } => changeset,
+                    ReviewScreen::Graph => panic!("expected the changeset screen"),
+                };
+
+                let cells = app.read_only_cells(repo, changeset, "hello.txt");
+                let cells = cells.expect(
+                    "read_only_cells should read the pending worktree content for an \
+                     unchanged file, not fail on the pending sentinel sha",
+                );
+                assert!(!cells.is_empty(), "hello.txt has content to select");
+            })
+            .expect("resolve read-only cells for an unchanged file in the pending changeset");
     }
 
     #[gpui::test]
@@ -7587,10 +8064,11 @@ mod tests {
         cx.run_until_parked();
 
         // The checked-out tip is selected on open, so its row renders with
-        // the selected treatment straight away.
+        // the selected treatment straight away. Row 0 is always the pending
+        // row, so the tip sits at row 1.
         let mut visual = VisualTestContext::from_window(*window, cx);
         let row_bounds = visual
-            .debug_bounds("selected-commit-row-0")
+            .debug_bounds("selected-commit-row-1")
             .expect("selected commit row debug bounds");
 
         visual.simulate_click(row_bounds.center(), Modifiers::none());
@@ -8353,6 +8831,59 @@ mod tests {
                     app.caret_blink_visible,
                     "stop_caret_blink leaves the caret visible"
                 );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn closing_a_changeset_refreshes_the_pending_summary(cx: &mut TestAppContext) {
+        let window = add_app_window(cx);
+        let (repo_dir, sha) = init_repo_with_one_commit();
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(repo_dir.path().to_path_buf(), window, cx);
+                assert!(!app.pending_summary.is_dirty());
+                app.selection = Selection::Single { sha };
+                app.open_changeset(window, cx);
+            })
+            .unwrap();
+
+        // Dirty the tree while the changeset is open.
+        std::fs::write(repo_dir.path().join("late.txt"), "late\n").unwrap();
+
+        window
+            .update(cx, |app, _, cx| {
+                app.close_changeset(cx);
+                assert!(app.pending_summary.is_dirty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn window_activation_refreshes_the_pending_summary(cx: &mut TestAppContext) {
+        let window = add_app_window(cx);
+        let (repo_dir, _sha) = init_repo_with_one_commit();
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(repo_dir.path().to_path_buf(), window, cx);
+                assert!(!app.pending_summary.is_dirty());
+            })
+            .unwrap();
+
+        // Dirty the tree while the window is inactive (as if edited from
+        // another app), then reactivate the window.
+        std::fs::write(repo_dir.path().join("late.txt"), "late\n").unwrap();
+
+        window
+            .update(cx, |_app, window, _cx| {
+                window.activate_window();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert!(app.pending_summary.is_dirty());
             })
             .unwrap();
     }

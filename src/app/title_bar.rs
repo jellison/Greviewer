@@ -36,6 +36,7 @@ fn commit_count_label(count: usize) -> String {
 /// git's three-dot notation.
 fn context_pill_label(selection: &Selection, changeset: &ChangeSet) -> String {
     match selection {
+        Selection::Pending => "pending".to_string(),
         Selection::Compare {
             base_sha,
             target_sha,
@@ -61,7 +62,7 @@ fn endpoints_line(selection: &Selection, changeset: &ChangeSet) -> Option<String
             let oldest = short_sha(shas.last()?);
             Some(format!("{oldest} \u{2026} {newest}"))
         }
-        Selection::Compare { .. } => None,
+        Selection::Compare { .. } | Selection::Pending => None,
         _ => Some(short_sha(&changeset.commit_sha)),
     }
 }
@@ -70,6 +71,7 @@ fn endpoints_line(selection: &Selection, changeset: &ChangeSet) -> Option<String
 /// {count}"; a comparison states the merge-preview direction.
 fn popover_header_title(selection: &Selection) -> String {
     match selection {
+        Selection::Pending => "Reviewing pending changes".to_string(),
         Selection::Compare {
             base_sha,
             target_sha,
@@ -126,8 +128,10 @@ fn popover_commit_rows(
         Selection::Range { shas, .. } if shas.len() > 1 => shas.clone(),
         Selection::Single { sha } => vec![sha.clone()],
         Selection::Compare { .. } => comparison_shas.map(<[String]>::to_vec).unwrap_or_default(),
+        // Pending has no discrete commits to list.
+        Selection::Pending => Vec::new(),
         // Unreachable from render_context_popover (a changeset always implies
-        // a Single, Range, or Compare selection); handled defensively.
+        // a Single, Range, Compare, or Pending selection); handled defensively.
         _ => vec![changeset.commit_sha.clone()],
     };
     shas.into_iter()
@@ -785,6 +789,29 @@ mod tests {
         assert!(visual.debug_bounds(PILL).is_some());
     }
 
+    #[gpui::test]
+    async fn pill_for_pending_reads_pending(cx: &mut TestAppContext) {
+        let window = app_window(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                let changeset = changeset_with(crate::repo::PENDING_SHA, vec![file_with(3, 1)]);
+                app.mode = Mode::RepoOpen {
+                    repo: repo_named("Demo", vec![]),
+                };
+                app.review_screen = ReviewScreen::Changeset {
+                    sha: crate::repo::PENDING_SHA.to_string(),
+                    changeset,
+                };
+                app.selection = Selection::Pending;
+                cx.notify();
+            })
+            .expect("set pending changeset state");
+
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds(PILL).is_some());
+    }
+
     const POPOVER: &str = "title-bar-context-popover";
     const CLOSE: &str = "title-bar-context-close";
 
@@ -945,6 +972,19 @@ mod tests {
                 ("aaaaaaa".to_string(), "feat: newest".to_string()),
                 ("bbbbbbb".to_string(), String::new()),
             ]
+        );
+    }
+
+    #[test]
+    fn context_pill_label_for_pending_reads_pending() {
+        let changeset = ChangeSet {
+            commit_sha: crate::repo::PENDING_SHA.to_string(),
+            base_sha: None,
+            files: Vec::new(),
+        };
+        assert_eq!(
+            context_pill_label(&Selection::Pending, &changeset),
+            "pending"
         );
     }
 
@@ -1115,6 +1155,44 @@ mod tests {
         assert!(
             visual.debug_bounds("title-bar-context-commit-0").is_some(),
             "a single commit lists its one commit row"
+        );
+    }
+
+    #[gpui::test]
+    async fn popover_for_pending_shows_no_commit_list_or_identifier_line(cx: &mut TestAppContext) {
+        let window = app_window(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                let changeset = changeset_with(crate::repo::PENDING_SHA, vec![file_with(3, 1)]);
+                app.mode = Mode::RepoOpen {
+                    repo: repo_named("Demo", vec![]),
+                };
+                app.review_screen = ReviewScreen::Changeset {
+                    sha: crate::repo::PENDING_SHA.to_string(),
+                    changeset,
+                };
+                app.selection = Selection::Pending;
+                app.context_popover_open = true;
+                cx.notify();
+            })
+            .expect("set pending changeset state");
+
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds("title-bar-context-popover").is_some());
+        assert!(
+            visual.debug_bounds("title-bar-context-endpoints").is_none(),
+            "pending has no commit identifier line"
+        );
+        assert!(
+            visual
+                .debug_bounds("title-bar-context-merge-base")
+                .is_none(),
+            "pending is not a comparison"
+        );
+        assert!(
+            visual.debug_bounds("title-bar-context-commits").is_none(),
+            "pending renders no commit list"
         );
     }
 
