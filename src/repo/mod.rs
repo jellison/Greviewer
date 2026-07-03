@@ -22,19 +22,22 @@ pub struct OpenRepository {
     pub branches: Vec<Branch>,
 }
 
-/// How a branch ref is scoped: a local branch under `refs/heads/`, or a
-/// remote-tracking branch under `refs/remotes/` belonging to a configured
-/// remote.
+/// How a ref is scoped: a local branch under `refs/heads/`, a remote-tracking
+/// branch under `refs/remotes/` belonging to a configured remote, or a tag
+/// under `refs/tags/`. Tags ride the `Branch` type so the sidebar tree,
+/// hiding, and label plumbing treat all three uniformly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BranchKind {
     Local,
     Remote { remote: String },
+    Tag,
 }
 
-/// A branch snapshot taken at open time. `name` is the qualified display
-/// name (`main`, or `origin/main` for a remote-tracking branch). `is_head`
-/// is true only for the checked-out local branch; a detached HEAD marks no
-/// branch.
+/// A ref snapshot taken at open time: a branch or, despite the type's name,
+/// a tag (see [`BranchKind`]). `name` is the qualified display name (`main`,
+/// `origin/main` for a remote-tracking branch, or `v1.0` for a tag).
+/// `is_head` is true only for the checked-out local branch; a detached HEAD
+/// marks no branch, and a tag is never marked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Branch {
     pub name: String,
@@ -209,7 +212,7 @@ pub fn open_at(path: &Path) -> Result<OpenRepository, OpenError> {
     let head_oid = head_commit.as_ref().map(|commit| commit.id());
     let head = head_commit.as_ref().map(head_info_from_commit);
     let checked_out_branch_oid = read_checked_out_branch_oid(&repo)?;
-    let branches = read_branches(&repo)?;
+    let branches = read_branches_and_tags(&repo)?;
     let branch_labels_by_oid = branch_labels_by_oid(&branches)?;
     let page = read_commit_page(
         &repo,
@@ -264,7 +267,7 @@ pub fn load_commits_after(path: &Path, after_sha: &str) -> Result<CommitPage, Op
     let head_commit = read_head_commit(&repo)?;
     let head_oid = head_commit.as_ref().map(|commit| commit.id());
     let checked_out_branch_oid = read_checked_out_branch_oid(&repo)?;
-    let branches = read_branches(&repo)?;
+    let branches = read_branches_and_tags(&repo)?;
     let branch_labels_by_oid = branch_labels_by_oid(&branches)?;
     let after_oid = git2::Oid::from_str(after_sha).map_err(OpenError::Git)?;
 
@@ -902,12 +905,52 @@ fn read_branches(repo: &git2::Repository) -> Result<Vec<Branch>, OpenError> {
     Ok(result)
 }
 
-/// Local branches order before remote-tracking branches everywhere a mixed
-/// list is shown.
+/// The full ref list the snapshot carries: branches (local before remote)
+/// followed by tags, each group name-sorted. Appending the tag group keeps
+/// the whole list ordered by `branch_kind_rank` then name.
+fn read_branches_and_tags(repo: &git2::Repository) -> Result<Vec<Branch>, OpenError> {
+    let mut refs = read_branches(repo)?;
+    refs.extend(read_tags(repo)?);
+    Ok(refs)
+}
+
+/// Reads tags under `refs/tags/`, sorted by name. An annotated tag peels
+/// through the tag object to the tagged commit; a lightweight tag resolves
+/// directly. A tag whose target is not a commit (a tagged blob or tree) is
+/// excluded — the graph has no row to attach it to.
+fn read_tags(repo: &git2::Repository) -> Result<Vec<Branch>, OpenError> {
+    let references = repo
+        .references_glob("refs/tags/*")
+        .map_err(OpenError::Git)?;
+
+    let mut result = Vec::new();
+    for reference in references {
+        let reference = reference.map_err(OpenError::Git)?;
+        let Some(name) = reference.shorthand().map(str::to_string) else {
+            continue;
+        };
+        let Ok(commit) = reference.peel_to_commit() else {
+            continue;
+        };
+        result.push(Branch {
+            name,
+            tip_sha: commit.id().to_string(),
+            is_head: false,
+            kind: BranchKind::Tag,
+        });
+    }
+
+    result.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(result)
+}
+
+/// Local branches order before remote-tracking branches, and tags after both,
+/// everywhere a mixed list is shown.
 fn branch_kind_rank(kind: &BranchKind) -> u8 {
     match kind {
         BranchKind::Local => 0,
         BranchKind::Remote { .. } => 1,
+        BranchKind::Tag => 2,
     }
 }
 
@@ -1346,7 +1389,7 @@ mod tests {
     }
 
     #[test]
-    fn open_at_includes_remote_only_commits_but_not_tag_commits() {
+    fn open_at_includes_remote_only_and_tag_only_commits() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let repo = Repository::init(dir.path()).expect("init repo");
 
@@ -1375,8 +1418,111 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             shas,
-            vec![remote_only.to_string(), root.to_string()],
-            "remote-tracking commits join the graph; tag-only commits stay out",
+            vec![
+                tag_only.to_string(),
+                remote_only.to_string(),
+                root.to_string()
+            ],
+            "remote-tracking and tag-only commits both join the graph",
+        );
+    }
+
+    #[test]
+    fn open_at_returns_tags_sorted_after_remote_branches() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        let tip = commit_tree_to_ref(&repo, Some("HEAD"), "Tip", 100, &[]);
+        repo.remote("origin", "https://example.invalid/repo.git")
+            .expect("configure remote");
+        repo.reference("refs/remotes/origin/master", tip, true, "remote master")
+            .expect("create remote master");
+        repo.reference("refs/tags/v2", tip, true, "lightweight tag")
+            .expect("create lightweight tag");
+        {
+            let commit = repo.find_commit(tip).expect("find tip commit");
+            let tagger = Signature::now("Greviewer Tests", "tests@greviewer.invalid")
+                .expect("create signature");
+            repo.tag("v1", commit.as_object(), &tagger, "Release v1", false)
+                .expect("create annotated tag");
+        }
+        drop(repo);
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+
+        let names_and_kinds = snapshot
+            .branches
+            .iter()
+            .map(|branch| (branch.name.as_str(), branch.kind.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names_and_kinds,
+            vec![
+                ("master", BranchKind::Local),
+                (
+                    "origin/master",
+                    BranchKind::Remote {
+                        remote: "origin".to_string()
+                    }
+                ),
+                ("v1", BranchKind::Tag),
+                ("v2", BranchKind::Tag),
+            ],
+            "tags list after remote-tracking branches, sorted by name",
+        );
+        let v1 = &snapshot.branches[2];
+        assert_eq!(
+            v1.tip_sha,
+            tip.to_string(),
+            "an annotated tag peels through the tag object to the tagged commit",
+        );
+        assert!(!v1.is_head, "a tag is never the checked-out ref");
+    }
+
+    #[test]
+    fn open_at_skips_tags_that_do_not_point_at_commits() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        commit_tree_to_ref(&repo, Some("HEAD"), "Tip", 100, &[]);
+        let blob = repo.blob(b"not a commit").expect("create blob");
+        repo.reference("refs/tags/blob-tag", blob, true, "tag a blob")
+            .expect("create blob tag");
+        drop(repo);
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+
+        assert!(
+            !snapshot.branches.iter().any(|b| b.name == "blob-tag"),
+            "a tag pointing at a non-commit object is excluded",
+        );
+    }
+
+    #[test]
+    fn commit_labels_list_tags_after_branches() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let repo = Repository::init(dir.path()).expect("init repo");
+
+        let tip = commit_tree_to_ref(&repo, Some("HEAD"), "Tip", 100, &[]);
+        repo.reference("refs/tags/v1", tip, true, "create tag")
+            .expect("create tag");
+        drop(repo);
+
+        let snapshot = open_at(dir.path()).expect("open succeeds");
+
+        assert_eq!(
+            snapshot.commits[0].branch_labels,
+            vec![
+                BranchLabel {
+                    name: "master".to_string(),
+                    kind: BranchKind::Local,
+                },
+                BranchLabel {
+                    name: "v1".to_string(),
+                    kind: BranchKind::Tag,
+                },
+            ],
+            "a commit carrying both labels the branch before the tag",
         );
     }
 

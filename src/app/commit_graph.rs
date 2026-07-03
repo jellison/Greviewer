@@ -58,6 +58,7 @@ pub(crate) enum CommitRefLabelKind {
     Head,
     Branch,
     RemoteBranch,
+    Tag,
 }
 
 /// The ref label pills a commit row renders: HEAD first when checked out,
@@ -86,6 +87,7 @@ pub(crate) fn commit_ref_labels(
                 kind: match label.kind {
                     repo::BranchKind::Local => CommitRefLabelKind::Branch,
                     repo::BranchKind::Remote { .. } => CommitRefLabelKind::RemoteBranch,
+                    repo::BranchKind::Tag => CommitRefLabelKind::Tag,
                 },
             }),
     );
@@ -97,18 +99,7 @@ pub(crate) fn render_commit_ref_label(row_index: usize, label: CommitRefLabel) -
         "commit-ref-label-{row_index}-{}",
         debug_ref_label_fragment(&label.selector_key)
     );
-    let (border_color, background, text_color) = match label.kind {
-        CommitRefLabelKind::Head => (
-            palette().ref_head_border,
-            palette().ref_head_bg,
-            palette().ref_head_fg,
-        ),
-        CommitRefLabelKind::Branch | CommitRefLabelKind::RemoteBranch => (
-            palette().ref_branch_border,
-            palette().ref_branch_bg,
-            palette().ref_branch_fg,
-        ),
-    };
+    let (border_color, background, text_color) = commit_ref_label_colors(label.kind);
 
     div()
         .px_1()
@@ -123,6 +114,31 @@ pub(crate) fn render_commit_ref_label(row_index: usize, label: CommitRefLabel) -
         .truncate()
         .debug_selector(move || selector.clone())
         .child(label.name)
+}
+
+/// The (border, background, text) triple a ref label pill draws with. HEAD
+/// takes the accent blue, branches the branch green, and tags their own
+/// yellow so the three ref families read apart at a glance.
+pub(crate) fn commit_ref_label_colors(
+    kind: CommitRefLabelKind,
+) -> (gpui::Hsla, gpui::Hsla, gpui::Hsla) {
+    match kind {
+        CommitRefLabelKind::Head => (
+            palette().ref_head_border,
+            palette().ref_head_bg,
+            palette().ref_head_fg,
+        ),
+        CommitRefLabelKind::Branch | CommitRefLabelKind::RemoteBranch => (
+            palette().ref_branch_border,
+            palette().ref_branch_bg,
+            palette().ref_branch_fg,
+        ),
+        CommitRefLabelKind::Tag => (
+            palette().ref_tag_border,
+            palette().ref_tag_bg,
+            palette().ref_tag_fg,
+        ),
+    }
 }
 
 /// The set of loaded commits reachable from HEAD or from any branch whose
@@ -1860,6 +1876,60 @@ mod tests {
     }
 
     #[test]
+    fn commit_ref_labels_mark_tags() {
+        let mut commit = commit_info("tip", &[]);
+        commit.branch_labels = vec![
+            repo::BranchLabel {
+                name: "main".to_string(),
+                kind: repo::BranchKind::Local,
+            },
+            repo::BranchLabel {
+                name: "v1".to_string(),
+                kind: repo::BranchKind::Tag,
+            },
+        ];
+
+        let labels = commit_ref_labels(&commit, &BTreeSet::new());
+
+        assert_eq!(
+            labels,
+            vec![
+                CommitRefLabel {
+                    name: "main".to_string(),
+                    selector_key: "heads/main".to_string(),
+                    kind: CommitRefLabelKind::Branch,
+                },
+                CommitRefLabel {
+                    name: "v1".to_string(),
+                    selector_key: "tags/v1".to_string(),
+                    kind: CommitRefLabelKind::Tag,
+                },
+            ],
+            "a tag label carries the tag kind and the tags/ selector namespace",
+        );
+    }
+
+    #[test]
+    fn tag_labels_use_the_tag_palette_distinct_from_branches() {
+        let tag_colors = commit_ref_label_colors(CommitRefLabelKind::Tag);
+        let branch_colors = commit_ref_label_colors(CommitRefLabelKind::Branch);
+
+        assert_eq!(
+            tag_colors,
+            (
+                palette().ref_tag_border,
+                palette().ref_tag_bg,
+                palette().ref_tag_fg,
+            ),
+            "tag labels draw from the tag palette entries",
+        );
+        assert_ne!(
+            tag_colors, branch_colors,
+            "tag labels must be visually distinct from branch labels",
+        );
+    }
+
+    #[test]
     fn commit_ref_labels_hide_only_the_hidden_namespace() {
         let mut commit = commit_info("tip", &[]);
         commit.branch_labels = vec![
@@ -1884,6 +1954,24 @@ mod tests {
             "hiding the remote ref leaves the same-named local label",
         );
         assert_eq!(labels[0].kind, CommitRefLabelKind::Branch);
+    }
+
+    #[test]
+    fn hiding_a_tag_removes_its_exclusive_commits() {
+        // tag-tip -> root <- main-tip; hiding the tag drops tag-tip only.
+        let commits = vec![
+            commit_info("tag-tip", &["root"]),
+            commit_info("main-tip", &["root"]),
+            commit_info("root", &[]),
+        ];
+        let branches = vec![local_branch("master", "main-tip"), tag_ref("v1", "tag-tip")];
+
+        let visible =
+            visible_commit_shas(&commits, &branches, Some("main-tip"), &hidden(&["tags/v1"]));
+
+        assert!(!visible.contains("tag-tip"));
+        assert!(visible.contains("main-tip"));
+        assert!(visible.contains("root"));
     }
 
     #[test]
@@ -3320,6 +3408,38 @@ mod tests {
             time.origin.x < labels.origin.x,
             "time should precede labels"
         );
+    }
+
+    #[gpui::test]
+    async fn commit_rows_render_tag_labels(cx: &mut TestAppContext) {
+        let (dir, tip_sha) = init_repo_with_tag();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+        cx.run_until_parked();
+
+        let tag_row = window
+            .read_with(cx, |app, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected repo open mode");
+                };
+                repo.commits
+                    .iter()
+                    .position(|commit| commit.sha == tip_sha)
+                    .expect("tagged commit row")
+            })
+            .expect("read tag row");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let selector = format!("commit-ref-label-{tag_row}-tags-v1");
+        visual
+            .debug_bounds(Box::leak(selector.into_boxed_str()) as &'static str)
+            .expect("tag label pill on the tagged commit row");
     }
 
     #[gpui::test]

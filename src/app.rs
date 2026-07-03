@@ -3481,7 +3481,13 @@ impl App {
             format!("branch-row-{name_fragment}")
         };
         let toggle_selector = format!("branch-visibility-{name_fragment}");
-        let icon_selector = format!("branch-icon-{name_fragment}");
+        // Tag rows carry the tag icon; the selector prefix mirrors the choice
+        // so the two stay distinguishable.
+        let (row_icon, icon_prefix) = match branch.kind {
+            repo::BranchKind::Tag => (LucideIcon::Tag, "tag"),
+            _ => (LucideIcon::GitBranch, "branch"),
+        };
+        let icon_selector = format!("{icon_prefix}-icon-{name_fragment}");
         let group_name = format!("branch-row-group-{name_fragment}");
         let tip_sha = branch.tip_sha.clone();
         let toggle_branch_key = key;
@@ -3525,7 +3531,7 @@ impl App {
                     .flex_shrink_0()
                     .debug_selector(move || icon_selector.clone())
                     .child(
-                        Icon::new(LucideIcon::GitBranch)
+                        Icon::new(row_icon)
                             .text_color(name_color)
                             .size(px(BRANCH_ROW_ICON_SIZE)),
                     ),

@@ -80,7 +80,7 @@ The user can quit Greviewer with the standard quit keyboard shortcut.
 
 ## Viewing the commit graph
 
-The user sees a graphical history of the repository's commits with branch lanes and merge connectors. The history covers the checked-out commit, every local branch, and every remote-tracking branch, so work that has not been merged or pulled is visible alongside the checked-out history; tags do not contribute commits. Commits from all branches interleave in a single graph ordered newest-first, with no visual distinction between commits that are and are not part of the checked-out history. Branch and merge lines use smooth rounded bends where they turn between lanes, including the final turn into a branch commit. Each commit is presented as a single-row entry whose reading order is graph, short identifier, summary line, author, authored date, and any branch names — local or remote-tracking — that point at it. The graph is scrollable; older commits load progressively as the user scrolls. The currently checked-out tip is visually marked, but selection is independent of checkout state — reviewing never moves HEAD.
+The user sees a graphical history of the repository's commits with branch lanes and merge connectors. The history covers the checked-out commit, every local branch, every remote-tracking branch, and every tag, so work that has not been merged or pulled — and releases whose branches are gone — is visible alongside the checked-out history. Commits from all branches interleave in a single graph ordered newest-first, with no visual distinction between commits that are and are not part of the checked-out history. Branch and merge lines use smooth rounded bends where they turn between lanes, including the final turn into a branch commit. Each commit is presented as a single-row entry whose reading order is graph, short identifier, summary line, author, authored date, and any branch names or tags — local branch, remote-tracking branch, or tag — that point at it. The graph is scrollable; older commits load progressively as the user scrolls. The currently checked-out tip is visually marked, but selection is independent of checkout state — reviewing never moves HEAD.
 
 **Triggering conditions**
 
@@ -89,11 +89,13 @@ The user sees a graphical history of the repository's commits with branch lanes 
 **Observable outcomes**
 
 - Commits appear in graphical order with branch lanes and merge connectors.
-- Commits reachable only from unmerged local or remote-tracking branches appear interleaved with the
-  checked-out history; each such branch renders as its own lane that ends at its tip.
+- Commits reachable only from unmerged local branches, remote-tracking branches, or tags appear
+  interleaved with the checked-out history; each such branch or tag renders as its own lane that
+  ends at its tip.
 - Each visible commit shows its short identifier, summary line, author, and authored date.
 - Branch names are shown on the commits they point to; a remote-tracking branch shows its remote-qualified name and renders visually distinct from local branch labels.
-- A local branch and a remote-tracking branch with the same name are never confusable; when both point at the same commit, both labels appear.
+- Tag names are shown on the commits they point to, in a color distinct from both branch labels and the checked-out marker; on a commit carrying both, branch labels precede tag labels.
+- A local branch, a remote-tracking branch, and a tag with the same name are never confusable; when more than one points at the same commit, every label appears.
 - The currently checked-out tip carries a visual marker.
 
 **Edge cases**
@@ -105,12 +107,15 @@ The user sees a graphical history of the repository's commits with branch lanes 
   left-most lane is simply empty above the checked-out commit's row.
 - A branch that shares no history with the others ends without joining any other lane.
 - A repository whose checked-out branch has no commits yet still shows the history of its
-  other local and remote-tracking branches.
+  other local branches, remote-tracking branches, and tags.
 - Detached-HEAD repositories render normally with no checked-out branch marker.
+- An annotated tag labels the commit it was created on, exactly like a plain tag; the tag's
+  message does not appear in the graph.
+- A tag that points at something other than a commit does not appear anywhere.
 
 ## Navigating branches from the sidebar
 
-Graph mode includes a sidebar beside the graph listing the repository's branches. The list is split into a Local section and a Remote section. Each section is introduced by a header that bears a distinguishing icon, the section's name, and a count of the branches the section contains; the header also acts as a collapse control for the whole section (see "Collapsing a section" below). The Local section holds the repository's local branches; the Remote section holds remote-tracking branches, grouped under one collapsible folder per remote so multiple remotes stay separate. Within either section, branch names containing `/` nest under collapsible folders (see "Nesting branches in sidebar folders" below). Tags are excluded. Remote branch entries render visually distinct from local entries. The checked-out branch carries a visual marker. Activating a branch focuses it in the graph: the branch's tip commit becomes the selected commit and the graph scrolls so that commit is visible. The divider between the sidebar and the graph is draggable to resize the sidebar. The sidebar exists only in graph mode; review mode shows the file tree in its place.
+Graph mode includes a sidebar beside the graph listing the repository's branches and tags. The list is split into a Local section, a Remote section, and a Tags section, in that order. Each section is introduced by a header that bears a distinguishing icon, the section's name, and a count of the refs the section contains; the header also acts as a collapse control for the whole section (see "Collapsing a section" below). The Local section holds the repository's local branches; the Remote section holds remote-tracking branches, grouped under one collapsible folder per remote so multiple remotes stay separate; the Tags section holds the repository's tags. Within any section, names containing `/` nest under collapsible folders (see "Nesting branches in sidebar folders" below). Remote branch entries render visually distinct from local entries, and tag entries carry a tag icon in place of the branch icon. The checked-out branch carries a visual marker. Activating a branch or tag focuses it in the graph: its tip commit becomes the selected commit and the graph scrolls so that commit is visible. The divider between the sidebar and the graph is draggable to resize the sidebar. The sidebar exists only in graph mode; review mode shows the file tree in its place.
 
 **Triggering conditions**
 
@@ -121,56 +126,56 @@ Graph mode includes a sidebar beside the graph listing the repository's branches
 
 **Observable outcomes**
 
-- The sidebar lists every local branch under the Local section and every remote-tracking branch under its remote's folder in the Remote section, alphabetically within each folder level, with the checked-out branch visually marked.
-- Each section header shows a distinguishing icon, the section's name, and the number of branches the section contains.
-- The two sections are set off from each other by a single divider: it sits below the local rows when Local is expanded, and is shared between the two headers when they stack directly (Local collapsed), never doubling. A section at the top of the list relies on the sidebar's own border rather than adding one.
-- A section with no branches does not appear; a repository with no remotes shows no Remote section.
-- Activating a branch selects its tip commit and scrolls the graph so the commit is visible.
-- A branch entry whose tip commit is the current selection is visually distinct, using the same selected treatment as the commit row.
+- The sidebar lists every local branch under the Local section, every remote-tracking branch under its remote's folder in the Remote section, and every tag under the Tags section, alphabetically within each folder level, with the checked-out branch visually marked.
+- Each section header shows a distinguishing icon, the section's name, and the number of refs the section contains.
+- Adjacent sections are set off from each other by a single divider: it sits below the upper section's rows when that section is expanded, and is shared between two headers when they stack directly (the upper section collapsed), never doubling. A section at the top of the list relies on the sidebar's own border rather than adding one.
+- A section with no refs does not appear; a repository with no remotes shows no Remote section, and one with no tags shows no Tags section.
+- Activating a branch or tag selects its tip commit and scrolls the graph so the commit is visible.
+- A branch or tag entry whose tip commit is the current selection is visually distinct, using the same selected treatment as the commit row.
 - Dragging the divider resizes the sidebar.
 
 **Edge cases**
 
-- A repository with no branches at all shows an explanatory message in place of the list.
+- A repository with no branches or tags at all shows an explanatory message in place of the list.
 - The remote's default-branch pointer (the remote's "HEAD") is not a branch and never appears.
 - Detached-HEAD repositories list branches normally with no checked-out marker.
-- Activating a branch whose tip commit has not yet been loaded into the visible history loads older history until the tip appears, then selects and reveals it.
-- Activating a branch whose tip is already the selected commit keeps that selection; it does not clear it.
-- When the branch list exceeds the sidebar's height, it scrolls; a scrollbar appears while the pointer is over the sidebar and stays out of the way otherwise.
+- Activating a branch or tag whose tip commit has not yet been loaded into the visible history loads older history until the tip appears, then selects and reveals it.
+- Activating a branch or tag whose tip is already the selected commit keeps that selection; it does not clear it.
+- When the list exceeds the sidebar's height, it scrolls; a scrollbar appears while the pointer is over the sidebar and stays out of the way otherwise.
 
 ## Collapsing a section
 
 Activating a section header collapses or expands the whole section. Collapsing
-is purely visual: the section's rows — folders and branches alike — leave the
-sidebar, but graph visibility does not change, and branches hidden from the
-graph stay hidden while the section is collapsed. The header reflects the
-collapsed state, and the count it shows always reports every branch the section
-contains, regardless of collapse state or whether individual branches are
-hidden from the graph. Sections start expanded, and collapse state is not
-persisted: opening a repository expands both sections.
+is purely visual: the section's rows — folders, branches, and tags alike —
+leave the sidebar, but graph visibility does not change, and refs hidden from
+the graph stay hidden while the section is collapsed. The header reflects the
+collapsed state, and the count it shows always reports every ref the section
+contains, regardless of collapse state or whether individual refs are hidden
+from the graph. Sections start expanded, and collapse state is not persisted:
+opening a repository expands every section.
 
 **Observable outcomes**
 
 - Activating a section header removes that section's rows from the sidebar;
   activating it again restores them. Graph contents are unchanged either way.
-- The count in a section header reports the total number of branches the
+- The count in a section header reports the total number of refs the
   section contains and does not change when the section is collapsed or when
-  branches are hidden from the graph. The one exception is while a sidebar
-  filter is active, when the count reports the number of matching branches
+  refs are hidden from the graph. The one exception is while a sidebar
+  filter is active, when the count reports the number of matching refs
   (see "Filtering branches in the sidebar").
-- Reopening a repository expands both sections.
+- Reopening a repository expands every section.
 
 ## Nesting branches in sidebar folders
 
-Branch names that contain `/` nest in the sidebar: every name segment except
-the last becomes a collapsible folder, so `features/some-feature` appears as
-a `some-feature` row inside a `features` folder, and `team/alice/feature-x`
-nests two folders deep. A folder exists even when it holds a single branch —
-grouping depends only on the branch's own name, so rows do not reorganize as
-siblings appear or disappear. Within a level, folders list before branches,
-each alphabetically. A nested branch row shows only its final name segment,
-indented under its folders; everywhere else — graph labels, hiding,
-focusing — the branch keeps its full name.
+Branch and tag names that contain `/` nest in the sidebar: every name segment
+except the last becomes a collapsible folder, so `features/some-feature`
+appears as a `some-feature` row inside a `features` folder, and
+`team/alice/feature-x` nests two folders deep. A folder exists even when it
+holds a single ref — grouping depends only on the ref's own name, so rows do
+not reorganize as siblings appear or disappear. Within a level, folders list
+before refs, each alphabetically. A nested row shows only its final name
+segment, indented under its folders; everywhere else — graph labels, hiding,
+focusing — the ref keeps its full name.
 
 Activating a folder row collapses or expands it. Collapsing is purely
 visual: descendant rows leave the sidebar, but graph visibility does not
@@ -216,16 +221,16 @@ actions (activating a branch, hiding a branch, collapsing a section or folder)
 affect the rest of the app, and they behave identically whether or not a
 filter is active.
 
-Matching is a case-insensitive subsequence ("fuzzy") test against each
-branch's full display path — a local branch's own name, and a remote branch's
+Matching is a case-insensitive subsequence ("fuzzy") test against each ref's
+full display path — a local branch's or tag's own name, and a remote branch's
 name led by its remote (for example `origin/feature/login`). While a filter is
-active, only sections and folders that contain at least one matching branch
+active, only sections and folders that contain at least one matching ref
 appear, and they render expanded regardless of any saved collapse state;
 clearing the query restores that collapse state. Matched characters are
-highlighted wherever they fall, across folder rows and the leaf branch row.
-Section counts report the number of matching branches while filtering. The
-checked-out branch is filtered like any other and is not kept visible when it
-does not match.
+highlighted wherever they fall, across folder rows and the leaf row.
+Section counts report the number of matching refs while filtering. The
+checked-out branch is filtered like any other ref and is not kept visible
+when it does not match.
 
 **Triggering conditions**
 
@@ -255,11 +260,11 @@ does not match.
 
 ## Hiding branches from the graph
 
-Every branch except the checked-out branch can be toggled off from the
-sidebar. A hidden branch's name no longer appears as a ref label in the
-graph, and commits reachable only from hidden branches are removed: the graph
-re-flows as if those commits did not exist. Commits a hidden branch shares
-with any visible branch (or with the checked-out branch) remain.
+Every branch and tag except the checked-out branch can be toggled off from
+the sidebar. A hidden ref's name no longer appears as a label in the graph,
+and commits reachable only from hidden refs are removed: the graph re-flows
+as if those commits did not exist. Commits a hidden ref shares with any
+visible ref (or with the checked-out branch) remain.
 
 The toggle control on a visible branch is revealed when the pointer is over
 its row; a hidden branch's control is always visible and its name renders
@@ -268,19 +273,19 @@ shown again first. The checked-out branch offers no toggle. If hiding a
 branch removes the selected commit — or any commit in a selected range — the
 selection resets to the checked-out tip, which can never be hidden.
 Visibility choices are not persisted: opening a repository
-shows every branch. Remote-tracking branches hide and show exactly like local ones; remote-tracking branches are visible by default. A local branch and a remote-tracking branch that share a display name are independent: hiding, showing, or collapsing one never affects the other.
+shows every branch and tag. Remote-tracking branches and tags hide and show exactly like local branches, and both are visible by default. A local branch, a remote-tracking branch, and a tag that share a display name are independent: hiding, showing, or collapsing one never affects the others.
 
 **Observable outcomes**
 
-- A non-checked-out branch row reveals a visibility toggle on hover; the
-  checked-out branch row never shows one.
-- Toggling a branch off removes its ref labels and its exclusive commits from
+- A non-checked-out branch or tag row reveals a visibility toggle on hover;
+  the checked-out branch row never shows one.
+- Toggling a ref off removes its labels and its exclusive commits from
   the graph; toggling it back on restores them.
-- A hidden branch's row is muted, keeps its toggle visible, and does not
+- A hidden ref's row is muted, keeps its toggle visible, and does not
   focus its tip when activated.
-- Hiding a branch that makes the current selection invisible resets the
+- Hiding a ref that makes the current selection invisible resets the
   selection to the checked-out tip.
-- Reopening a repository resets all branches to visible.
+- Reopening a repository resets all branches and tags to visible.
 
 ## Selecting commits to review
 

@@ -44,6 +44,8 @@ pub enum LucideIcon {
     SquareMinus,
     /// `square-plus.svg`
     SquarePlus,
+    /// `tag.svg`
+    Tag,
     /// `x.svg`
     X,
 }
@@ -70,6 +72,7 @@ impl LucideIcon {
         LucideIcon::SquareDot,
         LucideIcon::SquareMinus,
         LucideIcon::SquarePlus,
+        LucideIcon::Tag,
         LucideIcon::X,
     ];
 }
@@ -95,6 +98,7 @@ impl IconNamed for LucideIcon {
             LucideIcon::SquareDot => "icons/square-dot.svg",
             LucideIcon::SquareMinus => "icons/square-minus.svg",
             LucideIcon::SquarePlus => "icons/square-plus.svg",
+            LucideIcon::Tag => "icons/tag.svg",
             LucideIcon::X => "icons/x.svg",
         }
         .into()

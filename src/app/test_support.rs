@@ -148,6 +148,15 @@ pub(crate) fn remote_branch(remote: &str, name: &str, tip_sha: &str) -> repo::Br
     }
 }
 
+pub(crate) fn tag_ref(name: &str, tip_sha: &str) -> repo::Branch {
+    repo::Branch {
+        name: name.to_string(),
+        tip_sha: tip_sha.to_string(),
+        is_head: false,
+        kind: repo::BranchKind::Tag,
+    }
+}
+
 pub(crate) fn hidden(names: &[&str]) -> BTreeSet<String> {
     names.iter().map(|name| name.to_string()).collect()
 }
@@ -183,6 +192,25 @@ pub(crate) fn init_repo_with_two_commits() -> (tempfile::TempDir, String) {
     drop(repo);
 
     (dir, update_oid.to_string())
+}
+
+/// Two commits on master (HEAD at the tip) plus a lightweight tag `v1`
+/// pointing at the tip. Returns (dir, tip_sha).
+pub(crate) fn init_repo_with_tag() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let repo = Repository::init(dir.path()).expect("init repo");
+
+    fs::write(dir.path().join("hello.txt"), "hello\n").expect("write file");
+    let root_oid = commit_all(&repo, "Add hello.txt", &[]);
+
+    fs::write(dir.path().join("hello.txt"), "hello world\n").expect("update file");
+    let tip_oid = commit_all(&repo, "Update hello.txt", &[root_oid]);
+
+    repo.reference("refs/tags/v1", tip_oid, true, "create tag")
+        .expect("create tag");
+
+    drop(repo);
+    (dir, tip_oid.to_string())
 }
 
 pub(crate) fn init_repo_with_python_change() -> (tempfile::TempDir, String) {

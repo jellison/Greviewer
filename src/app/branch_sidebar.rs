@@ -15,23 +15,25 @@ pub(crate) struct BranchTreeNode {
     branches: Vec<repo::Branch>,
 }
 
-/// Namespaced identity for a branch, mirroring git's ref layout:
-/// `heads/{name}` for local branches, `remotes/{name}` for remote-tracking
-/// branches. `hidden_branches`, `collapsed_branch_folders`, and debug
-/// selectors key on this so a local branch literally named `origin/main`
-/// never collides with the remote-tracking `origin/main`.
+/// Namespaced identity for a ref, mirroring git's ref layout: `heads/{name}`
+/// for local branches, `remotes/{name}` for remote-tracking branches, and
+/// `tags/{name}` for tags. `hidden_branches`, `collapsed_branch_folders`, and
+/// debug selectors key on this so a local branch literally named
+/// `origin/main` never collides with the remote-tracking `origin/main` or a
+/// tag of the same name.
 pub(crate) fn branch_key(name: &str, kind: &repo::BranchKind) -> String {
     match kind {
         repo::BranchKind::Local => format!("heads/{name}"),
         repo::BranchKind::Remote { .. } => format!("remotes/{name}"),
+        repo::BranchKind::Tag => format!("tags/{name}"),
     }
 }
 
 /// The full sidebar row list: a "Local" section with the local branch tree,
 /// then a "Remote" section whose top-level folders are the remote names
 /// (remote branch names already lead with their remote, so the existing
-/// tree builder folders them for free). A section with no branches is
-/// omitted entirely.
+/// tree builder folders them for free), then a "Tags" section with the
+/// repository's tags. A section with no refs is omitted entirely.
 pub(crate) fn build_branch_sidebar_rows(
     branches: &[repo::Branch],
     collapsed_folders: &BTreeSet<String>,
@@ -41,11 +43,19 @@ pub(crate) fn build_branch_sidebar_rows(
 ) -> Vec<BranchTreeRow> {
     let filtering = !query.is_empty();
 
-    let (local, remote): (Vec<_>, Vec<_>) = branches
-        .iter()
-        .filter(|branch| !filtering || fuzzy_match(&branch.name, query).is_some())
-        .cloned()
-        .partition(|branch| matches!(branch.kind, repo::BranchKind::Local));
+    let mut local = Vec::new();
+    let mut remote = Vec::new();
+    let mut tags = Vec::new();
+    for branch in branches {
+        if filtering && fuzzy_match(&branch.name, query).is_none() {
+            continue;
+        }
+        match branch.kind {
+            repo::BranchKind::Local => local.push(branch.clone()),
+            repo::BranchKind::Remote { .. } => remote.push(branch.clone()),
+            repo::BranchKind::Tag => tags.push(branch.clone()),
+        }
+    }
 
     // While filtering, ignore saved collapse state so every surviving folder
     // and section is expanded and its matches are visible. Section counts fall
@@ -73,6 +83,15 @@ pub(crate) fn build_branch_sidebar_rows(
         "Remote",
         "remotes",
         &remote,
+        folders,
+        sections,
+        hidden_branches,
+    );
+    append_branch_section(
+        &mut rows,
+        "Tags",
+        "tags",
+        &tags,
         folders,
         sections,
         hidden_branches,
@@ -442,6 +461,71 @@ mod tests {
                 BranchTreeRow::Folder(f) if f.path == "heads/features" && !f.collapsed
             )),
             "the folder renders expanded while filtering"
+        );
+    }
+
+    #[test]
+    fn tags_form_their_own_section_below_remote() {
+        let branches = vec![
+            local_branch("master", "m"),
+            remote_branch("origin", "master", "m"),
+            tag_ref("releases/v1.0", "r"),
+            tag_ref("v2.0", "t"),
+        ];
+
+        let rows = build_branch_sidebar_rows(
+            &branches,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            "",
+        );
+
+        let summary = rows
+            .iter()
+            .map(|row| match row {
+                BranchTreeRow::Section(s) => format!("section:{}:{}:{}", s.title, s.key, s.count),
+                BranchTreeRow::Folder(f) => format!("folder:{}", f.path),
+                BranchTreeRow::Branch(b) => format!("ref:{}", b.branch.name),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            vec![
+                "section:Local:heads:1".to_string(),
+                "ref:master".to_string(),
+                "section:Remote:remotes:1".to_string(),
+                "folder:remotes/origin".to_string(),
+                "ref:origin/master".to_string(),
+                "section:Tags:tags:2".to_string(),
+                "folder:tags/releases".to_string(),
+                "ref:releases/v1.0".to_string(),
+                "ref:v2.0".to_string(),
+            ],
+            "tags list in their own section after Remote, with slash names folding",
+        );
+    }
+
+    #[gpui::test]
+    async fn tag_rows_render_with_the_tag_icon(cx: &mut TestAppContext) {
+        let (dir, _tip) = init_repo_with_tag();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("tag-icon-tags-v1")
+            .expect("a tag row should carry the tag icon");
+        assert!(
+            visual.debug_bounds("branch-icon-tags-v1").is_none(),
+            "a tag row must not carry the branch icon"
         );
     }
 

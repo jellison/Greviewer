@@ -66,6 +66,9 @@ pub struct Palette {
     pub ref_branch_fg: Hsla,
     pub ref_branch_bg: Hsla,
     pub ref_branch_border: Hsla,
+    pub ref_tag_fg: Hsla,
+    pub ref_tag_bg: Hsla,
+    pub ref_tag_border: Hsla,
     pub graph_lanes: [Hsla; 6],
 }
 
@@ -116,6 +119,9 @@ impl Palette {
             ref_branch_fg: Hsla::from(rgb(0xc3e88d)),
             ref_branch_bg: Hsla::from(rgba(0xc3e88d26)),
             ref_branch_border: Hsla::from(rgba(0xc3e88d66)),
+            ref_tag_fg: Hsla::from(rgb(0xffcb6b)),
+            ref_tag_bg: Hsla::from(rgba(0xffcb6b26)),
+            ref_tag_border: Hsla::from(rgba(0xffcb6b66)),
             graph_lanes: [
                 Hsla::from(rgb(0x82aaff)),
                 Hsla::from(rgb(0xc3e88d)),
