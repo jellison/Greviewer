@@ -1329,6 +1329,12 @@ pub(crate) const DIFF_GUTTER_WIDTH: f32 = DIFF_ACCENT_WIDTH + DIFF_LINE_NUMBER_W
 /// Horizontal padding inside a code cell, each side.
 pub(crate) const DIFF_CODE_CELL_PADDING: f32 = 8.;
 
+/// Horizontal margin kept between the caret and the pane edge when keyboard
+/// motion scrolls the caret into view — the horizontal counterpart of the
+/// one-line vertical margin, so the caret never sits flush against the edge
+/// with the adjacent text hidden.
+pub(crate) const DIFF_CARET_H_MARGIN: f32 = 24.;
+
 /// Font size for diff gutter numbers and code lines. Kept in one place so the
 /// gutter and the code text always render at the same scale.
 pub(crate) const DIFF_TEXT_SIZE: f32 = 14.;
@@ -2822,6 +2828,42 @@ mod tests {
             .read_with(cx, |app, cx| app.file_diff_hscroll_offset(cx))
             .expect("read pan offset after wheel");
         assert!(after.x < before.x, "horizontal wheel should pan the diff");
+    }
+
+    #[gpui::test]
+    async fn dragging_against_the_right_edge_autoscrolls_the_pan(cx: &mut TestAppContext) {
+        use gpui::{point, px};
+
+        let (_dir, window, mut visual) = open_wide_diff(cx);
+
+        let side = visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new file diff side debug bounds");
+        // Press near the code cell's left edge: a wide cell's painted bounds
+        // extend past the viewport, so its center may fall outside the side.
+        let row = visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("row 1 code content");
+        let start = point(row.left() + px(30.), row.center().y);
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        let before = window
+            .read_with(cx, |app, cx| app.file_diff_hscroll_offset(cx))
+            .expect("read pan offset before drag");
+        assert_eq!(before.x, px(0.), "a fresh diff starts unpanned");
+
+        // Pointer pressed against the side's right edge, vertically centered
+        // so only the horizontal axis sits in its autoscroll margin.
+        let edge = point(side.bottom_right().x - px(2.), side.center().y);
+        visual.simulate_mouse_move(edge, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+
+        let after = window
+            .read_with(cx, |app, cx| app.file_diff_hscroll_offset(cx))
+            .expect("read pan offset after drag");
+        assert!(
+            after.x < before.x,
+            "dragging against the right edge should pan the diff toward the overflow"
+        );
     }
 
     #[gpui::test]

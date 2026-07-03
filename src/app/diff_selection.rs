@@ -174,14 +174,17 @@ pub(crate) fn move_word_right(content: &DiffSideContent, point: DiffPoint) -> Di
     }
     let class = match rest[offset..].chars().next() {
         Some(character) => char_class(character),
+        // The rest of the line is whitespace: cross to the next line
+        // directly, landing on the line end when there is none — the same
+        // outcome as bouncing off this line's end, one recursion shallower.
         None => {
-            return move_word_right(
-                content,
-                DiffPoint {
+            return match content.next_selectable(point.row) {
+                Some(row) => move_word_right(content, DiffPoint { row, column: 0 }),
+                None => DiffPoint {
                     row: point.row,
                     column: text.len(),
                 },
-            )
+            }
         }
     };
     let mut end = offset;
@@ -337,6 +340,27 @@ mod tests {
     }
 
     #[test]
+    fn selection_text_snaps_mid_char_columns_to_boundaries() {
+        // "héllo" — 'é' spans bytes 1..3, so column 2 is mid-char. An
+        // unclamped endpoint must snap back rather than panic the slice.
+        let content = cells(&["héllo"]);
+        let selection = DiffSelection {
+            side: repo::DiffSide::New,
+            anchor: DiffPoint { row: 0, column: 0 },
+            head: DiffPoint { row: 0, column: 2 },
+            goal_x: None,
+        };
+        assert_eq!(selection_text(&content, &selection), "h");
+        let from_mid_char = DiffSelection {
+            side: repo::DiffSide::New,
+            anchor: DiffPoint { row: 0, column: 2 },
+            head: DiffPoint { row: 0, column: 6 },
+            goal_x: None,
+        };
+        assert_eq!(selection_text(&content, &from_mid_char), "éllo");
+    }
+
+    #[test]
     fn selection_text_for_bare_caret_is_empty() {
         let content = cells(&["hello"]);
         let selection =
@@ -434,6 +458,29 @@ mod tests {
         assert_eq!(word_range_at("foo bar", 3), 3..4); // on the space
         assert_eq!(word_range_at("foo", 3), 0..3); // at end of line
         assert_eq!(word_range_at("", 0), 0..0);
+    }
+
+    #[test]
+    fn word_range_at_spans_a_multi_character_whitespace_run() {
+        // Double-clicking the middle space of "a   b" selects the whole
+        // whitespace run, not just the one character under the pointer.
+        assert_eq!(word_range_at("a   b", 2), 1..4);
+    }
+
+    #[test]
+    fn word_motion_right_crosses_from_a_whitespace_tail() {
+        // From inside a whitespace-only tail, right crosses to the next
+        // line's first word; at the document edge it lands on the line end.
+        let content = cells(&["a  ", "b"]);
+        assert_eq!(
+            move_word_right(&content, DiffPoint { row: 0, column: 1 }),
+            DiffPoint { row: 1, column: 1 }
+        );
+        let last_line = cells(&["c  "]);
+        assert_eq!(
+            move_word_right(&last_line, DiffPoint { row: 0, column: 1 }),
+            DiffPoint { row: 0, column: 3 }
+        );
     }
 
     #[test]
@@ -535,8 +582,20 @@ mod tests {
     }
 }
 
+/// Snap `index` back to the nearest `char` boundary at or before it, so a
+/// caller-supplied byte offset can never slice mid-char.
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
 /// The selected characters as plain text: line slices in row order joined
-/// with `\n`, alignment gaps skipped. No markers, no line numbers.
+/// with `\n`, alignment gaps skipped. No markers, no line numbers. Endpoint
+/// columns are snapped back to `char` boundaries, so an unclamped column
+/// cannot make the slice panic mid-char.
 pub(crate) fn selection_text(content: &DiffSideContent, selection: &DiffSelection) -> String {
     let (start, end) = selection.range();
     let mut parts: Vec<&str> = Vec::new();
@@ -546,12 +605,12 @@ pub(crate) fn selection_text(content: &DiffSideContent, selection: &DiffSelectio
         }
         let text = &content.cell(row).text;
         let from = if row == start.row {
-            start.column.min(text.len())
+            floor_char_boundary(text, start.column)
         } else {
             0
         };
         let to = if row == end.row {
-            end.column.min(text.len())
+            floor_char_boundary(text, end.column)
         } else {
             text.len()
         };
@@ -745,10 +804,7 @@ impl DiffSideContent {
                 .unwrap_or(0);
         }
         let text = &self.cell(row).text;
-        let mut column = point.column.min(text.len());
-        while column > 0 && !text.is_char_boundary(column) {
-            column -= 1;
-        }
+        let column = floor_char_boundary(text, point.column);
         DiffPoint { row, column }
     }
 }

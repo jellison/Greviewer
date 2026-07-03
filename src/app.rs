@@ -150,6 +150,10 @@ const CHANGESET_FILES_DEFAULT_WIDTH: f32 = 340.;
 /// panel minimum and the container size.
 const SIDEBAR_MIN_WIDTH: f32 = 120.;
 
+/// Cache of read-only (unchanged-file) line cells, keyed by file path and the
+/// commit sha the content was read at. See the `read_only_cell_cache` field.
+type ReadOnlyCellCache = RefCell<HashMap<(String, String), Rc<Vec<diff_view::DiffLineCell>>>>;
+
 pub struct App {
     pub mode: Mode,
     pub selection: Selection,
@@ -204,6 +208,13 @@ pub struct App {
     /// never outlive the changeset they describe. `RefCell` because render paths
     /// take `&self`; the `Rc` lets a cache hit hand back the rows without cloning.
     diff_row_cache: RefCell<HashMap<DiffCacheKey, Rc<PreparedFileDiff>>>,
+    /// Line cells for read-only (unchanged-file) tabs, keyed by file path and
+    /// the commit sha the content was read at. Keyboard selection resolves
+    /// the active tab's content on every keystroke (twice, counting the
+    /// caret's scroll-into-view); without this cache each resolution would
+    /// re-read the file's blob from git. Cleared alongside `diff_row_cache`,
+    /// so entries never outlive the changeset they were read for.
+    read_only_cell_cache: ReadOnlyCellCache,
     /// While a tab drag hovers a pane's edge zone, the pane and the split
     /// direction its half-highlight previews. None when no edge is hovered.
     pub(crate) tab_drop_zone: Option<(crate::workspace::PaneId, crate::workspace::SplitDirection)>,
@@ -878,6 +889,7 @@ impl App {
             caret_blink_epoch: 0,
             diff_drag: None,
             diff_row_cache: RefCell::new(HashMap::new()),
+            read_only_cell_cache: RefCell::new(HashMap::new()),
             tab_drop_zone: None,
             file_list_mode: FileListMode::Changed,
             settings,
@@ -1002,6 +1014,7 @@ impl App {
         self.diff_selections.clear();
         self.stop_caret_blink();
         self.diff_row_cache.borrow_mut().clear();
+        self.read_only_cell_cache.borrow_mut().clear();
         self.graph_layout_cache.borrow_mut().take();
         self.file_tree_highlight_path = None;
         self.file_list_mode = FileListMode::Changed;
@@ -1525,6 +1538,7 @@ impl App {
                 self.diff_selections.clear();
                 self.stop_caret_blink();
                 self.diff_row_cache.borrow_mut().clear();
+                self.read_only_cell_cache.borrow_mut().clear();
                 self.file_tree_highlight_path = None;
                 self.file_tree_scroll.set_offset(point(px(0.), px(0.)));
                 self.file_tree_hscroll.set_offset(point(px(0.), px(0.)));
@@ -1551,6 +1565,7 @@ impl App {
         self.diff_selections.clear();
         self.stop_caret_blink();
         self.diff_row_cache.borrow_mut().clear();
+        self.read_only_cell_cache.borrow_mut().clear();
         cx.notify();
     }
 
@@ -2203,18 +2218,40 @@ impl App {
                 side: selection.side,
             }
         } else {
-            let file_content =
-                repo::file_content_at_commit(&repo.path, &changeset.commit_sha, &path).ok()?;
-            let repo::FileContentBody::Text(text) = file_content.content else {
-                // Binary read-only content has no selectable text.
-                return None;
-            };
             diff_selection::DiffSideContent::ReadOnly {
-                cells: Rc::new(diff_view::read_only_file_cells(&text)),
+                cells: self.read_only_cells(repo, changeset, &path)?,
             }
         };
 
         Some((pane, path, content, selection))
+    }
+
+    /// The line cells for the read-only (unchanged) file at `path`, read once
+    /// per changeset and cached — the read-only counterpart of
+    /// `prepared_file_diff`, so consecutive keystrokes don't each re-read the
+    /// blob from git. `None` for binary content (no selectable text) or a
+    /// failed read; neither is cached, mirroring `prepared_file_diff`'s
+    /// error handling.
+    fn read_only_cells(
+        &self,
+        repo: &repo::OpenRepository,
+        changeset: &repo::ChangeSet,
+        path: &str,
+    ) -> Option<Rc<Vec<diff_view::DiffLineCell>>> {
+        let key = (path.to_string(), changeset.commit_sha.clone());
+        if let Some(cached) = self.read_only_cell_cache.borrow().get(&key) {
+            return Some(cached.clone());
+        }
+        let file_content =
+            repo::file_content_at_commit(&repo.path, &changeset.commit_sha, path).ok()?;
+        let repo::FileContentBody::Text(text) = file_content.content else {
+            return None;
+        };
+        let cells = Rc::new(diff_view::read_only_file_cells(&text));
+        self.read_only_cell_cache
+            .borrow_mut()
+            .insert(key, cells.clone());
+        Some(cells)
     }
 
     /// The shape every keyboard motion/extension action shares: resolve the
@@ -2237,6 +2274,10 @@ impl App {
         let Some((pane, key, content, mut selection)) = self.active_diff_selection_context() else {
             return;
         };
+        // A keypress always snaps the caret solid, even when the motion is a
+        // boundary no-op (e.g. left at the document start) that
+        // `set_diff_selection` skips as an identical write.
+        self.pause_caret_blink(cx);
         let new_head = content.clamp(motion(&content, selection.head));
         selection.head = new_head;
         if !extend {
@@ -2264,6 +2305,9 @@ impl App {
         let Some((pane, key, content, mut selection)) = self.active_diff_selection_context() else {
             return;
         };
+        // As in `diff_motion`: a keypress snaps the caret solid even when the
+        // step is a no-op at the document edge.
+        self.pause_caret_blink(cx);
         let Some(target_row) =
             diff_selection::vertical_target_row(&content, selection.head.row, forward)
         else {
@@ -2343,7 +2387,8 @@ impl App {
     /// and its painted content height), jump so the caret rests one line
     /// inside the nearer edge. Horizontal: if the caret's shaped x position
     /// falls outside the panned viewport, adjust the shared horizontal pan
-    /// the same way. A no-op when there is no active selection or the side's
+    /// the same way, keeping `DIFF_CARET_H_MARGIN` between the caret and the
+    /// pane edge. A no-op when there is no active selection or the side's
     /// bounds have not been painted yet.
     fn scroll_diff_caret_into_view(
         &mut self,
@@ -2388,16 +2433,20 @@ impl App {
             let pan = scroll.diff.hscroll.offset().x;
             let viewport_width =
                 (bounds.size.width - px(diff_view::DIFF_GUTTER_WIDTH) - px(12.)).max(px(0.));
+            // A small margin inside each edge, mirroring the vertical axis's
+            // one-line margin, halved when the viewport is too narrow to
+            // afford one on both sides.
+            let margin = px(diff_view::DIFF_CARET_H_MARGIN).min(viewport_width / 2.);
             let visible_left = -pan;
             let visible_right = visible_left + viewport_width;
-            if caret_x < visible_left {
-                scroll
-                    .diff
-                    .hscroll
-                    .set_offset(point(-caret_x, scroll.diff.hscroll.offset().y));
-            } else if caret_x > visible_right {
+            if caret_x < visible_left + margin {
                 scroll.diff.hscroll.set_offset(point(
-                    -(caret_x - viewport_width),
+                    (margin - caret_x).min(px(0.)),
+                    scroll.diff.hscroll.offset().y,
+                ));
+            } else if caret_x > visible_right - margin {
+                scroll.diff.hscroll.set_offset(point(
+                    -(caret_x + margin - viewport_width),
                     scroll.diff.hscroll.offset().y,
                 ));
             }
@@ -7182,6 +7231,79 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn keyboard_selection_reuses_cached_read_only_cells(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_changed_and_context_files();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                // The unchanged file opens read-only; keyboard resolution
+                // needs a placed caret before it resolves any content.
+                app.open_file_preview("context.txt".to_string(), cx);
+                let pane = app.workspace.active_pane();
+                app.set_diff_selection(
+                    pane,
+                    "context.txt",
+                    crate::app::diff_selection::DiffSelection::caret_at(
+                        crate::app::diff_selection::DiffPoint { row: 0, column: 0 },
+                        crate::repo::DiffSide::New,
+                    ),
+                    cx,
+                );
+            })
+            .expect("open read-only file");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, _cx| {
+                let first = match app.active_diff_selection_context() {
+                    Some((
+                        _,
+                        _,
+                        crate::app::diff_selection::DiffSideContent::ReadOnly { cells },
+                        _,
+                    )) => cells,
+                    other => panic!("expected read-only content, got {:?}", other.is_some()),
+                };
+                let second = match app.active_diff_selection_context() {
+                    Some((
+                        _,
+                        _,
+                        crate::app::diff_selection::DiffSideContent::ReadOnly { cells },
+                        _,
+                    )) => cells,
+                    other => panic!("expected read-only content, got {:?}", other.is_some()),
+                };
+                assert!(
+                    Rc::ptr_eq(&first, &second),
+                    "a repeated resolution should return the cached cells, not re-read the blob"
+                );
+                assert_eq!(
+                    app.read_only_cell_cache.borrow().len(),
+                    1,
+                    "only one entry should be cached for the single open read-only file"
+                );
+            })
+            .expect("inspect read-only cell cache");
+
+        // Closing the changeset must invalidate the cache with the diff-row
+        // cache, so a later changeset re-reads against its own commit.
+        window
+            .update(cx, |app, _window, cx| {
+                app.close_changeset(cx);
+                assert!(
+                    app.read_only_cell_cache.borrow().is_empty(),
+                    "closing the changeset should clear the read-only cell cache"
+                );
+            })
+            .expect("verify invalidation");
+    }
+
+    #[gpui::test]
     async fn changing_changeset_selection_invalidates_diff_cache(cx: &mut TestAppContext) {
         let (dir, shas) = init_repo_with_three_commits();
         let path = dir.path().to_path_buf();
@@ -8143,6 +8265,53 @@ mod tests {
                     app.caret_blink_epoch, epoch_after_first_set,
                     "an identical selection must not bump the blink epoch"
                 );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn boundary_noop_motion_still_snaps_the_caret_solid(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_dir, window, _visual) = open_multi_block_diff(cx);
+        window
+            .update(cx, |app, window, cx| {
+                let pane = app.workspace.active_pane();
+                let key = app.workspace.active_item(pane).unwrap().key().to_string();
+                // Row 0 of the multi-block fixture is unchanged text, so
+                // (0, 0) is the document start and `move_left` from it is a
+                // boundary no-op that `set_diff_selection` skips.
+                let point = crate::app::diff_selection::DiffPoint { row: 0, column: 0 };
+                app.set_diff_selection(
+                    pane,
+                    &key,
+                    crate::app::diff_selection::DiffSelection::caret_at(
+                        point,
+                        crate::repo::DiffSide::New,
+                    ),
+                    cx,
+                );
+
+                app.caret_blink_visible = false;
+                let epoch_before = app.caret_blink_epoch;
+                app.diff_motion(false, window, cx, crate::app::diff_selection::move_left);
+                assert!(
+                    app.caret_blink_visible,
+                    "a boundary no-op keypress must still snap the caret solid"
+                );
+                assert_ne!(
+                    app.caret_blink_epoch, epoch_before,
+                    "the no-op motion must re-arm the blink chain"
+                );
+
+                // The same holds for a vertical step off the document's top.
+                app.caret_blink_visible = false;
+                let epoch_before = app.caret_blink_epoch;
+                app.diff_vertical_motion(false, false, window, cx);
+                assert!(
+                    app.caret_blink_visible,
+                    "a vertical boundary no-op must also snap the caret solid"
+                );
+                assert_ne!(app.caret_blink_epoch, epoch_before);
             })
             .unwrap();
     }
