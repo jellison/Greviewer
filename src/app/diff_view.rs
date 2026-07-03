@@ -6,15 +6,70 @@
 use super::*;
 
 use crate::theme::palette;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+/// Everything one diff side needs to paint and mutate the selection. Built
+/// per render from the caller's pane/key/selection/focus; cheap to clone
+/// (an `Entity` handle plus `Rc`/`ScrollHandle` clones only).
+///
+/// Built once per tab via `App::diff_selection_context` with `side` and
+/// `content` left as placeholders, then specialized per side with
+/// `clone_for_side` — that also filters `selection` down to the one
+/// belonging to that side, since a selection lives on exactly one side.
+#[derive(Clone)]
+pub(crate) struct DiffSelectionContext {
+    pub(crate) pane: crate::workspace::PaneId,
+    pub(crate) key: String,
+    pub(crate) side: repo::DiffSide,
+    pub(crate) content: diff_selection::DiffSideContent,
+    pub(crate) selection: Option<diff_selection::DiffSelection>,
+    /// Keyboard focus for the pane this diff belongs to; read per row (where
+    /// `window` is available, inside the `uniform_list` item builder) to
+    /// decide whether the caret paints.
+    pub(crate) focus: FocusHandle,
+    /// Current blink phase, mirroring `App::caret_blink_visible`: `false`
+    /// hides the caret for this render without affecting focus or selection.
+    pub(crate) caret_visible: bool,
+    /// Handle back to `App`, used by the mouse-down listener. A plain
+    /// `on_mouse_down` closure on a nested row div only receives
+    /// `&mut Window`/`&mut gpui::App`, not `Context<App>`, so a `cx.listener`
+    /// built at this depth cannot be stored in a `Clone` struct — the entity
+    /// handle is the standard way to reach back into app state from such a
+    /// closure (see `Context::entity`).
+    pub(crate) app: Entity<App>,
+    pub(crate) origins: Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
+    pub(crate) hscroll: ScrollHandle,
+}
+
+impl DiffSelectionContext {
+    /// This context specialized for one side: `content` set to that side's
+    /// rows, and `selection` cleared unless it belongs to that side (a
+    /// selection lives on exactly one side of one tab at a time).
+    fn clone_for_side(
+        &self,
+        side: repo::DiffSide,
+        content: diff_selection::DiffSideContent,
+    ) -> Self {
+        Self {
+            side,
+            content,
+            selection: self.selection.filter(|selection| selection.side == side),
+            ..self.clone()
+        }
+    }
+}
 
 pub(crate) fn render_prepared_file_diff(
-    prepared: &PreparedFileDiff,
+    prepared: &Rc<PreparedFileDiff>,
     scroll: &FileDiffScroll,
     hovered: bool,
+    selection_ctx: Option<&DiffSelectionContext>,
 ) -> AnyElement {
     let p = palette();
     let max_line_chars = prepared.max_line_chars();
-    match prepared {
+    match prepared.as_ref() {
         PreparedFileDiff::Single { side, rows, .. } => {
             let side = *side;
             let selector = match side {
@@ -29,6 +84,16 @@ pub(crate) fn render_prepared_file_diff(
                 })
                 .collect::<Vec<_>>();
 
+            let ctx = selection_ctx.map(|ctx| {
+                ctx.clone_for_side(
+                    side,
+                    diff_selection::DiffSideContent::Prepared {
+                        diff: prepared.clone(),
+                        side,
+                    },
+                )
+            });
+
             render_file_diff_side(
                 selector,
                 cells,
@@ -36,12 +101,32 @@ pub(crate) fn render_prepared_file_diff(
                 scroll.hscroll.clone(),
                 max_line_chars,
                 hovered,
+                ctx,
             )
             .into_any_element()
         }
         PreparedFileDiff::SideBySide { rows, .. } => {
             let old_cells = rows.iter().map(|row| row.old.clone()).collect::<Vec<_>>();
             let new_cells = rows.iter().map(|row| row.new.clone()).collect::<Vec<_>>();
+
+            let old_ctx = selection_ctx.map(|ctx| {
+                ctx.clone_for_side(
+                    repo::DiffSide::Old,
+                    diff_selection::DiffSideContent::Prepared {
+                        diff: prepared.clone(),
+                        side: repo::DiffSide::Old,
+                    },
+                )
+            });
+            let new_ctx = selection_ctx.map(|ctx| {
+                ctx.clone_for_side(
+                    repo::DiffSide::New,
+                    diff_selection::DiffSideContent::Prepared {
+                        diff: prepared.clone(),
+                        side: repo::DiffSide::New,
+                    },
+                )
+            });
 
             div()
                 .flex()
@@ -54,6 +139,7 @@ pub(crate) fn render_prepared_file_diff(
                     scroll.hscroll.clone(),
                     max_line_chars,
                     hovered,
+                    old_ctx,
                 ))
                 .child(div().w(px(1.)).flex_none().bg(p.border))
                 .child(render_file_diff_side(
@@ -63,6 +149,7 @@ pub(crate) fn render_prepared_file_diff(
                     scroll.hscroll.clone(),
                     max_line_chars,
                     hovered,
+                    new_ctx,
                 ))
                 .into_any_element()
         }
@@ -209,6 +296,13 @@ pub(crate) fn set_diff_scroll_top(handle: &UniformListScrollHandle, offset_y: Pi
     state.base_handle.set_offset(point(x, offset_y));
 }
 
+/// A diff side's current vertical scroll offset (negative once scrolled
+/// down). Mirrors `set_diff_scroll_top`; used by drag/autoscroll row math to
+/// translate a pointer y position into a row index.
+pub(crate) fn diff_scroll_top(handle: &UniformListScrollHandle) -> Pixels {
+    handle.0.borrow().base_handle.offset().y
+}
+
 /// When a diff is first shown, scroll it to its first change block so the
 /// reviewer lands on the change instead of the file's top. Consumes the
 /// scroll's pending-focus flag (set on open), so it fires once per open and
@@ -330,6 +424,7 @@ pub(crate) fn render_file_content(
     scroll: &FileDiffScroll,
     language: &str,
     hovered: bool,
+    selection_ctx: Option<&DiffSelectionContext>,
 ) -> AnyElement {
     match content {
         repo::FileContentBody::Text(text) => {
@@ -348,6 +443,15 @@ pub(crate) fn render_file_content(
                 .max()
                 .unwrap_or(0);
 
+            let ctx = selection_ctx.map(|ctx| {
+                ctx.clone_for_side(
+                    repo::DiffSide::New,
+                    diff_selection::DiffSideContent::ReadOnly {
+                        cells: Rc::new(cells.clone()),
+                    },
+                )
+            });
+
             render_file_diff_side(
                 "file-read-only-content",
                 cells,
@@ -355,6 +459,7 @@ pub(crate) fn render_file_content(
                 scroll.hscroll.clone(),
                 max_line_chars,
                 hovered,
+                ctx,
             )
             .into_any_element()
         }
@@ -773,11 +878,23 @@ pub(crate) fn render_file_diff_side(
     hscroll: ScrollHandle,
     max_line_chars: usize,
     hovered: bool,
+    selection_ctx: Option<DiffSelectionContext>,
 ) -> impl IntoElement {
     let p = palette();
     let list_hscroll = hscroll.clone();
+    let list_ctx = selection_ctx.clone();
+    // Cloned before `.track_scroll` consumes `scroll_handle`; the drag/
+    // autoscroll listeners below need their own handle to read and mutate
+    // this side's vertical offset.
+    let drag_scroll_handle = scroll_handle.clone();
     let mut list = uniform_list(selector, cells.len(), move |range, window, _cx| {
         let code_min_width = code_cell_min_width(max_line_chars, window);
+        // Read focus here, where `window` is available (a plain
+        // `on_mouse_down` closure deep in the row tree only gets `&mut
+        // Window`/`&mut gpui::App`, not this list-builder's `window`).
+        let focused = list_ctx
+            .as_ref()
+            .is_some_and(|ctx| ctx.focus.is_focused(window));
         range
             .map(|index| {
                 render_file_diff_line(
@@ -786,6 +903,11 @@ pub(crate) fn render_file_diff_side(
                     cells[index].clone(),
                     &list_hscroll,
                     code_min_width,
+                    RowSelectionState {
+                        ctx: list_ctx.as_ref(),
+                        focused,
+                    },
+                    window,
                 )
             })
             .collect::<Vec<_>>()
@@ -818,6 +940,56 @@ pub(crate) fn render_file_diff_side(
         .min_w_0()
         .min_h_0()
         .child(list)
+        .when_some(selection_ctx, |side, ctx| {
+            // Captures this side's painted bounds for pixel->column mapping
+            // in the mouse-down listener below.
+            let origins = ctx.origins.clone();
+            // `track_focus` makes gpui's own mouse-down auto-focus land on
+            // the pane's focus handle for any click on this side. Without
+            // it, the app root's `track_focus` (the only other focusable)
+            // reclaims focus in the same bubble pass — its handler runs
+            // after the row listeners — and the caret, gated on pane focus,
+            // would never paint. The innermost tracked element wins because
+            // gpui prevents parents from transferring focus after it does.
+            let side = side.track_focus(&ctx.focus).child(
+                canvas(
+                    move |bounds, _window, _cx| {
+                        origins.borrow_mut().insert(selector, bounds);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            );
+
+            let side = side.on_mouse_move({
+                let ctx = ctx.clone();
+                let side_scroll = DiffSideScroll {
+                    selector,
+                    vertical: drag_scroll_handle.clone(),
+                    hscroll: hscroll.clone(),
+                };
+                move |event: &MouseMoveEvent, window, cx| {
+                    let ctx = ctx.clone();
+                    let side_scroll = side_scroll.clone();
+                    ctx.app.clone().update(cx, move |app, cx| {
+                        app.drag_diff_mouse_move(&ctx, &side_scroll, event, window, cx);
+                    });
+                }
+            });
+
+            let clear_drag = {
+                let ctx = ctx.clone();
+                move |_event: &MouseUpEvent, _window: &mut Window, cx: &mut gpui::App| {
+                    let ctx = ctx.clone();
+                    ctx.app.clone().update(cx, move |app, _cx| {
+                        app.end_diff_mouse_drag(&ctx);
+                    });
+                }
+            };
+            let side = side.on_mouse_up(MouseButton::Left, clear_drag.clone());
+            side.on_mouse_up_out(MouseButton::Left, clear_drag)
+        })
         .when(show_scrollbar, |side| {
             side.child(
                 // The overlay spans only the panning code region: inset past
@@ -835,13 +1007,57 @@ pub(crate) fn render_file_diff_side(
         })
 }
 
+/// The byte span within `row_index`'s line that a selection covers, and
+/// whether that row is the selection's final row (so no trailing-newline
+/// stub is drawn). `None` when the row is not part of a selected range at
+/// all — including a bare caret, which highlights nothing.
+fn selection_span_for_row(
+    selection: &diff_selection::DiffSelection,
+    row_index: usize,
+    line_len: usize,
+) -> Option<(Range<usize>, bool)> {
+    if selection.is_caret() {
+        return None;
+    }
+    if !selection.line_range().contains(&row_index) {
+        return None;
+    }
+    let (start, end) = selection.range();
+    let span_start = if row_index == start.row {
+        start.column
+    } else {
+        0
+    };
+    let span_end = if row_index == end.row {
+        end.column
+    } else {
+        line_len
+    };
+    Some((span_start..span_end, row_index == end.row))
+}
+
+/// A diff side's selection context plus this render's focus snapshot, bundled
+/// so `render_file_diff_line` stays under clippy's argument-count limit.
+/// `focused` is read once per side (in the `uniform_list` item builder, where
+/// `window` is available) rather than per row.
+pub(crate) struct RowSelectionState<'a> {
+    pub(crate) ctx: Option<&'a DiffSelectionContext>,
+    pub(crate) focused: bool,
+}
+
 pub(crate) fn render_file_diff_line(
     pane_selector: &'static str,
     row_index: usize,
-    cell: DiffLineCell,
+    mut cell: DiffLineCell,
     hscroll: &ScrollHandle,
     code_min_width: Pixels,
+    selection: RowSelectionState,
+    window: &mut Window,
 ) -> impl IntoElement {
+    let RowSelectionState {
+        ctx: selection_ctx,
+        focused,
+    } = selection;
     let p = palette();
     let line_number = cell
         .line_number
@@ -855,9 +1071,50 @@ pub(crate) fn render_file_diff_line(
     let id_index = row_index * 3 + pane_offset;
     let row_selector = diff_line_debug_selector(cell.status);
     let accent = diff_line_accent(cell.status);
+
+    let selection = selection_ctx.and_then(|ctx| ctx.selection);
+    // Alignment gaps are not selectable: they hold no text and
+    // `selection_text` skips them, so they take no fill and no newline stub
+    // even when a range crosses them.
+    let selectable = cell.status != DiffLineStatus::Empty;
+    // Unfocused panes still show a selection (so it isn't lost when the user
+    // clicks another pane), but dimmed, and with no caret or active-line
+    // cue — those read as "you are here," which isn't true for a pane that
+    // doesn't own focus.
+    let selection_fill = if focused {
+        p.diff_selection_bg
+    } else {
+        p.diff_selection_bg_unfocused
+    };
+    let selection_span = selection
+        .filter(|_| selectable)
+        .and_then(|selection| selection_span_for_row(&selection, row_index, cell.text.len()));
+    let show_newline_stub = match selection_span {
+        Some((span, is_final_row)) => {
+            cell.highlights =
+                diff_selection::overlay_background(&cell.highlights, span, selection_fill);
+            !is_final_row
+        }
+        None => false,
+    };
     let has_text = !cell.text.is_empty();
 
+    // The caret always paints at the selection's head — bare caret or the
+    // moving end of a range — but only while the pane owns focus and the
+    // blink phase shows it. The active-line tint is a bare-caret cue only: a
+    // range selection reads by its fill. Both are skipped entirely when the
+    // pane is unfocused.
+    let head_here = selection.filter(|selection| selection.caret().row == row_index);
+    let show_active_line = focused && head_here.is_some_and(|selection| selection.is_caret());
+    let caret_x = head_here
+        .filter(|_| focused && selection_ctx.is_some_and(|ctx| ctx.caret_visible))
+        .map(|selection| x_for_column(window, &cell.text, selection.caret().column));
+
+    let mouse_down_ctx = selection_ctx.cloned();
+    let mouse_down_text = cell.text.clone();
+
     div()
+        .relative()
         .flex()
         .h(px(DIFF_LINE_HEIGHT))
         // `uniform_list` lays each row out with the pane's width as the
@@ -872,6 +1129,15 @@ pub(crate) fn render_file_diff_line(
         .bg(diff_line_fill(cell.status))
         .id(("file-diff-line", id_index))
         .debug_selector(move || row_selector.to_string())
+        .when(show_active_line, |row| {
+            row.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .bg(p.active_line_bg)
+                    .debug_selector(|| "diff-active-line".to_string()),
+            )
+        })
         .child(div().w(px(DIFF_ACCENT_WIDTH)).flex_none().when_some(
             accent,
             |bar, (color, accent_selector)| {
@@ -879,8 +1145,9 @@ pub(crate) fn render_file_diff_line(
                     .debug_selector(move || accent_selector.to_string())
             },
         ))
-        .child(
-            div()
+        .child({
+            let mut gutter_cell = div()
+                .id(("file-diff-line-number", id_index))
                 .flex()
                 .items_center()
                 .justify_end()
@@ -892,8 +1159,28 @@ pub(crate) fn render_file_diff_line(
                 .line_height(px(DIFF_LINE_HEIGHT))
                 .font_family(MONO_FONT_FAMILY)
                 .debug_selector(move || diff_line_index_selector(pane_selector, row_index))
-                .child(line_number),
-        )
+                .child(line_number);
+            if cell.line_number.is_some() {
+                let ctx = mouse_down_ctx.clone();
+                gutter_cell = gutter_cell.on_mouse_down(MouseButton::Left, {
+                    move |_event: &MouseDownEvent, window, cx| {
+                        let Some(ctx) = ctx.as_ref() else {
+                            return;
+                        };
+                        let point = diff_selection::DiffPoint {
+                            row: row_index,
+                            column: 0,
+                        };
+                        let ctx = ctx.clone();
+                        ctx.app.clone().update(cx, |app, cx| {
+                            app.select_diff_line(&ctx, point, cx);
+                            app.pane_scroll(ctx.pane, cx).focus.focus(window);
+                        });
+                    }
+                });
+            }
+            gutter_cell
+        })
         .child({
             let mut code_cell = div()
                 .id(("file-diff-code", id_index))
@@ -910,11 +1197,12 @@ pub(crate) fn render_file_diff_line(
                 // sizing for the code text lives here, not in `diff_text_style()`.
                 .text_size(px(DIFF_TEXT_SIZE))
                 .line_height(px(DIFF_LINE_HEIGHT))
-                .child(
+                .child({
                     // Every cell's content advertises the same minimum width
                     // (see `code_cell_min_width`), keeping the shared pan's
                     // clamp identical across rows and panes.
-                    div()
+                    let mut content = div()
+                        .relative()
                         .flex()
                         .items_center()
                         .h_full()
@@ -926,16 +1214,74 @@ pub(crate) fn render_file_diff_line(
                         })
                         .when(has_text, |content| {
                             content.child(
-                                StyledText::new(cell.text)
+                                StyledText::new(cell.text.clone())
                                     .with_default_highlights(&diff_text_style(), cell.highlights),
                             )
-                        }),
-                );
+                        })
+                        .when(show_newline_stub, |content| {
+                            let mut stub = div()
+                                .w(px(DIFF_TEXT_SIZE * 0.6))
+                                .h_full()
+                                .bg(selection_fill);
+                            if !focused {
+                                stub = stub.debug_selector(|| "diff-selection-dim".to_string());
+                            }
+                            content.child(stub)
+                        });
+                    if let Some(caret_x) = caret_x {
+                        content = content.child(
+                            div()
+                                .absolute()
+                                .top(px(2.))
+                                .bottom(px(2.))
+                                .left(caret_x + px(DIFF_CODE_CELL_PADDING) - px(1.))
+                                .w(px(2.))
+                                .bg(p.caret)
+                                .debug_selector(|| "diff-caret".to_string()),
+                        );
+                    }
+                    content
+                });
             // Without this, gpui redirects a *vertical* wheel gesture onto
             // this horizontal-only cell, panning when the user meant to
             // scroll the rows.
             code_cell.interactivity().base_style.restrict_scroll_to_axis = Some(true);
-            code_cell
+            code_cell.on_mouse_down(MouseButton::Left, {
+                let ctx = mouse_down_ctx.clone();
+                let text = mouse_down_text.clone();
+                move |event: &MouseDownEvent, window, cx| {
+                    let Some(ctx) = ctx.as_ref() else {
+                        return;
+                    };
+                    let origin = ctx
+                        .origins
+                        .borrow()
+                        .get(pane_selector)
+                        .map(|bounds| bounds.origin);
+                    let Some(origin) = origin else {
+                        return;
+                    };
+                    // x within the code content: window x minus the side
+                    // origin, the frozen gutter, and the cell padding, plus
+                    // the shared pan (negative when panned right, so adding
+                    // it shifts the hit-test to match the panned text).
+                    let pan = ctx.hscroll.offset().x;
+                    let x = event.position.x
+                        - origin.x
+                        - px(DIFF_GUTTER_WIDTH)
+                        - px(DIFF_CODE_CELL_PADDING)
+                        - pan;
+                    let column = column_for_x(window, &text, x);
+                    let point = ctx.content.clamp(diff_selection::DiffPoint {
+                        row: row_index,
+                        column,
+                    });
+                    let ctx = ctx.clone();
+                    ctx.app.clone().update(cx, |app, cx| {
+                        app.begin_diff_mouse_selection(&ctx, point, event, window, cx);
+                    });
+                }
+            })
         })
 }
 
@@ -1004,6 +1350,128 @@ pub(crate) fn diff_text_style() -> TextStyle {
         line_height: px(DIFF_LINE_HEIGHT).into(),
         ..TextStyle::default()
     }
+}
+
+/// Map a pixel offset within a line's code content to the nearest column
+/// (UTF-8 byte offset on a char boundary), by shaping the line once. A
+/// single default run is enough: every token uses the same mono font/size,
+/// so color-only syntax runs don't change metrics.
+pub(crate) fn column_for_x(window: &mut Window, text: &str, x: Pixels) -> usize {
+    let style = diff_text_style();
+    let run = style.to_run(text.len());
+    let shaped =
+        window
+            .text_system()
+            .shape_line(text.to_string().into(), px(DIFF_TEXT_SIZE), &[run], None);
+    shaped.closest_index_for_x(x)
+}
+
+/// The x offset (within the shaped line, no cell padding or pan) of `column`.
+pub(crate) fn x_for_column(window: &mut Window, text: &str, column: usize) -> Pixels {
+    let style = diff_text_style();
+    let run = style.to_run(text.len());
+    let shaped =
+        window
+            .text_system()
+            .shape_line(text.to_string().into(), px(DIFF_TEXT_SIZE), &[run], None);
+    shaped.x_for_index(column)
+}
+
+/// A diff side's scroll handles plus its debug selector, bundled for the
+/// drag/autoscroll listeners so they stay under clippy's argument-count
+/// limit. `selector` is this side's `content_origins` key, used to look up
+/// its painted bounds.
+#[derive(Clone)]
+pub(crate) struct DiffSideScroll {
+    pub(crate) selector: &'static str,
+    pub(crate) vertical: UniformListScrollHandle,
+    pub(crate) hscroll: ScrollHandle,
+}
+
+/// Map a pointer position during a drag or autoscroll tick to a `DiffPoint`
+/// on `ctx.content`: the row from the pointer's y within `side_bounds` minus
+/// the side's vertical scroll offset, divided by the row height and clamped
+/// to the content's row range, then the column from `column_for_x` on that
+/// row's text using the same x math as the mouse-down listener. `content.clamp`
+/// snaps a gap row to a neighboring selectable row and the column to a char
+/// boundary within the line.
+pub(crate) fn drag_point(
+    window: &mut Window,
+    ctx: &DiffSelectionContext,
+    side_scroll: &DiffSideScroll,
+    side_bounds: Bounds<Pixels>,
+    position: Point<Pixels>,
+) -> diff_selection::DiffPoint {
+    let vertical_offset = diff_scroll_top(&side_scroll.vertical);
+    let relative_y = (position.y - side_bounds.origin.y) - vertical_offset;
+    let row_count = ctx.content.len();
+    let row = if row_count == 0 {
+        0
+    } else {
+        let candidate = (relative_y / px(DIFF_LINE_HEIGHT)).floor();
+        (candidate.max(0.) as usize).min(row_count - 1)
+    };
+
+    let pan = ctx.hscroll.offset().x;
+    let x = position.x
+        - side_bounds.origin.x
+        - px(DIFF_GUTTER_WIDTH)
+        - px(DIFF_CODE_CELL_PADDING)
+        - pan;
+    let text = if row_count == 0 {
+        String::new()
+    } else {
+        ctx.content.cell(row).text.clone()
+    };
+    let column = column_for_x(window, &text, x);
+    ctx.content.clamp(diff_selection::DiffPoint { row, column })
+}
+
+/// Event-driven edge autoscroll for a drag: when the pointer sits within
+/// `DIFF_LINE_HEIGHT` (capped at a third of the side's height) of the top or
+/// bottom edge, nudges the side's vertical offset by up to one line height;
+/// same shape horizontally against the code region's left/right edges,
+/// applied to the shared pan. gpui's own layout clamps both offsets to their
+/// content's range on the next paint, so no manual clamping is needed here.
+/// Returns whether either axis moved, so the caller knows to repaint even
+/// when the drag point itself did not change.
+pub(crate) fn autoscroll_diff_side(
+    side_scroll: &DiffSideScroll,
+    side_bounds: Bounds<Pixels>,
+    position: Point<Pixels>,
+) -> bool {
+    let margin = px(DIFF_LINE_HEIGHT).min(side_bounds.size.height / 3.);
+    let mut delta = point(px(0.), px(0.));
+    if position.y < side_bounds.origin.y + margin {
+        delta.y = (side_bounds.origin.y + margin - position.y).min(px(DIFF_LINE_HEIGHT));
+    } else if position.y > side_bounds.bottom_left().y - margin {
+        delta.y = -(position.y - (side_bounds.bottom_left().y - margin)).min(px(DIFF_LINE_HEIGHT));
+    }
+
+    let code_left = side_bounds.origin.x + px(DIFF_GUTTER_WIDTH);
+    let code_right = side_bounds.bottom_right().x;
+    let h_margin = px(DIFF_LINE_HEIGHT).min((code_right - code_left) / 3.);
+    if position.x < code_left + h_margin {
+        delta.x = (code_left + h_margin - position.x).min(px(DIFF_LINE_HEIGHT));
+    } else if position.x > code_right - h_margin {
+        delta.x = -(position.x - (code_right - h_margin)).min(px(DIFF_LINE_HEIGHT));
+    }
+
+    if delta.y != px(0.) {
+        let state = side_scroll.vertical.0.borrow();
+        let offset = state.base_handle.offset();
+        state
+            .base_handle
+            .set_offset(point(offset.x, offset.y + delta.y));
+    }
+    if delta.x != px(0.) {
+        let offset = side_scroll.hscroll.offset();
+        side_scroll
+            .hscroll
+            .set_offset(point(offset.x + delta.x, offset.y));
+    }
+
+    delta.y != px(0.) || delta.x != px(0.)
 }
 
 /// Stroke width and spacing, in device pixels, of the alignment-gap hatch.
@@ -1786,7 +2254,7 @@ mod tests {
             .debug_bounds("file-diff-side-new")
             .expect("new file diff side debug bounds");
         let max_offset = window
-            .read_with(cx, |app, _cx| app.file_diff_new_scroll_max_offset())
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_max_offset(cx))
             .expect("read new diff scroll max offset");
         assert!(
             max_offset.height > px(0.),
@@ -1794,7 +2262,7 @@ mod tests {
         );
 
         let before = window
-            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_offset(cx))
             .expect("read new diff scroll offset before wheel");
         visual.simulate_event(ScrollWheelEvent {
             position: scroll_bounds.center(),
@@ -1802,7 +2270,7 @@ mod tests {
             ..Default::default()
         });
         let after = window
-            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_offset(cx))
             .expect("read new diff scroll offset after wheel");
 
         assert!(
@@ -1837,10 +2305,10 @@ mod tests {
             .debug_bounds("file-diff-side-new")
             .expect("new file diff side debug bounds");
         let old_before = window
-            .read_with(cx, |app, _cx| app.file_diff_old_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_old_scroll_offset(cx))
             .expect("read old diff scroll offset before wheel");
         let new_before = window
-            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_offset(cx))
             .expect("read new diff scroll offset before wheel");
 
         visual.simulate_event(ScrollWheelEvent {
@@ -1850,10 +2318,10 @@ mod tests {
         });
 
         let old_after = window
-            .read_with(cx, |app, _cx| app.file_diff_old_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_old_scroll_offset(cx))
             .expect("read old diff scroll offset after wheel");
         let new_after = window
-            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_offset(cx))
             .expect("read new diff scroll offset after wheel");
 
         assert!(
@@ -1896,10 +2364,10 @@ mod tests {
             .debug_bounds("file-diff-side-old")
             .expect("old file diff side debug bounds");
         let old_before = window
-            .read_with(cx, |app, _cx| app.file_diff_old_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_old_scroll_offset(cx))
             .expect("read old diff scroll offset before wheel");
         let new_before = window
-            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_offset(cx))
             .expect("read new diff scroll offset before wheel");
 
         visual.simulate_event(ScrollWheelEvent {
@@ -1909,10 +2377,10 @@ mod tests {
         });
 
         let old_after = window
-            .read_with(cx, |app, _cx| app.file_diff_old_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_old_scroll_offset(cx))
             .expect("read old diff scroll offset after wheel");
         let new_after = window
-            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_offset(cx))
             .expect("read new diff scroll offset after wheel");
 
         assert!(
@@ -1966,6 +2434,37 @@ mod tests {
         );
     }
 
+    /// The active tab's diff selection, if any — reads through the active
+    /// pane and item key so tests don't repeat that lookup per assertion.
+    fn read_active_selection(
+        window: &WindowHandle<App>,
+        cx: &TestAppContext,
+    ) -> Option<diff_selection::DiffSelection> {
+        window
+            .read_with(cx, |app, _| {
+                let pane = app.workspace.active_pane();
+                let key = app.workspace.active_item(pane)?.key().to_string();
+                app.diff_selection(pane, &key)
+            })
+            .unwrap()
+    }
+
+    /// The active tab's new-side cell text at `row`, for asserting copy
+    /// output against the diff's own content instead of a hardcoded literal.
+    fn read_active_row_text(window: &WindowHandle<App>, cx: &TestAppContext, row: usize) -> String {
+        window
+            .read_with(cx, |app, cx| {
+                let (prepared, _scroll) = app.active_pane_prepared_diff(cx)?;
+                let content = diff_selection::DiffSideContent::Prepared {
+                    diff: prepared,
+                    side: repo::DiffSide::New,
+                };
+                Some(content.cell(row).text.clone())
+            })
+            .unwrap()
+            .expect("active pane has a prepared diff")
+    }
+
     /// Open the three-block modified file in a single pane at a size that keeps
     /// the diff scrollable, returning the temp repo (kept alive by the caller),
     /// the window, and its visual context.
@@ -1994,6 +2493,279 @@ mod tests {
         cx.run_until_parked();
 
         (dir, window, visual)
+    }
+
+    // `blocks.txt`'s three changed lines are 5, 30, and 55 (1-indexed; see
+    // `init_repo_with_multiple_change_blocks`). All lines above line 5 are
+    // unchanged, so the first change block's replace of line 5 lands on flat
+    // diff row index 4 (0-indexed) on both sides.
+    #[gpui::test]
+    async fn clicking_a_diff_line_places_the_caret(cx: &mut TestAppContext) {
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+        let bounds = visual
+            .debug_bounds("file-diff-code-new-4")
+            .expect("row 4 code content");
+        visual.simulate_click(bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        let selection = read_active_selection(&window, cx).expect("click created a selection");
+        assert!(selection.is_caret());
+        assert_eq!(selection.head.row, 4);
+        visual.debug_bounds("diff-caret").expect("caret painted");
+        visual
+            .debug_bounds("diff-active-line")
+            .expect("active line tinted");
+    }
+
+    #[gpui::test]
+    async fn caret_blinks_off_and_back(cx: &mut TestAppContext) {
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+        let target = visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("row")
+            .center();
+        visual.simulate_click(target, Modifiers::default());
+        cx.run_until_parked();
+        visual
+            .debug_bounds("diff-caret")
+            .expect("caret visible after click");
+        assert!(
+            window
+                .read_with(cx, |app, _| app.caret_blink_visible)
+                .unwrap(),
+            "caret starts solid immediately after placement"
+        );
+
+        // gpui's test harness only records that a `debug_selector` *has*
+        // painted at some point in this window's lifetime — a selector that
+        // stops painting keeps its last-recorded bounds rather than
+        // clearing, so an "off" phase can't be proven by `debug_bounds`
+        // absence. Assert against `caret_blink_visible` instead: it is the
+        // exact value `render_file_diff_line`'s `if let Some(caret_x)` gate
+        // reads (via `DiffSelectionContext::caret_visible`) to decide
+        // whether to paint the caret at all.
+        cx.executor()
+            .advance_clock(CARET_BLINK_INTERVAL + std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+        assert!(
+            !window
+                .read_with(cx, |app, _| app.caret_blink_visible)
+                .unwrap(),
+            "caret blinked off"
+        );
+
+        cx.executor().advance_clock(CARET_BLINK_INTERVAL);
+        cx.run_until_parked();
+        assert!(
+            window
+                .read_with(cx, |app, _| app.caret_blink_visible)
+                .unwrap(),
+            "caret blinked back on"
+        );
+        visual
+            .debug_bounds("diff-caret")
+            .expect("caret painted again once the blink phase returns to solid");
+    }
+
+    #[gpui::test]
+    async fn unfocused_pane_dims_its_selection_and_hides_the_caret(cx: &mut TestAppContext) {
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+        let pane_a = window
+            .read_with(cx, |app, _| app.workspace.active_pane())
+            .unwrap();
+
+        // A multi-row range selection (rather than a bare caret) so the
+        // newline stub — and therefore `diff-selection-dim` — actually
+        // paints: a caret-only selection has no span to fill or dim.
+        let start = visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("row 1")
+            .center();
+        let end = visual
+            .debug_bounds("file-diff-code-new-3")
+            .expect("row 3")
+            .center();
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        visual
+            .debug_bounds("diff-caret")
+            .expect("caret visible while pane A is focused");
+        assert!(
+            visual.debug_bounds("diff-selection-dim").is_none(),
+            "a focused pane's selection is not dimmed"
+        );
+
+        // Split so a second pane exists, then explicitly move keyboard focus
+        // to it — `split_workspace_pane` makes the new pane active, which is
+        // what actually moves gpui focus away from pane A.
+        window
+            .update(cx, |app, window, cx| {
+                app.split_workspace_pane(pane_a, crate::workspace::SplitDirection::Right, cx);
+                let pane_b = app.workspace.active_pane();
+                assert_ne!(pane_b, pane_a, "split creates a distinct second pane");
+                app.pane_scroll(pane_b, cx).focus.focus(window);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // `debug_bounds` only ever records that a selector *has* painted, so
+        // the caret's disappearance is asserted against the same `focused`
+        // read `render_file_diff_line` gates on, not against bounds absence
+        // (see `caret_blinks_off_and_back` for the same caveat).
+        let pane_a_focused = window
+            .update(cx, |app, window, cx| {
+                app.pane_scroll(pane_a, cx).focus.is_focused(window)
+            })
+            .unwrap();
+        assert!(!pane_a_focused, "focus moved to pane B");
+        visual
+            .debug_bounds("diff-selection-dim")
+            .expect("unfocused pane A dims its selection fill");
+    }
+
+    #[gpui::test]
+    async fn clicking_the_other_side_moves_the_selection(cx: &mut TestAppContext) {
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+        let new_side = visual
+            .debug_bounds("file-diff-code-new-4")
+            .expect("new side");
+        visual.simulate_click(new_side.center(), Modifiers::default());
+        cx.run_until_parked();
+        let old_side = visual
+            .debug_bounds("file-diff-code-old-4")
+            .expect("old side");
+        visual.simulate_click(old_side.center(), Modifiers::default());
+        cx.run_until_parked();
+        let selection = read_active_selection(&window, cx).expect("selection exists");
+        assert_eq!(selection.side, repo::DiffSide::Old);
+    }
+
+    #[gpui::test]
+    async fn dragging_selects_text_across_rows(cx: &mut TestAppContext) {
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+        let start = visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("row 1")
+            .center();
+        let end = visual
+            .debug_bounds("file-diff-code-new-3")
+            .expect("row 3")
+            .center();
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        let selection = read_active_selection(&window, cx).expect("drag created a selection");
+        let drag_cleared = window
+            .read_with(cx, |app, _| app.diff_drag.is_none())
+            .unwrap();
+        assert!(!selection.is_caret());
+        assert_eq!(selection.line_range(), 1..=3);
+        assert!(drag_cleared, "mouse-up ended the drag");
+    }
+
+    #[gpui::test]
+    async fn shift_click_extends_from_the_anchor(cx: &mut TestAppContext) {
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+        let start = visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("row 1")
+            .center();
+        visual.simulate_click(start, Modifiers::default());
+        cx.run_until_parked();
+        let end = visual
+            .debug_bounds("file-diff-code-new-3")
+            .expect("row 3")
+            .center();
+        visual.simulate_click(
+            end,
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        cx.run_until_parked();
+        let selection = read_active_selection(&window, cx).expect("selection exists");
+        assert_eq!(selection.anchor.row, 1);
+        assert_eq!(selection.head.row, 3);
+    }
+
+    #[gpui::test]
+    async fn double_click_selects_the_word(cx: &mut TestAppContext) {
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+        let target = visual
+            .debug_bounds("file-diff-code-new-4")
+            .expect("row")
+            .center();
+        visual.simulate_mouse_down(target, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_up(target, MouseButton::Left, Modifiers::default());
+        visual.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: target,
+            modifiers: Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+        let selection = read_active_selection(&window, cx).expect("selection");
+        assert!(!selection.is_caret(), "double-click selected a word");
+        assert_eq!(selection.head.row, 4);
+        assert_eq!(selection.anchor.row, 4);
+    }
+
+    #[gpui::test]
+    async fn dragging_a_word_selection_backward_keeps_the_head_on_the_pointer(
+        cx: &mut TestAppContext,
+    ) {
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+        let origin = visual
+            .debug_bounds("file-diff-code-new-4")
+            .expect("row 4")
+            .center();
+        visual.simulate_mouse_down(origin, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_up(origin, MouseButton::Left, Modifiers::default());
+        visual.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: origin,
+            modifiers: Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.run_until_parked();
+        let earlier = visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("row 1")
+            .center();
+        visual.simulate_mouse_move(earlier, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        let selection = read_active_selection(&window, cx).expect("drag created a selection");
+        assert_eq!(
+            selection.head.row, 1,
+            "head should track the pointer on a backward drag"
+        );
+        assert_eq!(
+            selection.anchor.row, 4,
+            "anchor should stay at the drag origin"
+        );
+    }
+
+    #[gpui::test]
+    async fn gutter_click_selects_the_whole_line(cx: &mut TestAppContext) {
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+        let gutter = visual
+            .debug_bounds("file-diff-line-new-4")
+            .expect("gutter cell")
+            .center();
+        visual.simulate_click(gutter, Modifiers::default());
+        cx.run_until_parked();
+        let selection = read_active_selection(&window, cx).expect("selection");
+        assert_eq!(
+            selection.anchor,
+            crate::app::diff_selection::DiffPoint { row: 4, column: 0 }
+        );
+        assert_eq!(selection.head.row, 4);
+        assert!(selection.head.column > 0, "head at line end");
     }
 
     /// Open the wide-lined modified file in a single pane, returning the temp
@@ -2035,7 +2807,7 @@ mod tests {
             .debug_bounds("file-diff-side-new")
             .expect("new file diff side debug bounds");
         let before = window
-            .read_with(cx, |app, _cx| app.file_diff_hscroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_hscroll_offset(cx))
             .expect("read pan offset before wheel");
         assert_eq!(before.x, px(0.), "a fresh diff starts unpanned");
 
@@ -2047,7 +2819,7 @@ mod tests {
         cx.run_until_parked();
 
         let after = window
-            .read_with(cx, |app, _cx| app.file_diff_hscroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_hscroll_offset(cx))
             .expect("read pan offset after wheel");
         assert!(after.x < before.x, "horizontal wheel should pan the diff");
     }
@@ -2138,7 +2910,7 @@ mod tests {
         cx.run_until_parked();
 
         let offset = window
-            .read_with(cx, |app, _cx| app.file_diff_hscroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_hscroll_offset(cx))
             .expect("read pan offset");
         assert_eq!(
             offset.x,
@@ -2157,7 +2929,7 @@ mod tests {
             .debug_bounds("file-diff-side-new")
             .expect("new file diff side debug bounds");
         let vertical_before = window
-            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_offset(cx))
             .expect("read vertical offset before wheel");
 
         visual.simulate_event(ScrollWheelEvent {
@@ -2168,10 +2940,10 @@ mod tests {
         cx.run_until_parked();
 
         let vertical_after = window
-            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_offset(cx))
             .expect("read vertical offset after wheel");
         let pan = window
-            .read_with(cx, |app, _cx| app.file_diff_hscroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_hscroll_offset(cx))
             .expect("read pan offset");
 
         assert!(
@@ -2202,7 +2974,7 @@ mod tests {
         cx.run_until_parked();
 
         let panned = window
-            .read_with(cx, |app, _cx| app.file_diff_hscroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_hscroll_offset(cx))
             .expect("read pan offset while panned");
         assert!(panned.x < px(0.), "the wide diff panned");
 
@@ -2214,7 +2986,7 @@ mod tests {
         cx.run_until_parked();
 
         let reset = window
-            .read_with(cx, |app, _cx| app.file_diff_hscroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_hscroll_offset(cx))
             .expect("read pan offset after switching files");
         assert_eq!(reset.x, px(0.), "opening a file starts it unpanned");
     }
@@ -2231,7 +3003,7 @@ mod tests {
             .expect("change-block label");
 
         let position = window
-            .read_with(cx, |app, _cx| app.active_diff_block_position())
+            .read_with(cx, |app, cx| app.active_diff_block_position(cx))
             .expect("read block position");
         assert_eq!(
             position,
@@ -2245,7 +3017,7 @@ mod tests {
         let (_dir, window, mut visual) = open_multi_block_diff(cx);
 
         let before = window
-            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_offset(cx))
             .expect("read offset before");
 
         let next = visual
@@ -2255,12 +3027,12 @@ mod tests {
         cx.run_until_parked();
 
         let position = window
-            .read_with(cx, |app, _cx| app.active_diff_block_position())
+            .read_with(cx, |app, cx| app.active_diff_block_position(cx))
             .expect("read block position");
         assert_eq!(position, Some((1, 3)), "next advances to the second block");
 
         let after = window
-            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_offset(cx))
             .expect("read offset after");
         assert!(
             after.y < before.y,
@@ -2279,7 +3051,7 @@ mod tests {
         cx.run_until_parked();
 
         let position = window
-            .read_with(cx, |app, _cx| app.active_diff_block_position())
+            .read_with(cx, |app, cx| app.active_diff_block_position(cx))
             .expect("read block position");
         assert_eq!(
             position,
@@ -2293,19 +3065,19 @@ mod tests {
         cx.update(crate::app::bind_app_keys);
         let (_dir, window, mut visual) = open_multi_block_diff(cx);
 
-        visual.simulate_keystrokes("cmd-down");
+        visual.simulate_keystrokes("alt-cmd-down");
         cx.run_until_parked();
         let after_next = window
-            .read_with(cx, |app, _cx| app.active_diff_block_position())
-            .expect("read block position after cmd-down");
-        assert_eq!(after_next, Some((1, 3)), "cmd-down advances a block");
+            .read_with(cx, |app, cx| app.active_diff_block_position(cx))
+            .expect("read block position after alt-cmd-down");
+        assert_eq!(after_next, Some((1, 3)), "alt-cmd-down advances a block");
 
-        visual.simulate_keystrokes("cmd-up");
+        visual.simulate_keystrokes("alt-cmd-up");
         cx.run_until_parked();
         let after_prev = window
-            .read_with(cx, |app, _cx| app.active_diff_block_position())
-            .expect("read block position after cmd-up");
-        assert_eq!(after_prev, Some((0, 3)), "cmd-up steps back a block");
+            .read_with(cx, |app, cx| app.active_diff_block_position(cx))
+            .expect("read block position after alt-cmd-up");
+        assert_eq!(after_prev, Some((0, 3)), "alt-cmd-up steps back a block");
     }
 
     #[gpui::test]
@@ -2315,7 +3087,7 @@ mod tests {
         let (_dir, window, _visual) = open_multi_block_diff(cx);
 
         let offset = window
-            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_offset(cx))
             .expect("read offset");
         assert!(
             offset.y < px(0.),
@@ -2343,11 +3115,11 @@ mod tests {
         cx.run_until_parked();
 
         let at_top = window
-            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_offset(cx))
             .expect("read offset at top");
         assert_eq!(at_top.y, px(0.), "scrolled to the very top of the file");
         let at_top_position = window
-            .read_with(cx, |app, _cx| app.active_diff_block_position())
+            .read_with(cx, |app, cx| app.active_diff_block_position(cx))
             .expect("read block position at top");
         assert_eq!(
             at_top_position,
@@ -2363,14 +3135,14 @@ mod tests {
         cx.run_until_parked();
 
         let after = window
-            .read_with(cx, |app, _cx| app.file_diff_new_scroll_offset())
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_offset(cx))
             .expect("read offset after next");
         assert!(
             after.y < px(0.),
             "next from the top scrolls down into the first block"
         );
         let after_position = window
-            .read_with(cx, |app, _cx| app.active_diff_block_position())
+            .read_with(cx, |app, cx| app.active_diff_block_position(cx))
             .expect("read block position after next");
         assert_eq!(
             after_position,
@@ -2496,6 +3268,81 @@ mod tests {
                 .debug_bounds("file-diff-side-new-hscrollbar")
                 .is_none(),
             "a diff with no horizontal overflow never shows the bar"
+        );
+    }
+
+    #[gpui::test]
+    async fn arrow_keys_move_the_caret_and_shift_extends(cx: &mut TestAppContext) {
+        cx.update(crate::app::bind_app_keys);
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+        let target = visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("row")
+            .center();
+        visual.simulate_click(target, Modifiers::default());
+        cx.run_until_parked();
+        let before = read_active_selection(&window, cx).expect("caret");
+        visual.simulate_keystrokes("down");
+        cx.run_until_parked();
+        let after = read_active_selection(&window, cx).expect("caret moved");
+        assert!(after.head.row > before.head.row);
+        assert!(after.is_caret());
+        visual.simulate_keystrokes("shift-down shift-right");
+        cx.run_until_parked();
+        let extended = read_active_selection(&window, cx).expect("selection");
+        assert!(!extended.is_caret());
+        assert_eq!(
+            extended.anchor, after.head,
+            "anchor stayed put while shift extended"
+        );
+    }
+
+    #[gpui::test]
+    async fn cmd_c_copies_the_selected_text(cx: &mut TestAppContext) {
+        cx.update(crate::app::bind_app_keys);
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+        let gutter = visual
+            .debug_bounds("file-diff-line-new-2")
+            .expect("gutter")
+            .center();
+        visual.simulate_click(gutter, Modifiers::default()); // whole line 2
+        cx.run_until_parked();
+        visual.simulate_keystrokes("cmd-c");
+        cx.run_until_parked();
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("clipboard text");
+        let expected = read_active_row_text(&window, cx, 2);
+        assert_eq!(copied, expected);
+    }
+
+    #[gpui::test]
+    async fn selection_keys_do_nothing_before_the_first_click(cx: &mut TestAppContext) {
+        cx.update(crate::app::bind_app_keys);
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+        visual.simulate_keystrokes("cmd-a");
+        visual.simulate_keystrokes("cmd-c");
+        cx.run_until_parked();
+        assert!(
+            read_active_selection(&window, cx).is_none(),
+            "no caret, no selection"
+        );
+    }
+
+    #[gpui::test]
+    async fn block_navigation_moved_to_alt_cmd(cx: &mut TestAppContext) {
+        cx.update(crate::app::bind_app_keys);
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+        visual.simulate_keystrokes("alt-cmd-down");
+        cx.run_until_parked();
+        let position = window
+            .read_with(cx, |app, cx| app.active_diff_block_position(cx))
+            .unwrap();
+        assert_eq!(
+            position,
+            Some((1, 3)),
+            "alt-cmd-down stepped to the second block"
         );
     }
 }

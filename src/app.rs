@@ -3,6 +3,7 @@
 mod branch_filter;
 mod branch_sidebar;
 mod commit_graph;
+pub(crate) mod diff_selection;
 mod diff_view;
 mod file_tree;
 pub mod menu;
@@ -28,9 +29,10 @@ pub use path_picker::{repository_prompt_options, GpuiPathPicker, PathPicker, Pat
 use gpui::prelude::FluentBuilder;
 use gpui::{
     actions, canvas, div, pattern_slash, point, px, uniform_list, AnyElement, AppContext,
-    Background, ClickEvent, Context, Entity, EventEmitter, FocusHandle, HighlightStyle, Hsla,
-    InteractiveElement, IntoElement, Modifiers, ParentElement, PathBuilder, Pixels, Render,
-    ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledText, TextStyle,
+    Background, Bounds, ClickEvent, Context, Entity, EventEmitter, FocusHandle, HighlightStyle,
+    Hsla, InteractiveElement, IntoElement, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, PathBuilder, Pixels, Point, Render, ScrollHandle,
+    ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledText, TextStyle,
     UniformListScrollHandle, Window,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -74,11 +76,42 @@ actions!(
     ]
 );
 
+actions!(
+    app,
+    [
+        DiffMoveLeft,
+        DiffMoveRight,
+        DiffMoveUp,
+        DiffMoveDown,
+        DiffMoveWordLeft,
+        DiffMoveWordRight,
+        DiffMoveLineStart,
+        DiffMoveLineEnd,
+        DiffMoveDocStart,
+        DiffMoveDocEnd,
+        DiffSelectLeft,
+        DiffSelectRight,
+        DiffSelectUp,
+        DiffSelectDown,
+        DiffSelectWordLeft,
+        DiffSelectWordRight,
+        DiffSelectLineStart,
+        DiffSelectLineEnd,
+        DiffSelectDocStart,
+        DiffSelectDocEnd,
+        DiffSelectAll,
+        DiffCopy,
+        DiffCancelSelection
+    ]
+);
+
 /// The application-wide monospace font, used by every text surface (file tree,
 /// branch sidebar, tab bar, diff view, and commit graph) so they render
 /// consistently. The value is the installed family name of the Nerd Font
 /// variant; see the resolution test in `file_tree` for the no-fallback contract.
 pub(crate) const MONO_FONT_FAMILY: &str = "BerkeleyMono Nerd Font";
+/// Interval between diff-caret blink phase flips.
+const CARET_BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const FILE_TREE_INDENT_WIDTH: f32 = 16.;
 const FILE_TREE_ROW_HEIGHT: f32 = 24.;
 /// Vertical breathing room added inside each branch-sidebar row, within its
@@ -144,6 +177,25 @@ pub struct App {
     /// RefCell because render paths take `&self`; ScrollHandle clones share
     /// their underlying state, so handing out clones is safe.
     pane_scrolls: RefCell<HashMap<crate::workspace::PaneId, PaneScrollState>>,
+    /// The selection (or bare caret) on one side of one open tab's diff, keyed
+    /// by pane id and the tab's key (file path). Pruned whenever a workspace
+    /// mutation can close or replace tabs, so an entry never outlives the tab
+    /// it was made on.
+    diff_selections: HashMap<(crate::workspace::PaneId, String), diff_selection::DiffSelection>,
+    /// An in-flight mouse selection drag, if the user is currently dragging
+    /// inside a diff. Lives from mouse-down to mouse-up.
+    diff_drag: Option<DiffDrag>,
+    /// Current blink phase for the diff caret: `true` paints it, `false`
+    /// hides it. Read into `DiffSelectionContext::caret_visible` on every
+    /// render. Starts `true`; the blink loop only starts once a caret is
+    /// actually placed (see `pause_caret_blink`).
+    caret_blink_visible: bool,
+    /// Epoch guard for the blink loop: each armed timer captures the epoch
+    /// it was scheduled under, and a fired timer whose epoch no longer
+    /// matches `caret_blink_epoch` is stale and does nothing. Bumped by
+    /// every `pause_caret_blink`/`blink_caret` call, so a fresh caret
+    /// placement orphans whatever timer was previously in flight.
+    caret_blink_epoch: usize,
     /// Computed diff rows for the changed-file detail view, keyed by file path
     /// plus the commit/base shas they were derived from. `render_changed_file_detail`
     /// runs on every App render; without this cache it would re-read the file from
@@ -239,14 +291,84 @@ pub(crate) struct FileDiffScroll {
 pub(crate) struct PaneScrollState {
     pub(crate) tab_bar: ScrollHandle,
     pub(crate) diff: FileDiffScroll,
+    /// Keyboard focus for this pane's diff selection. Mouse and keyboard
+    /// selection handlers focus this handle so key events route to the pane
+    /// the user is interacting with, and the caret paints only while the
+    /// pane holds it.
+    pub(crate) focus: FocusHandle,
+    /// Last painted bounds of each side's list container, keyed by side
+    /// selector (e.g. "file-diff-side-old"). Written during paint by the
+    /// bounds-capturing canvas in `render_file_diff_side` and read back to
+    /// translate pointer positions into diff coordinates.
+    pub(crate) content_origins: Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
 }
 
 impl PaneScrollState {
-    fn new() -> Self {
+    fn new(cx: &gpui::App) -> Self {
         Self {
             tab_bar: ScrollHandle::new(),
             diff: FileDiffScroll::new(),
+            focus: cx.focus_handle(),
+            content_origins: Rc::new(RefCell::new(HashMap::new())),
         }
+    }
+}
+
+/// The render-time context the `render_*_file_detail` chain needs beyond
+/// `repo`/`changeset`/the selected path: which pane is rendering, its diff
+/// scroll state, and whether the pointer is currently over it. Bundled so
+/// those functions stay under clippy's argument-count limit.
+pub(crate) struct PaneRenderContext<'a> {
+    pub(crate) pane: crate::workspace::PaneId,
+    pub(crate) scroll: &'a FileDiffScroll,
+    pub(crate) hovered: bool,
+}
+
+/// An in-flight mouse selection drag. Lives from mouse-down to mouse-up.
+pub(crate) struct DiffDrag {
+    pub(crate) pane: crate::workspace::PaneId,
+    pub(crate) key: String,
+    pub(crate) mode: DiffDragMode,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DiffDragMode {
+    Character,
+    /// Original double-clicked word; drag unions the pointer's word with it.
+    Word {
+        origin: (diff_selection::DiffPoint, diff_selection::DiffPoint),
+    },
+    /// Original clicked line range; drag unions the pointer's line with it.
+    Line {
+        origin: (diff_selection::DiffPoint, diff_selection::DiffPoint),
+    },
+}
+
+/// Shared union logic for `Word`/`Line` drag extension: the selection spans
+/// the union of `origin` and `pointer`'s ranges. The head sits on whichever
+/// end of that union the pointer's range extended toward, so the caret keeps
+/// tracking the mouse; the anchor sits at the opposite (farther) end,
+/// pinning the drag origin. Whether the pointer dragged backward past the
+/// origin is decided by comparing the pointer's range against the origin's
+/// range directly (not the raw click point against the union), since on a
+/// same-row drag the click point rarely falls exactly on the union bound.
+fn union_range_selection(
+    side: repo::DiffSide,
+    origin: (diff_selection::DiffPoint, diff_selection::DiffPoint),
+    pointer: (diff_selection::DiffPoint, diff_selection::DiffPoint),
+) -> diff_selection::DiffSelection {
+    let start = origin.0.min(pointer.0);
+    let end = origin.1.max(pointer.1);
+    let (anchor, head) = if pointer.0 < origin.0 {
+        (end, start)
+    } else {
+        (start, end)
+    };
+    diff_selection::DiffSelection {
+        side,
+        anchor,
+        head,
+        goal_x: None,
     }
 }
 
@@ -751,6 +873,10 @@ impl App {
             workspace: crate::workspace::Workspace::new(),
             file_tree_highlight_path: None,
             pane_scrolls: RefCell::new(HashMap::new()),
+            diff_selections: HashMap::new(),
+            caret_blink_visible: true,
+            caret_blink_epoch: 0,
+            diff_drag: None,
             diff_row_cache: RefCell::new(HashMap::new()),
             tab_drop_zone: None,
             file_list_mode: FileListMode::Changed,
@@ -873,6 +999,8 @@ impl App {
         self.comparison_commit_shas = None;
         self.workspace = crate::workspace::Workspace::new();
         self.pane_scrolls.borrow_mut().clear();
+        self.diff_selections.clear();
+        self.stop_caret_blink();
         self.diff_row_cache.borrow_mut().clear();
         self.graph_layout_cache.borrow_mut().take();
         self.file_tree_highlight_path = None;
@@ -1394,6 +1522,8 @@ impl App {
                 // splits last only while the changeset stays open.
                 self.workspace = crate::workspace::Workspace::new();
                 self.pane_scrolls.borrow_mut().clear();
+                self.diff_selections.clear();
+                self.stop_caret_blink();
                 self.diff_row_cache.borrow_mut().clear();
                 self.file_tree_highlight_path = None;
                 self.file_tree_scroll.set_offset(point(px(0.), px(0.)));
@@ -1418,6 +1548,8 @@ impl App {
         self.file_tree_hovered = false;
         self.hovered_diff_pane = None;
         self.reset_pane_scrolls();
+        self.diff_selections.clear();
+        self.stop_caret_blink();
         self.diff_row_cache.borrow_mut().clear();
         cx.notify();
     }
@@ -1429,11 +1561,15 @@ impl App {
 
     /// The scroll handles for `pane`, created on first use. The returned
     /// clone shares its underlying state with every other clone for the pane.
-    pub(crate) fn pane_scroll(&self, pane: crate::workspace::PaneId) -> PaneScrollState {
+    pub(crate) fn pane_scroll(
+        &self,
+        pane: crate::workspace::PaneId,
+        cx: &gpui::App,
+    ) -> PaneScrollState {
         self.pane_scrolls
             .borrow_mut()
             .entry(pane)
-            .or_insert_with(PaneScrollState::new)
+            .or_insert_with(|| PaneScrollState::new(cx))
             .clone()
     }
 
@@ -1454,6 +1590,378 @@ impl App {
             .retain(|pane, _| live.contains(pane));
     }
 
+    /// The selection on `key`'s diff in `pane`, if one has been made.
+    pub(crate) fn diff_selection(
+        &self,
+        pane: crate::workspace::PaneId,
+        key: &str,
+    ) -> Option<diff_selection::DiffSelection> {
+        self.diff_selections.get(&(pane, key.to_string())).copied()
+    }
+
+    /// Bump and return the new blink epoch, orphaning whatever timer was
+    /// previously in flight.
+    fn next_blink_epoch(&mut self) -> usize {
+        self.caret_blink_epoch += 1;
+        self.caret_blink_epoch
+    }
+
+    /// Epoch-guarded blink loop, after gpui-component's `BlinkCursor`: each
+    /// tick flips visibility and re-arms under a fresh epoch; a stale timer
+    /// (its epoch no longer current) is a no-op instead of a spurious flip.
+    fn blink_caret(&mut self, epoch: usize, cx: &mut Context<Self>) {
+        if epoch != self.caret_blink_epoch {
+            return;
+        }
+        self.caret_blink_visible = !self.caret_blink_visible;
+        cx.notify();
+        let next = self.next_blink_epoch();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CARET_BLINK_INTERVAL).await;
+            this.update(cx, |app, cx| app.blink_caret(next, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Any caret activity (placement, move, selection change) shows the
+    /// caret solid immediately, then resumes blinking after one interval.
+    /// Also the lazy start for the blink loop: the first call arms the
+    /// recurring timer. The loop keeps running (re-arming itself) for as
+    /// long as it's left unpaused; `stop_caret_blink` is what actually
+    /// silences it, so callers that bulk-clear every selection must call
+    /// that instead of relying on the absence of a caret to stop the timer.
+    fn pause_caret_blink(&mut self, cx: &mut Context<Self>) {
+        self.caret_blink_visible = true;
+        cx.notify();
+        let next = self.next_blink_epoch();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CARET_BLINK_INTERVAL).await;
+            this.update(cx, |app, cx| app.blink_caret(next, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Silence the blink loop: orphan whatever timer is in flight (a stale
+    /// epoch makes its next tick a no-op, see `blink_caret`) and leave the
+    /// caret visible. Callers that bulk-clear `diff_selections` (opening a
+    /// repository or changeset, closing a changeset) must call this beside
+    /// the clear, since none of those paths otherwise stop a blink chain
+    /// that a prior selection may have started — without it the 2Hz timer
+    /// would run forever with nothing left to paint.
+    fn stop_caret_blink(&mut self) {
+        self.caret_blink_epoch += 1;
+        self.caret_blink_visible = true;
+    }
+
+    /// Replace the selection on `key`'s diff in `pane`. A no-op (no insert,
+    /// no notify, no blink pause) when `selection` is identical to what's
+    /// already stored: an unchanged selection has nothing new to repaint,
+    /// and leaving the blink chain alone means a stationary drag's per-tick
+    /// mouse-move events don't each spawn a fresh pause/timer task. Callers
+    /// that need a repaint independent of the selection (e.g. autoscroll)
+    /// already issue their own `cx.notify()`.
+    pub(crate) fn set_diff_selection(
+        &mut self,
+        pane: crate::workspace::PaneId,
+        key: &str,
+        selection: diff_selection::DiffSelection,
+        cx: &mut Context<Self>,
+    ) {
+        let key_pair = (pane, key.to_string());
+        if self.diff_selections.get(&key_pair) == Some(&selection) {
+            return;
+        }
+        self.diff_selections.insert(key_pair, selection);
+        self.pause_caret_blink(cx);
+        cx.notify();
+    }
+
+    /// Drop selection entries whose `(pane, key)` no longer identifies an
+    /// open tab. Called after every workspace mutation that can close or
+    /// replace tabs, mirroring `prune_pane_scrolls`.
+    fn prune_diff_selections(&mut self) {
+        let live: HashSet<(crate::workspace::PaneId, String)> =
+            self.workspace.open_keys().into_iter().collect();
+        self.diff_selections.retain(|entry, _| live.contains(entry));
+    }
+
+    /// Entry point for every mouse-down inside a diff's code content: focuses
+    /// the pane so keyboard selection routes there, then dispatches on click
+    /// count and modifiers. Shift+click extends the existing selection on the
+    /// same side (Task 8); a shift+click on the other side behaves like a
+    /// plain click there, since a selection lives on exactly one side.
+    /// A double-click selects the word under the pointer; a triple-click (or
+    /// higher) selects the whole line. Any other click count falls through to
+    /// placing a bare caret.
+    pub(crate) fn begin_diff_mouse_selection(
+        &mut self,
+        ctx: &diff_view::DiffSelectionContext,
+        point: diff_selection::DiffPoint,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pane_scroll(ctx.pane, cx).focus.focus(window);
+
+        // Shift-extend takes priority over click-count dispatch and always
+        // extends character-wise from the prior anchor, regardless of
+        // whether the shift-click itself is a double- or triple-click.
+        if event.modifiers.shift {
+            if let Some(existing) = self.diff_selection(ctx.pane, &ctx.key) {
+                if existing.side == ctx.side {
+                    self.extend_diff_selection_from_anchor(ctx, existing.anchor, point, cx);
+                    return;
+                }
+            }
+        }
+
+        match event.click_count {
+            0 => {}
+            2 => self.select_diff_word(ctx, point, cx),
+            count if count >= 3 => self.select_diff_line(ctx, point, cx),
+            _ => self.place_diff_caret(ctx, point, cx),
+        }
+    }
+
+    /// Double-click's behavior: select the word under `point` (per
+    /// `diff_selection::word_range_at`) and arm a `Word`-mode drag from it.
+    fn select_diff_word(
+        &mut self,
+        ctx: &diff_view::DiffSelectionContext,
+        point: diff_selection::DiffPoint,
+        cx: &mut Context<Self>,
+    ) {
+        let text = &ctx.content.cell(point.row).text;
+        let range = diff_selection::word_range_at(text, point.column);
+        let anchor = diff_selection::DiffPoint {
+            row: point.row,
+            column: range.start,
+        };
+        let head = diff_selection::DiffPoint {
+            row: point.row,
+            column: range.end,
+        };
+        self.set_diff_selection(
+            ctx.pane,
+            &ctx.key,
+            diff_selection::DiffSelection {
+                side: ctx.side,
+                anchor,
+                head,
+                goal_x: None,
+            },
+            cx,
+        );
+        self.diff_drag = Some(DiffDrag {
+            pane: ctx.pane,
+            key: ctx.key.clone(),
+            mode: DiffDragMode::Word {
+                origin: (anchor, head),
+            },
+        });
+    }
+
+    /// Triple-click's (and gutter click's) behavior: select the whole line
+    /// containing `point` (column 0 through the line's length) and arm a
+    /// `Line`-mode drag from it.
+    fn select_diff_line(
+        &mut self,
+        ctx: &diff_view::DiffSelectionContext,
+        point: diff_selection::DiffPoint,
+        cx: &mut Context<Self>,
+    ) {
+        let anchor = diff_selection::line_start(point);
+        let head = diff_selection::line_end(&ctx.content, point);
+        self.set_diff_selection(
+            ctx.pane,
+            &ctx.key,
+            diff_selection::DiffSelection {
+                side: ctx.side,
+                anchor,
+                head,
+                goal_x: None,
+            },
+            cx,
+        );
+        self.diff_drag = Some(DiffDrag {
+            pane: ctx.pane,
+            key: ctx.key.clone(),
+            mode: DiffDragMode::Line {
+                origin: (anchor, head),
+            },
+        });
+    }
+
+    /// Task 7's plain-click behavior: replace the selection with a bare
+    /// caret at `point` and arm a character-mode drag from it.
+    fn place_diff_caret(
+        &mut self,
+        ctx: &diff_view::DiffSelectionContext,
+        point: diff_selection::DiffPoint,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_diff_selection(
+            ctx.pane,
+            &ctx.key,
+            diff_selection::DiffSelection::caret_at(point, ctx.side),
+            cx,
+        );
+        self.diff_drag = Some(DiffDrag {
+            pane: ctx.pane,
+            key: ctx.key.clone(),
+            mode: DiffDragMode::Character,
+        });
+    }
+
+    /// Shift+click's behavior: keep `anchor`, move the head to `point`, and
+    /// arm a character-mode drag so a shift+click-then-drag keeps extending.
+    fn extend_diff_selection_from_anchor(
+        &mut self,
+        ctx: &diff_view::DiffSelectionContext,
+        anchor: diff_selection::DiffPoint,
+        point: diff_selection::DiffPoint,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_diff_selection(
+            ctx.pane,
+            &ctx.key,
+            diff_selection::DiffSelection {
+                side: ctx.side,
+                anchor,
+                head: point,
+                goal_x: None,
+            },
+            cx,
+        );
+        self.diff_drag = Some(DiffDrag {
+            pane: ctx.pane,
+            key: ctx.key.clone(),
+            mode: DiffDragMode::Character,
+        });
+    }
+
+    /// Extend the in-flight drag's selection to `point`. `Character` mode
+    /// moves the head directly; `Word`/`Line` modes union the pointer's
+    /// word/line range with the drag's origin range, anchoring at whichever
+    /// end of the union is farther from the pointer so dragging back past the
+    /// origin keeps growing the selection from the opposite end.
+    pub(crate) fn extend_diff_mouse_selection(
+        &mut self,
+        ctx: &diff_view::DiffSelectionContext,
+        point: diff_selection::DiffPoint,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = &self.diff_drag else {
+            return;
+        };
+        if drag.pane != ctx.pane || drag.key != ctx.key {
+            return;
+        }
+        match drag.mode {
+            DiffDragMode::Character => {
+                let Some(mut selection) = self.diff_selection(ctx.pane, &ctx.key) else {
+                    return;
+                };
+                // A selection lives on exactly one side; a drag that strayed
+                // onto the other side's container (or a stale drag from a
+                // since-replaced selection) does not move this side's head.
+                if selection.side != ctx.side {
+                    return;
+                }
+                selection.head = point;
+                selection.goal_x = None;
+                self.set_diff_selection(ctx.pane, &ctx.key, selection, cx);
+            }
+            DiffDragMode::Word { origin } => {
+                let text = &ctx.content.cell(point.row).text;
+                let range = diff_selection::word_range_at(text, point.column);
+                let pointer = (
+                    diff_selection::DiffPoint {
+                        row: point.row,
+                        column: range.start,
+                    },
+                    diff_selection::DiffPoint {
+                        row: point.row,
+                        column: range.end,
+                    },
+                );
+                self.set_diff_selection(
+                    ctx.pane,
+                    &ctx.key,
+                    union_range_selection(ctx.side, origin, pointer),
+                    cx,
+                );
+            }
+            DiffDragMode::Line { origin } => {
+                let pointer = (
+                    diff_selection::line_start(point),
+                    diff_selection::line_end(&ctx.content, point),
+                );
+                self.set_diff_selection(
+                    ctx.pane,
+                    &ctx.key,
+                    union_range_selection(ctx.side, origin, pointer),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// One mouse-move tick of an in-flight drag on a diff side container:
+    /// autoscrolls the side (and shared horizontal pan) when the pointer sits
+    /// in the edge margin, then maps the (possibly now-scrolled) pointer
+    /// position to a `DiffPoint` and extends the selection. A no-op while no
+    /// drag is armed for this pane+key, so a plain hover costs one field read.
+    fn drag_diff_mouse_move(
+        &mut self,
+        ctx: &diff_view::DiffSelectionContext,
+        side_scroll: &diff_view::DiffSideScroll,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = &self.diff_drag else {
+            return;
+        };
+        if drag.pane != ctx.pane || drag.key != ctx.key {
+            return;
+        }
+        let Some(side_bounds) = self
+            .pane_scroll(ctx.pane, cx)
+            .content_origins
+            .borrow()
+            .get(side_scroll.selector)
+            .copied()
+        else {
+            return;
+        };
+
+        let scrolled = diff_view::autoscroll_diff_side(side_scroll, side_bounds, event.position);
+
+        let point = diff_view::drag_point(window, ctx, side_scroll, side_bounds, event.position);
+        self.extend_diff_mouse_selection(ctx, point, cx);
+        // `extend_diff_mouse_selection` only notifies when the head actually
+        // moves; an autoscroll tick that repeats the same point (pointer held
+        // still in the margin) must still repaint to show the new scroll
+        // position.
+        if scrolled {
+            cx.notify();
+        }
+    }
+
+    /// End an in-flight diff mouse drag on mouse-up (inside or outside the
+    /// side container). A no-op when the drag already belongs to a different
+    /// pane+key, or none is armed.
+    fn end_diff_mouse_drag(&mut self, ctx: &diff_view::DiffSelectionContext) {
+        if self
+            .diff_drag
+            .as_ref()
+            .is_some_and(|drag| drag.pane == ctx.pane && drag.key == ctx.key)
+        {
+            self.diff_drag = None;
+        }
+    }
+
     fn open_file_preview(&mut self, path: String, cx: &mut Context<Self>) {
         self.open_file(path, false, cx);
     }
@@ -1472,10 +1980,13 @@ impl App {
             self.workspace.open_preview(item)
         };
         if content_changed {
-            self.pane_scroll(pane).diff.reset();
+            self.pane_scroll(pane, cx).diff.reset();
+            // A replaced preview tab keeps the same (pane, index) slot but a
+            // new key, so the old key's selection would otherwise linger.
+            self.prune_diff_selections();
         }
         if let Some(index) = self.workspace.active_index(pane) {
-            self.pane_scroll(pane).tab_bar.scroll_to_item(index);
+            self.pane_scroll(pane, cx).tab_bar.scroll_to_item(index);
         }
         cx.notify();
     }
@@ -1487,9 +1998,9 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         if self.workspace.activate_tab(pane, index) {
-            self.pane_scroll(pane).diff.reset();
+            self.pane_scroll(pane, cx).diff.reset();
         }
-        self.pane_scroll(pane).tab_bar.scroll_to_item(index);
+        self.pane_scroll(pane, cx).tab_bar.scroll_to_item(index);
         cx.notify();
     }
 
@@ -1511,14 +2022,15 @@ impl App {
     ) {
         if self.workspace.close_tab(pane, index) {
             if self.workspace.pane_ids().contains(&pane) {
-                self.pane_scroll(pane).diff.reset();
+                self.pane_scroll(pane, cx).diff.reset();
                 if let Some(index) = self.workspace.active_index(pane) {
-                    self.pane_scroll(pane).tab_bar.scroll_to_item(index);
+                    self.pane_scroll(pane, cx).tab_bar.scroll_to_item(index);
                 }
             } else {
                 // Closing the pane's last tab collapsed the pane itself.
                 self.prune_pane_scrolls();
             }
+            self.prune_diff_selections();
         }
         cx.notify();
     }
@@ -1551,9 +2063,9 @@ impl App {
         };
         if changed {
             let pane = self.workspace.active_pane();
-            self.pane_scroll(pane).diff.reset();
+            self.pane_scroll(pane, cx).diff.reset();
             if let Some(index) = self.workspace.active_index(pane) {
-                self.pane_scroll(pane).tab_bar.scroll_to_item(index);
+                self.pane_scroll(pane, cx).tab_bar.scroll_to_item(index);
             }
             cx.notify();
         }
@@ -1582,7 +2094,10 @@ impl App {
     /// The prepared diff and scroll state for the file open in the active pane,
     /// or `None` when no changeset is open, no file is shown, or the file has
     /// no diff to prepare. Shared by change-block navigation and its footer.
-    fn active_pane_prepared_diff(&self) -> Option<(Rc<PreparedFileDiff>, FileDiffScroll)> {
+    fn active_pane_prepared_diff(
+        &self,
+        cx: &gpui::App,
+    ) -> Option<(Rc<PreparedFileDiff>, FileDiffScroll)> {
         let Mode::RepoOpen { repo } = &self.mode else {
             return None;
         };
@@ -1596,7 +2111,7 @@ impl App {
             .map(|item| item.path().to_string())?;
         let file = changeset.files.iter().find(|file| file.path == path)?;
         let prepared = self.prepared_file_diff(repo, changeset, file).ok()?;
-        Some((prepared, self.pane_scroll(pane).diff))
+        Some((prepared, self.pane_scroll(pane, cx).diff))
     }
 
     /// Scroll the active pane's diff to the next or previous change block,
@@ -1605,7 +2120,7 @@ impl App {
     /// viewport, so a block scrolled off screen is stepped to rather than
     /// skipped.
     fn navigate_change_block(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let Some((prepared, scroll)) = self.active_pane_prepared_diff() else {
+        let Some((prepared, scroll)) = self.active_pane_prepared_diff(cx) else {
             return;
         };
         let blocks = prepared.blocks();
@@ -1648,10 +2163,245 @@ impl App {
     /// both derived from the live scroll offset. `None` when there is no
     /// navigable diff. Test-only observation hook.
     #[cfg(test)]
-    fn active_diff_block_position(&self) -> Option<(usize, usize)> {
-        let (prepared, scroll) = self.active_pane_prepared_diff()?;
+    fn active_diff_block_position(&self, cx: &gpui::App) -> Option<(usize, usize)> {
+        let (prepared, scroll) = self.active_pane_prepared_diff(cx)?;
         let current = diff_view::current_change_block(&prepared, &scroll)?;
         Some((current, prepared.blocks().len()))
+    }
+
+    /// The active pane's active tab, its selectable content, and its stored
+    /// selection — the shared resolution every keyboard selection action
+    /// starts from. `None` when there is no changeset open, no active tab, or
+    /// (the "no caret yet" rule) no selection has been made on that tab, since
+    /// every keyboard selection action is a no-op before the first click.
+    /// Mirrors `render_file_detail`'s changed-vs-read-only dispatch and, for a
+    /// changed file rendered side-by-side, uses the stored selection's `side`
+    /// to pick which side's content to resolve (a selection lives on exactly
+    /// one side).
+    fn active_diff_selection_context(
+        &self,
+    ) -> Option<(
+        crate::workspace::PaneId,
+        String,
+        diff_selection::DiffSideContent,
+        diff_selection::DiffSelection,
+    )> {
+        let Mode::RepoOpen { repo } = &self.mode else {
+            return None;
+        };
+        let ReviewScreen::Changeset { changeset, .. } = &self.review_screen else {
+            return None;
+        };
+        let pane = self.workspace.active_pane();
+        let path = self.workspace.active_item(pane)?.path().to_string();
+        let selection = self.diff_selection(pane, &path)?;
+
+        let content = if let Some(file) = changeset.files.iter().find(|file| file.path == path) {
+            let prepared = self.prepared_file_diff(repo, changeset, file).ok()?;
+            diff_selection::DiffSideContent::Prepared {
+                diff: prepared,
+                side: selection.side,
+            }
+        } else {
+            let file_content =
+                repo::file_content_at_commit(&repo.path, &changeset.commit_sha, &path).ok()?;
+            let repo::FileContentBody::Text(text) = file_content.content else {
+                // Binary read-only content has no selectable text.
+                return None;
+            };
+            diff_selection::DiffSideContent::ReadOnly {
+                cells: Rc::new(diff_view::read_only_file_cells(&text)),
+            }
+        };
+
+        Some((pane, path, content, selection))
+    }
+
+    /// The shape every keyboard motion/extension action shares: resolve the
+    /// active caret (no-op if there is none), run `motion` to get the new
+    /// head, clamp it onto real content, move the head (and, unless
+    /// `extend`, the anchor too), store the result, and scroll the caret into
+    /// view. Horizontal motions call this directly; vertical motions wrap it
+    /// (see `diff_vertical_motion`) since they must manage `goal_x`
+    /// themselves rather than have it cleared here.
+    pub(crate) fn diff_motion(
+        &mut self,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        motion: impl Fn(
+            &diff_selection::DiffSideContent,
+            diff_selection::DiffPoint,
+        ) -> diff_selection::DiffPoint,
+    ) {
+        let Some((pane, key, content, mut selection)) = self.active_diff_selection_context() else {
+            return;
+        };
+        let new_head = content.clamp(motion(&content, selection.head));
+        selection.head = new_head;
+        if !extend {
+            selection.anchor = new_head;
+        }
+        selection.goal_x = None;
+        self.set_diff_selection(pane, &key, selection, cx);
+        self.scroll_diff_caret_into_view(pane, &key, window, cx);
+    }
+
+    /// Vertical motion: `Up`/`Down`, honoring and updating the goal-x
+    /// position (the remembered pixel column vertical steps track across
+    /// rows of different widths). Unlike `diff_motion`, this does not clear
+    /// `goal_x` — it sets it on the first vertical step and preserves it
+    /// across consecutive ones, only clearing when `active_diff_selection_context`
+    /// changes it via a horizontal motion or a fresh click. A no-op at the
+    /// document edge, matching `vertical_target_row`'s `None` there.
+    pub(crate) fn diff_vertical_motion(
+        &mut self,
+        extend: bool,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((pane, key, content, mut selection)) = self.active_diff_selection_context() else {
+            return;
+        };
+        let Some(target_row) =
+            diff_selection::vertical_target_row(&content, selection.head.row, forward)
+        else {
+            return;
+        };
+        let current_text = &content.cell(selection.head.row).text;
+        let goal_x = selection.goal_x.unwrap_or_else(|| {
+            diff_view::x_for_column(window, current_text, selection.head.column)
+        });
+        let target_text = content.cell(target_row).text.clone();
+        let target_column = diff_view::column_for_x(window, &target_text, goal_x);
+        let new_head = content.clamp(diff_selection::DiffPoint {
+            row: target_row,
+            column: target_column,
+        });
+        selection.head = new_head;
+        if !extend {
+            selection.anchor = new_head;
+        }
+        selection.goal_x = Some(goal_x);
+        self.set_diff_selection(pane, &key, selection, cx);
+        self.scroll_diff_caret_into_view(pane, &key, window, cx);
+    }
+
+    /// `Cmd+A`: select the caret's entire side. A no-op when the content has
+    /// no selectable rows at all (`document_start`/`document_end` are `None`)
+    /// — vacuously nothing to select.
+    pub(crate) fn select_all_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((pane, key, content, mut selection)) = self.active_diff_selection_context() else {
+            return;
+        };
+        let Some(start) = diff_selection::document_start(&content) else {
+            return;
+        };
+        let Some(end) = diff_selection::document_end(&content) else {
+            return;
+        };
+        selection.anchor = start;
+        selection.head = end;
+        selection.goal_x = None;
+        self.set_diff_selection(pane, &key, selection, cx);
+        self.scroll_diff_caret_into_view(pane, &key, window, cx);
+    }
+
+    /// `Escape`: collapse the selection to a bare caret at the head, per
+    /// `docs/superpowers/specs/2026-07-02-diff-selection-design.md` ("Escape
+    /// collapses the selection to the caret") — it does not clear the
+    /// selection entirely.
+    pub(crate) fn cancel_diff_selection(&mut self, cx: &mut Context<Self>) {
+        let Some((pane, key, _content, mut selection)) = self.active_diff_selection_context()
+        else {
+            return;
+        };
+        if selection.is_caret() {
+            return;
+        }
+        selection.anchor = selection.head;
+        self.set_diff_selection(pane, &key, selection, cx);
+    }
+
+    /// `Cmd+C`: copy the selected text as plain characters, no line numbers or
+    /// `+`/`-` markers. A bare caret copies nothing.
+    pub(crate) fn copy_diff_selection(&mut self, cx: &mut Context<Self>) {
+        let Some((_pane, _key, content, selection)) = self.active_diff_selection_context() else {
+            return;
+        };
+        if selection.is_caret() {
+            return;
+        }
+        let text = diff_selection::selection_text(&content, &selection);
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+    }
+
+    /// Scroll `pane`'s `key` diff so its caret is on screen on both axes,
+    /// after any keyboard motion. Vertical: if the caret's row sits outside
+    /// the visible row window (derived from the side's current scroll offset
+    /// and its painted content height), jump so the caret rests one line
+    /// inside the nearer edge. Horizontal: if the caret's shaped x position
+    /// falls outside the panned viewport, adjust the shared horizontal pan
+    /// the same way. A no-op when there is no active selection or the side's
+    /// bounds have not been painted yet.
+    fn scroll_diff_caret_into_view(
+        &mut self,
+        pane: crate::workspace::PaneId,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selection) = self.diff_selection(pane, key) else {
+            return;
+        };
+        let Some((_pane, _key, content, _selection)) = self.active_diff_selection_context() else {
+            return;
+        };
+        let scroll = self.pane_scroll(pane, cx);
+        let handle = scroll.diff.handle_for(selection.side).clone();
+        let selector = match selection.side {
+            repo::DiffSide::Old => "file-diff-side-old",
+            repo::DiffSide::New => "file-diff-side-new",
+        };
+        let side_bounds = scroll.content_origins.borrow().get(selector).copied();
+
+        let line_height = px(diff_view::DIFF_LINE_HEIGHT);
+        let row = selection.head.row;
+        let current_offset = diff_view::diff_scroll_top(&handle);
+        if let Some(bounds) = side_bounds {
+            let visible_rows = (bounds.size.height / line_height).floor().max(1.) as usize;
+            let topmost = diff_view::topmost_row_for_offset(current_offset, content.len());
+            // One line of margin inside each edge, per the brief.
+            if row < topmost + 1 {
+                let target_row = row.saturating_sub(1);
+                diff_view::set_diff_scroll_top(&handle, -px(target_row as f32 * DIFF_LINE_HEIGHT));
+            } else if row + 1 >= topmost + visible_rows {
+                let target_row = (row + 2).saturating_sub(visible_rows);
+                diff_view::set_diff_scroll_top(&handle, -px(target_row as f32 * DIFF_LINE_HEIGHT));
+            }
+        }
+
+        if let Some(bounds) = side_bounds {
+            let text = &content.cell(row).text;
+            let caret_x = diff_view::x_for_column(window, text, selection.head.column);
+            let pan = scroll.diff.hscroll.offset().x;
+            let viewport_width =
+                (bounds.size.width - px(diff_view::DIFF_GUTTER_WIDTH) - px(12.)).max(px(0.));
+            let visible_left = -pan;
+            let visible_right = visible_left + viewport_width;
+            if caret_x < visible_left {
+                scroll
+                    .diff
+                    .hscroll
+                    .set_offset(point(-caret_x, scroll.diff.hscroll.offset().y));
+            } else if caret_x > visible_right {
+                scroll.diff.hscroll.set_offset(point(
+                    -(caret_x - viewport_width),
+                    scroll.diff.hscroll.offset().y,
+                ));
+            }
+        }
     }
 
     pub(crate) fn activate_workspace_pane(
@@ -1686,6 +2436,7 @@ impl App {
     ) {
         if self.workspace.close_pane(pane) {
             self.pane_scrolls.borrow_mut().remove(&pane);
+            self.prune_diff_selections();
             cx.notify();
         }
     }
@@ -1714,11 +2465,12 @@ impl App {
             .workspace
             .move_tab(from_pane, from_index, to_pane, to_index)
         {
-            self.pane_scroll(to_pane).diff.reset();
+            self.pane_scroll(to_pane, cx).diff.reset();
             if let Some(index) = self.workspace.active_index(to_pane) {
-                self.pane_scroll(to_pane).tab_bar.scroll_to_item(index);
+                self.pane_scroll(to_pane, cx).tab_bar.scroll_to_item(index);
             }
             self.prune_pane_scrolls();
+            self.prune_diff_selections();
         }
         cx.notify();
     }
@@ -1736,8 +2488,9 @@ impl App {
             self.workspace
                 .split_with_tab(target_pane, direction, from_pane, from_index)
         {
-            self.pane_scroll(new_pane).diff.reset();
+            self.pane_scroll(new_pane, cx).diff.reset();
             self.prune_pane_scrolls();
+            self.prune_diff_selections();
         }
         cx.notify();
     }
@@ -1902,29 +2655,29 @@ impl App {
     }
 
     #[cfg(test)]
-    fn file_diff_old_scroll_offset(&self) -> gpui::Point<gpui::Pixels> {
-        self.pane_scroll(self.workspace.active_pane())
+    fn file_diff_old_scroll_offset(&self, cx: &gpui::App) -> gpui::Point<gpui::Pixels> {
+        self.pane_scroll(self.workspace.active_pane(), cx)
             .diff
             .side_by_side_offset()
     }
 
     #[cfg(test)]
-    fn file_diff_new_scroll_offset(&self) -> gpui::Point<gpui::Pixels> {
-        self.pane_scroll(self.workspace.active_pane())
+    fn file_diff_new_scroll_offset(&self, cx: &gpui::App) -> gpui::Point<gpui::Pixels> {
+        self.pane_scroll(self.workspace.active_pane(), cx)
             .diff
             .side_by_side_offset()
     }
 
     #[cfg(test)]
-    fn file_diff_new_scroll_max_offset(&self) -> gpui::Size<gpui::Pixels> {
-        self.pane_scroll(self.workspace.active_pane())
+    fn file_diff_new_scroll_max_offset(&self, cx: &gpui::App) -> gpui::Size<gpui::Pixels> {
+        self.pane_scroll(self.workspace.active_pane(), cx)
             .diff
             .side_by_side_max_offset()
     }
 
     #[cfg(test)]
-    fn file_diff_hscroll_offset(&self) -> gpui::Point<gpui::Pixels> {
-        self.pane_scroll(self.workspace.active_pane())
+    fn file_diff_hscroll_offset(&self, cx: &gpui::App) -> gpui::Point<gpui::Pixels> {
+        self.pane_scroll(self.workspace.active_pane(), cx)
             .diff
             .hscroll_offset()
     }
@@ -3665,16 +4418,16 @@ impl App {
         repo: &repo::OpenRepository,
         changeset: &repo::ChangeSet,
         selected_path: Option<&str>,
-        scroll: &FileDiffScroll,
-        hovered: bool,
+        pane_render: PaneRenderContext,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         match selected_path {
             Some(path) => {
                 if let Some(file) = changeset.files.iter().find(|file| file.path == path) {
-                    return self.render_changed_file_detail(repo, changeset, file, scroll, hovered);
+                    return self.render_changed_file_detail(repo, changeset, file, pane_render, cx);
                 }
 
-                self.render_read_only_file_detail(repo, changeset, path, scroll, hovered)
+                self.render_read_only_file_detail(repo, changeset, path, pane_render, cx)
             }
             None => div()
                 .flex()
@@ -3689,6 +4442,34 @@ impl App {
                 .text_size(px(14.))
                 .child("Select a file to inspect its diff.")
                 .into_any_element(),
+        }
+    }
+
+    /// The selection-painting bundle for `path`'s diff in `pane`, shared by
+    /// the changed- and read-only-file render paths. `side`/`content` are
+    /// placeholders the callee specializes per side via `clone_for_side`.
+    fn diff_selection_context(
+        &self,
+        pane: crate::workspace::PaneId,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> diff_view::DiffSelectionContext {
+        let scroll = self.pane_scroll(pane, cx);
+        diff_view::DiffSelectionContext {
+            pane,
+            key: path.to_string(),
+            // Placeholder, replaced by `clone_for_side` for each side that
+            // actually renders.
+            side: repo::DiffSide::New,
+            content: diff_selection::DiffSideContent::ReadOnly {
+                cells: Rc::new(Vec::new()),
+            },
+            selection: self.diff_selection(pane, path),
+            focus: scroll.focus,
+            caret_visible: self.caret_blink_visible,
+            app: cx.entity(),
+            origins: scroll.content_origins,
+            hscroll: scroll.diff.hscroll.clone(),
         }
     }
 
@@ -3735,9 +4516,14 @@ impl App {
         repo: &repo::OpenRepository,
         changeset: &repo::ChangeSet,
         file: &repo::ChangedFile,
-        scroll: &FileDiffScroll,
-        hovered: bool,
+        pane_render: PaneRenderContext,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
+        let PaneRenderContext {
+            pane,
+            scroll,
+            hovered,
+        } = pane_render;
         let rename_source_selector = format!(
             "file-detail-rename-source-{}",
             debug_path_fragment(&file.path)
@@ -3752,8 +4538,11 @@ impl App {
             .as_ref()
             .ok()
             .and_then(|prepared| render_change_block_footer(prepared, scroll));
+        let selection_ctx = self.diff_selection_context(pane, &file.path, cx);
         let content = match prepared {
-            Ok(prepared) => render_prepared_file_diff(&prepared, scroll, hovered),
+            Ok(prepared) => {
+                render_prepared_file_diff(&prepared, scroll, hovered, Some(&selection_ctx))
+            }
             Err(err) => render_file_diff_error(err),
         };
 
@@ -3790,15 +4579,22 @@ impl App {
         repo: &repo::OpenRepository,
         changeset: &repo::ChangeSet,
         path: &str,
-        scroll: &FileDiffScroll,
-        hovered: bool,
+        pane_render: PaneRenderContext,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
+        let PaneRenderContext {
+            pane,
+            scroll,
+            hovered,
+        } = pane_render;
+        let selection_ctx = self.diff_selection_context(pane, path, cx);
         let content = match repo::file_content_at_commit(&repo.path, &changeset.commit_sha, path) {
             Ok(content) => render_file_content(
                 content.content,
                 scroll,
                 diff_highlight::language_for_path(path),
                 hovered,
+                Some(&selection_ctx),
             ),
             Err(err) => render_file_diff_error(err.to_string()),
         };
@@ -4117,14 +4913,15 @@ fn restored_width(saved: Option<f32>, default: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        restored_width, selection_summary, App, CloseChangeset, Mode, OpenChangeset, OpenFailed,
-        PreparedFileDiff, ReviewScreen, Selection, FILE_TREE_ROW_HEIGHT, SIDEBAR_MIN_WIDTH,
+        restored_width, selection_summary, App, CloseChangeset, DiffDrag, DiffDragMode, Mode,
+        OpenChangeset, OpenFailed, PreparedFileDiff, ReviewScreen, Selection, FILE_TREE_ROW_HEIGHT,
+        SIDEBAR_MIN_WIDTH,
     };
     use crate::repo::{ChangeKind, INITIAL_COMMIT_LIMIT};
     use crate::settings::{RecentRepository, Settings, SidebarWidths, WindowMode};
     use crate::workspace::test_util::simulate_double_click;
     use git2::{IndexAddOption, Repository, Signature};
-    use gpui::{px, Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{px, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
     use std::{fs, rc::Rc};
 
     use super::test_support::*;
@@ -4915,8 +5712,8 @@ mod tests {
                 let pane = app.workspace.active_pane();
                 app.split_workspace_pane(pane, crate::workspace::SplitDirection::Right, cx);
                 // Touch both panes' scroll state so both have map entries.
-                app.pane_scroll(0);
-                app.pane_scroll(1);
+                app.pane_scroll(0, cx);
+                app.pane_scroll(1, cx);
                 // Moving pane 0's only tab collapses pane 0; its scroll
                 // state must not linger in the map.
                 app.move_workspace_tab(0, 0, 1, 0, cx);
@@ -4928,6 +5725,149 @@ mod tests {
                 assert!(app.pane_scrolls.borrow().contains_key(&1));
             })
             .expect("exercise scroll pruning");
+    }
+
+    /// Open the three-block modified file in a single pane at a size that
+    /// keeps the diff scrollable, returning the temp repo (kept alive by the
+    /// caller), the window, and its visual context. Mirrors the
+    /// identically-named helper in `diff_view`'s test module, which is
+    /// private to that module.
+    fn open_multi_block_diff(
+        cx: &mut TestAppContext,
+    ) -> (tempfile::TempDir, WindowHandle<App>, VisualTestContext) {
+        use gpui::size;
+
+        let (dir, oid_hex) = init_repo_with_multiple_change_blocks();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.open_file_preview("blocks.txt".to_string(), cx);
+            })
+            .expect("open multi-block diff");
+
+        cx.run_until_parked();
+
+        let visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(360.)));
+        cx.run_until_parked();
+
+        (dir, window, visual)
+    }
+
+    #[gpui::test]
+    async fn diff_selection_is_pruned_when_its_tab_closes(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_dir, window, _visual) = open_multi_block_diff(cx);
+        let (pane, key) = window
+            .read_with(cx, |app, _| {
+                let pane = app.workspace.active_pane();
+                let key = app.workspace.active_item(pane).unwrap().key().to_string();
+                (pane, key)
+            })
+            .unwrap();
+        window
+            .update(cx, |app, _window, cx| {
+                let point = crate::app::diff_selection::DiffPoint { row: 0, column: 0 };
+                let selection = crate::app::diff_selection::DiffSelection::caret_at(
+                    point,
+                    crate::repo::DiffSide::New,
+                );
+                app.set_diff_selection(pane, &key, selection, cx);
+                assert!(app.diff_selection(pane, &key).is_some());
+            })
+            .unwrap();
+        // Close the tab; the selection entry must go with it.
+        window
+            .update(cx, |app, _window, cx| app.close_active_workspace_tab(cx))
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .read_with(cx, |app, _| {
+                assert!(app.diff_selection(pane, &key).is_none())
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn pane_scroll_state_carries_a_focus_handle_and_content_origins(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_dir, window, _visual) = open_multi_block_diff(cx);
+        window
+            .update(cx, |app, window, cx| {
+                let pane = app.workspace.active_pane();
+                let scroll = app.pane_scroll(pane, cx);
+                // The handle is live and distinct per pane: focusing it and
+                // reading it back round-trips through gpui's focus system.
+                scroll.focus.focus(window);
+                assert!(scroll.focus.is_focused(window));
+
+                // Task 7's `render_file_diff_side` canvas already wrote real
+                // bounds for the sides this diff rendered.
+                assert!(
+                    !scroll.content_origins.borrow().is_empty(),
+                    "a rendered diff should have recorded its sides' bounds"
+                );
+                let bounds =
+                    gpui::Bounds::new(gpui::point(px(0.), px(0.)), gpui::size(px(10.), px(10.)));
+                scroll.content_origins.borrow_mut().insert("new", bounds);
+                assert_eq!(scroll.content_origins.borrow().get("new"), Some(&bounds));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn diff_drag_field_holds_and_clears_an_in_flight_drag(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_dir, window, _visual) = open_multi_block_diff(cx);
+        window
+            .update(cx, |app, _window, _cx| {
+                let pane = app.workspace.active_pane();
+                let key = app.workspace.active_item(pane).unwrap().key().to_string();
+                assert!(app.diff_drag.is_none());
+
+                app.diff_drag = Some(DiffDrag {
+                    pane,
+                    key: key.clone(),
+                    mode: DiffDragMode::Character,
+                });
+                let drag = app.diff_drag.as_ref().expect("drag was just set");
+                assert_eq!(drag.pane, pane);
+                assert_eq!(drag.key, key);
+                assert_eq!(drag.mode, DiffDragMode::Character);
+
+                let origin = (
+                    crate::app::diff_selection::DiffPoint { row: 0, column: 0 },
+                    crate::app::diff_selection::DiffPoint { row: 0, column: 3 },
+                );
+                app.diff_drag = Some(DiffDrag {
+                    pane,
+                    key: key.clone(),
+                    mode: DiffDragMode::Word { origin },
+                });
+                assert_eq!(
+                    app.diff_drag.as_ref().map(|drag| drag.mode.clone()),
+                    Some(DiffDragMode::Word { origin })
+                );
+
+                app.diff_drag = Some(DiffDrag {
+                    pane,
+                    key,
+                    mode: DiffDragMode::Line { origin },
+                });
+                assert_eq!(
+                    app.diff_drag.as_ref().map(|drag| drag.mode.clone()),
+                    Some(DiffDragMode::Line { origin })
+                );
+
+                app.diff_drag = None;
+                assert!(app.diff_drag.is_none());
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -7167,5 +8107,78 @@ mod tests {
             "notification body matches NotARepository, got {:?}",
             events[0],
         );
+    }
+
+    #[gpui::test]
+    async fn setting_an_identical_selection_does_not_touch_the_blink_epoch(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (_dir, window, _visual) = open_multi_block_diff(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                let pane = app.workspace.active_pane();
+                let key = app.workspace.active_item(pane).unwrap().key().to_string();
+                let point = crate::app::diff_selection::DiffPoint { row: 0, column: 0 };
+                let selection = crate::app::diff_selection::DiffSelection::caret_at(
+                    point,
+                    crate::repo::DiffSide::New,
+                );
+
+                // Placing the first caret is a real change: it must pause
+                // (and thereby arm) the blink loop.
+                app.set_diff_selection(pane, &key, selection, cx);
+                let epoch_after_first_set = app.caret_blink_epoch;
+                assert_ne!(
+                    epoch_after_first_set, 0,
+                    "placing a caret bumps the blink epoch"
+                );
+
+                // Setting the exact same selection again must be a no-op:
+                // no insert, no notify, and critically no blink-epoch bump,
+                // so a stationary drag's repeated mouse-move ticks don't
+                // each spawn a fresh pause/timer task.
+                app.set_diff_selection(pane, &key, selection, cx);
+                assert_eq!(
+                    app.caret_blink_epoch, epoch_after_first_set,
+                    "an identical selection must not bump the blink epoch"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn stop_caret_blink_orphans_the_live_chain(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_dir, window, _visual) = open_multi_block_diff(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                let pane = app.workspace.active_pane();
+                let key = app.workspace.active_item(pane).unwrap().key().to_string();
+                let point = crate::app::diff_selection::DiffPoint { row: 0, column: 0 };
+                let selection = crate::app::diff_selection::DiffSelection::caret_at(
+                    point,
+                    crate::repo::DiffSide::New,
+                );
+
+                // Arm the blink chain via a real caret placement.
+                app.set_diff_selection(pane, &key, selection, cx);
+                let epoch_before_stop = app.caret_blink_epoch;
+                assert_ne!(epoch_before_stop, 0, "the blink chain is armed");
+
+                // `stop_caret_blink` must orphan the in-flight timer by
+                // bumping the epoch again, and leave the caret visible.
+                app.caret_blink_visible = false;
+                app.stop_caret_blink();
+                assert_ne!(
+                    app.caret_blink_epoch, epoch_before_stop,
+                    "stop_caret_blink must bump the epoch to orphan the live chain"
+                );
+                assert!(
+                    app.caret_blink_visible,
+                    "stop_caret_blink leaves the caret visible"
+                );
+            })
+            .unwrap();
     }
 }

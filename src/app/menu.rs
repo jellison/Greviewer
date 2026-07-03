@@ -3,9 +3,13 @@
 use gpui::{Action, App as GpuiApp, KeyBinding, Menu, MenuItem, SharedString};
 
 use super::{
-    ActivateNextTab, ActivatePreviousTab, CloseActivePane, CloseActiveTab, NextChangeBlock,
-    OpenChangeset, OpenRepository, PreviousChangeBlock, QuitApplication, SplitPaneDown,
-    SplitPaneLeft, SplitPaneRight, SplitPaneUp,
+    ActivateNextTab, ActivatePreviousTab, CloseActivePane, CloseActiveTab, DiffCancelSelection,
+    DiffCopy, DiffMoveDocEnd, DiffMoveDocStart, DiffMoveDown, DiffMoveLeft, DiffMoveLineEnd,
+    DiffMoveLineStart, DiffMoveRight, DiffMoveUp, DiffMoveWordLeft, DiffMoveWordRight,
+    DiffSelectAll, DiffSelectDocEnd, DiffSelectDocStart, DiffSelectDown, DiffSelectLeft,
+    DiffSelectLineEnd, DiffSelectLineStart, DiffSelectRight, DiffSelectUp, DiffSelectWordLeft,
+    DiffSelectWordRight, NextChangeBlock, OpenChangeset, OpenRepository, PreviousChangeBlock,
+    QuitApplication, SplitPaneDown, SplitPaneLeft, SplitPaneRight, SplitPaneUp,
 };
 
 pub const GREVIEWER_MENU_LABEL: &str = "Greviewer";
@@ -25,8 +29,33 @@ pub const CLOSE_ACTIVE_PANE_KEYSTROKE: &str = "cmd-k w";
 /// outside graph mode, and focused components (such as the branch-filter
 /// input) bind this key in their own context and win.
 pub const OPEN_CHANGESET_KEYSTROKE: &str = "enter";
-pub const NEXT_CHANGE_BLOCK_KEYSTROKE: &str = "cmd-down";
-pub const PREVIOUS_CHANGE_BLOCK_KEYSTROKE: &str = "cmd-up";
+pub const NEXT_CHANGE_BLOCK_KEYSTROKE: &str = "alt-cmd-down";
+pub const PREVIOUS_CHANGE_BLOCK_KEYSTROKE: &str = "alt-cmd-up";
+
+pub const DIFF_PANE_CONTEXT: &str = "DiffPane";
+pub const DIFF_MOVE_LEFT_KEYSTROKE: &str = "left";
+pub const DIFF_MOVE_RIGHT_KEYSTROKE: &str = "right";
+pub const DIFF_MOVE_UP_KEYSTROKE: &str = "up";
+pub const DIFF_MOVE_DOWN_KEYSTROKE: &str = "down";
+pub const DIFF_MOVE_WORD_LEFT_KEYSTROKE: &str = "alt-left";
+pub const DIFF_MOVE_WORD_RIGHT_KEYSTROKE: &str = "alt-right";
+pub const DIFF_MOVE_LINE_START_KEYSTROKE: &str = "cmd-left";
+pub const DIFF_MOVE_LINE_END_KEYSTROKE: &str = "cmd-right";
+pub const DIFF_MOVE_DOC_START_KEYSTROKE: &str = "cmd-up";
+pub const DIFF_MOVE_DOC_END_KEYSTROKE: &str = "cmd-down";
+pub const DIFF_SELECT_LEFT_KEYSTROKE: &str = "shift-left";
+pub const DIFF_SELECT_RIGHT_KEYSTROKE: &str = "shift-right";
+pub const DIFF_SELECT_UP_KEYSTROKE: &str = "shift-up";
+pub const DIFF_SELECT_DOWN_KEYSTROKE: &str = "shift-down";
+pub const DIFF_SELECT_WORD_LEFT_KEYSTROKE: &str = "alt-shift-left";
+pub const DIFF_SELECT_WORD_RIGHT_KEYSTROKE: &str = "alt-shift-right";
+pub const DIFF_SELECT_LINE_START_KEYSTROKE: &str = "cmd-shift-left";
+pub const DIFF_SELECT_LINE_END_KEYSTROKE: &str = "cmd-shift-right";
+pub const DIFF_SELECT_DOC_START_KEYSTROKE: &str = "cmd-shift-up";
+pub const DIFF_SELECT_DOC_END_KEYSTROKE: &str = "cmd-shift-down";
+pub const DIFF_SELECT_ALL_KEYSTROKE: &str = "cmd-a";
+pub const DIFF_COPY_KEYSTROKE: &str = "cmd-c";
+pub const DIFF_CANCEL_SELECTION_KEYSTROKE: &str = "escape";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuSnapshot {
@@ -82,6 +111,113 @@ pub fn bind_app_keys(cx: &mut GpuiApp) {
         KeyBinding::new(OPEN_CHANGESET_KEYSTROKE, OpenChangeset, None),
         KeyBinding::new(NEXT_CHANGE_BLOCK_KEYSTROKE, NextChangeBlock, None),
         KeyBinding::new(PREVIOUS_CHANGE_BLOCK_KEYSTROKE, PreviousChangeBlock, None),
+        KeyBinding::new(
+            DIFF_MOVE_LEFT_KEYSTROKE,
+            DiffMoveLeft,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_MOVE_RIGHT_KEYSTROKE,
+            DiffMoveRight,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(DIFF_MOVE_UP_KEYSTROKE, DiffMoveUp, Some(DIFF_PANE_CONTEXT)),
+        KeyBinding::new(
+            DIFF_MOVE_DOWN_KEYSTROKE,
+            DiffMoveDown,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_MOVE_WORD_LEFT_KEYSTROKE,
+            DiffMoveWordLeft,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_MOVE_WORD_RIGHT_KEYSTROKE,
+            DiffMoveWordRight,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_MOVE_LINE_START_KEYSTROKE,
+            DiffMoveLineStart,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_MOVE_LINE_END_KEYSTROKE,
+            DiffMoveLineEnd,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_MOVE_DOC_START_KEYSTROKE,
+            DiffMoveDocStart,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_MOVE_DOC_END_KEYSTROKE,
+            DiffMoveDocEnd,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_SELECT_LEFT_KEYSTROKE,
+            DiffSelectLeft,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_SELECT_RIGHT_KEYSTROKE,
+            DiffSelectRight,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_SELECT_UP_KEYSTROKE,
+            DiffSelectUp,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_SELECT_DOWN_KEYSTROKE,
+            DiffSelectDown,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_SELECT_WORD_LEFT_KEYSTROKE,
+            DiffSelectWordLeft,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_SELECT_WORD_RIGHT_KEYSTROKE,
+            DiffSelectWordRight,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_SELECT_LINE_START_KEYSTROKE,
+            DiffSelectLineStart,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_SELECT_LINE_END_KEYSTROKE,
+            DiffSelectLineEnd,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_SELECT_DOC_START_KEYSTROKE,
+            DiffSelectDocStart,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_SELECT_DOC_END_KEYSTROKE,
+            DiffSelectDocEnd,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_SELECT_ALL_KEYSTROKE,
+            DiffSelectAll,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(DIFF_COPY_KEYSTROKE, DiffCopy, Some(DIFF_PANE_CONTEXT)),
+        KeyBinding::new(
+            DIFF_CANCEL_SELECTION_KEYSTROKE,
+            DiffCancelSelection,
+            Some(DIFF_PANE_CONTEXT),
+        ),
     ]);
 }
 

@@ -44,6 +44,11 @@ pub struct Palette {
     pub diff_removed_emphasis: Hsla,
     pub diff_empty_hatch: Hsla,
     pub code_text: Hsla,
+    // Diff selection.
+    pub diff_selection_bg: Hsla,
+    pub diff_selection_bg_unfocused: Hsla,
+    pub caret: Hsla,
+    pub active_line_bg: Hsla,
     // Change kinds.
     pub change_added: Hsla,
     pub change_modified: Hsla,
@@ -93,6 +98,10 @@ impl Palette {
             diff_removed_emphasis: Hsla::from(rgba(0xf0717840)),
             diff_empty_hatch: Hsla::from(rgba(0x546e7acc)),
             code_text: Hsla::from(rgb(0xeeffff)),
+            diff_selection_bg: Hsla::from(rgba(0x82aaff4d)),
+            diff_selection_bg_unfocused: Hsla::from(rgba(0x82aaff26)),
+            caret: Hsla::from(rgb(0x82aaff)),
+            active_line_bg: Hsla::from(rgba(0xeeffff0f)),
             change_added: Hsla::from(rgb(0xc3e88d)),
             change_modified: Hsla::from(rgb(0x82aaff)),
             change_deleted: Hsla::from(rgb(0xf07178)),

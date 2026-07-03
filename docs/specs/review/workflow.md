@@ -556,6 +556,55 @@ For files that exist on only one side of the selection — added or deleted file
 - Renamed files diff old-path content against new-path content; the file's pre-rename path is surfaced so the user can see what was renamed.
 - Binary files render an explanatory placeholder rather than attempting a textual diff.
 
+## Selecting text in a diff
+
+A file's diff behaves like an editor, not a static page: the user can place a caret, select text, and copy it out. Clicking places a caret at the character position under the pointer; a caret is a thin blinking bar, and its line carries a subtle full-width tint so its position reads at a glance even on a long line. Dragging from that point selects a run of text, and the fill of that selection takes over as the position signal — the caret-line tint is suppressed while a selection is active. Clicking anywhere in the diff, code or gutter, gives that pane keyboard focus, so selection and typing-driven motion pick up from wherever the user last clicked.
+
+In a side-by-side diff, a selection lives on one side at a time. Placing the caret or starting a drag on the other side moves the selection there; a selection is never split across both sides, and a drag never crosses the divider between them. Alignment gaps — rows with no counterpart line on the other side — take no part in selection: they cannot hold the caret, a drag contributes nothing while passing through them, and copying skips them.
+
+Beyond a plain click-and-drag, the diff recognizes the gestures reviewers expect from a text editor. Shift-clicking extends the selection from the existing anchor to the clicked point. Double-clicking selects the word under the pointer, and dragging afterward extends word by word; triple-clicking selects the whole line, and dragging afterward extends line by line. In both cases the selection never splits the word or line where the gesture began — a word-wise or line-wise drag only grows in whole words or whole lines. Clicking a line number selects that entire line, and dragging in the gutter extends the selection line by line regardless of where within each line the pointer sits. Dragging the pointer to the edge of the pane auto-scrolls the diff in the direction of the drag, on whichever axis or axes the pointer is pressed against, so a selection can extend beyond what is currently visible.
+
+Once a pane is focused, the full range of keyboard motion is available: moving by character or by word, jumping to the start or end of a line, jumping to the start or end of the document, and extending any of these motions into a selection. A select-all action selects the entire side the caret is on. Escape collapses an active selection back down to a caret at its current position, without moving that position. Before the user has clicked anywhere in a diff there is no caret, and every selection-related keyboard action is a no-op until a click establishes one. Any motion that moves the caret scrolls it into view, so keyboard navigation never leaves the caret off-screen.
+
+Copying a selection places exactly the selected characters on the clipboard — the selected lines joined by newlines, gap rows skipped, with no diff markers or line numbers mixed in. Copying with only a caret placed, and no range selected, copies nothing.
+
+Selection belongs to the open tab it was made in. It survives switching away from that tab and back, and is discarded when the tab closes, when its preview content is replaced by opening a different file into the same preview slot, or when the changeset closes. The same file open in two different panes holds two independent selections. Only the focused pane shows a blinking caret; every other pane that holds a selection keeps it visible but dimmed, with no caret shown. Moving between change blocks and scrolling the diff by hand move the view only — the caret and selection never move because of them, and a caret that scrolls off-screen this way is normal, not an error.
+
+Read-only views of unchanged files, and full-width diffs for added or deleted files, support the same selection behavior on their single side. Binary placeholders have no textual content and support no selection.
+
+**Triggering conditions**
+
+- The user clicks in a diff's code or gutter.
+- The user drags the pointer after pressing down in a diff, including dragging to the pane's edge.
+- The user shift-clicks, double-clicks, or triple-clicks in a diff, or clicks a line number.
+- The user presses a caret-motion, selection-extension, select-all, or Escape key while a diff pane is focused.
+- The user copies while a diff pane holds a selection or caret.
+- The user switches tabs, closes a tab, replaces a preview tab's content, or closes the changeset.
+- The user moves focus between panes.
+
+**Observable outcomes**
+
+- Clicking places a blinking caret at the clicked character position and focuses that pane; the caret's line shows a subtle full-width tint.
+- Dragging selects a run of text; the selection fill replaces the caret-line tint while the selection exists.
+- Shift-click extends the selection from the current anchor to the clicked point.
+- Double-click selects a word and extends word-wise on further dragging; triple-click selects a line and extends line-wise on further dragging; a line-number click selects the whole line and gutter dragging extends line-wise. None of these ever split the word or line the gesture started on.
+- Dragging to the pane's edge auto-scrolls the diff on the axis or axes the drag is pressed against.
+- Starting a selection or caret on one side of a side-by-side diff and then clicking or dragging on the other side moves the selection to that side; a selection never spans both sides at once.
+- With a diff pane focused, character, word, line-start/end, and document-start/end motions move the caret; adding shift extends the selection instead of just moving the caret; select-all selects the whole current side; Escape collapses the selection to a caret without moving it.
+- Any caret motion scrolls the caret into view.
+- Copying with an active selection places exactly the selected text on the clipboard, lines joined by newlines, with gap rows skipped and no diff markers or line numbers included. Copying with only a caret placed does nothing.
+- Selection is preserved across switching away from and back to a tab.
+- Only the focused pane's caret blinks; other panes holding a selection show it dimmed with no caret.
+- Unchanged-file views and single-side added/deleted diffs support the same behavior on their one side.
+
+**Edge cases**
+
+- Before any click has been made in a diff, there is no caret, and every keyboard selection action is a no-op.
+- Alignment-gap rows never receive the caret, contribute nothing to a drag that passes through them, and are skipped when copying.
+- Binary placeholders have no caret and no selection.
+- Closing a tab, replacing a preview tab's content with a different file, or closing the changeset discards that tab's selection. The same file open in two panes keeps two independent selections.
+- Stepping between change blocks and scrolling the diff by hand move the view only; the caret and any selection stay exactly where they were, even if that leaves the caret off-screen.
+
 ## Navigating change blocks
 
 A file diff groups its changes into blocks: runs of changed lines, with runs

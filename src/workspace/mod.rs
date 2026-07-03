@@ -212,6 +212,21 @@ impl Workspace {
         }
     }
 
+    /// Every open tab as `(pane, key)`, across all panes. Lets callers with
+    /// per-tab state (e.g. diff selections) prune entries for tabs that no
+    /// longer exist without threading pane/tab bookkeeping through every
+    /// mutation themselves.
+    pub(crate) fn open_keys(&self) -> Vec<(PaneId, String)> {
+        self.panes
+            .iter()
+            .flat_map(|(pane_id, pane)| {
+                pane.tabs
+                    .iter()
+                    .map(move |tab| (*pane_id, tab.key().to_string()))
+            })
+            .collect()
+    }
+
     /// Returns true when the active pane changed.
     pub fn activate_pane(&mut self, pane: PaneId) -> bool {
         if self.active_pane == pane || self.pane(pane).is_none() {

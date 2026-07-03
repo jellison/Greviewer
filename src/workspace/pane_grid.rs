@@ -19,7 +19,14 @@ use gpui::{
 
 use super::tab_bar::DraggedTab;
 use super::{AxisNode, PaneGroup, PaneId, SplitAxis, SplitDirection};
-use crate::app::App;
+use crate::app::menu::DIFF_PANE_CONTEXT;
+use crate::app::{
+    App, DiffCancelSelection, DiffCopy, DiffMoveDocEnd, DiffMoveDocStart, DiffMoveDown,
+    DiffMoveLeft, DiffMoveLineEnd, DiffMoveLineStart, DiffMoveRight, DiffMoveUp, DiffMoveWordLeft,
+    DiffMoveWordRight, DiffSelectAll, DiffSelectDocEnd, DiffSelectDocStart, DiffSelectDown,
+    DiffSelectLeft, DiffSelectLineEnd, DiffSelectLineStart, DiffSelectRight, DiffSelectUp,
+    DiffSelectWordLeft, DiffSelectWordRight,
+};
 use crate::repo;
 use crate::theme::palette;
 
@@ -61,7 +68,7 @@ fn render_pane(
     changeset: &repo::ChangeSet,
     cx: &mut Context<App>,
 ) -> AnyElement {
-    let scrolls = app.pane_scroll(pane);
+    let scrolls = app.pane_scroll(pane, cx);
 
     div()
         .id(("workspace-pane", pane))
@@ -104,7 +111,7 @@ fn render_pane_content(
     changeset: &repo::ChangeSet,
     cx: &mut Context<App>,
 ) -> AnyElement {
-    let scrolls = app.pane_scroll(pane);
+    let scrolls = app.pane_scroll(pane, cx);
     let pane_is_empty = app.workspace.tabs(pane).is_empty();
     let active_path = app
         .workspace
@@ -118,12 +125,110 @@ fn render_pane_content(
 
     div()
         .id(("workspace-pane-content", pane))
+        .key_context(DIFF_PANE_CONTEXT)
+        .track_focus(&scrolls.focus)
         .relative()
         .flex()
         .flex_col()
         .flex_1()
         .min_h_0()
         .overflow_hidden()
+        .on_action(cx.listener(|app, _: &DiffMoveLeft, window, cx| {
+            app.diff_motion(false, window, cx, crate::app::diff_selection::move_left);
+        }))
+        .on_action(cx.listener(|app, _: &DiffMoveRight, window, cx| {
+            app.diff_motion(false, window, cx, crate::app::diff_selection::move_right);
+        }))
+        .on_action(cx.listener(|app, _: &DiffMoveUp, window, cx| {
+            app.diff_vertical_motion(false, false, window, cx);
+        }))
+        .on_action(cx.listener(|app, _: &DiffMoveDown, window, cx| {
+            app.diff_vertical_motion(false, true, window, cx);
+        }))
+        .on_action(cx.listener(|app, _: &DiffMoveWordLeft, window, cx| {
+            app.diff_motion(
+                false,
+                window,
+                cx,
+                crate::app::diff_selection::move_word_left,
+            );
+        }))
+        .on_action(cx.listener(|app, _: &DiffMoveWordRight, window, cx| {
+            app.diff_motion(
+                false,
+                window,
+                cx,
+                crate::app::diff_selection::move_word_right,
+            );
+        }))
+        .on_action(cx.listener(|app, _: &DiffMoveLineStart, window, cx| {
+            app.diff_motion(false, window, cx, |_, point| {
+                crate::app::diff_selection::line_start(point)
+            });
+        }))
+        .on_action(cx.listener(|app, _: &DiffMoveLineEnd, window, cx| {
+            app.diff_motion(false, window, cx, crate::app::diff_selection::line_end);
+        }))
+        .on_action(cx.listener(|app, _: &DiffMoveDocStart, window, cx| {
+            app.diff_motion(false, window, cx, |content, point| {
+                crate::app::diff_selection::document_start(content).unwrap_or(point)
+            });
+        }))
+        .on_action(cx.listener(|app, _: &DiffMoveDocEnd, window, cx| {
+            app.diff_motion(false, window, cx, |content, point| {
+                crate::app::diff_selection::document_end(content).unwrap_or(point)
+            });
+        }))
+        .on_action(cx.listener(|app, _: &DiffSelectLeft, window, cx| {
+            app.diff_motion(true, window, cx, crate::app::diff_selection::move_left);
+        }))
+        .on_action(cx.listener(|app, _: &DiffSelectRight, window, cx| {
+            app.diff_motion(true, window, cx, crate::app::diff_selection::move_right);
+        }))
+        .on_action(cx.listener(|app, _: &DiffSelectUp, window, cx| {
+            app.diff_vertical_motion(true, false, window, cx);
+        }))
+        .on_action(cx.listener(|app, _: &DiffSelectDown, window, cx| {
+            app.diff_vertical_motion(true, true, window, cx);
+        }))
+        .on_action(cx.listener(|app, _: &DiffSelectWordLeft, window, cx| {
+            app.diff_motion(true, window, cx, crate::app::diff_selection::move_word_left);
+        }))
+        .on_action(cx.listener(|app, _: &DiffSelectWordRight, window, cx| {
+            app.diff_motion(
+                true,
+                window,
+                cx,
+                crate::app::diff_selection::move_word_right,
+            );
+        }))
+        .on_action(cx.listener(|app, _: &DiffSelectLineStart, window, cx| {
+            app.diff_motion(true, window, cx, |_, point| {
+                crate::app::diff_selection::line_start(point)
+            });
+        }))
+        .on_action(cx.listener(|app, _: &DiffSelectLineEnd, window, cx| {
+            app.diff_motion(true, window, cx, crate::app::diff_selection::line_end);
+        }))
+        .on_action(cx.listener(|app, _: &DiffSelectDocStart, window, cx| {
+            app.diff_motion(true, window, cx, |content, point| {
+                crate::app::diff_selection::document_start(content).unwrap_or(point)
+            });
+        }))
+        .on_action(cx.listener(|app, _: &DiffSelectDocEnd, window, cx| {
+            app.diff_motion(true, window, cx, |content, point| {
+                crate::app::diff_selection::document_end(content).unwrap_or(point)
+            });
+        }))
+        .on_action(cx.listener(|app, _: &DiffSelectAll, window, cx| {
+            app.select_all_diff(window, cx);
+        }))
+        .on_action(cx.listener(|app, _: &DiffCopy, _window, cx| {
+            app.copy_diff_selection(cx);
+        }))
+        .on_action(cx.listener(|app, _: &DiffCancelSelection, _window, cx| {
+            app.cancel_diff_selection(cx);
+        }))
         .on_hover(cx.listener(move |app, hovered: &bool, _window, cx| {
             if *hovered {
                 if app.hovered_diff_pane != Some(pane) {
@@ -197,8 +302,12 @@ fn render_pane_content(
             repo,
             changeset,
             active_path.as_deref(),
-            &scrolls.diff,
-            app.hovered_diff_pane == Some(pane),
+            crate::app::PaneRenderContext {
+                pane,
+                scroll: &scrolls.diff,
+                hovered: app.hovered_diff_pane == Some(pane),
+            },
+            cx,
         ))
         .when_some(highlight, |content, direction| {
             let selector = format!("workspace-drop-half-{pane}");
