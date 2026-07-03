@@ -673,7 +673,7 @@ mod tests {
         use gpui::{point, px, Modifiers};
 
         // Reuse the Task 1 setup helper (deeply-nested changeset, 360×200 window).
-        let (_window, mut visual) = open_deeply_nested_changeset_at_360x200(cx);
+        let (window, mut visual) = open_deeply_nested_changeset_at_360x200(cx);
 
         // Not hovered: no scrollbar overlay is rendered.
         assert!(
@@ -694,12 +694,21 @@ mod tests {
         );
 
         // Move the cursor outside the panel; the overlay should disappear.
+        // `debug_bounds` never clears a selector once it has been painted in a
+        // frame, so an `is_none()` check here would pass only by timing
+        // coincidence. Assert the state that gates the render instead: the
+        // scrollbar overlay is wrapped in `.when(self.file_tree_hovered, ...)`,
+        // so a cleared hover flag is exactly "the overlay is not rendered".
         visual.simulate_mouse_move(point(px(-10.), px(-10.)), None, Modifiers::default());
         cx.run_until_parked();
 
+        let hovered = window
+            .read_with(cx, |app, _cx| app.file_tree_hovered)
+            .expect("read file-tree hover state");
         assert!(
-            visual.debug_bounds("file-tree-scrollbar").is_none(),
-            "scrollbar overlay should disappear when the cursor leaves the panel"
+            !hovered,
+            "file_tree_hovered must clear when the cursor leaves the panel, \
+             hiding the scrollbar overlay"
         );
     }
 
