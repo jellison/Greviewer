@@ -221,6 +221,9 @@ pub struct App {
     pub file_list_mode: FileListMode,
     pub settings: Settings,
     collapsed_file_tree_paths: BTreeSet<String>,
+    /// All AI threads and their subprocesses (ADR-0005); killed on changeset
+    /// close and app quit so no `claude` process outlives its context.
+    ai_sessions: Entity<crate::ai::AiSessions>,
     notifications: Entity<NotificationList>,
     path_picker: Box<dyn PathPicker>,
     settings_store_path: Option<PathBuf>,
@@ -738,6 +741,7 @@ impl App {
             recent_repositories,
             window_state: None,
             sidebar_widths: SidebarWidths::default(),
+            ai_enabled: false,
         };
         Self::new_with_picker_and_settings(window, cx, Box::new(GpuiPathPicker), settings)
     }
@@ -791,6 +795,7 @@ impl App {
         settings_store_path: Option<PathBuf>,
     ) -> Self {
         let notifications = cx.new(|cx| NotificationList::new(window, cx));
+        let ai_sessions = cx.new(|_| crate::ai::AiSessions::new());
         let changeset_resizable = cx.new(|_| ResizableState::default());
         let graph_resizable = cx.new(|_| ResizableState::default());
         let focus_handle = cx.focus_handle();
@@ -922,6 +927,7 @@ impl App {
             file_list_mode: FileListMode::Changed,
             settings,
             collapsed_file_tree_paths: BTreeSet::new(),
+            ai_sessions,
             notifications,
             path_picker,
             settings_store_path,
@@ -1635,6 +1641,10 @@ impl App {
         self.hovered_diff_pane = None;
         self.reset_pane_scrolls();
         self.diff_selections.clear();
+        // AI threads are ephemeral and scoped to the open changeset
+        // (ADR-0005): closing it kills every running session.
+        self.ai_sessions
+            .update(cx, |sessions, cx| sessions.cancel_all(cx));
         self.stop_caret_blink();
         self.diff_row_cache.borrow_mut().clear();
         self.read_only_cell_cache.borrow_mut().clear();
@@ -1643,8 +1653,16 @@ impl App {
     }
 
     fn quit_application(&mut self, cx: &mut Context<Self>) {
+        self.ai_sessions
+            .update(cx, |sessions, cx| sessions.cancel_all(cx));
         cx.emit(QuitRequested);
         cx.quit();
+    }
+
+    /// The AI session manager (ADR-0005). Feature surfaces reach AI threads
+    /// exclusively through this entity.
+    pub fn ai_sessions(&self) -> &Entity<crate::ai::AiSessions> {
+        &self.ai_sessions
     }
 
     /// The scroll handles for `pane`, created on first use. The returned
@@ -5188,6 +5206,59 @@ mod tests {
 
     use super::test_support::*;
 
+    #[gpui::test]
+    fn closing_the_changeset_cancels_ai_threads(cx: &mut TestAppContext) {
+        let window = crate::app::test_support::add_app_window(cx);
+
+        // Start a long-running AI thread against a stub CLI, then close the
+        // changeset; the thread must be cancelled and nothing left running.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = dir.path().join("claude-stub.sh");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 300\nexit 0\n").expect("write stub");
+        let mut perms = std::fs::metadata(&stub).expect("stat").permissions();
+        use std::os::unix::fs::PermissionsExt as _;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod");
+
+        let id = window
+            .update(cx, |app, _window, cx| {
+                app.ai_sessions().update(cx, |sessions, cx| {
+                    *sessions = crate::ai::AiSessions::with_cli_program(stub.clone());
+                    sessions.start_thread(
+                        dir.path().to_path_buf(),
+                        crate::ai::ThreadKind::Ask,
+                        None,
+                        "q".to_string(),
+                        None,
+                        cx,
+                    )
+                })
+            })
+            .expect("window update")
+            .expect("start thread");
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.close_changeset(cx);
+                app.ai_sessions().read(cx).running_count()
+            })
+            .map(|running| assert_eq!(running, 0))
+            .expect("window update");
+
+        window
+            .update(cx, |app, _window, cx| {
+                let status = app
+                    .ai_sessions()
+                    .read(cx)
+                    .thread(id)
+                    .expect("thread exists")
+                    .status
+                    .clone();
+                assert_eq!(status, crate::ai::ThreadStatus::Cancelled);
+            })
+            .expect("window update");
+    }
+
     #[test]
     fn selection_underlay_rects_follow_scroll_and_clip_to_the_list() {
         use super::{
@@ -5363,6 +5434,7 @@ mod tests {
                     branch_sidebar: None,
                     changeset_files: Some(333.0),
                 },
+                ai_enabled: false,
             },
         )
         .expect("seed settings");

@@ -165,6 +165,7 @@ mod tests {
                 recent_repositories: vec![],
                 window_state: Some(sample_state(WindowMode::Windowed, &saved_uuid)),
                 sidebar_widths: SidebarWidths::default(),
+                ai_enabled: false,
             };
 
             let (bounds, display_id) = restore_window_options(&settings, cx);
@@ -185,6 +186,7 @@ mod tests {
                 recent_repositories: vec![],
                 window_state: Some(sample_state(WindowMode::Windowed, "uuid-not-connected")),
                 sidebar_widths: SidebarWidths::default(),
+                ai_enabled: false,
             };
 
             let (bounds, display_id) = restore_window_options(&settings, cx);

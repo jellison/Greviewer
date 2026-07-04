@@ -28,6 +28,9 @@ pub struct Settings {
     /// Persisted widths of the resizable sidebars. Each entry is `None` until a
     /// width has been measured and saved for that sidebar.
     pub sidebar_widths: SidebarWidths,
+    /// Whether AI assistance (ADR-0005) is enabled. Off by default; enabling
+    /// requires a configured Claude CLI on the machine.
+    pub ai_enabled: bool,
 }
 
 /// A repository the user has opened before, plus whether its folder could still
@@ -159,6 +162,7 @@ mod tests {
             ],
             window_state: None,
             sidebar_widths: SidebarWidths::default(),
+            ai_enabled: false,
         };
 
         save(&path, &settings).expect("save settings");
@@ -214,6 +218,7 @@ mod tests {
                     height: 900.0,
                 }),
                 sidebar_widths: SidebarWidths::default(),
+                ai_enabled: false,
             };
 
             save(&path, &settings).expect("save settings");
@@ -234,6 +239,21 @@ mod tests {
     }
 
     #[test]
+    fn ai_enabled_defaults_off_and_round_trips() {
+        // Old settings files (no ai_enabled key) must load with it off.
+        let legacy: Settings = serde_json::from_str("{}").expect("legacy parses");
+        assert!(!legacy.ai_enabled);
+
+        let enabled = Settings {
+            ai_enabled: true,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&enabled).expect("serialize");
+        let reloaded: Settings = serde_json::from_str(&json).expect("reload");
+        assert!(reloaded.ai_enabled);
+    }
+
+    #[test]
     fn sidebar_widths_survive_json_round_trip() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("settings.json");
@@ -244,6 +264,7 @@ mod tests {
                 branch_sidebar: Some(275.5),
                 changeset_files: Some(360.0),
             },
+            ai_enabled: false,
         };
 
         save(&path, &settings).expect("save settings");

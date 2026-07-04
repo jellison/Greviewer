@@ -44,6 +44,7 @@ pub(crate) fn add_app_window_with_recent_and_widths(
         recent_repositories,
         window_state: None,
         sidebar_widths,
+        ai_enabled: false,
     };
     cx.add_window(move |window, cx| App::new_with_settings(window, cx, settings.clone()))
 }
@@ -60,6 +61,7 @@ pub(crate) fn seed_recent_repositories(
             recent_repositories,
             window_state: None,
             sidebar_widths: SidebarWidths::default(),
+            ai_enabled: false,
         },
     )
     .expect("seed settings store");

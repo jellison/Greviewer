@@ -2472,6 +2472,7 @@ dependencies = [
 name = "greviewer"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "git2",
  "gpui",
  "gpui-component",
@@ -2481,6 +2482,7 @@ dependencies = [
  "serde_json",
  "similar",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]

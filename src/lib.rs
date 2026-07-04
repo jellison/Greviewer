@@ -6,6 +6,7 @@ use gpui_component::{Root, TitleBar};
 use crate::assets::Assets;
 use crate::window_placement::{restore_window_options, MIN_WINDOW_SIZE};
 
+pub mod ai;
 pub mod app;
 pub mod assets;
 pub mod diff_highlight;
