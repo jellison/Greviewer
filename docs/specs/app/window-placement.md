@@ -31,14 +31,21 @@ left it, without having to move or resize it again.
 - Window placement is remembered per physical monitor, so reconnecting a
   previously used display restores the window to it.
 - The remembered placement persists across application restarts.
+- The remembered size survives even when the monitor the window was last shown
+  on can no longer be identified. Which screen showed the window is a targeting
+  hint, not a precondition for restoring how large the user made it.
 
 **Edge cases the user can encounter**
 
 - On first launch, or when no placement has been remembered, the window opens
   at a default size centered on the primary monitor.
-- If the monitor the window was last shown on is no longer connected, the
-  window opens at the default size centered on the primary monitor.
-- A remembered window never returns smaller than a usable minimum size.
+- If the monitor the window was last shown on can no longer be identified — it
+  was disconnected, or the system reports it under a different identity than
+  before — the window still reopens at its remembered size and window mode on
+  the primary monitor. Its position is preserved when it still lands on-screen
+  and otherwise nudged fully into view, rather than being reset to a default.
+- A remembered window never returns smaller than a usable minimum size, and
+  never opens partly or wholly off-screen.
 
 ## Remembering placement when leaving
 

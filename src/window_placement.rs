@@ -37,22 +37,56 @@ pub fn window_state_from(bounds: WindowBounds, display: String) -> WindowState {
     }
 }
 
-/// Reconstruct gpui window bounds from persisted state, clamping the size up to
-/// [`MIN_WINDOW_SIZE`] so a degenerate saved value cannot open an unusable
-/// window.
-pub fn window_bounds_from(state: &WindowState) -> WindowBounds {
-    let bounds = Bounds {
-        origin: point(px(state.x), px(state.y)),
-        size: size(
-            px(state.width.max(f32::from(MIN_WINDOW_SIZE.width))),
-            px(state.height.max(f32::from(MIN_WINDOW_SIZE.height))),
-        ),
-    };
+/// The saved size, clamped up to [`MIN_WINDOW_SIZE`] so a degenerate saved value
+/// cannot produce an unusable window.
+fn clamped_size(state: &WindowState) -> Size<Pixels> {
+    size(
+        px(state.width.max(f32::from(MIN_WINDOW_SIZE.width))),
+        px(state.height.max(f32::from(MIN_WINDOW_SIZE.height))),
+    )
+}
+
+/// Wrap `bounds` in the [`WindowBounds`] variant matching `state`'s window mode.
+fn bounds_in_mode(state: &WindowState, bounds: Bounds<Pixels>) -> WindowBounds {
     match state.mode {
         WindowMode::Windowed => WindowBounds::Windowed(bounds),
         WindowMode::Maximized => WindowBounds::Maximized(bounds),
         WindowMode::Fullscreen => WindowBounds::Fullscreen(bounds),
     }
+}
+
+/// Reconstruct gpui window bounds from persisted state, clamping the size up to
+/// [`MIN_WINDOW_SIZE`] so a degenerate saved value cannot open an unusable
+/// window. Used when the saved monitor is still connected, so the saved position
+/// is honored as-is.
+pub fn window_bounds_from(state: &WindowState) -> WindowBounds {
+    bounds_in_mode(
+        state,
+        Bounds {
+            origin: point(px(state.x), px(state.y)),
+            size: clamped_size(state),
+        },
+    )
+}
+
+/// Reconstruct window bounds for the case where the monitor the state was saved
+/// on is not among the currently connected displays. Losing the monitor must not
+/// lose the user's window size: a window's size has nothing to do with which
+/// screen shows it, so the saved size and window mode are preserved. Only the
+/// position is adjusted — clamped onto the primary display — so the window can
+/// never be restored partly or wholly off-screen on the new arrangement.
+fn window_bounds_without_saved_display(state: &WindowState, cx: &App) -> WindowBounds {
+    let size = clamped_size(state);
+    let origin = match cx.primary_display() {
+        Some(display) => {
+            let display_bounds = display.bounds();
+            let max_x = (f32::from(display_bounds.size.width) - f32::from(size.width)).max(0.0);
+            let max_y = (f32::from(display_bounds.size.height) - f32::from(size.height)).max(0.0);
+            point(px(state.x.clamp(0.0, max_x)), px(state.y.clamp(0.0, max_y)))
+        }
+        None => point(px(state.x), px(state.y)),
+    };
+    bounds_in_mode(state, Bounds { origin, size })
 }
 
 /// Find the live display whose stable UUID matches `saved`, returning its
@@ -81,14 +115,23 @@ fn matching_display_index(saved: &str, available: &[String]) -> Option<usize> {
     available.iter().position(|uuid| uuid == saved)
 }
 
-/// Decide the bounds and target display for opening the main window. Restores
-/// the saved state when it exists and its monitor is still connected; otherwise
-/// falls back to a centered default on the primary display.
+/// Decide the bounds and target display for opening the main window.
+///
+/// When saved state exists and its monitor is still connected, the window is
+/// restored exactly — size, position, mode, and monitor. When the saved monitor
+/// is *not* connected, the size and mode are still preserved and only the
+/// position is re-homed onto the primary display; this matters because a
+/// monitor's identity is not always stable across sessions (some systems,
+/// notably headless or virtual displays, report a fresh display UUID after a
+/// sleep or reconnect), and losing that match must not silently reset the
+/// window to a default size. With no saved state at all, a default-size window
+/// is centered on the primary display.
 pub fn restore_window_options(settings: &Settings, cx: &App) -> (WindowBounds, Option<DisplayId>) {
     if let Some(state) = &settings.window_state {
         if let Some(display_id) = resolve_display_id(&state.display, cx) {
             return (window_bounds_from(state), Some(display_id));
         }
+        return (window_bounds_without_saved_display(state, cx), None);
     }
     let centered = Bounds::centered(None, DEFAULT_WINDOW_SIZE, cx);
     (WindowBounds::Windowed(centered), None)
@@ -180,7 +223,12 @@ mod tests {
     }
 
     #[gpui::test]
-    fn restore_falls_back_to_centered_default_when_display_is_gone(cx: &mut TestAppContext) {
+    fn restore_keeps_saved_size_and_position_when_display_is_gone(cx: &mut TestAppContext) {
+        // The saved monitor is not connected (or its identity changed across
+        // sessions). The window must NOT reset to a default size: the saved
+        // size and an on-screen position are preserved, only the monitor is
+        // dropped. This is the fix for geometry being lost across rebuilds on
+        // systems whose display UUID is not stable.
         cx.update(|cx| {
             let settings = Settings {
                 recent_repositories: vec![],
@@ -195,14 +243,76 @@ mod tests {
             let WindowBounds::Windowed(bounds) = bounds else {
                 panic!("expected windowed fallback");
             };
-            assert_eq!(
-                f32::from(bounds.size.width),
-                f32::from(DEFAULT_WINDOW_SIZE.width)
-            );
-            assert_eq!(
-                f32::from(bounds.size.height),
-                f32::from(DEFAULT_WINDOW_SIZE.height)
-            );
+            // Saved size is preserved, not reset to the default.
+            assert_eq!(f32::from(bounds.size.width), 1024.0);
+            assert_eq!(f32::from(bounds.size.height), 768.0);
+            // The saved position (100, 200) fits on the test display, so it is
+            // kept exactly.
+            assert_eq!(f32::from(bounds.origin.x), 100.0);
+            assert_eq!(f32::from(bounds.origin.y), 200.0);
+        });
+    }
+
+    #[gpui::test]
+    fn restore_clamps_offscreen_position_onto_the_primary_display(cx: &mut TestAppContext) {
+        // A position saved on a now-missing monitor can land off-screen on the
+        // remaining arrangement; it is clamped so the window is always visible,
+        // while the saved size is still preserved.
+        cx.update(|cx| {
+            let mut state = sample_state(WindowMode::Windowed, "uuid-not-connected");
+            state.x = 5000.0;
+            state.y = 5000.0;
+            let settings = Settings {
+                recent_repositories: vec![],
+                window_state: Some(state),
+                sidebar_widths: SidebarWidths::default(),
+                ai_enabled: false,
+            };
+
+            let (bounds, display_id) = restore_window_options(&settings, cx);
+
+            assert!(display_id.is_none());
+            let WindowBounds::Windowed(bounds) = bounds else {
+                panic!("expected windowed fallback");
+            };
+            let display = cx.primary_display().expect("primary display");
+            let display_bounds = display.bounds();
+            // Fully on-screen: right/bottom edges do not exceed the display.
+            assert!(f32::from(bounds.origin.x) + 1024.0 <= f32::from(display_bounds.size.width));
+            assert!(f32::from(bounds.origin.y) + 768.0 <= f32::from(display_bounds.size.height));
+            assert!(f32::from(bounds.origin.x) >= 0.0);
+            assert!(f32::from(bounds.origin.y) >= 0.0);
+            // Size is still the saved size.
+            assert_eq!(f32::from(bounds.size.width), 1024.0);
+            assert_eq!(f32::from(bounds.size.height), 768.0);
+        });
+    }
+
+    #[gpui::test]
+    fn restore_preserves_window_mode_when_display_is_gone(cx: &mut TestAppContext) {
+        // A maximized/fullscreen window whose monitor is gone stays in that mode
+        // (its saved size is the restore size for when the user leaves the mode).
+        cx.update(|cx| {
+            for mode in [WindowMode::Maximized, WindowMode::Fullscreen] {
+                let settings = Settings {
+                    recent_repositories: vec![],
+                    window_state: Some(sample_state(mode, "uuid-not-connected")),
+                    sidebar_widths: SidebarWidths::default(),
+                    ai_enabled: false,
+                };
+
+                let (bounds, _display_id) = restore_window_options(&settings, cx);
+
+                match mode {
+                    WindowMode::Maximized => {
+                        assert!(matches!(bounds, WindowBounds::Maximized(_)))
+                    }
+                    WindowMode::Fullscreen => {
+                        assert!(matches!(bounds, WindowBounds::Fullscreen(_)))
+                    }
+                    WindowMode::Windowed => unreachable!(),
+                }
+            }
         });
     }
 
