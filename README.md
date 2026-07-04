@@ -18,6 +18,22 @@ cargo run
 
 A 1280×800 window titled "Greviewer" opens with the placeholder root view. Closing the window exits the process.
 
+## Packaging (macOS)
+
+Local development with `cargo run` launches the bare binary, which shows the generic
+executable icon in the Dock — this is expected, since there is no app bundle to carry
+the icon.
+
+To produce an icon-bearing macOS app bundle:
+
+```
+bin/bundle
+```
+
+This builds the release binary, generates `AppIcon.icns` from
+`packaging/macos/AppIcon.iconset` with `iconutil`, and assembles
+`target/bundle/Greviewer.app`. Open it with `open target/bundle/Greviewer.app`.
+
 ## Documentation
 
 - `docs/adr/` — Architecture Decision Records. Start with ADR-0001, ADR-0002, and ADR-0003.

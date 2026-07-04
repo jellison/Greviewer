@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Greviewer macOS bundler.
+# Assembles target/bundle/Greviewer.app with the app icon.
+# macOS only; uses native iconutil + plutil. Not part of bin/check.
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+APP_NAME="Greviewer"
+EXECUTABLE="greviewer"
+IDENTIFIER="com.justinellison.greviewer"
+ICONSET="packaging/macos/AppIcon.iconset"
+OUT_DIR="target/bundle"
+APP="${OUT_DIR}/${APP_NAME}.app"
+CONTENTS="${APP}/Contents"
+
+if [[ "$(uname)" != "Darwin" ]]; then
+  echo "bin/bundle: macOS only (uname reported $(uname))." >&2
+  exit 1
+fi
+
+# Version comes from Cargo.toml so the plist can never drift from the crate.
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+if [[ -z "${VERSION}" ]]; then
+  echo "bin/bundle: could not parse version from Cargo.toml." >&2
+  exit 1
+fi
+
+echo "==> Building release binary"
+cargo build --release
+
+echo "==> Assembling ${APP} (v${VERSION})"
+rm -rf "${APP}"
+mkdir -p "${CONTENTS}/MacOS" "${CONTENTS}/Resources"
+
+cp "target/release/${EXECUTABLE}" "${CONTENTS}/MacOS/${EXECUTABLE}"
+
+echo "==> Generating AppIcon.icns from ${ICONSET}"
+iconutil -c icns "${ICONSET}" -o "${CONTENTS}/Resources/AppIcon.icns"
+
+echo "==> Writing Info.plist"
+cat > "${CONTENTS}/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>${APP_NAME}</string>
+    <key>CFBundleDisplayName</key>
+    <string>${APP_NAME}</string>
+    <key>CFBundleExecutable</key>
+    <string>${EXECUTABLE}</string>
+    <key>CFBundleIdentifier</key>
+    <string>${IDENTIFIER}</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${VERSION}</string>
+    <key>CFBundleVersion</key>
+    <string>${VERSION}</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+</dict>
+</plist>
+PLIST
+
+echo "==> Verifying bundle"
+plutil -lint "${CONTENTS}/Info.plist"
+test -s "${CONTENTS}/Resources/AppIcon.icns" || { echo "AppIcon.icns missing/empty" >&2; exit 1; }
+test -x "${CONTENTS}/MacOS/${EXECUTABLE}"     || { echo "executable missing" >&2; exit 1; }
+
+echo "==> Done: ${APP}"
