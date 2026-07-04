@@ -400,6 +400,43 @@ pub(crate) fn init_repo_with_detached_head() -> (tempfile::TempDir, String) {
     (dir, tip_oid.to_string())
 }
 
+/// A main repository with one commit plus one linked worktree named
+/// "feature". Returns (parent tempdir, main path, worktree path), the
+/// paths canonicalized. git2's `worktree()` creates and checks out a
+/// branch named "feature" at HEAD in the new worktree.
+pub(crate) fn fixture_repo_with_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let parent = tempfile::tempdir().expect("create parent tempdir");
+    let main = parent.path().join("primary");
+    let repo = git2::Repository::init(&main).expect("init repo");
+    std::fs::write(main.join("hello.txt"), "hello\n").expect("write file");
+    let mut index = repo.index().expect("open index");
+    index
+        .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+        .expect("stage files");
+    index.write().expect("write index");
+    let tree_oid = index.write_tree().expect("write tree");
+    let tree = repo.find_tree(tree_oid).expect("find tree");
+    let signature = git2::Signature::now("Greviewer Tests", "tests@greviewer.invalid")
+        .expect("create signature");
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "Add hello.txt",
+        &tree,
+        &[],
+    )
+    .expect("create commit");
+    let worktree_path = parent.path().join("feature");
+    repo.worktree("feature", &worktree_path, None)
+        .expect("add worktree");
+    (
+        parent,
+        main.canonicalize().expect("canonicalize main"),
+        worktree_path.canonicalize().expect("canonicalize worktree"),
+    )
+}
+
 /// One commit with HEAD detached and the initial branch deleted, so the
 /// repository has zero local branches.
 pub(crate) fn init_repo_with_detached_head_no_branches() -> (tempfile::TempDir, String) {
@@ -642,6 +679,7 @@ pub(crate) fn seed_repo_open_mode_with_commits(
 
     app.mode = Mode::RepoOpen {
         repo: crate::repo::OpenRepository {
+            main_path: path.clone(),
             path,
             head,
             commits,

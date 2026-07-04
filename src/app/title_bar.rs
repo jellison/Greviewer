@@ -7,9 +7,10 @@ use gpui::{
     div, px, AnyElement, Context, Div, Hsla, InteractiveElement, IntoElement, ParentElement,
     Stateful, StatefulInteractiveElement as _, Styled,
 };
-use gpui_component::{TitleBar, TITLE_BAR_HEIGHT};
+use gpui_component::{Icon, TitleBar, TITLE_BAR_HEIGHT};
 
-use super::{short_sha, App, Mode, ReviewScreen, Selection, MONO_FONT_FAMILY};
+use super::{short_sha, worktree_title, App, Mode, ReviewScreen, Selection, MONO_FONT_FAMILY};
+use crate::icons::LucideIcon;
 use crate::repo::{ChangeKind, ChangeSet, CommitInfo};
 use crate::theme::palette;
 
@@ -183,6 +184,45 @@ fn switcher_pill(id: &'static str, text_color: Hsla, open: bool) -> Stateful<Div
     }
 }
 
+/// Compact path label for a switcher row: home-relative (`~/…`) when the
+/// path is under `$HOME`, and leading-ellipsized to the trailing `max_chars`
+/// characters when it is still too long — the tail of a worktree path is the
+/// part that identifies it.
+fn abbreviated_path(path: &std::path::Path, max_chars: usize) -> String {
+    let home = std::env::var_os("HOME").map(|home| home.to_string_lossy().into_owned());
+    abbreviated_path_with_home(path, home.as_deref(), max_chars)
+}
+
+/// Core of `abbreviated_path`, parameterized on the home directory so it is
+/// unit-testable without touching the process environment. Only substitutes
+/// `~` when `home` is a whole-component prefix of the path: the remainder
+/// after stripping must be empty or start with a path separator, so a HOME of
+/// `/Users/je` does not match inside `/Users/jellison/x`.
+fn abbreviated_path_with_home(
+    path: &std::path::Path,
+    home: Option<&str>,
+    max_chars: usize,
+) -> String {
+    let display = path.display().to_string();
+    let display = match home {
+        Some(home) if !home.is_empty() => {
+            let home = home.strip_suffix('/').unwrap_or(home);
+            match display.strip_prefix(home) {
+                Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
+                _ => display,
+            }
+        }
+        _ => display,
+    };
+    let chars: Vec<char> = display.chars().collect();
+    if chars.len() <= max_chars {
+        display
+    } else {
+        let tail: String = chars[chars.len() - max_chars..].iter().collect();
+        format!("\u{2026}{tail}")
+    }
+}
+
 impl App {
     /// The window-chrome title bar. Always shows the repo name when a
     /// repository is open; in changeset mode it also shows the clickable
@@ -190,23 +230,60 @@ impl App {
     pub(crate) fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match &self.mode {
             Mode::RepoOpen { repo } => {
-                let repo_name = super::repository_title(&repo.path);
-                let mut row = div().flex().items_center().child(
-                    switcher_pill("title-bar-repo", palette().text, self.repo_switcher_open)
-                        .on_click(cx.listener(|app, _event, _window, cx| {
-                            app.repo_switcher_open = !app.repo_switcher_open;
+                let repo_name = super::repository_title(&repo.main_path);
+                let mut row = div()
+                    .flex()
+                    .items_center()
+                    .child(
+                        switcher_pill("title-bar-repo", palette().text, self.repo_switcher_open)
+                            .on_click(cx.listener(|app, _event, _window, cx| {
+                                app.repo_switcher_open = !app.repo_switcher_open;
+                                app.context_popover_open = false;
+                                app.worktree_switcher_open = false;
+                                cx.notify();
+                            }))
+                            .child(repo_name),
+                    )
+                    .child(
+                        div()
+                            .mx_0p5()
+                            .text_size(px(13.))
+                            .text_color(palette().text_muted)
+                            .child("/"),
+                    )
+                    .child(
+                        switcher_pill(
+                            "title-bar-worktree",
+                            palette().text,
+                            self.worktree_switcher_open,
+                        )
+                        .on_click(cx.listener(|app, _event, window, cx| {
+                            let opening = !app.worktree_switcher_open;
+                            if opening {
+                                app.refresh_worktree_entries(window, cx);
+                            }
+                            app.worktree_switcher_open = opening;
+                            app.repo_switcher_open = false;
                             app.context_popover_open = false;
                             cx.notify();
                         }))
-                        .child(repo_name),
-                );
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            Icon::new(LucideIcon::GitBranchPlus)
+                                .text_color(palette().text_muted)
+                                .size(px(13.)),
+                        )
+                        .child(worktree_title(repo)),
+                    );
 
                 if let ReviewScreen::Changeset { changeset, .. } = &self.review_screen {
                     let label = context_pill_label(&self.selection, changeset);
                     row = row
                         .child(
                             div()
-                                .mx_2()
+                                .mx_0p5()
                                 .text_size(px(13.))
                                 .text_color(palette().text_muted)
                                 .child("/"),
@@ -220,8 +297,17 @@ impl App {
                             .on_click(cx.listener(|app, _event, _window, cx| {
                                 app.context_popover_open = !app.context_popover_open;
                                 app.repo_switcher_open = false;
+                                app.worktree_switcher_open = false;
                                 cx.notify();
                             }))
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                Icon::new(LucideIcon::GitCompareArrows)
+                                    .text_color(palette().text_muted)
+                                    .size(px(13.)),
+                            )
                             .child(label),
                         );
                 }
@@ -436,7 +522,12 @@ impl App {
         let backdrop = div()
             .id("title-bar-context-backdrop")
             .absolute()
-            .inset_0()
+            // See the worktree switcher's backdrop for why this starts below
+            // the title bar rather than covering the whole window.
+            .top(TITLE_BAR_HEIGHT)
+            .bottom(px(0.))
+            .left(px(0.))
+            .right(px(0.))
             .on_click(cx.listener(|app, _event, _window, cx| {
                 app.context_popover_open = false;
                 cx.notify();
@@ -458,6 +549,12 @@ impl App {
     /// folder picker. Returns `None` unless a repository is open and the switcher
     /// is toggled on. Like the context popover, it is a full-window overlay: a
     /// transparent backdrop that dismisses on outside click, plus the card.
+    ///
+    /// Anchored on the repository's main worktree, not the open path: with a
+    /// linked worktree open, the repo pill and window title already read the
+    /// main worktree's name (see `render_title_bar`), so the sibling scan and
+    /// the current-repo marker must agree with that identity rather than the
+    /// linked worktree's own directory.
     pub(crate) fn render_repo_switcher(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.repo_switcher_open {
             return None;
@@ -466,7 +563,7 @@ impl App {
             return None;
         };
 
-        let current = repo.path.clone();
+        let current = repo.main_path.clone();
         let parent_label = current
             .parent()
             .map(|parent| parent.display().to_string())
@@ -572,9 +669,144 @@ impl App {
         let backdrop = div()
             .id("title-bar-repo-switcher-backdrop")
             .absolute()
-            .inset_0()
+            // See the worktree switcher's backdrop for why this starts below
+            // the title bar rather than covering the whole window.
+            .top(TITLE_BAR_HEIGHT)
+            .bottom(px(0.))
+            .left(px(0.))
+            .right(px(0.))
             .on_click(cx.listener(|app, _event, _window, cx| {
                 app.repo_switcher_open = false;
+                cx.notify();
+            }));
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .child(backdrop)
+                .child(card)
+                .into_any_element(),
+        )
+    }
+
+    /// The worktree switcher popover, shown when the worktree pill is active.
+    /// Lists the snapshot in `worktree_entries` (refreshed when the pill
+    /// opened the popover): the main worktree first, each row naming the
+    /// worktree with its branch, short sha, and abbreviated path, the current
+    /// row marked. Selecting another worktree opens it exactly like a
+    /// repository switch. Full-window overlay like the other two popovers.
+    pub(crate) fn render_worktree_switcher(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.worktree_switcher_open {
+            return None;
+        }
+        let Mode::RepoOpen { .. } = &self.mode else {
+            return None;
+        };
+
+        let mut list = div().flex().flex_col().py_1();
+        for (index, entry) in self.worktree_entries.iter().enumerate() {
+            let title = if entry.is_main {
+                "main worktree".to_string()
+            } else {
+                entry.name.clone()
+            };
+            let mut sub_parts: Vec<String> = Vec::new();
+            if let Some(branch) = &entry.branch {
+                sub_parts.push(branch.clone());
+            }
+            if let Some(sha) = &entry.short_sha {
+                sub_parts.push(sha.clone());
+            }
+            sub_parts.push(abbreviated_path(&entry.path, 36));
+            let subline = sub_parts.join(" \u{2022} ");
+
+            let mut row = div()
+                .id(("title-bar-worktree-row", index))
+                .debug_selector(move || format!("title-bar-worktree-row-{index}"))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .cursor_pointer()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .font_family(MONO_FONT_FAMILY)
+                                .text_size(px(12.))
+                                .text_color(palette().text)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .font_family(MONO_FONT_FAMILY)
+                                .text_size(px(11.))
+                                .text_color(palette().text_muted)
+                                .child(subline),
+                        ),
+                );
+
+            if entry.is_current {
+                row = row
+                    .child(
+                        div()
+                            .debug_selector(|| "title-bar-worktree-current".to_string())
+                            .text_size(px(11.))
+                            .text_color(palette().text_muted)
+                            .child("\u{2713}"),
+                    )
+                    .on_click(cx.listener(|app, _event, _window, cx| {
+                        app.worktree_switcher_open = false;
+                        cx.notify();
+                    }));
+            } else {
+                let open_path = entry.path.clone();
+                row = row.on_click(cx.listener(move |app, _event, window, cx| {
+                    app.worktree_switcher_open = false;
+                    app.open_repository_at(open_path.clone(), window, cx);
+                }));
+            }
+
+            list = list.child(row);
+        }
+
+        let card = div()
+            .absolute()
+            .top(TITLE_BAR_HEIGHT)
+            .left(px(44.))
+            .occlude()
+            .w(px(360.))
+            .bg(palette().surface)
+            .border_1()
+            .border_color(palette().border)
+            .rounded_lg()
+            .debug_selector(|| "title-bar-worktree-switcher".to_string())
+            .child(list);
+
+        let backdrop = div()
+            .id("title-bar-worktree-switcher-backdrop")
+            .absolute()
+            // The backdrop deliberately starts below the title bar rather
+            // than covering the whole window: every pill that opens one of
+            // these popovers lives inside the title bar strip, so a backdrop
+            // that also covered that strip would sit on top of every pill's
+            // own click handler. That caused a second click on this same
+            // pill to first close the popover here and then immediately
+            // reopen it in the pill's own toggle handler (both handlers see
+            // the click), and made pills for the *other* popovers
+            // unreachable while this one was open.
+            .top(TITLE_BAR_HEIGHT)
+            .bottom(px(0.))
+            .left(px(0.))
+            .right(px(0.))
+            .on_click(cx.listener(|app, _event, _window, cx| {
+                app.worktree_switcher_open = false;
                 cx.notify();
             }));
 
@@ -606,8 +838,10 @@ mod tests {
     }
 
     fn repo_named(name: &str, commits: Vec<CommitInfo>) -> OpenRepository {
+        let path = PathBuf::from(format!("/tmp/{name}"));
         OpenRepository {
-            path: PathBuf::from(format!("/tmp/{name}")),
+            main_path: path.clone(),
+            path,
             head: None,
             commits,
             has_more_commits: false,
@@ -1232,6 +1466,292 @@ mod tests {
 
     const REPO_NAME: &str = "title-bar-repo";
     const SWITCHER: &str = "title-bar-repo-switcher";
+    const WORKTREE_PILL: &str = "title-bar-worktree";
+
+    #[test]
+    fn worktree_title_is_main_for_the_primary_and_the_dir_name_otherwise() {
+        let (_parent, main, worktree_path) = crate::app::test_support::fixture_repo_with_worktree();
+        let primary = crate::repo::open_at(&main).expect("open main");
+        let linked = crate::repo::open_at(&worktree_path).expect("open worktree");
+        assert_eq!(worktree_title(&primary), "main");
+        assert_eq!(worktree_title(&linked), "feature");
+    }
+
+    #[gpui::test]
+    async fn worktree_pill_renders_whenever_a_repo_is_open(cx: &mut TestAppContext) {
+        let window = app_window(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                app.mode = Mode::RepoOpen {
+                    repo: repo_named("Demo", vec![]),
+                };
+                app.review_screen = ReviewScreen::Graph;
+                cx.notify();
+            })
+            .expect("set graph state");
+
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds(WORKTREE_PILL).is_some());
+    }
+
+    #[gpui::test]
+    async fn clicking_the_worktree_pill_opens_its_switcher_and_closes_the_others(
+        cx: &mut TestAppContext,
+    ) {
+        let (_parent, paths) = parent_with_repos(&["solo"]);
+        let window = window_with_repo_open(cx, &paths[0]);
+        window
+            .update(cx, |app, _window, cx| {
+                app.repo_switcher_open = true;
+                cx.notify();
+            })
+            .expect("open repo switcher");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let pill = visual
+            .debug_bounds(WORKTREE_PILL)
+            .expect("worktree pill bounds");
+        visual.simulate_click(pill.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert!(app.worktree_switcher_open);
+                assert!(!app.repo_switcher_open);
+                assert!(!app.context_popover_open);
+            })
+            .expect("read popover states");
+    }
+
+    #[gpui::test]
+    async fn opening_the_repo_switcher_closes_the_worktree_switcher(cx: &mut TestAppContext) {
+        let (_parent, paths) = parent_with_repos(&["solo"]);
+        let window = window_with_repo_open(cx, &paths[0]);
+        window
+            .update(cx, |app, _window, cx| {
+                app.worktree_switcher_open = true;
+                cx.notify();
+            })
+            .expect("open worktree switcher");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let name = visual.debug_bounds(REPO_NAME).expect("repo name bounds");
+        visual.simulate_click(name.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert!(app.repo_switcher_open);
+                assert!(!app.worktree_switcher_open);
+            })
+            .expect("read popover states");
+    }
+
+    const WORKTREE_SWITCHER: &str = "title-bar-worktree-switcher";
+
+    /// Open the worktree switcher by clicking the pill, so the entries
+    /// snapshot refreshes exactly as it does for a user.
+    fn click_worktree_pill(visual: &mut VisualTestContext) {
+        let pill = visual
+            .debug_bounds("title-bar-worktree")
+            .expect("worktree pill bounds");
+        visual.simulate_click(pill.center(), Modifiers::none());
+    }
+
+    #[gpui::test]
+    async fn worktree_switcher_falls_back_to_the_current_worktree_when_the_registry_read_fails(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, _sha) = crate::app::test_support::init_repo_with_one_commit();
+        let window = window_with_repo_open(cx, dir.path());
+        cx.run_until_parked();
+
+        // Delete the repository's `.git` directory so `list_worktrees` fails
+        // to even open the repo, exercising `refresh_worktree_entries`'s
+        // error branch. `dir` is a tempdir owned by this test, so removing
+        // its `.git` subdirectory is the test destroying its own fixture.
+        std::fs::remove_dir_all(dir.path().join(".git")).expect("delete fixture .git dir");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        click_worktree_pill(&mut visual);
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds("title-bar-worktree-row-0").is_some());
+        assert!(visual.debug_bounds("title-bar-worktree-row-1").is_none());
+        assert!(visual.debug_bounds("title-bar-worktree-current").is_some());
+        window
+            .read_with(cx, |app, cx| {
+                assert_eq!(app.worktree_entries.len(), 1);
+                assert_eq!(app.notification_count(cx), 1);
+            })
+            .expect("read fallback worktree entries");
+    }
+
+    #[gpui::test]
+    async fn worktree_switcher_lists_both_worktrees_and_marks_the_current(cx: &mut TestAppContext) {
+        let (_parent, main, _worktree_path) =
+            crate::app::test_support::fixture_repo_with_worktree();
+        let window = window_with_repo_open(cx, &main);
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        click_worktree_pill(&mut visual);
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds(WORKTREE_SWITCHER).is_some());
+        assert!(visual.debug_bounds("title-bar-worktree-row-0").is_some());
+        assert!(visual.debug_bounds("title-bar-worktree-row-1").is_some());
+        assert!(visual.debug_bounds("title-bar-worktree-current").is_some());
+    }
+
+    #[gpui::test]
+    async fn clicking_another_worktree_switches_the_context(cx: &mut TestAppContext) {
+        let (_parent, main, worktree_path) = crate::app::test_support::fixture_repo_with_worktree();
+        let window = window_with_repo_open(cx, &main);
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        click_worktree_pill(&mut visual);
+        cx.run_until_parked();
+
+        // Row 0 is the main worktree (current); row 1 is "feature".
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row = visual
+            .debug_bounds("title-bar-worktree-row-1")
+            .expect("feature row bounds");
+        visual.simulate_click(row.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _cx| {
+                match &app.mode {
+                    Mode::RepoOpen { repo } => {
+                        assert_eq!(repo.path, worktree_path);
+                        assert_eq!(repo.main_path, main);
+                    }
+                    Mode::NoRepo => panic!("expected a repo to be open"),
+                }
+                assert!(!app.worktree_switcher_open, "switching closes the popover");
+            })
+            .expect("read switched context");
+    }
+
+    #[gpui::test]
+    async fn clicking_the_current_worktree_row_only_closes_the_popover(cx: &mut TestAppContext) {
+        let (_parent, main, _worktree_path) =
+            crate::app::test_support::fixture_repo_with_worktree();
+        let window = window_with_repo_open(cx, &main);
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        click_worktree_pill(&mut visual);
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row = visual
+            .debug_bounds("title-bar-worktree-row-0")
+            .expect("current row bounds");
+        visual.simulate_click(row.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert!(!app.worktree_switcher_open);
+                match &app.mode {
+                    Mode::RepoOpen { repo } => assert_eq!(repo.path, main),
+                    Mode::NoRepo => panic!("expected a repo to be open"),
+                }
+            })
+            .expect("read unchanged context");
+    }
+
+    #[gpui::test]
+    async fn clicking_the_worktree_pill_twice_closes_its_popover(cx: &mut TestAppContext) {
+        let (_parent, paths) = parent_with_repos(&["solo"]);
+        let window = window_with_repo_open(cx, &paths[0]);
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        click_worktree_pill(&mut visual);
+        cx.run_until_parked();
+        window
+            .read_with(cx, |app, _cx| assert!(app.worktree_switcher_open))
+            .expect("read opened state");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        click_worktree_pill(&mut visual);
+        cx.run_until_parked();
+        window
+            .read_with(cx, |app, _cx| assert!(!app.worktree_switcher_open))
+            .expect("read closed state");
+    }
+
+    #[gpui::test]
+    async fn clicking_the_context_pill_closes_the_worktree_switcher(cx: &mut TestAppContext) {
+        let window = open_changeset_window(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                app.worktree_switcher_open = true;
+                cx.notify();
+            })
+            .expect("open worktree switcher");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let pill = visual.debug_bounds(PILL).expect("context pill bounds");
+        visual.simulate_click(pill.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert!(app.context_popover_open);
+                assert!(!app.worktree_switcher_open);
+            })
+            .expect("read popover states");
+    }
+
+    #[test]
+    fn abbreviated_path_keeps_short_paths_and_leading_ellipsizes_long_ones() {
+        let short = Path::new("/a/b");
+        assert_eq!(abbreviated_path(short, 40), "/a/b");
+
+        let long = Path::new("/very/long/path/that/goes/on/and/on/forever/repo");
+        let label = abbreviated_path(long, 12);
+        assert!(label.starts_with('\u{2026}'));
+        assert!(label.ends_with("forever/repo"));
+        assert_eq!(label.chars().count(), 13); // ellipsis + 12 kept chars
+    }
+
+    #[test]
+    fn abbreviated_path_with_home_substitutes_an_exact_home_prefix() {
+        let path = Path::new("/Users/jellison/x");
+        assert_eq!(
+            abbreviated_path_with_home(path, Some("/Users/jellison"), 40),
+            "~/x"
+        );
+    }
+
+    #[test]
+    fn abbreviated_path_with_home_ignores_a_partial_component_prefix() {
+        // HOME="/Users/je" is a byte-prefix of "/Users/jellison/x" but not a
+        // whole path component, so no substitution should occur.
+        let path = Path::new("/Users/jellison/x");
+        assert_eq!(
+            abbreviated_path_with_home(path, Some("/Users/je"), 40),
+            "/Users/jellison/x"
+        );
+    }
+
+    #[test]
+    fn abbreviated_path_with_home_handles_a_trailing_slash_on_home() {
+        let path = Path::new("/Users/jellison/x");
+        assert_eq!(
+            abbreviated_path_with_home(path, Some("/Users/jellison/"), 40),
+            "~/x"
+        );
+    }
 
     /// Create a parent directory containing one git repository per name and
     /// return the parent (kept alive) plus the canonicalized repo paths.
@@ -1317,6 +1837,59 @@ mod tests {
         assert!(visual.debug_bounds("title-bar-repo-sibling-1").is_some());
         // The current repo (beta) carries a marker.
         assert!(visual.debug_bounds("title-bar-repo-current").is_some());
+    }
+
+    #[gpui::test]
+    async fn switcher_anchors_on_the_main_worktree_when_a_linked_worktree_is_open(
+        cx: &mut TestAppContext,
+    ) {
+        // The fixture's "primary" (main) and "feature" (linked worktree) live
+        // side by side in the same parent folder, so both are visible to the
+        // sibling scan; only "primary" should ever be marked current, even
+        // though the open repository's own path is the "feature" worktree.
+        let (_parent, main, worktree_path) = crate::app::test_support::fixture_repo_with_worktree();
+        let window = window_with_repo_open(cx, &worktree_path);
+        window
+            .update(cx, |app, _window, cx| {
+                app.repo_switcher_open = true;
+                cx.notify();
+            })
+            .expect("open switcher");
+
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds(SWITCHER).is_some());
+        // "feature" sorts before "primary" alphabetically → row 0 is
+        // "feature", row 1 is "primary".
+        let feature_row = visual
+            .debug_bounds("title-bar-repo-sibling-0")
+            .expect("feature row bounds");
+        let primary_row = visual
+            .debug_bounds("title-bar-repo-sibling-1")
+            .expect("primary row bounds");
+        let current_marker = visual
+            .debug_bounds("title-bar-repo-current")
+            .expect("a current marker is shown");
+        // The current marker must sit inside the "primary" row (the main
+        // worktree), not the open "feature" worktree's own row.
+        assert!(
+            primary_row.contains(&current_marker.center()),
+            "the main worktree's row is marked current"
+        );
+        assert!(
+            !feature_row.contains(&current_marker.center()),
+            "the linked worktree's own row is not marked current"
+        );
+
+        window
+            .read_with(cx, |app, _cx| match &app.mode {
+                Mode::RepoOpen { repo } => {
+                    assert_eq!(repo.path, worktree_path);
+                    assert_eq!(repo.main_path, main);
+                }
+                Mode::NoRepo => panic!("expected a repo to be open"),
+            })
+            .expect("read open repo");
     }
 
     #[gpui::test]

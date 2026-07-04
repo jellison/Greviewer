@@ -20,6 +20,10 @@ pub const PENDING_SHA: &str = "0000000000000000000000000000000000000000";
 #[derive(Debug, Clone)]
 pub struct OpenRepository {
     pub path: PathBuf,
+    /// Root of the repository's primary (main) worktree. Equal to `path`
+    /// when the primary worktree itself is open; for a linked worktree it
+    /// is resolved through the shared common dir at open time.
+    pub main_path: PathBuf,
     pub head: Option<HeadInfo>,
     pub commits: Vec<CommitInfo>,
     pub has_more_commits: bool,
@@ -241,13 +245,31 @@ pub fn open_at(path: &Path) -> Result<OpenRepository, OpenError> {
         INITIAL_COMMIT_LIMIT,
     )?;
 
+    let main_path = resolve_main_path(&repo, &canonical);
+
     Ok(OpenRepository {
         path: canonical,
+        main_path,
         head,
         commits: page.commits,
         has_more_commits: page.has_more,
         branches,
     })
+}
+
+/// The primary worktree's root for the repository behind `repo`. The main
+/// worktree resolves to `fallback` (its own root); a linked worktree resolves
+/// through the shared common dir. Any resolution failure degrades to
+/// `fallback` so opening never breaks on an odd layout.
+fn resolve_main_path(repo: &git2::Repository, fallback: &Path) -> PathBuf {
+    if !repo.is_worktree() {
+        return fallback.to_path_buf();
+    }
+    git2::Repository::open(repo.commondir())
+        .ok()
+        .and_then(|main| main.workdir().map(Path::to_path_buf))
+        .and_then(|path| path.canonicalize().ok())
+        .unwrap_or_else(|| fallback.to_path_buf())
 }
 
 /// The git repositories sitting alongside `current` in its parent folder,
@@ -277,6 +299,87 @@ pub fn sibling_repositories(current: &Path) -> Vec<PathBuf> {
             .unwrap_or_default()
     });
     repositories
+}
+
+/// One worktree of a repository, as recorded in git's worktree registry —
+/// the same data `git worktree list` prints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub short_sha: Option<String>,
+    pub is_current: bool,
+    pub is_main: bool,
+}
+
+/// Every worktree of the repository containing `path`: the primary (main)
+/// worktree first, then linked worktrees in registry order. Entries whose
+/// directory no longer exists on disk are skipped. `is_current` marks the
+/// entry whose root is `path` itself.
+pub fn list_worktrees(path: &Path) -> Result<Vec<WorktreeEntry>, OpenError> {
+    let current = path.canonicalize().map_err(OpenError::Io)?;
+    let repo = git2::Repository::open(&current).map_err(classify_open_error)?;
+    let main_path = resolve_main_path(&repo, &current);
+    // The registry is shared, but enumerate through the main repository so
+    // linked-worktree handles and odd layouts behave identically.
+    let main_repo = git2::Repository::open(&main_path).map_err(classify_open_error)?;
+
+    let mut entries = vec![worktree_entry("main", &main_path, &current, true)];
+    let names = main_repo.worktrees().map_err(OpenError::Git)?;
+    for name in names.iter().flatten() {
+        let Ok(worktree) = main_repo.find_worktree(name) else {
+            continue;
+        };
+        // Canonicalization doubles as the existence check: a worktree whose
+        // directory was deleted fails here and is skipped.
+        let Ok(worktree_path) = worktree.path().canonicalize() else {
+            continue;
+        };
+        // If the main worktree's own directory is unreachable, `main_path`
+        // above already fell back to `current` (see `resolve_main_path`), so
+        // the registry's entry for the current worktree would otherwise
+        // duplicate the "main" row already pushed. Skip it.
+        if worktree_path == main_path {
+            continue;
+        }
+        entries.push(worktree_entry(name, &worktree_path, &current, false));
+    }
+    Ok(entries)
+}
+
+fn worktree_entry(name: &str, path: &Path, current: &Path, is_main: bool) -> WorktreeEntry {
+    let (branch, head_sha) = read_worktree_head(path);
+    WorktreeEntry {
+        name: name.to_string(),
+        path: path.to_path_buf(),
+        branch,
+        short_sha: head_sha,
+        is_current: path == current,
+        is_main,
+    }
+}
+
+/// HEAD branch shorthand and short sha for the worktree rooted at `path`.
+/// A worktree that cannot be opened or has an unborn HEAD yields two `None`s;
+/// a detached HEAD yields a sha but no branch.
+fn read_worktree_head(path: &Path) -> (Option<String>, Option<String>) {
+    let Ok(repo) = git2::Repository::open(path) else {
+        return (None, None);
+    };
+    let Ok(head) = repo.head() else {
+        return (None, None);
+    };
+    let branch = if head.is_branch() {
+        head.shorthand().map(str::to_string)
+    } else {
+        None
+    };
+    let sha = head
+        .peel_to_commit()
+        .ok()
+        .map(|commit| short_sha(commit.id()));
+    (branch, sha)
 }
 
 pub fn load_commits_after(path: &Path, after_sha: &str) -> Result<CommitPage, OpenError> {
@@ -2727,5 +2830,182 @@ mod tests {
             "ghost",
             "an unmatched ref falls back to its first path segment",
         );
+    }
+
+    /// A main repository with one commit plus one linked worktree named `name`.
+    /// Returns the parent tempdir (kept alive) and the canonicalized main and
+    /// worktree paths. git2's `worktree()` creates and checks out a branch
+    /// named `name` at HEAD in the new worktree.
+    fn init_repo_with_worktree(name: &str) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let parent = tempfile::tempdir().expect("create parent tempdir");
+        let main = parent.path().join("primary");
+        let repo = Repository::init(&main).expect("init repo");
+
+        fs::write(main.join("hello.txt"), "hello\n").expect("write file");
+        let mut index = repo.index().expect("open index");
+        index
+            .add_all(["*"], IndexAddOption::DEFAULT, None)
+            .expect("stage files");
+        index.write().expect("write index");
+        let tree_oid = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let signature =
+            Signature::now("Greviewer Tests", "tests@greviewer.invalid").expect("create signature");
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "Add hello.txt",
+            &tree,
+            &[],
+        )
+        .expect("create commit");
+
+        let worktree_path = parent.path().join(name);
+        repo.worktree(name, &worktree_path, None)
+            .expect("add worktree");
+
+        let main = main.canonicalize().expect("canonicalize main path");
+        let worktree_path = worktree_path
+            .canonicalize()
+            .expect("canonicalize worktree path");
+        (parent, main, worktree_path)
+    }
+
+    #[test]
+    fn open_at_main_worktree_sets_main_path_to_itself() {
+        let (dir, _sha) = init_repo_with_one_commit();
+        let repo = open_at(dir.path()).expect("open repo");
+        assert_eq!(repo.main_path, repo.path);
+    }
+
+    #[test]
+    fn open_at_linked_worktree_resolves_main_path_to_the_primary() {
+        let (_parent, main, worktree_path) = init_repo_with_worktree("feature");
+        let repo = open_at(&worktree_path).expect("open linked worktree");
+        assert_eq!(repo.path, worktree_path);
+        assert_eq!(repo.main_path, main);
+    }
+
+    #[test]
+    fn list_worktrees_puts_the_main_worktree_first() {
+        let (_parent, main, worktree_path) = init_repo_with_worktree("feature");
+
+        let entries = list_worktrees(&main).expect("list worktrees");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "main");
+        assert_eq!(entries[0].path, main);
+        assert!(entries[0].is_main);
+        assert!(entries[0].is_current);
+        assert_eq!(entries[1].name, "feature");
+        assert_eq!(entries[1].path, worktree_path);
+        assert!(!entries[1].is_main);
+        assert!(!entries[1].is_current);
+    }
+
+    #[test]
+    fn list_worktrees_reads_branch_and_short_sha_per_worktree() {
+        let (_parent, main, _worktree_path) = init_repo_with_worktree("feature");
+
+        let entries = list_worktrees(&main).expect("list worktrees");
+
+        // The main worktree is on the default branch; the linked worktree is on
+        // the branch git2 created for it ("feature").
+        assert!(entries[0].branch.is_some());
+        assert_eq!(entries[1].branch.as_deref(), Some("feature"));
+        // Both point at the same single commit.
+        assert_eq!(entries[0].short_sha, entries[1].short_sha);
+        assert_eq!(entries[0].short_sha.as_ref().map(String::len), Some(7));
+    }
+
+    #[test]
+    fn list_worktrees_marks_the_linked_worktree_current_when_called_from_it() {
+        let (_parent, _main, worktree_path) = init_repo_with_worktree("feature");
+
+        let entries = list_worktrees(&worktree_path).expect("list worktrees");
+
+        assert!(!entries[0].is_current, "main is not current here");
+        assert!(entries[1].is_current);
+    }
+
+    #[test]
+    fn list_worktrees_skips_entries_whose_directory_is_gone() {
+        let (_parent, main, worktree_path) = init_repo_with_worktree("feature");
+        fs::remove_dir_all(&worktree_path).expect("delete worktree dir");
+
+        let entries = list_worktrees(&main).expect("list worktrees");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "main");
+    }
+
+    /// A main repository whose git directory lives outside its working
+    /// directory (`--separate-git-dir`), plus one linked worktree. Because
+    /// the git dir is stored elsewhere, deleting the main worktree's working
+    /// directory leaves the linked worktree fully openable while
+    /// `resolve_main_path`'s canonicalize step fails to find the (now
+    /// deleted) main working directory and falls back to the linked
+    /// worktree's own path — the real trigger for the main/current-row
+    /// dedup this test exercises. Returns the parent tempdir (kept alive)
+    /// plus the canonicalized main and worktree paths.
+    fn init_repo_with_worktree_separate_gitdir(
+        name: &str,
+    ) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let parent = tempfile::tempdir().expect("create parent tempdir");
+        let main = parent.path().join("primary");
+        let git_dir = parent.path().join("primary.git");
+        let mut opts = git2::RepositoryInitOptions::new();
+        opts.workdir_path(&main);
+        let repo = Repository::init_opts(&git_dir, &opts).expect("init repo with separate gitdir");
+
+        fs::write(main.join("hello.txt"), "hello\n").expect("write file");
+        let mut index = repo.index().expect("open index");
+        index
+            .add_all(["*"], IndexAddOption::DEFAULT, None)
+            .expect("stage files");
+        index.write().expect("write index");
+        let tree_oid = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let signature =
+            Signature::now("Greviewer Tests", "tests@greviewer.invalid").expect("create signature");
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "Add hello.txt",
+            &tree,
+            &[],
+        )
+        .expect("create commit");
+
+        let worktree_path = parent.path().join(name);
+        repo.worktree(name, &worktree_path, None)
+            .expect("add worktree");
+
+        let main = main.canonicalize().expect("canonicalize main path");
+        let worktree_path = worktree_path
+            .canonicalize()
+            .expect("canonicalize worktree path");
+        (parent, main, worktree_path)
+    }
+
+    #[test]
+    fn list_worktrees_does_not_duplicate_the_current_worktree_when_main_dir_is_gone() {
+        let (_parent, main, worktree_path) = init_repo_with_worktree_separate_gitdir("feature");
+        fs::remove_dir_all(&main).expect("delete main working directory");
+
+        let entries = list_worktrees(&worktree_path).expect("list worktrees");
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "the linked worktree must appear only once"
+        );
+        assert!(entries[0].is_current);
+        assert_eq!(entries[0].path, worktree_path);
+        let unique_paths: std::collections::HashSet<_> =
+            entries.iter().map(|entry| &entry.path).collect();
+        assert_eq!(unique_paths.len(), entries.len(), "no duplicate paths");
     }
 }

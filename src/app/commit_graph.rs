@@ -3352,13 +3352,15 @@ mod tests {
     #[gpui::test]
     async fn commit_rows_render_as_single_line_columns_in_requested_order(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
 
         window
             .update(cx, |app, _window, cx| {
                 app.mode = Mode::RepoOpen {
                     repo: crate::repo::OpenRepository {
-                        path: dir.path().to_path_buf(),
+                        main_path: path.clone(),
+                        path,
                         head: Some(crate::repo::HeadInfo {
                             short_sha: "abcdef0".to_string(),
                             summary: "Compact row".to_string(),
@@ -3592,6 +3594,7 @@ mod tests {
     #[gpui::test]
     async fn long_branch_labels_do_not_cover_the_commit_graph(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().to_path_buf();
         let branch_name = "not-merged-branch-with-a-name-that-would-cover-the-graph".to_string();
         let label_selector = Box::leak(
             format!(
@@ -3606,7 +3609,8 @@ mod tests {
             .update(cx, |app, _window, cx| {
                 app.mode = Mode::RepoOpen {
                     repo: crate::repo::OpenRepository {
-                        path: dir.path().to_path_buf(),
+                        main_path: path.clone(),
+                        path,
                         head: Some(crate::repo::HeadInfo {
                             short_sha: "abcdef0".to_string(),
                             summary: "Long branch label".to_string(),

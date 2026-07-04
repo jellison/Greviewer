@@ -35,7 +35,9 @@ folder. The open repository is shown in the list and marked as the current one; 
 other repository opens it in place, exactly as if it had been opened from the folder picker.
 The switcher always offers an "open repository" control that falls back to the folder picker
 so any repository remains reachable. The switcher is available in both graph and changeset
-mode, since the repository name is always shown.
+mode, since the repository name is always shown. When a linked worktree is open, the switcher
+lists and marks repositories relative to the repository's primary worktree rather than the
+linked worktree's own location, matching the repository name the window bar already shows.
 
 **Triggering conditions**
 
@@ -65,6 +67,52 @@ mode, since the repository name is always shown.
 - Selecting a sibling whose folder has been moved or deleted since the switcher opened
   surfaces a clear error through the normal open-failure flow and leaves the previous
   repository open.
+
+## Switching worktrees from the window bar
+
+With a repository open, the window bar shows the active worktree's name between the
+repository name and the changeset identifier — "main" when the primary worktree is open,
+otherwise the worktree folder's name. The worktree name is an affordance: activating it opens
+a switcher listing every worktree registered for the repository, read from Git's own worktree
+registry each time the switcher opens. The primary worktree is listed first as "main
+worktree"; linked worktrees follow in registry order under their folder names. Each entry
+shows its checked-out branch, short commit identifier, and an abbreviated path, and the
+active worktree is marked. Selecting another worktree switches the review context to it,
+exactly as if that folder had been opened from the folder picker. The switcher is available
+in both graph and changeset mode and never offers to create, remove, or search worktrees.
+
+The window bar and window title always identify the repository by its primary worktree's
+folder name, even while a linked worktree is open. Worktree selection is session-only: the
+recently opened list records the primary worktree, so relaunching the application always
+returns to the primary worktree.
+
+**Triggering conditions**
+
+- The user activates the worktree name in the window bar.
+- The user selects another worktree in the switcher.
+- The user activates the entry for the already-active worktree.
+- The user dismisses the switcher by activating outside it.
+
+**Observable outcomes**
+
+- Activating the worktree name opens the switcher and dismisses the repository switcher and
+  the diff-context popover; opening either of those dismisses the worktree switcher. At most
+  one of the three is ever shown.
+- Selecting another worktree opens it: the window shows that worktree's commit graph with its
+  checked-out tip selected (see "Selecting commits to review"), any open changeset is closed,
+  pending changes reflect that worktree's working tree, and the repository's primary worktree
+  is moved to the top of the recently opened list.
+- Selecting the already-active worktree, or dismissing the switcher by activating outside it,
+  closes the switcher and leaves the context unchanged.
+
+**Edge cases**
+
+- A repository with no linked worktrees still shows the worktree name and opens a switcher
+  containing only "main worktree", marked as current.
+- A registered worktree whose folder has been moved or deleted is omitted from the list.
+- If the worktree registry cannot be read, the switcher shows only the active worktree and a
+  clear error is surfaced through the normal notification flow.
+- A worktree on a detached or unborn HEAD lists without a branch name.
 
 ## Quitting the application
 

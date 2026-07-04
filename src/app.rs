@@ -281,6 +281,11 @@ pub struct App {
     context_popover_open: bool,
     /// Whether the title-bar repo switcher (sibling-repository list) is open.
     repo_switcher_open: bool,
+    /// Toggles the worktree switcher popover in the title bar.
+    pub(crate) worktree_switcher_open: bool,
+    /// Worktree registry snapshot backing the switcher popover, re-read each
+    /// time the popover opens.
+    pub(crate) worktree_entries: Vec<repo::WorktreeEntry>,
     /// Roll-up of the pending working-tree state, rendered as the graph's
     /// synthetic top row. Recomputed by `refresh_pending_summary` on
     /// repository open (and, in a later slice, window activation and
@@ -830,7 +835,7 @@ impl App {
             let path = settings.recent_repositories[0].path.clone();
             match repo::open_at(&path) {
                 Ok(repo) => {
-                    window.set_window_title(&repository_title(&repo.path));
+                    window.set_window_title(&repository_title(&repo.main_path));
                     mode = Mode::RepoOpen { repo };
                 }
                 // Construction-time fallback: no `&mut self` and no notification
@@ -954,6 +959,8 @@ impl App {
             focus_handle,
             context_popover_open: false,
             repo_switcher_open: false,
+            worktree_switcher_open: false,
+            worktree_entries: Vec::new(),
             pending_summary,
         }
     }
@@ -1034,8 +1041,8 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.set_window_title(&repository_title(&repo.path));
-        let recent_path = repo.path.clone();
+        window.set_window_title(&repository_title(&repo.main_path));
+        let recent_path = repo.main_path.clone();
 
         // Hidden branches are reset below, so the default selection is
         // computed against the fully visible graph.
@@ -1082,6 +1089,8 @@ impl App {
         self.hovered_diff_pane = None;
         self.context_popover_open = false;
         self.repo_switcher_open = false;
+        self.worktree_switcher_open = false;
+        self.worktree_entries.clear();
         cx.notify();
     }
 
@@ -1093,6 +1102,26 @@ impl App {
             Mode::RepoOpen { repo } => repo::read_pending_summary(&repo.path).unwrap_or_default(),
             Mode::NoRepo => repo::PendingSummary::default(),
         };
+    }
+
+    /// Re-read the worktree registry snapshot for the switcher popover. On
+    /// failure the list degrades to just the active worktree and the error
+    /// surfaces as a notification.
+    fn refresh_worktree_entries(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Mode::RepoOpen { repo } = &self.mode else {
+            self.worktree_entries = Vec::new();
+            return;
+        };
+        match repo::list_worktrees(&repo.path) {
+            Ok(entries) => self.worktree_entries = entries,
+            Err(err) => {
+                self.worktree_entries = vec![current_worktree_entry(repo)];
+                let message = err.to_string();
+                self.notifications.update(cx, |list, cx| {
+                    list.push(Notification::error(message), window, cx);
+                });
+            }
+        }
     }
 
     fn record_recent_repository(&mut self, path: PathBuf) {
@@ -4181,7 +4210,7 @@ impl App {
         folder_defaults: Vec<(String, bool)>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let name = repository_title(&repo.path);
+        let name = repository_title(&repo.main_path);
         let name_selector = format!("file-tree-repo-root-name-{}", debug_path_fragment(&name));
 
         div()
@@ -5095,6 +5124,7 @@ impl Render for App {
             .child(div().flex().flex_1().min_h(px(0.)).w_full().child(body))
             .children(self.render_context_popover(cx))
             .children(self.render_repo_switcher(cx))
+            .children(self.render_worktree_switcher(cx))
             .child(self.notifications.clone())
     }
 }
@@ -5176,6 +5206,33 @@ fn repository_title(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_default()
+}
+
+/// Display name of the repository's active worktree: "main" for the primary
+/// worktree, otherwise the worktree directory's name.
+pub(crate) fn worktree_title(repo: &repo::OpenRepository) -> String {
+    if repo.path == repo.main_path {
+        "main".to_string()
+    } else {
+        repository_title(&repo.path)
+    }
+}
+
+/// Fallback single-entry snapshot for the switcher when the registry cannot
+/// be read: the active worktree described from the open repository itself.
+fn current_worktree_entry(repo: &repo::OpenRepository) -> repo::WorktreeEntry {
+    repo::WorktreeEntry {
+        name: worktree_title(repo),
+        path: repo.path.clone(),
+        branch: repo
+            .branches
+            .iter()
+            .find(|branch| branch.is_head)
+            .map(|branch| branch.name.clone()),
+        short_sha: repo.head.as_ref().map(|head| head.short_sha.clone()),
+        is_current: true,
+        is_main: repo.path == repo.main_path,
+    }
 }
 
 /// Resolve a persisted sidebar width to the value to open at: the saved width
@@ -5943,6 +6000,35 @@ mod tests {
             load_recent_repositories(&store_path),
             vec![RecentRepository::available(path)],
         );
+    }
+
+    #[gpui::test]
+    async fn opening_a_linked_worktree_records_the_main_path_in_recents(cx: &mut TestAppContext) {
+        let (_parent, main, worktree_path) = fixture_repo_with_worktree();
+        cx.update(gpui_component::init);
+        let window = cx.add_window(App::new);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(worktree_path.clone(), window, cx);
+            })
+            .expect("open linked worktree");
+
+        window
+            .read_with(cx, |app, _cx| {
+                match &app.mode {
+                    Mode::RepoOpen { repo } => {
+                        assert_eq!(repo.path, worktree_path);
+                        assert_eq!(repo.main_path, main);
+                    }
+                    Mode::NoRepo => panic!("expected a repo to be open"),
+                }
+                assert_eq!(
+                    app.settings.recent_repositories[0].path, main,
+                    "recents record the main worktree, never a linked one"
+                );
+            })
+            .expect("read recents");
     }
 
     #[gpui::test]

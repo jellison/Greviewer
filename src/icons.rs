@@ -30,6 +30,10 @@ pub enum LucideIcon {
     EyeOff,
     /// `git-branch.svg`
     GitBranch,
+    /// `git-branch-plus.svg`
+    GitBranchPlus,
+    /// `git-compare-arrows.svg`
+    GitCompareArrows,
     /// `list-tree.svg`
     ListTree,
     /// `monitor.svg`
@@ -65,6 +69,8 @@ impl LucideIcon {
         LucideIcon::Eye,
         LucideIcon::EyeOff,
         LucideIcon::GitBranch,
+        LucideIcon::GitBranchPlus,
+        LucideIcon::GitCompareArrows,
         LucideIcon::ListTree,
         LucideIcon::Monitor,
         LucideIcon::Rows2,
@@ -91,6 +97,8 @@ impl IconNamed for LucideIcon {
             LucideIcon::Eye => "icons/eye.svg",
             LucideIcon::EyeOff => "icons/eye-off.svg",
             LucideIcon::GitBranch => "icons/git-branch.svg",
+            LucideIcon::GitBranchPlus => "icons/git-branch-plus.svg",
+            LucideIcon::GitCompareArrows => "icons/git-compare-arrows.svg",
             LucideIcon::ListTree => "icons/list-tree.svg",
             LucideIcon::Monitor => "icons/monitor.svg",
             LucideIcon::Rows2 => "icons/rows-2.svg",
