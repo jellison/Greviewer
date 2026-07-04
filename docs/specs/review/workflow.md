@@ -128,7 +128,7 @@ The user can quit Greviewer with the standard quit keyboard shortcut.
 
 ## Viewing the commit graph
 
-The user sees a graphical history of the repository's commits with branch lanes and merge connectors. The history covers the checked-out commit, every local branch, every remote-tracking branch, and every tag, so work that has not been merged or pulled — and releases whose branches are gone — is visible alongside the checked-out history. Commits from all branches interleave in a single graph ordered newest-first, with no visual distinction between commits that are and are not part of the checked-out history. Branch and merge lines use smooth rounded bends where they turn between lanes, including the final turn into a branch commit. Each commit is presented as a single-row entry whose reading order is graph, short identifier, summary line, author, authored date, and any branch names or tags — local branch, remote-tracking branch, or tag — that point at it. The graph is scrollable; older commits load progressively as the user scrolls. The currently checked-out tip is visually marked, but selection is independent of checkout state — reviewing never moves HEAD.
+The user sees a graphical history of the repository's commits with branch lanes and merge connectors. The history covers the checked-out commit, every local branch, every remote-tracking branch, and every tag, so work that has not been merged or pulled — and releases whose branches are gone — is visible alongside the checked-out history. Commits from all branches interleave in a single graph ordered newest-first, with no visual distinction between commits that are and are not part of the checked-out history. Branch and merge lines use smooth rounded bends where they turn between lanes, including the final turn into a branch commit. Each commit is presented as a single-row entry whose reading order is ref labels, graph, short identifier, summary line, author, and authored date. The ref labels — any branch names or tags (local branch, remote-tracking branch, or tag) that point at the commit — occupy a column at the left edge of every row that is exactly as wide as the widest set of labels currently visible — at most about a third of the panel — and gives its space back to the summary when no labels are visible. Labels that do not fit the column are clipped at its edge; hovering the column reveals the full set, unabridged, in a tooltip that also names each label's role — checked out, checked out in a linked worktree, remote, or tag. The graph is scrollable; older commits load progressively as the user scrolls. The currently checked-out tip is visually marked, but selection is independent of checkout state — reviewing never moves HEAD.
 
 **Triggering conditions**
 
@@ -143,9 +143,11 @@ The user sees a graphical history of the repository's commits with branch lanes 
   ends at its tip.
 - Each visible commit shows its short identifier, summary line, author, and authored date.
 - Branch names are shown on the commits they point to; a remote-tracking branch shows its remote-qualified name and renders visually distinct from local branch labels.
-- Tag names are shown on the commits they point to, in a color distinct from both branch labels and the checked-out marker; on a commit carrying both, branch labels precede tag labels.
+- Tag names are shown on the commits they point to, in a color distinct from both branch labels and the checked-out marker, and carry a tag icon; on a commit carrying both, branch labels precede tag labels.
 - A local branch, a remote-tracking branch, and a tag with the same name are never confusable; when more than one points at the same commit, every label appears.
-- The currently checked-out tip carries a visual marker.
+- The currently checked-out tip carries a visual marker: the checked-out branch's own label renders in the checked-out accent with a checked-out icon in place of a separate HEAD label. When no visible label names the checked-out branch, a standalone HEAD label carries the marker instead.
+- A local branch checked out in a linked worktree carries a worktree icon on its label.
+- Ref labels render in a shared leading column sized to the widest visible label set, capped at roughly a third of the panel width; labels that overflow the cap are clipped at the column edge, and hovering the column reveals every label in full. The column is the same width on every row, and it yields its space to the commit summary when no labels are visible.
 
 **Edge cases**
 

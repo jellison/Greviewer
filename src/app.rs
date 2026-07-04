@@ -28,7 +28,7 @@ pub use path_picker::{repository_prompt_options, GpuiPathPicker, PathPicker, Pat
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, canvas, div, pattern_slash, point, px, uniform_list, AnyElement, AppContext,
+    actions, canvas, div, pattern_slash, point, px, relative, uniform_list, AnyElement, AppContext,
     Background, Bounds, ClickEvent, Context, Entity, EventEmitter, FocusHandle, HighlightStyle,
     Hsla, InteractiveElement, IntoElement, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, PathBuilder, Pixels, Point, Render, ScrollHandle,
@@ -1050,6 +1050,7 @@ impl App {
         self.mode = Mode::RepoOpen { repo };
         self.selection = selection;
         self.refresh_pending_summary();
+        self.refresh_worktree_entries(window, cx);
         self.review_screen = ReviewScreen::Graph;
         self.comparison_commit_shas = None;
         self.workspace = crate::workspace::Workspace::new();
@@ -1122,6 +1123,27 @@ impl App {
                 });
             }
         }
+    }
+
+    /// The checked-out local branch's name, when HEAD points at a branch.
+    fn head_branch_name(&self) -> Option<String> {
+        let Mode::RepoOpen { repo } = &self.mode else {
+            return None;
+        };
+        repo.branches
+            .iter()
+            .find(|branch| branch.is_head)
+            .map(|branch| branch.name.clone())
+    }
+
+    /// Local branches checked out in linked worktrees other than this one,
+    /// from the worktree snapshot refreshed at repository open.
+    fn worktree_branch_names(&self) -> BTreeSet<String> {
+        self.worktree_entries
+            .iter()
+            .filter(|entry| !entry.is_current)
+            .filter_map(|entry| entry.branch.clone())
+            .collect()
     }
 
     fn record_recent_repository(&mut self, path: PathBuf) {
@@ -3074,7 +3096,7 @@ impl App {
         uniform_list(
             "commit-history",
             item_count,
-            cx.processor(move |app, range: std::ops::Range<usize>, _window, cx| {
+            cx.processor(move |app, range: std::ops::Range<usize>, window, cx| {
                 let Mode::RepoOpen { repo } = &app.mode else {
                     return Vec::new();
                 };
@@ -3084,6 +3106,25 @@ impl App {
                 // `graph_layout`.
                 let visible_commits = visible_commits(repo, &app.hidden_branches);
                 let layout = app.graph_layout(repo);
+                // Hoisted once per render pass rather than per row: both are
+                // pure functions of `app` state, and computing them per row
+                // would allocate a `String`/`BTreeSet` for every visible
+                // commit instead of once for the whole page.
+                let head_branch = app.head_branch_name();
+                let worktree_branches = app.worktree_branch_names();
+                let text_system = window.text_system();
+                let font_id = text_system.resolve_font(&gpui::font(MONO_FONT_FAMILY));
+                let glyph_advance = text_system
+                    .advance(font_id, px(10.), '0')
+                    .map(|advance| f32::from(advance.width))
+                    .unwrap_or(6.);
+                let refs_column_width = commit_ref_labels_column_width(
+                    &visible_commits,
+                    &app.hidden_branches,
+                    head_branch.as_deref(),
+                    &worktree_branches,
+                    glyph_advance,
+                );
                 range
                     .map(|index| {
                         if index == 0 {
@@ -3091,6 +3132,7 @@ impl App {
                                 &layout.rows,
                                 layout.max_lanes,
                                 app.selection == Selection::Pending,
+                                refs_column_width,
                                 cx,
                             )
                             .into_any_element()
@@ -3098,9 +3140,13 @@ impl App {
                             app.render_commit_row(
                                 index,
                                 visible_commits[index - 1],
-                                &layout.rows,
-                                layout.max_lanes,
+                                &layout,
                                 app.is_commit_selected(&visible_commits[index - 1].sha),
+                                RefsColumnContext {
+                                    head_branch: head_branch.as_deref(),
+                                    worktree_branches: &worktree_branches,
+                                    width: refs_column_width,
+                                },
                                 cx,
                             )
                             .into_any_element()
@@ -4847,9 +4893,9 @@ impl App {
         &self,
         index: usize,
         commit: &repo::CommitInfo,
-        graph_rows: &[graph::GraphRow],
-        max_graph_lanes: usize,
+        layout: &GraphLayout,
         selected: bool,
+        refs_column: RefsColumnContext<'_>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let debug_selector = if selected {
@@ -4895,12 +4941,20 @@ impl App {
                     app.select_commit(sha.clone(), event.modifiers(), window, cx);
                 }
             }))
+            .child(render_commit_ref_labels(
+                index,
+                commit,
+                &self.hidden_branches,
+                refs_column.head_branch,
+                refs_column.worktree_branches,
+                refs_column.width,
+            ))
             .child(render_commit_graph_gutter(
                 index,
-                &graph_rows[index],
-                index.checked_sub(1).and_then(|prev| graph_rows.get(prev)),
-                graph_rows.get(index + 1),
-                max_graph_lanes,
+                &layout.rows[index],
+                index.checked_sub(1).and_then(|prev| layout.rows.get(prev)),
+                layout.rows.get(index + 1),
+                layout.max_lanes,
                 CommitDotStyle::Solid,
             ))
             .child(
@@ -4943,11 +4997,6 @@ impl App {
                     .debug_selector(move || format!("commit-time-{index}"))
                     .child(commit.authored_date.clone()),
             )
-            .child(render_commit_ref_labels(
-                index,
-                commit,
-                &self.hidden_branches,
-            ))
     }
 
     /// Render the synthetic pending-changes row that always tops the graph
@@ -4959,6 +5008,7 @@ impl App {
         graph_rows: &[graph::GraphRow],
         max_graph_lanes: usize,
         selected: bool,
+        refs_column_width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let debug_selector = if selected {
@@ -4999,6 +5049,13 @@ impl App {
                     app.select_commit(repo::PENDING_SHA.to_string(), event.modifiers(), window, cx);
                 }
             }))
+            .child(
+                div()
+                    .w(px(refs_column_width))
+                    .max_w(relative(COMMIT_REF_LABELS_MAX_FRACTION))
+                    .flex_shrink_0()
+                    .debug_selector(|| "pending-ref-labels-spacer".to_string()),
+            )
             .child(render_commit_graph_gutter(
                 0,
                 &graph_rows[0],
@@ -5026,6 +5083,15 @@ impl App {
                     .child(summary_text),
             )
     }
+}
+
+/// The refs-column inputs `render_commit_row` needs, computed once per render
+/// pass by the history-list processor and threaded down instead of recomputed
+/// per row (see `render_commit_history_list`).
+struct RefsColumnContext<'a> {
+    head_branch: Option<&'a str>,
+    worktree_branches: &'a BTreeSet<String>,
+    width: f32,
 }
 
 const COMMIT_ROW_HEIGHT: f32 = 44.;

@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::theme::palette;
+use gpui::SharedString;
 
 pub(crate) fn commit_row_separator_width() -> f32 {
     0.
@@ -22,17 +23,26 @@ pub(crate) fn render_commit_ref_labels(
     row_index: usize,
     commit: &repo::CommitInfo,
     hidden_branches: &BTreeSet<String>,
-) -> gpui::Div {
-    let labels = commit_ref_labels(commit, hidden_branches);
+    head_branch: Option<&str>,
+    worktree_branches: &BTreeSet<String>,
+    column_width: f32,
+) -> impl IntoElement {
+    let labels = commit_ref_labels(commit, hidden_branches, head_branch, worktree_branches);
+    let tooltip_text: SharedString = commit_ref_tooltip_text(&labels).into();
 
     div()
+        .id(("commit-ref-labels", row_index))
         .flex()
         .items_center()
         .gap_1()
-        .w(px(COMMIT_REF_LABELS_WIDTH))
+        .w(px(column_width))
+        .max_w(relative(COMMIT_REF_LABELS_MAX_FRACTION))
         .overflow_hidden()
         .flex_shrink_0()
         .debug_selector(move || format!("commit-ref-labels-{row_index}"))
+        .when(!labels.is_empty(), |cell| {
+            cell.tooltip(move |window, cx| Tooltip::new(tooltip_text.clone()).build(window, cx))
+        })
         .children(
             labels
                 .into_iter()
@@ -41,8 +51,58 @@ pub(crate) fn render_commit_ref_labels(
         )
 }
 
-pub(crate) const COMMIT_REF_LABELS_WIDTH: f32 = 156.;
-pub(crate) const COMMIT_REF_LABEL_MAX_WIDTH: f32 = COMMIT_REF_LABELS_WIDTH - 8.;
+/// The refs column's ceiling as a fraction of the history panel width. The
+/// column auto-sizes to its widest visible label row; this cap keeps long
+/// branch names from starving the commit summary on narrow panels.
+pub(crate) const COMMIT_REF_LABELS_MAX_FRACTION: f32 = 0.35;
+
+const COMMIT_REF_LABEL_PILL_CHROME: f32 = 10.; // px_1 padding (4+4) + 1px border each side
+const COMMIT_REF_LABEL_ICON_WIDTH: f32 = 10. + 4.; // icon + gap_1 before the text
+const COMMIT_REF_LABELS_PILL_GAP: f32 = 4.; // gap_1 between pills
+
+/// The width one pill lays out at, mirroring `render_commit_ref_label`'s
+/// styles: padding + border chrome, optional leading icon, and the name at
+/// the mono glyph advance.
+pub(crate) fn commit_ref_label_pill_width(label: &CommitRefLabel, glyph_advance: f32) -> f32 {
+    let icon = if commit_ref_label_icon(label).is_some() {
+        COMMIT_REF_LABEL_ICON_WIDTH
+    } else {
+        0.
+    };
+    COMMIT_REF_LABEL_PILL_CHROME + icon + label.name.chars().count() as f32 * glyph_advance
+}
+
+/// The uniform width of the refs column: the widest visible label row among
+/// the loaded commits, or zero when nothing carries a label. Uniformity is
+/// what keeps the graph lanes vertically aligned, so this is computed once
+/// per render pass, not per row. Commits without labels skip label
+/// construction entirely, so the pass stays O(number of refs), not
+/// O(number of commits x allocations).
+pub(crate) fn commit_ref_labels_column_width(
+    commits: &[&repo::CommitInfo],
+    hidden_branches: &BTreeSet<String>,
+    head_branch: Option<&str>,
+    worktree_branches: &BTreeSet<String>,
+    glyph_advance: f32,
+) -> f32 {
+    let mut width: f32 = 0.;
+    for commit in commits {
+        if commit.branch_labels.is_empty() && !commit.is_head {
+            continue;
+        }
+        let labels = commit_ref_labels(commit, hidden_branches, head_branch, worktree_branches);
+        if labels.is_empty() {
+            continue;
+        }
+        let row = labels
+            .iter()
+            .map(|label| commit_ref_label_pill_width(label, glyph_advance))
+            .sum::<f32>()
+            + (labels.len() - 1) as f32 * COMMIT_REF_LABELS_PILL_GAP;
+        width = width.max(row);
+    }
+    width
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitRefLabel {
@@ -51,6 +111,7 @@ pub(crate) struct CommitRefLabel {
     /// remote labels stay distinguishable (`heads/main` vs `remotes/origin/main`).
     pub(crate) selector_key: String,
     pub(crate) kind: CommitRefLabelKind,
+    pub(crate) marker: Option<CommitRefMarker>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,47 +122,109 @@ pub(crate) enum CommitRefLabelKind {
     Tag,
 }
 
-/// The ref label pills a commit row renders: HEAD first when checked out,
-/// then one pill per branch label whose namespaced key (see [`branch_key`])
-/// the user has not hidden.
+/// Checkout state a ref label advertises beyond its kind: the branch is
+/// checked out in this window, or checked out in a linked worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitRefMarker {
+    CheckedOut,
+    Worktree,
+}
+
+/// The ref label pills a commit row renders: one pill per branch or tag label
+/// whose namespaced key (see [`branch_key`]) the user has not hidden. The
+/// checked-out branch's own pill absorbs the HEAD marker — it renders in the
+/// HEAD style, carries the checked-out marker, and sorts first. A standalone
+/// HEAD pill appears only when the checked-out commit has no visible label
+/// naming the checked-out branch (for example when that branch is hidden).
 pub(crate) fn commit_ref_labels(
     commit: &repo::CommitInfo,
     hidden_branches: &BTreeSet<String>,
+    head_branch: Option<&str>,
+    worktree_branches: &BTreeSet<String>,
 ) -> Vec<CommitRefLabel> {
-    let mut labels = Vec::new();
-    if commit.is_head {
-        labels.push(CommitRefLabel {
-            name: "HEAD".to_string(),
-            selector_key: "HEAD".to_string(),
-            kind: CommitRefLabelKind::Head,
-        });
-    }
-    labels.extend(
-        commit
-            .branch_labels
-            .iter()
-            .filter(|label| !hidden_branches.contains(&branch_key(&label.name, &label.kind)))
-            .map(|label| CommitRefLabel {
+    let mut labels: Vec<CommitRefLabel> = commit
+        .branch_labels
+        .iter()
+        .filter(|label| !hidden_branches.contains(&branch_key(&label.name, &label.kind)))
+        .map(|label| {
+            let is_local = matches!(label.kind, repo::BranchKind::Local);
+            let checked_out =
+                commit.is_head && is_local && head_branch == Some(label.name.as_str());
+            let marker = if checked_out {
+                Some(CommitRefMarker::CheckedOut)
+            } else if is_local && worktree_branches.contains(&label.name) {
+                Some(CommitRefMarker::Worktree)
+            } else {
+                None
+            };
+            CommitRefLabel {
                 name: label.name.clone(),
                 selector_key: branch_key(&label.name, &label.kind),
-                kind: match label.kind {
-                    repo::BranchKind::Local => CommitRefLabelKind::Branch,
-                    repo::BranchKind::Remote { .. } => CommitRefLabelKind::RemoteBranch,
-                    repo::BranchKind::Tag => CommitRefLabelKind::Tag,
+                kind: if checked_out {
+                    CommitRefLabelKind::Head
+                } else {
+                    match label.kind {
+                        repo::BranchKind::Local => CommitRefLabelKind::Branch,
+                        repo::BranchKind::Remote { .. } => CommitRefLabelKind::RemoteBranch,
+                        repo::BranchKind::Tag => CommitRefLabelKind::Tag,
+                    }
                 },
-            }),
-    );
+                marker,
+            }
+        })
+        .collect();
+
+    let has_checked_out = labels
+        .iter()
+        .any(|label| label.marker == Some(CommitRefMarker::CheckedOut));
+    if commit.is_head && !has_checked_out {
+        labels.insert(
+            0,
+            CommitRefLabel {
+                name: "HEAD".to_string(),
+                selector_key: "HEAD".to_string(),
+                kind: CommitRefLabelKind::Head,
+                marker: Some(CommitRefMarker::CheckedOut),
+            },
+        );
+    } else {
+        // Stable: keeps the remaining labels in branch-then-tag order.
+        labels.sort_by_key(|label| label.marker != Some(CommitRefMarker::CheckedOut));
+    }
     labels
 }
 
+/// One line per label for the refs-column hover tooltip: the full name plus a
+/// plain-language qualifier, so clipped pills stay discoverable.
+pub(crate) fn commit_ref_tooltip_text(labels: &[CommitRefLabel]) -> String {
+    labels
+        .iter()
+        .map(|label| {
+            let qualifier = match (label.marker, label.kind) {
+                (Some(CommitRefMarker::CheckedOut), _) => " \u{2014} checked out",
+                (Some(CommitRefMarker::Worktree), _) => " \u{2014} in a linked worktree",
+                (None, CommitRefLabelKind::Tag) => " \u{2014} tag",
+                (None, CommitRefLabelKind::RemoteBranch) => " \u{2014} remote",
+                (None, _) => "",
+            };
+            format!("{}{qualifier}", label.name)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(crate) fn render_commit_ref_label(row_index: usize, label: CommitRefLabel) -> gpui::Div {
-    let selector = format!(
-        "commit-ref-label-{row_index}-{}",
-        debug_ref_label_fragment(&label.selector_key)
-    );
+    let fragment = debug_ref_label_fragment(&label.selector_key);
+    let selector = format!("commit-ref-label-{row_index}-{fragment}");
+    let icon_selector = format!("commit-ref-label-icon-{row_index}-{fragment}");
     let (border_color, background, text_color) = commit_ref_label_colors(label.kind);
+    let icon = commit_ref_label_icon(&label);
 
     div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .flex_shrink_0()
         .px_1()
         .py_0p5()
         .border_1()
@@ -110,10 +233,17 @@ pub(crate) fn render_commit_ref_label(row_index: usize, label: CommitRefLabel) -
         .text_color(text_color)
         .text_size(px(10.))
         .font_family(MONO_FONT_FAMILY)
-        .max_w(px(COMMIT_REF_LABEL_MAX_WIDTH))
-        .truncate()
+        .max_w(relative(1.))
         .debug_selector(move || selector.clone())
-        .child(label.name)
+        .when_some(icon, |pill, icon| {
+            pill.child(
+                div()
+                    .flex_shrink_0()
+                    .debug_selector(move || icon_selector.clone())
+                    .child(Icon::new(icon).text_color(text_color).size(px(10.))),
+            )
+        })
+        .child(div().min_w_0().truncate().child(label.name))
 }
 
 /// The (border, background, text) triple a ref label pill draws with. HEAD
@@ -138,6 +268,18 @@ pub(crate) fn commit_ref_label_colors(
             palette().ref_tag_bg,
             palette().ref_tag_fg,
         ),
+    }
+}
+
+/// The glyph a ref pill leads with: a monitor for the branch checked out in
+/// this window, a worktree glyph for branches checked out in linked
+/// worktrees, and a tag glyph for tags. Plain and remote branches carry none.
+pub(crate) fn commit_ref_label_icon(label: &CommitRefLabel) -> Option<LucideIcon> {
+    match (label.marker, label.kind) {
+        (Some(CommitRefMarker::CheckedOut), _) => Some(LucideIcon::Monitor),
+        (Some(CommitRefMarker::Worktree), _) => Some(LucideIcon::GitBranchPlus),
+        (None, CommitRefLabelKind::Tag) => Some(LucideIcon::Tag),
+        (None, _) => None,
     }
 }
 
@@ -1874,7 +2016,7 @@ mod tests {
             },
         ];
 
-        let labels = commit_ref_labels(&commit, &BTreeSet::new());
+        let labels = commit_ref_labels(&commit, &BTreeSet::new(), None, &BTreeSet::new());
 
         assert_eq!(
             labels,
@@ -1883,11 +2025,13 @@ mod tests {
                     name: "main".to_string(),
                     selector_key: "heads/main".to_string(),
                     kind: CommitRefLabelKind::Branch,
+                    marker: None,
                 },
                 CommitRefLabel {
                     name: "origin/main".to_string(),
                     selector_key: "remotes/origin/main".to_string(),
                     kind: CommitRefLabelKind::RemoteBranch,
+                    marker: None,
                 },
             ],
             "a shared tip shows both labels, the remote one marked as remote",
@@ -1908,7 +2052,7 @@ mod tests {
             },
         ];
 
-        let labels = commit_ref_labels(&commit, &BTreeSet::new());
+        let labels = commit_ref_labels(&commit, &BTreeSet::new(), None, &BTreeSet::new());
 
         assert_eq!(
             labels,
@@ -1917,11 +2061,13 @@ mod tests {
                     name: "main".to_string(),
                     selector_key: "heads/main".to_string(),
                     kind: CommitRefLabelKind::Branch,
+                    marker: None,
                 },
                 CommitRefLabel {
                     name: "v1".to_string(),
                     selector_key: "tags/v1".to_string(),
                     kind: CommitRefLabelKind::Tag,
+                    marker: None,
                 },
             ],
             "a tag label carries the tag kind and the tags/ selector namespace",
@@ -1965,7 +2111,7 @@ mod tests {
         ];
         let hidden = ["remotes/origin/main".to_string()].into_iter().collect();
 
-        let labels = commit_ref_labels(&commit, &hidden);
+        let labels = commit_ref_labels(&commit, &hidden, None, &BTreeSet::new());
 
         assert_eq!(
             labels.len(),
@@ -1973,6 +2119,199 @@ mod tests {
             "hiding the remote ref leaves the same-named local label",
         );
         assert_eq!(labels[0].kind, CommitRefLabelKind::Branch);
+    }
+
+    #[test]
+    fn checked_out_branch_label_absorbs_the_head_marker() {
+        let mut commit = test_support::commit_info("aaa", &[]);
+        commit.is_head = true;
+        commit.branch_labels = vec![
+            repo::BranchLabel {
+                name: "main".into(),
+                kind: repo::BranchKind::Local,
+            },
+            repo::BranchLabel {
+                name: "origin/main".into(),
+                kind: repo::BranchKind::Remote {
+                    remote: "origin".into(),
+                },
+            },
+        ];
+
+        let labels = commit_ref_labels(&commit, &BTreeSet::new(), Some("main"), &BTreeSet::new());
+
+        assert!(
+            !labels.iter().any(|label| label.name == "HEAD"),
+            "no standalone HEAD pill when the checked-out branch is visible"
+        );
+        assert_eq!(labels[0].name, "main");
+        assert_eq!(labels[0].kind, CommitRefLabelKind::Head);
+        assert_eq!(labels[0].marker, Some(CommitRefMarker::CheckedOut));
+        assert_eq!(labels[1].name, "origin/main");
+        assert_eq!(labels[1].marker, None);
+    }
+
+    #[test]
+    fn head_commit_without_a_visible_checked_out_branch_keeps_the_head_pill() {
+        let mut commit = test_support::commit_info("aaa", &[]);
+        commit.is_head = true;
+        commit.branch_labels = vec![repo::BranchLabel {
+            name: "main".into(),
+            kind: repo::BranchKind::Local,
+        }];
+        let hidden = BTreeSet::from(["heads/main".to_string()]);
+
+        let labels = commit_ref_labels(&commit, &hidden, Some("main"), &BTreeSet::new());
+
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].name, "HEAD");
+        assert_eq!(labels[0].kind, CommitRefLabelKind::Head);
+        assert_eq!(labels[0].marker, Some(CommitRefMarker::CheckedOut));
+    }
+
+    #[test]
+    fn worktree_branch_labels_carry_the_worktree_marker() {
+        let mut commit = test_support::commit_info("aaa", &[]);
+        commit.branch_labels = vec![repo::BranchLabel {
+            name: "feature".into(),
+            kind: repo::BranchKind::Local,
+        }];
+        let worktrees = BTreeSet::from(["feature".to_string()]);
+
+        let labels = commit_ref_labels(&commit, &BTreeSet::new(), None, &worktrees);
+
+        assert_eq!(labels[0].marker, Some(CommitRefMarker::Worktree));
+        assert_eq!(labels[0].kind, CommitRefLabelKind::Branch);
+    }
+
+    #[test]
+    fn ref_label_icons_mark_checkout_state_and_tags() {
+        let label = |kind, marker| CommitRefLabel {
+            name: "x".into(),
+            selector_key: "x".into(),
+            kind,
+            marker,
+        };
+
+        assert_eq!(
+            commit_ref_label_icon(&label(
+                CommitRefLabelKind::Head,
+                Some(CommitRefMarker::CheckedOut)
+            )),
+            Some(LucideIcon::Monitor)
+        );
+        assert_eq!(
+            commit_ref_label_icon(&label(
+                CommitRefLabelKind::Branch,
+                Some(CommitRefMarker::Worktree)
+            )),
+            Some(LucideIcon::GitBranchPlus)
+        );
+        assert_eq!(
+            commit_ref_label_icon(&label(CommitRefLabelKind::Tag, None)),
+            Some(LucideIcon::Tag)
+        );
+        assert_eq!(
+            commit_ref_label_icon(&label(CommitRefLabelKind::Branch, None)),
+            None
+        );
+        assert_eq!(
+            commit_ref_label_icon(&label(CommitRefLabelKind::RemoteBranch, None)),
+            None
+        );
+    }
+
+    #[test]
+    fn ref_label_column_width_fits_the_widest_visible_label_row() {
+        let advance = 6.;
+        let mut labeled = test_support::commit_info("aaa", &[]);
+        labeled.branch_labels = vec![
+            repo::BranchLabel {
+                name: "main".into(),
+                kind: repo::BranchKind::Local,
+            },
+            repo::BranchLabel {
+                name: "v1".into(),
+                kind: repo::BranchKind::Tag,
+            },
+        ];
+        let plain = test_support::commit_info("bbb", &[]);
+
+        let commits = vec![&labeled, &plain];
+        let width = commit_ref_labels_column_width(
+            &commits,
+            &BTreeSet::new(),
+            None,
+            &BTreeSet::new(),
+            advance,
+        );
+
+        // "main": pad+border 10 + 4 chars * 6 = 34; "v1" (tag icon): 10 + (10 + 4) + 2 * 6 = 36;
+        // inter-pill gap 4 => 74.
+        assert_eq!(width, 74.);
+    }
+
+    #[test]
+    fn ref_label_column_width_is_zero_without_visible_labels() {
+        let plain = test_support::commit_info("aaa", &[]);
+        let mut hidden_only = test_support::commit_info("bbb", &[]);
+        hidden_only.branch_labels = vec![repo::BranchLabel {
+            name: "feature".into(),
+            kind: repo::BranchKind::Local,
+        }];
+        let hidden = BTreeSet::from(["heads/feature".to_string()]);
+
+        let commits = vec![&plain, &hidden_only];
+        let width = commit_ref_labels_column_width(&commits, &hidden, None, &BTreeSet::new(), 6.);
+
+        assert_eq!(width, 0.);
+    }
+
+    #[test]
+    fn ref_label_pill_width_accounts_for_icon_and_glyphs() {
+        let label = CommitRefLabel {
+            name: "main".into(),
+            selector_key: "heads/main".into(),
+            kind: CommitRefLabelKind::Head,
+            marker: Some(CommitRefMarker::CheckedOut),
+        };
+        // pad+border 10 + icon 10 + icon gap 4 + 4 chars * 6 = 48.
+        assert_eq!(commit_ref_label_pill_width(&label, 6.), 48.);
+    }
+
+    #[test]
+    fn tooltip_text_lists_every_label_with_its_qualifier() {
+        let labels = vec![
+            CommitRefLabel {
+                name: "main".into(),
+                selector_key: "heads/main".into(),
+                kind: CommitRefLabelKind::Head,
+                marker: Some(CommitRefMarker::CheckedOut),
+            },
+            CommitRefLabel {
+                name: "origin/main".into(),
+                selector_key: "remotes/origin/main".into(),
+                kind: CommitRefLabelKind::RemoteBranch,
+                marker: None,
+            },
+            CommitRefLabel {
+                name: "sku".into(),
+                selector_key: "heads/sku".into(),
+                kind: CommitRefLabelKind::Branch,
+                marker: Some(CommitRefMarker::Worktree),
+            },
+            CommitRefLabel {
+                name: "v0.1".into(),
+                selector_key: "tags/v0.1".into(),
+                kind: CommitRefLabelKind::Tag,
+                marker: None,
+            },
+        ];
+
+        assert_eq!(
+            commit_ref_tooltip_text(&labels),
+            "main — checked out\norigin/main — remote\nsku — in a linked worktree\nv0.1 — tag"
+        );
     }
 
     #[test]
@@ -3417,7 +3756,12 @@ mod tests {
             row.size.height <= px(44.),
             "commit row should be compact enough for a single-line layout: {row:?}"
         );
-        assert!(graph.origin.x < hash.origin.x, "graph should be first");
+        assert!(
+            labels.size.width > px(0.),
+            "refs column sizes to its labels"
+        );
+        assert!(labels.origin.x < graph.origin.x, "refs should be first");
+        assert!(graph.origin.x < hash.origin.x, "graph should follow refs");
         assert!(hash.origin.x < summary.origin.x, "hash should follow graph");
         assert!(
             summary.origin.x < author.origin.x,
@@ -3426,10 +3770,6 @@ mod tests {
         assert!(
             author.origin.x < time.origin.x,
             "author should precede time"
-        );
-        assert!(
-            time.origin.x < labels.origin.x,
-            "time should precede labels"
         );
     }
 
@@ -3466,6 +3806,10 @@ mod tests {
         visual
             .debug_bounds(Box::leak(selector.into_boxed_str()) as &'static str)
             .expect("tag label pill on the tagged commit row");
+        let icon_selector = format!("commit-ref-label-icon-{tag_row}-tags-v1");
+        visual
+            .debug_bounds(Box::leak(icon_selector.into_boxed_str()) as &'static str)
+            .expect("tag icon on the tag pill");
     }
 
     #[gpui::test]
@@ -3519,9 +3863,12 @@ mod tests {
         let label_selector = |row: usize, label: &str| {
             Box::leak(format!("commit-ref-label-{row}-{label}").into_boxed_str()) as &'static str
         };
-        visual
-            .debug_bounds(label_selector(head_row, "head"))
-            .expect("head label on merge commit");
+        assert!(
+            visual
+                .debug_bounds(label_selector(head_row, "head"))
+                .is_none(),
+            "the checked-out branch's own label absorbs the HEAD pill"
+        );
         visual
             .debug_bounds(label_selector(master_row, "heads-master"))
             .expect("master label on merge commit");
@@ -3531,6 +3878,11 @@ mod tests {
         visual
             .debug_bounds(label_selector(right_row, "heads-right"))
             .expect("right branch label on right commit");
+        visual
+            .debug_bounds(Box::leak(
+                format!("commit-ref-label-icon-{master_row}-heads-master").into_boxed_str(),
+            ) as &'static str)
+            .expect("checked-out icon on the master pill");
     }
 
     #[gpui::test]
@@ -3649,8 +4001,83 @@ mod tests {
             .expect("commit graph gutter debug bounds");
 
         assert!(
-            label_bounds.origin.x >= graph_bounds.origin.x + graph_bounds.size.width,
-            "branch label should not cover the graph gutter; label: {label_bounds:?}, graph: {graph_bounds:?}"
+            label_bounds.right() <= graph_bounds.origin.x,
+            "the refs column must clip long labels before the graph: {label_bounds:?} vs {graph_bounds:?}"
+        );
+
+        let label_cell_bounds = visual
+            .debug_bounds("commit-ref-labels-1")
+            .expect("commit ref labels cell debug bounds");
+        let row_bounds = visual
+            .debug_bounds("commit-row-1")
+            .expect("commit row debug bounds");
+        assert!(
+            label_cell_bounds.size.width <= row_bounds.size.width * 0.35 + px(1.),
+            "refs column must cap at 35% of the row: {label_cell_bounds:?} vs {row_bounds:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn pending_row_reserves_the_refs_column(cx: &mut TestAppContext) {
+        let (dir, _tip_sha) = init_repo_with_tag();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("pending-ref-labels-spacer")
+            .expect("pending row leading spacer");
+        let pending_gutter = visual
+            .debug_bounds("commit-graph-gutter-0")
+            .expect("pending row gutter");
+        let commit_gutter = visual
+            .debug_bounds("commit-graph-gutter-1")
+            .expect("first commit row gutter");
+        assert_eq!(
+            pending_gutter.origin.x, commit_gutter.origin.x,
+            "graph lanes must stay vertically aligned across the pending row"
+        );
+    }
+
+    #[gpui::test]
+    async fn refs_column_width_is_uniform_across_rows_and_pending_spacer(cx: &mut TestAppContext) {
+        let (dir, _tip_sha) = init_repo_with_tag();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repo");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let pending_spacer = visual
+            .debug_bounds("pending-ref-labels-spacer")
+            .expect("pending row leading spacer");
+        let row_1_labels = visual
+            .debug_bounds("commit-ref-labels-1")
+            .expect("first commit row labels cell");
+        let mut widths = vec![pending_spacer.size.width, row_1_labels.size.width];
+        if let Some(row_2_labels) = visual.debug_bounds("commit-ref-labels-2") {
+            widths.push(row_2_labels.size.width);
+        }
+
+        assert!(
+            widths.iter().all(|width| *width == widths[0]),
+            "the refs column must be the same width on every row and the pending spacer: {widths:?}"
+        );
+        assert!(
+            widths[0] > px(0.),
+            "the refs column must size to the widest visible label row"
         );
     }
 
