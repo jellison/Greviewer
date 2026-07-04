@@ -51,7 +51,9 @@ use std::{
 };
 
 use crate::icons::LucideIcon;
-use crate::settings::{self, RecentRepository, Settings, SidebarWidths, MAX_RECENT_REPOSITORIES};
+use crate::settings::{
+    self, GraphViewMode, RecentRepository, Settings, SidebarWidths, MAX_RECENT_REPOSITORIES,
+};
 use crate::theme::palette;
 use crate::workspace::FileDiffItem;
 use crate::{diff_highlight, graph, repo};
@@ -166,6 +168,9 @@ pub struct App {
     /// a single click on the bar (the only other surface that consumes it).
     double_click_anchor: Option<String>,
     pub review_screen: ReviewScreen,
+    /// Which commit-graph layout is active. Mirrors `settings.graph_view_mode`;
+    /// the switcher updates both together.
+    pub view_mode: GraphViewMode,
     /// While a comparison changeset is open, the commits a merge of the
     /// target into the base would introduce (base..target), newest first.
     /// Computed once when the changeset opens — the title-bar popover renders
@@ -747,6 +752,7 @@ impl App {
             window_state: None,
             sidebar_widths: SidebarWidths::default(),
             ai_enabled: false,
+            graph_view_mode: GraphViewMode::default(),
         };
         Self::new_with_picker_and_settings(window, cx, Box::new(GpuiPathPicker), settings)
     }
@@ -918,6 +924,7 @@ impl App {
             selection,
             double_click_anchor: None,
             review_screen: ReviewScreen::Graph,
+            view_mode: settings.graph_view_mode,
             comparison_commit_shas: None,
             workspace: crate::workspace::Workspace::new(),
             file_tree_highlight_path: None,
@@ -962,6 +969,16 @@ impl App {
             worktree_switcher_open: false,
             worktree_entries: Vec::new(),
             pending_summary,
+        }
+    }
+
+    /// Height in pixels of one commit-graph row in the active layout. The
+    /// single source of truth for row height; scroll math, the selection
+    /// underlay, and the graph gutter all derive from it.
+    fn row_height(&self) -> f32 {
+        match self.view_mode {
+            GraphViewMode::Compact => COMMIT_ROW_HEIGHT,
+            GraphViewMode::Table => COMMIT_ROW_HEIGHT_TABLE,
         }
     }
 
@@ -1386,7 +1403,8 @@ impl App {
             .bounds()
             .size
             .height;
-        let row_top = px(index as f32 * COMMIT_ROW_HEIGHT);
+        let row_height = self.row_height();
+        let row_top = px(index as f32 * row_height);
         if viewport_height <= px(0.) {
             // Not laid out yet; pin the row to the top rather than centering
             // against a zero-height viewport.
@@ -1397,8 +1415,8 @@ impl App {
                 .set_offset(point(px(0.), -row_top));
             return;
         }
-        let centered_top = row_top - (viewport_height - px(COMMIT_ROW_HEIGHT)) / 2.;
-        let content_height = px(commit_count as f32 * COMMIT_ROW_HEIGHT);
+        let centered_top = row_top - (viewport_height - px(row_height)) / 2.;
+        let content_height = px(commit_count as f32 * row_height);
         let max_offset = (content_height - viewport_height).max(px(0.));
         let target = (-centered_top).clamp(-max_offset, px(0.));
         self.commit_history_scroll
@@ -3128,28 +3146,46 @@ impl App {
                 range
                     .map(|index| {
                         if index == 0 {
-                            app.render_pending_row(
-                                &layout.rows,
-                                layout.max_lanes,
-                                app.selection == Selection::Pending,
-                                refs_column_width,
-                                cx,
-                            )
-                            .into_any_element()
+                            match app.view_mode {
+                                GraphViewMode::Compact => app
+                                    .render_pending_row(
+                                        &layout.rows,
+                                        layout.max_lanes,
+                                        app.selection == Selection::Pending,
+                                        refs_column_width,
+                                        cx,
+                                    )
+                                    .into_any_element(),
+                                GraphViewMode::Table => app
+                                    .render_pending_row_table(
+                                        &layout,
+                                        app.selection == Selection::Pending,
+                                        cx,
+                                    )
+                                    .into_any_element(),
+                            }
                         } else {
-                            app.render_commit_row(
-                                index,
-                                visible_commits[index - 1],
-                                &layout,
-                                app.is_commit_selected(&visible_commits[index - 1].sha),
-                                RefsColumnContext {
-                                    head_branch: head_branch.as_deref(),
-                                    worktree_branches: &worktree_branches,
-                                    width: refs_column_width,
-                                },
-                                cx,
-                            )
-                            .into_any_element()
+                            let commit = visible_commits[index - 1];
+                            let selected = app.is_commit_selected(&commit.sha);
+                            match app.view_mode {
+                                GraphViewMode::Compact => app
+                                    .render_commit_row(
+                                        index,
+                                        commit,
+                                        &layout,
+                                        selected,
+                                        RefsColumnContext {
+                                            head_branch: head_branch.as_deref(),
+                                            worktree_branches: &worktree_branches,
+                                            width: refs_column_width,
+                                        },
+                                        cx,
+                                    )
+                                    .into_any_element(),
+                                GraphViewMode::Table => app
+                                    .render_commit_row_table(index, commit, &layout, selected, cx)
+                                    .into_any_element(),
+                            }
                         }
                     })
                     .collect::<Vec<_>>()
@@ -3196,6 +3232,7 @@ impl App {
             selected_indices.insert(0, 0);
         }
         let underlay_scroll = self.commit_history_scroll.clone();
+        let row_height = self.row_height();
         let selection_underlay = canvas(
             |_, _, _| {},
             move |bounds, _, window, _| {
@@ -3204,6 +3241,7 @@ impl App {
                     bounds,
                     scroll_offset.y,
                     &selected_indices,
+                    row_height,
                 ) {
                     window.paint_quad(gpui::fill(rect, palette().row_selected));
                 }
@@ -3291,6 +3329,75 @@ impl App {
     /// The graph's contextual selection bar: selection count on the left,
     /// the open-changeset affordance (with its keyboard hint) on the right.
     /// Rendered only while a selection is active.
+    /// Switch the active graph layout, mirror it to the persisted settings so
+    /// it survives restarts, and repaint. A no-op when the mode is unchanged.
+    fn set_view_mode(&mut self, mode: GraphViewMode, cx: &mut Context<Self>) {
+        if self.view_mode == mode {
+            return;
+        }
+        self.view_mode = mode;
+        self.settings.graph_view_mode = mode;
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// One segment of the view switcher. The active segment reads as a filled
+    /// accent pill; the others are muted and clickable.
+    fn view_switch_segment(
+        &self,
+        mode: GraphViewMode,
+        label: &'static str,
+        id: &'static str,
+        active_selector: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.view_mode == mode;
+        let selector = if active { active_selector } else { id };
+        div()
+            .flex()
+            .items_center()
+            .px_2()
+            .py(px(3.))
+            .rounded(px(4.))
+            .id(id)
+            .debug_selector(move || selector.to_string())
+            .when(active, |seg| {
+                seg.bg(palette().accent_bg).text_color(palette().accent)
+            })
+            .when(!active, |seg| {
+                seg.text_color(palette().text_muted)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(palette().accent_bg_hover))
+            })
+            .on_click(cx.listener(move |app, _event, _window, cx| {
+                app.set_view_mode(mode, cx);
+            }))
+            .child(label)
+    }
+
+    /// The graph layout switcher: one segment per `GraphViewMode`, docked to the
+    /// right edge of the selection bar.
+    fn render_view_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(self.view_switch_segment(
+                GraphViewMode::Compact,
+                "Compact",
+                "view-switch-compact",
+                "selected-view-switch-compact",
+                cx,
+            ))
+            .child(self.view_switch_segment(
+                GraphViewMode::Table,
+                "Table",
+                "view-switch-table",
+                "selected-view-switch-table",
+                cx,
+            ))
+    }
+
     fn render_selection_bar(
         &self,
         summary: String,
@@ -3337,6 +3444,28 @@ impl App {
                 }
             }))
             .child(div().text_color(palette().accent).child(summary))
+            // The open-changeset affordance sits immediately after the summary
+            // on the left; the layout switcher takes the bar's right edge.
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py(px(3.))
+                    .rounded(px(4.))
+                    .bg(palette().accent_bg)
+                    .text_color(palette().accent)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(palette().accent_bg_hover))
+                    .id("open-changeset")
+                    .debug_selector(|| "open-changeset".to_string())
+                    .on_click(cx.listener(|app, _event, window, cx| {
+                        app.open_changeset(window, cx);
+                    }))
+                    .child("Open changeset")
+                    .child(keycap("\u{23ce}", palette().accent, palette().accent)),
+            )
             // A pending comparison is directional; the swap control reverses
             // which endpoint the merge preview targets.
             .when(matches!(self.selection, Selection::Compare { .. }), |bar| {
@@ -3360,26 +3489,7 @@ impl App {
                 )
             })
             .child(div().flex_1())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py(px(3.))
-                    .rounded(px(4.))
-                    .bg(palette().accent_bg)
-                    .text_color(palette().accent)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(palette().accent_bg_hover))
-                    .id("open-changeset")
-                    .debug_selector(|| "open-changeset".to_string())
-                    .on_click(cx.listener(|app, _event, window, cx| {
-                        app.open_changeset(window, cx);
-                    }))
-                    .child("Open changeset")
-                    .child(keycap("\u{23ce}", palette().accent, palette().accent)),
-            )
+            .child(self.render_view_switch(cx))
     }
 
     /// Width the branch sidebar opens at: the saved width when present and
@@ -4889,6 +4999,48 @@ impl App {
             .into_any_element()
     }
 
+    /// Shared commit-row click gesture: single click selects (extending the
+    /// selection per modifiers), double click opens the changeset for the
+    /// clicked commit. Used by both the Compact and Table row builders so
+    /// neither mode can drift from the other's gesture behavior.
+    fn handle_commit_row_click(
+        &mut self,
+        sha: String,
+        event: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.click_count() >= 2 {
+            // The first click may have shifted the rows (selection bar
+            // appearing/disappearing above the graph), so this row may not
+            // be the one the gesture started on; the anchor is (see its
+            // field doc).
+            let sha = self.double_click_anchor.take().unwrap_or(sha);
+            self.selection = Selection::Single { sha };
+            self.open_changeset(window, cx);
+        } else {
+            self.double_click_anchor = Some(sha.clone());
+            self.select_commit(sha, event.modifiers(), window, cx);
+        }
+    }
+
+    /// Shared pending-row click gesture, mirroring `handle_commit_row_click`
+    /// for the synthetic pending-changes row (row 0).
+    fn handle_pending_row_click(
+        &mut self,
+        event: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.click_count() >= 2 {
+            self.double_click_anchor = None;
+            self.selection = Selection::Pending;
+            self.open_changeset(window, cx);
+        } else {
+            self.select_commit(repo::PENDING_SHA.to_string(), event.modifiers(), window, cx);
+        }
+    }
+
     fn render_commit_row(
         &self,
         index: usize,
@@ -4909,7 +5061,7 @@ impl App {
             .flex()
             .items_center()
             .w_full()
-            .h(px(COMMIT_ROW_HEIGHT))
+            .h(px(self.row_height()))
             .font_family(MONO_FONT_FAMILY)
             .gap_3()
             .px_4()
@@ -4925,21 +5077,7 @@ impl App {
             .id(("commit-row", index))
             .debug_selector(move || debug_selector.clone())
             .on_click(cx.listener(move |app, event: &ClickEvent, window, cx| {
-                if event.click_count() >= 2 {
-                    // The first click may have shifted the rows (selection
-                    // bar appearing/disappearing above the graph), so this
-                    // row may not be the one the gesture started on; the
-                    // anchor is (see its field doc).
-                    let sha = app
-                        .double_click_anchor
-                        .take()
-                        .unwrap_or_else(|| sha.clone());
-                    app.selection = Selection::Single { sha };
-                    app.open_changeset(window, cx);
-                } else {
-                    app.double_click_anchor = Some(sha.clone());
-                    app.select_commit(sha.clone(), event.modifiers(), window, cx);
-                }
+                app.handle_commit_row_click(sha.clone(), event, window, cx);
             }))
             .child(render_commit_ref_labels(
                 index,
@@ -4956,6 +5094,7 @@ impl App {
                 layout.rows.get(index + 1),
                 layout.max_lanes,
                 CommitDotStyle::Solid,
+                GutterMetrics::new(self.row_height()),
             ))
             .child(
                 div()
@@ -5033,7 +5172,7 @@ impl App {
             .flex()
             .items_center()
             .w_full()
-            .h(px(COMMIT_ROW_HEIGHT))
+            .h(px(self.row_height()))
             .font_family(MONO_FONT_FAMILY)
             .gap_3()
             .px_4()
@@ -5041,13 +5180,7 @@ impl App {
             .id("pending-row")
             .debug_selector(move || debug_selector.clone())
             .on_click(cx.listener(|app, event: &ClickEvent, window, cx| {
-                if event.click_count() >= 2 {
-                    app.double_click_anchor = None;
-                    app.selection = Selection::Pending;
-                    app.open_changeset(window, cx);
-                } else {
-                    app.select_commit(repo::PENDING_SHA.to_string(), event.modifiers(), window, cx);
-                }
+                app.handle_pending_row_click(event, window, cx);
             }))
             .child(
                 div()
@@ -5063,6 +5196,7 @@ impl App {
                 graph_rows.get(1),
                 max_graph_lanes,
                 CommitDotStyle::Hollow,
+                GutterMetrics::new(self.row_height()),
             ))
             .child(
                 div()
@@ -5083,6 +5217,218 @@ impl App {
                     .child(summary_text),
             )
     }
+
+    /// Two-line "Table" counterpart to `render_commit_row`: a 14px summary
+    /// line over a 12px metadata line (hash, author, date, and the
+    /// right-aligned ref-label pills), with the graph dot centered across
+    /// the full row height. No leading refs column — labels live on the
+    /// metadata line instead. See `render_commit_row` for the shell details
+    /// this mirrors (separator, click gesture, gutter wiring).
+    fn render_commit_row_table(
+        &self,
+        index: usize,
+        commit: &repo::CommitInfo,
+        layout: &GraphLayout,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let debug_selector = if selected {
+            format!("selected-commit-row-{index}")
+        } else {
+            format!("commit-row-{index}")
+        };
+        let sha = commit.sha.clone();
+        let head_branch = self.head_branch_name();
+        let worktree_branches = self.worktree_branch_names();
+
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(self.row_height()))
+            .font_family(MONO_FONT_FAMILY)
+            .gap_3()
+            .px_4()
+            // No background: the selection highlight paints from the list's
+            // underlay canvas (see `render_graph_screen`), and an opaque row
+            // background here would erase the graph bend overlays the row
+            // above draws across the shared border.
+            .when(commit_row_separator_width() > 0., |row| {
+                row.border_b(px(commit_row_separator_width()))
+                    .border_color(commit_row_separator_color(selected))
+            })
+            .cursor_pointer()
+            .id(("commit-row", index))
+            .debug_selector(move || debug_selector.clone())
+            .on_click(cx.listener(move |app, event: &ClickEvent, window, cx| {
+                app.handle_commit_row_click(sha.clone(), event, window, cx);
+            }))
+            .child(render_commit_graph_gutter(
+                index,
+                &layout.rows[index],
+                index.checked_sub(1).and_then(|prev| layout.rows.get(prev)),
+                layout.rows.get(index + 1),
+                layout.max_lanes,
+                CommitDotStyle::Solid,
+                GutterMetrics::new(self.row_height()),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .justify_center()
+                    .gap_1()
+                    .child(
+                        // The summary must be a flex child (flex_1 + min_w_0),
+                        // not a w_full block: inside a flex_col a percentage
+                        // width feeds the truncating text a ~0 measurement, so
+                        // it collapses to a bare ellipsis. A flex row wrapper
+                        // gives the text a flex-resolved width to truncate to.
+                        div().flex().w_full().min_w_0().child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(palette().text)
+                                .text_size(px(14.))
+                                .truncate()
+                                .debug_selector(move || format!("commit-summary-{index}"))
+                                .child(commit.summary.clone()),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .w_full()
+                            .min_w_0()
+                            .gap_3()
+                            .debug_selector(move || format!("commit-meta-{index}"))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(palette().commit_hash_fg)
+                                    .text_size(px(12.))
+                                    .font_family(MONO_FONT_FAMILY)
+                                    .debug_selector(move || format!("commit-hash-{index}"))
+                                    .child(commit.short_sha.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(palette().text_muted)
+                                    .text_size(px(12.))
+                                    .debug_selector(move || format!("commit-author-{index}"))
+                                    .child(commit.author.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(palette().text_muted)
+                                    .text_size(px(12.))
+                                    .debug_selector(move || format!("commit-time-{index}"))
+                                    .child(commit.authored_date.clone()),
+                            )
+                            .child(render_commit_ref_labels_trailing(
+                                index,
+                                commit,
+                                &self.hidden_branches,
+                                head_branch.as_deref(),
+                                &worktree_branches,
+                            )),
+                    ),
+            )
+    }
+
+    /// Two-line "Table" counterpart to `render_pending_row`: mirrors
+    /// `render_commit_row_table`'s shell (height, gap, padding, click
+    /// gesture), with "Pending changes" on the first line and the
+    /// file/line summary on the second. Its gutter dot renders hollow to
+    /// read as distinct from committed rows.
+    fn render_pending_row_table(
+        &self,
+        layout: &GraphLayout,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let debug_selector = if selected {
+            "selected-pending-row".to_string()
+        } else {
+            "pending-row".to_string()
+        };
+        let summary = self.pending_summary;
+        let summary_text = if summary.is_dirty() {
+            format!(
+                "{} file{} changed   +{} \u{2212}{}",
+                summary.file_count,
+                if summary.file_count == 1 { "" } else { "s" },
+                summary.line_stats.added,
+                summary.line_stats.removed,
+            )
+        } else {
+            "No pending changes".to_string()
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(self.row_height()))
+            .font_family(MONO_FONT_FAMILY)
+            .gap_3()
+            .px_4()
+            .cursor_pointer()
+            .id("pending-row")
+            .debug_selector(move || debug_selector.clone())
+            .on_click(cx.listener(|app, event: &ClickEvent, window, cx| {
+                app.handle_pending_row_click(event, window, cx);
+            }))
+            .child(render_commit_graph_gutter(
+                0,
+                &layout.rows[0],
+                None,
+                layout.rows.get(1),
+                layout.max_lanes,
+                CommitDotStyle::Hollow,
+                GutterMetrics::new(self.row_height()),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .justify_center()
+                    .gap_1()
+                    .child(
+                        // Same flex-child requirement as the commit summary:
+                        // a w_full block would collapse the truncating text to
+                        // a bare ellipsis inside this flex_col.
+                        div().flex().w_full().min_w_0().child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(palette().text)
+                                .text_size(px(14.))
+                                .truncate()
+                                .debug_selector(|| "pending-title".to_string())
+                                .child("Pending changes"),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .w_full()
+                            .min_w_0()
+                            .text_color(palette().text_muted)
+                            .text_size(px(12.))
+                            .debug_selector(|| "pending-summary".to_string())
+                            .child(summary_text),
+                    ),
+            )
+    }
 }
 
 /// The refs-column inputs `render_commit_row` needs, computed once per render
@@ -5094,7 +5440,11 @@ struct RefsColumnContext<'a> {
     width: f32,
 }
 
+/// Row height of the single-row Compact layout.
 const COMMIT_ROW_HEIGHT: f32 = 44.;
+/// Row height of the two-line Table layout (a 14px summary line over a 12px
+/// metadata line, with the graph dot centered across the full height).
+const COMMIT_ROW_HEIGHT_TABLE: f32 = 56.;
 const COMMIT_HASH_WIDTH: f32 = 72.;
 const COMMIT_AUTHOR_WIDTH: f32 = 168.;
 const COMMIT_TIME_WIDTH: f32 = 96.;
@@ -5111,15 +5461,16 @@ pub(crate) fn commit_history_selection_underlay_rects(
     bounds: gpui::Bounds<gpui::Pixels>,
     scroll_offset_y: gpui::Pixels,
     selected_indices: &[usize],
+    row_height: f32,
 ) -> Vec<gpui::Bounds<gpui::Pixels>> {
     let width = (bounds.size.width - px(COMMIT_HISTORY_SCROLLBAR_GUTTER)).max(px(0.));
     selected_indices
         .iter()
         .filter_map(|index| {
-            let top = bounds.origin.y + scroll_offset_y + px(*index as f32 * COMMIT_ROW_HEIGHT);
+            let top = bounds.origin.y + scroll_offset_y + px(*index as f32 * row_height);
             let row = gpui::Bounds::new(
                 point(bounds.origin.x, top),
-                gpui::size(width, px(COMMIT_ROW_HEIGHT)),
+                gpui::size(width, px(row_height)),
             );
             let clipped = row.intersect(&bounds);
             (clipped.size.height > px(0.)).then_some(clipped)
@@ -5321,7 +5672,7 @@ mod tests {
         FILE_TREE_ROW_HEIGHT, SIDEBAR_MIN_WIDTH,
     };
     use crate::repo::{ChangeKind, INITIAL_COMMIT_LIMIT};
-    use crate::settings::{RecentRepository, Settings, SidebarWidths, WindowMode};
+    use crate::settings::{GraphViewMode, RecentRepository, Settings, SidebarWidths, WindowMode};
     use crate::workspace::test_util::simulate_double_click;
     use git2::{IndexAddOption, Repository, Signature};
     use gpui::{px, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
@@ -5394,7 +5745,8 @@ mod tests {
 
         // Unscrolled, row 1 sits one row height below the list top and stops
         // short of the scrollbar gutter.
-        let rects = commit_history_selection_underlay_rects(bounds, px(0.), &[1]);
+        let rects =
+            commit_history_selection_underlay_rects(bounds, px(0.), &[1], COMMIT_ROW_HEIGHT);
         assert_eq!(rects.len(), 1);
         assert_eq!(
             rects[0].origin,
@@ -5409,22 +5761,34 @@ mod tests {
         );
 
         // Scrolling up by half a row shifts the highlight with the rows.
-        let rects =
-            commit_history_selection_underlay_rects(bounds, px(-COMMIT_ROW_HEIGHT / 2.), &[1]);
+        let rects = commit_history_selection_underlay_rects(
+            bounds,
+            px(-COMMIT_ROW_HEIGHT / 2.),
+            &[1],
+            COMMIT_ROW_HEIGHT,
+        );
         assert_eq!(
             rects[0].origin.y,
             px(50. + COMMIT_ROW_HEIGHT - COMMIT_ROW_HEIGHT / 2.)
         );
 
         // A row scrolled partly above the list clips to the list's top edge...
-        let rects =
-            commit_history_selection_underlay_rects(bounds, px(-COMMIT_ROW_HEIGHT / 2.), &[0]);
+        let rects = commit_history_selection_underlay_rects(
+            bounds,
+            px(-COMMIT_ROW_HEIGHT / 2.),
+            &[0],
+            COMMIT_ROW_HEIGHT,
+        );
         assert_eq!(rects[0].origin.y, px(50.));
         assert_eq!(rects[0].size.height, px(COMMIT_ROW_HEIGHT / 2.));
 
         // ...and rows entirely outside the list paint nothing.
-        let rects =
-            commit_history_selection_underlay_rects(bounds, px(-COMMIT_ROW_HEIGHT), &[0, 40]);
+        let rects = commit_history_selection_underlay_rects(
+            bounds,
+            px(-COMMIT_ROW_HEIGHT),
+            &[0, 40],
+            COMMIT_ROW_HEIGHT,
+        );
         assert!(rects.is_empty());
     }
 
@@ -5558,6 +5922,7 @@ mod tests {
                     changeset_files: Some(333.0),
                 },
                 ai_enabled: false,
+                graph_view_mode: GraphViewMode::default(),
             },
         )
         .expect("seed settings");

@@ -51,6 +51,35 @@ pub(crate) fn render_commit_ref_labels(
         )
 }
 
+/// Ref-label pills for the two-line "Table" layout: a right-aligned group on
+/// the row's second line that takes the width the hash/author/date group
+/// leaves and clips overflow rather than pushing into it. Distinct from the
+/// Compact layout's leading `render_commit_ref_labels` column.
+pub(crate) fn render_commit_ref_labels_trailing(
+    row_index: usize,
+    commit: &repo::CommitInfo,
+    hidden_branches: &BTreeSet<String>,
+    head_branch: Option<&str>,
+    worktree_branches: &BTreeSet<String>,
+) -> gpui::Div {
+    let labels = commit_ref_labels(commit, hidden_branches, head_branch, worktree_branches);
+    div()
+        .flex()
+        .items_center()
+        .justify_end()
+        .gap_1()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .debug_selector(move || format!("commit-ref-labels-{row_index}"))
+        .children(
+            labels
+                .into_iter()
+                .map(|label| render_commit_ref_label(row_index, label))
+                .collect::<Vec<_>>(),
+        )
+}
+
 /// The refs column's ceiling as a fraction of the history panel width. The
 /// column auto-sizes to its widest visible label row; this cap keeps long
 /// branch names from starving the commit summary on narrow panels.
@@ -367,6 +396,7 @@ pub(crate) fn render_commit_graph_gutter(
     next_row: Option<&graph::GraphRow>,
     max_lanes: usize,
     dot_style: CommitDotStyle,
+    metrics: GutterMetrics,
 ) -> impl IntoElement {
     let lane_count = max_lanes.max(1);
     let debug_selector = format!("commit-graph-gutter-{row_index}");
@@ -381,7 +411,7 @@ pub(crate) fn render_commit_graph_gutter(
         // compresses at narrow panel widths.
         .flex_shrink_0()
         .w(px(commit_graph_gutter_width(lane_count)))
-        .h(px(COMMIT_GRAPH_LANE_HEIGHT))
+        .h(px(metrics.lane_height))
         .font_family(MONO_FONT_FAMILY)
         .id(("commit-graph-gutter", row_index))
         .debug_selector(move || debug_selector.clone())
@@ -402,6 +432,7 @@ pub(crate) fn render_commit_graph_gutter(
                                 next: next_row,
                             },
                             dot_style,
+                            metrics,
                         ))
                 })
                 .collect::<Vec<_>>(),
@@ -413,14 +444,45 @@ pub(crate) fn commit_graph_gutter_width(lane_count: usize) -> f32 {
 }
 
 pub(crate) const COMMIT_GRAPH_LANE_WIDTH: f32 = 22.;
-pub(crate) const COMMIT_GRAPH_LANE_HEIGHT: f32 = COMMIT_ROW_HEIGHT;
 pub(crate) const COMMIT_GRAPH_MIDDLE_HEIGHT: f32 = 10.;
+/// The Compact layout's fixed lane height and derived vertical extent. Production
+/// geometry now flows through [`GutterMetrics`] from the active row height; these
+/// baseline consts remain only for the gutter geometry unit tests.
+#[cfg(test)]
+pub(crate) const COMMIT_GRAPH_LANE_HEIGHT: f32 = COMMIT_ROW_HEIGHT;
+#[cfg(test)]
 pub(crate) const COMMIT_GRAPH_VERTICAL_HEIGHT: f32 =
     (COMMIT_GRAPH_LANE_HEIGHT - COMMIT_GRAPH_MIDDLE_HEIGHT) / 2.;
 pub(crate) const COMMIT_GRAPH_LINE_WIDTH: f32 = 2.;
 pub(crate) const COMMIT_GRAPH_DOT_SIZE: f32 = 8.;
 pub(crate) const COMMIT_GRAPH_BEND_RADIUS: f32 = 8.;
 pub(crate) const COMMIT_GRAPH_BEND_CUBIC_CONTROL: f32 = 0.552_284_8;
+
+/// Vertical geometry of one gutter row, derived from the active layout's row
+/// height. The dot band (`COMMIT_GRAPH_MIDDLE_HEIGHT`) and every horizontal
+/// extent stay fixed; only the vertical space above and below the band scales,
+/// so all row-height-dependent gutter geometry threads through this one value.
+#[derive(Clone, Copy)]
+pub(crate) struct GutterMetrics {
+    pub lane_height: f32,
+    pub vertical_height: f32,
+}
+
+impl GutterMetrics {
+    pub(crate) fn new(lane_height: f32) -> Self {
+        Self {
+            lane_height,
+            vertical_height: (lane_height - COMMIT_GRAPH_MIDDLE_HEIGHT) / 2.,
+        }
+    }
+
+    /// The historical single-height geometry (44px Compact rows), used by the
+    /// gutter geometry unit tests to check values against the original layout.
+    #[cfg(test)]
+    pub(crate) fn compact() -> Self {
+        Self::new(COMMIT_GRAPH_LANE_HEIGHT)
+    }
+}
 
 pub(crate) fn commit_graph_line_x() -> f32 {
     (COMMIT_GRAPH_LANE_WIDTH - COMMIT_GRAPH_LINE_WIDTH) / 2.
@@ -454,12 +516,12 @@ pub(crate) fn commit_graph_line_width() -> f32 {
     COMMIT_GRAPH_LINE_WIDTH
 }
 
-pub(crate) fn commit_graph_bend_overlay_height() -> f32 {
-    COMMIT_GRAPH_LANE_HEIGHT
+pub(crate) fn commit_graph_bend_overlay_height(metrics: GutterMetrics) -> f32 {
+    metrics.lane_height
 }
 
-pub(crate) fn commit_graph_bend_overlay_top() -> f32 {
-    -COMMIT_GRAPH_VERTICAL_HEIGHT
+pub(crate) fn commit_graph_bend_overlay_top(metrics: GutterMetrics) -> f32 {
+    -metrics.vertical_height
 }
 
 pub(crate) fn commit_graph_bend_overlay_x() -> f32 {
@@ -502,18 +564,18 @@ pub(crate) fn commit_graph_merge_target_commit_bend_overlay_dot_center_x() -> f3
         + COMMIT_GRAPH_DOT_SIZE / 2.
 }
 
-pub(crate) fn commit_graph_merge_in_commit_bend_end_y() -> f32 {
-    -commit_graph_bend_overlay_top()
+pub(crate) fn commit_graph_merge_in_commit_bend_end_y(metrics: GutterMetrics) -> f32 {
+    -commit_graph_bend_overlay_top(metrics)
         + commit_graph_dot_bottom_gap_y()
         + commit_graph_line_width() / 2.
 }
 
-pub(crate) fn commit_graph_merge_in_commit_line_y() -> f32 {
-    commit_graph_merge_in_commit_bend_end_y() + commit_graph_bend_radius()
+pub(crate) fn commit_graph_merge_in_commit_line_y(metrics: GutterMetrics) -> f32 {
+    commit_graph_merge_in_commit_bend_end_y(metrics) + commit_graph_bend_radius()
 }
 
-pub(crate) fn commit_graph_merge_in_commit_line_y_in_middle() -> f32 {
-    commit_graph_merge_in_commit_line_y() - COMMIT_GRAPH_VERTICAL_HEIGHT
+pub(crate) fn commit_graph_merge_in_commit_line_y_in_middle(metrics: GutterMetrics) -> f32 {
+    commit_graph_merge_in_commit_line_y(metrics) - metrics.vertical_height
 }
 
 pub(crate) fn commit_graph_dot_gap_height() -> f32 {
@@ -556,31 +618,34 @@ pub(crate) struct CommitGraphBranchOffSourceBend {
     pub(crate) horizontal_end: Option<CommitGraphPoint>,
 }
 
-pub(crate) fn commit_graph_lower_merge_in_horizontal_top_in_middle() -> f32 {
-    commit_graph_merge_in_commit_line_y_in_middle() - commit_graph_line_width() / 2.
+pub(crate) fn commit_graph_lower_merge_in_horizontal_top_in_middle(metrics: GutterMetrics) -> f32 {
+    commit_graph_merge_in_commit_line_y_in_middle(metrics) - commit_graph_line_width() / 2.
 }
 
-pub(crate) fn commit_graph_lower_connector_vertical_shift() -> f32 {
-    COMMIT_GRAPH_LANE_HEIGHT
-        - COMMIT_GRAPH_VERTICAL_HEIGHT
-        - commit_graph_merge_in_commit_line_y_in_middle()
+pub(crate) fn commit_graph_lower_connector_vertical_shift(metrics: GutterMetrics) -> f32 {
+    metrics.lane_height
+        - metrics.vertical_height
+        - commit_graph_merge_in_commit_line_y_in_middle(metrics)
 }
 
-pub(crate) fn commit_graph_shifted_lower_merge_in_horizontal_top_in_middle() -> f32 {
-    commit_graph_lower_merge_in_horizontal_top_in_middle()
-        + commit_graph_lower_connector_vertical_shift()
+pub(crate) fn commit_graph_shifted_lower_merge_in_horizontal_top_in_middle(
+    metrics: GutterMetrics,
+) -> f32 {
+    commit_graph_lower_merge_in_horizontal_top_in_middle(metrics)
+        + commit_graph_lower_connector_vertical_shift(metrics)
 }
 
-pub(crate) fn commit_graph_shifted_bend_overlay_height() -> f32 {
-    commit_graph_bend_overlay_height() + commit_graph_lower_connector_vertical_shift()
+pub(crate) fn commit_graph_shifted_bend_overlay_height(metrics: GutterMetrics) -> f32 {
+    commit_graph_bend_overlay_height(metrics) + commit_graph_lower_connector_vertical_shift(metrics)
 }
 
 pub(crate) fn commit_graph_branch_off_source_bend_geometry(
     _spans_occupied_lanes: bool,
+    metrics: GutterMetrics,
 ) -> CommitGraphBranchOffSourceBend {
     let lane_offset_x = commit_graph_bend_overlay_lane_offset_x();
     let center_x = lane_offset_x + commit_graph_line_x() + commit_graph_line_width() / 2.;
-    let lower_line_y = commit_graph_merge_in_commit_line_y();
+    let lower_line_y = commit_graph_merge_in_commit_line_y(metrics);
     let radius = commit_graph_bend_radius();
     let curve_end_x = center_x + radius;
     let horizontal_control = radius * COMMIT_GRAPH_BEND_CUBIC_CONTROL;
@@ -613,12 +678,14 @@ pub(crate) fn commit_graph_branch_off_source_bend_geometry(
     }
 }
 
-pub(crate) fn commit_graph_merge_in_commit_bend_geometry() -> CommitGraphCubicBend {
+pub(crate) fn commit_graph_merge_in_commit_bend_geometry(
+    metrics: GutterMetrics,
+) -> CommitGraphCubicBend {
     let end_x = commit_graph_commit_bend_overlay_dot_center_x();
-    let end_y = commit_graph_merge_in_commit_bend_end_y();
+    let end_y = commit_graph_merge_in_commit_bend_end_y(metrics);
     let radius = commit_graph_bend_radius();
     let start_x = end_x - radius;
-    let lower_line_y = commit_graph_merge_in_commit_line_y();
+    let lower_line_y = commit_graph_merge_in_commit_line_y(metrics);
     let horizontal_control = radius * COMMIT_GRAPH_BEND_CUBIC_CONTROL;
     let vertical_control = radius * COMMIT_GRAPH_BEND_CUBIC_CONTROL;
 
@@ -639,12 +706,14 @@ pub(crate) fn commit_graph_merge_in_commit_bend_geometry() -> CommitGraphCubicBe
     }
 }
 
-pub(crate) fn commit_graph_merge_target_commit_bend_geometry() -> CommitGraphCubicBend {
+pub(crate) fn commit_graph_merge_target_commit_bend_geometry(
+    metrics: GutterMetrics,
+) -> CommitGraphCubicBend {
     let end_x = commit_graph_merge_target_commit_bend_overlay_dot_center_x();
-    let end_y = commit_graph_merge_in_commit_bend_end_y();
+    let end_y = commit_graph_merge_in_commit_bend_end_y(metrics);
     let radius = commit_graph_bend_radius();
     let start_x = end_x + radius;
-    let lower_line_y = commit_graph_merge_in_commit_line_y();
+    let lower_line_y = commit_graph_merge_in_commit_line_y(metrics);
     let horizontal_control = radius * COMMIT_GRAPH_BEND_CUBIC_CONTROL;
     let vertical_control = radius * COMMIT_GRAPH_BEND_CUBIC_CONTROL;
 
@@ -665,23 +734,27 @@ pub(crate) fn commit_graph_merge_target_commit_bend_geometry() -> CommitGraphCub
     }
 }
 
-pub(crate) fn commit_graph_merge_in_commit_dot_connector_geometry() -> CommitGraphRect {
-    let bend = commit_graph_merge_in_commit_bend_geometry();
+pub(crate) fn commit_graph_merge_in_commit_dot_connector_geometry(
+    metrics: GutterMetrics,
+) -> CommitGraphRect {
+    let bend = commit_graph_merge_in_commit_bend_geometry(metrics);
     let width = commit_graph_line_width();
     CommitGraphRect {
         x: bend.end.x - width / 2.,
-        y: -commit_graph_bend_overlay_top() + commit_graph_dot_bottom_gap_y(),
+        y: -commit_graph_bend_overlay_top(metrics) + commit_graph_dot_bottom_gap_y(),
         width,
         height: width,
     }
 }
 
-pub(crate) fn commit_graph_shifted_merge_in_commit_dot_connector_geometry() -> CommitGraphRect {
-    let bend = commit_graph_merge_in_commit_bend_geometry();
-    let connector = commit_graph_merge_in_commit_dot_connector_geometry();
+pub(crate) fn commit_graph_shifted_merge_in_commit_dot_connector_geometry(
+    metrics: GutterMetrics,
+) -> CommitGraphRect {
+    let bend = commit_graph_merge_in_commit_bend_geometry(metrics);
+    let connector = commit_graph_merge_in_commit_dot_connector_geometry(metrics);
 
     CommitGraphRect {
-        height: bend.end.y + commit_graph_lower_connector_vertical_shift() - connector.y
+        height: bend.end.y + commit_graph_lower_connector_vertical_shift(metrics) - connector.y
             + commit_graph_line_width() / 2.,
         ..connector
     }
@@ -699,6 +772,7 @@ pub(crate) fn render_commit_graph_lane(
     row: &graph::GraphRow,
     neighbors: CommitGraphNeighborRows<'_>,
     dot_style: CommitDotStyle,
+    metrics: GutterMetrics,
 ) -> gpui::Div {
     let has_incoming = row.incoming_lanes.contains(&lane);
     let has_outgoing = row.outgoing_lanes.contains(&lane);
@@ -720,22 +794,23 @@ pub(crate) fn render_commit_graph_lane(
         .items_center()
         .justify_center()
         .w(px(COMMIT_GRAPH_LANE_WIDTH))
-        .h(px(COMMIT_GRAPH_LANE_HEIGHT))
+        .h(px(metrics.lane_height))
         .debug_selector(move || lane_selector.clone())
         .when_some(upper_merge_target_elbow, |lane_div, connector| {
             lane_div.child(
                 div()
                     .absolute()
                     .left_0()
-                    .top(px(COMMIT_GRAPH_VERTICAL_HEIGHT))
+                    .top(px(metrics.vertical_height))
                     .w(px(COMMIT_GRAPH_LANE_WIDTH))
                     .h(px(commit_graph_middle_height()))
                     .child(render_commit_graph_rounded_elbow(
                         format!("commit-graph-rounded-upper-merge-target-elbow-{row_index}-{lane}"),
                         graph::GraphConnectorKind::MergeIn,
                         false,
-                        commit_graph_upper_merge_in_horizontal_top_in_middle(),
+                        commit_graph_upper_merge_in_horizontal_top_in_middle(metrics),
                         commit_graph_connector_color(row, connector),
+                        metrics,
                     )),
             )
         })
@@ -745,11 +820,14 @@ pub(crate) fn render_commit_graph_lane(
             row,
             neighbors,
             "top",
-            has_incoming,
-            lane_color,
+            CommitGraphSegmentStyle {
+                visible: has_incoming,
+                color: lane_color,
+            },
+            metrics,
         ))
         .child(render_commit_graph_middle_segment(
-            row_index, lane, row, lane_color, dot_style,
+            row_index, lane, row, lane_color, dot_style, metrics,
         ))
         .child(render_commit_graph_vertical_segment(
             row_index,
@@ -757,8 +835,11 @@ pub(crate) fn render_commit_graph_lane(
             row,
             neighbors,
             "bottom",
-            has_outgoing,
-            lane_color,
+            CommitGraphSegmentStyle {
+                visible: has_outgoing,
+                color: lane_color,
+            },
+            metrics,
         ))
 }
 
@@ -773,31 +854,41 @@ pub(crate) fn commit_graph_lane_color(row: &graph::GraphRow, lane: usize) -> gpu
         .into()
 }
 
+/// How a gutter vertical segment paints: whether it is drawn, and its lane color.
+#[derive(Clone, Copy)]
+pub(crate) struct CommitGraphSegmentStyle {
+    pub visible: bool,
+    pub color: gpui::Rgba,
+}
+
 pub(crate) fn render_commit_graph_vertical_segment(
     row_index: usize,
     lane: usize,
     row: &graph::GraphRow,
     neighbors: CommitGraphNeighborRows<'_>,
     position: &'static str,
-    visible: bool,
-    color: gpui::Rgba,
+    style: CommitGraphSegmentStyle,
+    metrics: GutterMetrics,
 ) -> gpui::Div {
     let selector = format!("commit-graph-vertical-{row_index}-{lane}-{position}");
-    let (top, height) = commit_graph_vertical_segment_geometry(row, neighbors, lane, position);
+    let (top, height) =
+        commit_graph_vertical_segment_geometry(row, neighbors, lane, position, metrics);
     let segment = div()
         .absolute()
         .left(px(commit_graph_line_x()))
         .top(px(top))
         .w(px(COMMIT_GRAPH_LINE_WIDTH))
         .h(px(height))
-        .when(visible, |segment| {
-            segment.bg(color).debug_selector(move || selector.clone())
+        .when(style.visible, |segment| {
+            segment
+                .bg(style.color)
+                .debug_selector(move || selector.clone())
         });
 
     div()
         .relative()
         .w(px(COMMIT_GRAPH_LANE_WIDTH))
-        .h(px(COMMIT_GRAPH_VERTICAL_HEIGHT))
+        .h(px(metrics.vertical_height))
         .child(segment)
 }
 
@@ -806,47 +897,51 @@ pub(crate) fn commit_graph_vertical_segment_geometry(
     neighbors: CommitGraphNeighborRows<'_>,
     lane: usize,
     position: &'static str,
+    metrics: GutterMetrics,
 ) -> (f32, f32) {
+    let vertical_height = metrics.vertical_height;
     if position == "top" {
         if let Some(top) = commit_graph_top_vertical_inset_after_previous_row_branch_out(
             row,
             neighbors.previous,
             lane,
         ) {
-            return (top, COMMIT_GRAPH_VERTICAL_HEIGHT - top);
+            return (top, vertical_height - top);
         }
     }
 
     if position == "bottom" {
-        if let Some(height) =
-            commit_graph_bottom_vertical_inset_before_next_row_merge_in(neighbors.next, lane)
-        {
+        if let Some(height) = commit_graph_bottom_vertical_inset_before_next_row_merge_in(
+            neighbors.next,
+            lane,
+            metrics,
+        ) {
             return (0., height);
         }
     }
 
     if commit_graph_rounded_elbow_preserves_target_vertical(row, lane) {
-        return (0., COMMIT_GRAPH_VERTICAL_HEIGHT);
+        return (0., vertical_height);
     }
 
-    let Some(tangent_y) = commit_graph_rounded_elbow_tangent_y(row, lane) else {
-        return (0., COMMIT_GRAPH_VERTICAL_HEIGHT);
+    let Some(tangent_y) = commit_graph_rounded_elbow_tangent_y(row, lane, metrics) else {
+        return (0., vertical_height);
     };
 
-    let middle_top = COMMIT_GRAPH_VERTICAL_HEIGHT;
-    let middle_bottom = COMMIT_GRAPH_VERTICAL_HEIGHT + commit_graph_middle_height();
+    let middle_top = vertical_height;
+    let middle_bottom = vertical_height + commit_graph_middle_height();
 
     match position {
         "top" if tangent_y < middle_top => (
             0.,
-            (tangent_y + commit_graph_line_width()).clamp(0., COMMIT_GRAPH_VERTICAL_HEIGHT),
+            (tangent_y + commit_graph_line_width()).clamp(0., vertical_height),
         ),
         "bottom" if tangent_y > middle_bottom => {
-            let top = (tangent_y - middle_bottom - commit_graph_line_width())
-                .clamp(0., COMMIT_GRAPH_VERTICAL_HEIGHT);
-            (top, COMMIT_GRAPH_VERTICAL_HEIGHT - top)
+            let top =
+                (tangent_y - middle_bottom - commit_graph_line_width()).clamp(0., vertical_height);
+            (top, vertical_height - top)
         }
-        _ => (0., COMMIT_GRAPH_VERTICAL_HEIGHT),
+        _ => (0., vertical_height),
     }
 }
 
@@ -877,14 +972,13 @@ pub(crate) fn commit_graph_top_vertical_inset_after_previous_row_branch_out(
 pub(crate) fn commit_graph_bottom_vertical_inset_before_next_row_merge_in(
     next_row: Option<&graph::GraphRow>,
     lane: usize,
+    metrics: GutterMetrics,
 ) -> Option<f32> {
     let next_row = next_row?;
     commit_graph_upper_merge_in_connectors(next_row)
         .iter()
         .any(|connector| connector.from_lane == lane)
-        .then(|| {
-            COMMIT_GRAPH_VERTICAL_HEIGHT - commit_graph_bend_radius() + commit_graph_line_width()
-        })
+        .then(|| metrics.vertical_height - commit_graph_bend_radius() + commit_graph_line_width())
 }
 
 /// Merge connectors that terminate at this row's commit while the commit lane
@@ -918,8 +1012,8 @@ pub(crate) fn commit_graph_uses_upper_merge_in_line(row: &graph::GraphRow, lane:
     commit_graph_connector_uses_upper_merge_in_line(row, connector)
 }
 
-pub(crate) fn commit_graph_upper_merge_in_horizontal_top_in_middle() -> f32 {
-    -(COMMIT_GRAPH_VERTICAL_HEIGHT + commit_graph_line_width() / 2.)
+pub(crate) fn commit_graph_upper_merge_in_horizontal_top_in_middle(metrics: GutterMetrics) -> f32 {
+    -(metrics.vertical_height + commit_graph_line_width() / 2.)
 }
 
 pub(crate) fn commit_graph_rounded_elbow_preserves_target_vertical(
@@ -936,7 +1030,9 @@ pub(crate) fn commit_graph_rounded_elbow_preserves_target_vertical(
 pub(crate) fn commit_graph_rounded_elbow_tangent_y(
     row: &graph::GraphRow,
     lane: usize,
+    metrics: GutterMetrics,
 ) -> Option<f32> {
+    let vertical_height = metrics.vertical_height;
     let Some(connector) = commit_graph_target_connector_for_lane(row, lane) else {
         // A branch lane merging along the upper border leaves this row
         // entirely: its curve sits above the row, so no vertical remains.
@@ -945,8 +1041,8 @@ pub(crate) fn commit_graph_rounded_elbow_tangent_y(
             return None;
         }
 
-        let middle_center_y = COMMIT_GRAPH_VERTICAL_HEIGHT
-            + commit_graph_upper_merge_in_horizontal_top_in_middle()
+        let middle_center_y = vertical_height
+            + commit_graph_upper_merge_in_horizontal_top_in_middle(metrics)
             + commit_graph_line_width() / 2.;
         return Some(middle_center_y - commit_graph_bend_radius());
     };
@@ -957,11 +1053,11 @@ pub(crate) fn commit_graph_rounded_elbow_tangent_y(
     }
 
     let middle_center_y = if commit_graph_uses_lower_branch_out_line(row, lane) {
-        COMMIT_GRAPH_VERTICAL_HEIGHT
-            + commit_graph_merge_in_commit_line_y_in_middle()
-            + commit_graph_lower_connector_vertical_shift()
+        vertical_height
+            + commit_graph_merge_in_commit_line_y_in_middle(metrics)
+            + commit_graph_lower_connector_vertical_shift(metrics)
     } else {
-        COMMIT_GRAPH_VERTICAL_HEIGHT + commit_graph_middle_line_y() + commit_graph_line_width() / 2.
+        vertical_height + commit_graph_middle_line_y() + commit_graph_line_width() / 2.
     };
 
     Some(if commit_graph_rounded_elbow_turns_up(row, lane) {
@@ -977,6 +1073,7 @@ pub(crate) fn render_commit_graph_middle_segment(
     row: &graph::GraphRow,
     color: gpui::Rgba,
     dot_style: CommitDotStyle,
+    metrics: GutterMetrics,
 ) -> gpui::Div {
     let is_commit = lane == row.lane;
     let has_connector = row.connector_lanes.contains(&lane);
@@ -1002,6 +1099,7 @@ pub(crate) fn render_commit_graph_middle_segment(
                 lane,
                 row,
                 non_commit_connector_selector.clone(),
+                metrics,
             ))
         })
         .when(
@@ -1117,6 +1215,7 @@ pub(crate) fn render_commit_graph_middle_segment(
                         commit.child(render_commit_graph_rounded_merge_in_commit_bend(
                             selector,
                             left_connector_color,
+                            metrics,
                         ))
                     })
                     .when_some(rounded_right_connector, |commit, connector| {
@@ -1141,6 +1240,7 @@ pub(crate) fn render_commit_graph_middle_segment(
                         commit.child(render_commit_graph_rounded_merge_target_commit_bend(
                             selector,
                             commit_graph_connector_color(row, connector),
+                            metrics,
                         ))
                     })
                     .child({
@@ -1351,14 +1451,16 @@ pub(crate) fn render_commit_graph_rounded_elbow(
     turns_up: bool,
     horizontal_top_y: f32,
     connector_color: gpui::Rgba,
+    metrics: GutterMetrics,
 ) -> gpui::Div {
-    let overlay_height = commit_graph_bend_overlay_height()
-        + (horizontal_top_y - commit_graph_lower_merge_in_horizontal_top_in_middle()).max(0.);
+    let overlay_height = commit_graph_bend_overlay_height(metrics)
+        + (horizontal_top_y - commit_graph_lower_merge_in_horizontal_top_in_middle(metrics))
+            .max(0.);
 
     div()
         .absolute()
         .left(px(commit_graph_bend_overlay_x()))
-        .top(px(commit_graph_bend_overlay_top()))
+        .top(px(commit_graph_bend_overlay_top(metrics)))
         .w(px(commit_graph_bend_overlay_width()))
         .h(px(overlay_height))
         .debug_selector(move || selector.clone())
@@ -1371,7 +1473,7 @@ pub(crate) fn render_commit_graph_rounded_elbow(
                     let center_x = bounds.origin.x
                         + px(lane_offset_x + commit_graph_line_x() + line_width / 2.);
                     let center_y = bounds.origin.y
-                        + px(COMMIT_GRAPH_VERTICAL_HEIGHT + horizontal_top_y + line_width / 2.);
+                        + px(metrics.vertical_height + horizontal_top_y + line_width / 2.);
                     let left_x = bounds.origin.x;
                     let right_x = bounds.origin.x + px(commit_graph_bend_overlay_width());
                     let radius = px(commit_graph_bend_radius());
@@ -1435,20 +1537,24 @@ pub(crate) fn render_commit_graph_rounded_branch_off_source_bend(
     connector_color: gpui::Rgba,
     spans_occupied_lanes: bool,
     vertical_offset: f32,
+    metrics: GutterMetrics,
 ) -> gpui::Div {
     div()
         .absolute()
         .left(px(commit_graph_bend_overlay_x()))
-        .top(px(commit_graph_bend_overlay_top()))
+        .top(px(commit_graph_bend_overlay_top(metrics)))
         .w(px(commit_graph_bend_overlay_width()))
-        .h(px(commit_graph_bend_overlay_height() + vertical_offset))
+        .h(px(
+            commit_graph_bend_overlay_height(metrics) + vertical_offset
+        ))
         .debug_selector(move || selector.clone())
         .child(
             canvas(
                 |_, _, _| {},
                 move |bounds, _, window, _| {
                     let line_width = commit_graph_line_width();
-                    let bend = commit_graph_branch_off_source_bend_geometry(spans_occupied_lanes);
+                    let bend =
+                        commit_graph_branch_off_source_bend_geometry(spans_occupied_lanes, metrics);
 
                     let mut connector = PathBuilder::stroke(px(line_width));
                     connector.move_to(point(
@@ -1485,30 +1591,31 @@ pub(crate) fn render_commit_graph_rounded_branch_off_source_bend(
             .left_0()
             .top(px(vertical_offset))
             .w(px(commit_graph_bend_overlay_width()))
-            .h(px(commit_graph_bend_overlay_height())),
+            .h(px(commit_graph_bend_overlay_height(metrics))),
         )
 }
 
 pub(crate) fn render_commit_graph_rounded_merge_in_commit_bend(
     selector: String,
     connector_color: gpui::Rgba,
+    metrics: GutterMetrics,
 ) -> gpui::Div {
     let dot_connector_selector = format!("{selector}-dot-connector");
-    let vertical_offset = commit_graph_lower_connector_vertical_shift();
+    let vertical_offset = commit_graph_lower_connector_vertical_shift(metrics);
 
     div()
         .absolute()
         .left(px(commit_graph_commit_bend_overlay_x()))
-        .top(px(commit_graph_bend_overlay_top()))
+        .top(px(commit_graph_bend_overlay_top(metrics)))
         .w(px(commit_graph_commit_bend_overlay_width()))
-        .h(px(commit_graph_shifted_bend_overlay_height()))
+        .h(px(commit_graph_shifted_bend_overlay_height(metrics)))
         .debug_selector(move || selector.clone())
         .child(
             canvas(
                 |_, _, _| {},
                 move |bounds, _, window, _| {
                     let line_width = commit_graph_line_width();
-                    let bend = commit_graph_merge_in_commit_bend_geometry();
+                    let bend = commit_graph_merge_in_commit_bend_geometry(metrics);
                     let horizontal_start_x = -commit_graph_commit_bend_overlay_x();
 
                     let mut connector = PathBuilder::stroke(px(line_width));
@@ -1544,10 +1651,10 @@ pub(crate) fn render_commit_graph_rounded_merge_in_commit_bend(
             .left_0()
             .top(px(vertical_offset))
             .w(px(commit_graph_commit_bend_overlay_width()))
-            .h(px(commit_graph_bend_overlay_height())),
+            .h(px(commit_graph_bend_overlay_height(metrics))),
         )
         .child({
-            let connector = commit_graph_shifted_merge_in_commit_dot_connector_geometry();
+            let connector = commit_graph_shifted_merge_in_commit_dot_connector_geometry(metrics);
             div()
                 .absolute()
                 .left(px(connector.x))
@@ -1562,22 +1669,23 @@ pub(crate) fn render_commit_graph_rounded_merge_in_commit_bend(
 pub(crate) fn render_commit_graph_rounded_merge_target_commit_bend(
     selector: String,
     connector_color: gpui::Rgba,
+    metrics: GutterMetrics,
 ) -> gpui::Div {
-    let vertical_offset = commit_graph_lower_connector_vertical_shift();
+    let vertical_offset = commit_graph_lower_connector_vertical_shift(metrics);
 
     div()
         .absolute()
         .left(px(commit_graph_merge_target_commit_bend_overlay_x()))
-        .top(px(commit_graph_bend_overlay_top()))
+        .top(px(commit_graph_bend_overlay_top(metrics)))
         .w(px(commit_graph_merge_target_commit_bend_overlay_width()))
-        .h(px(commit_graph_shifted_bend_overlay_height()))
+        .h(px(commit_graph_shifted_bend_overlay_height(metrics)))
         .debug_selector(move || selector.clone())
         .child(
             canvas(
                 |_, _, _| {},
                 move |bounds, _, window, _| {
                     let line_width = commit_graph_line_width();
-                    let bend = commit_graph_merge_target_commit_bend_geometry();
+                    let bend = commit_graph_merge_target_commit_bend_geometry(metrics);
                     let horizontal_start_x = commit_graph_merge_target_commit_bend_overlay_width();
 
                     let mut connector = PathBuilder::stroke(px(line_width));
@@ -1613,7 +1721,7 @@ pub(crate) fn render_commit_graph_rounded_merge_target_commit_bend(
             .left_0()
             .top(px(vertical_offset))
             .w(px(commit_graph_merge_target_commit_bend_overlay_width()))
-            .h(px(commit_graph_bend_overlay_height())),
+            .h(px(commit_graph_bend_overlay_height(metrics))),
         )
 }
 
@@ -1622,6 +1730,7 @@ pub(crate) fn render_commit_graph_non_commit_connector(
     lane: usize,
     row: &graph::GraphRow,
     connector_selector: String,
+    metrics: GutterMetrics,
 ) -> gpui::Div {
     let target_connector = commit_graph_target_connector_for_lane(row, lane);
     let source_connector = commit_graph_source_connector_for_lane(row, lane);
@@ -1725,9 +1834,9 @@ pub(crate) fn render_commit_graph_non_commit_connector(
         || lower_merge_in_source_bend.is_some();
     let has_rounded_elbow = left_horizontal_is_rounded || right_horizontal_is_rounded;
     let horizontal_top_y = if uses_upper_merge_in_line {
-        commit_graph_upper_merge_in_horizontal_top_in_middle()
+        commit_graph_upper_merge_in_horizontal_top_in_middle(metrics)
     } else if uses_lower_merge_in_line || uses_lower_branch_out_line {
-        commit_graph_shifted_lower_merge_in_horizontal_top_in_middle()
+        commit_graph_shifted_lower_merge_in_horizontal_top_in_middle(metrics)
     } else {
         commit_graph_middle_line_y()
     };
@@ -1761,11 +1870,11 @@ pub(crate) fn render_commit_graph_non_commit_connector(
             return None;
         }
 
-        let tangent_y = commit_graph_rounded_elbow_tangent_y(row, lane)?;
-        (tangent_y > COMMIT_GRAPH_VERTICAL_HEIGHT).then(|| {
+        let tangent_y = commit_graph_rounded_elbow_tangent_y(row, lane, metrics)?;
+        (tangent_y > metrics.vertical_height).then(|| {
             (
                 format!("commit-graph-rounded-branch-out-vertical-bridge-{row_index}-{lane}"),
-                tangent_y - COMMIT_GRAPH_VERTICAL_HEIGHT + commit_graph_line_width(),
+                tangent_y - metrics.vertical_height + commit_graph_line_width(),
             )
         })
     });
@@ -1864,7 +1973,7 @@ pub(crate) fn render_commit_graph_non_commit_connector(
                 .absolute()
                 .left(px(0.))
                 .top(px(
-                    commit_graph_shifted_lower_merge_in_horizontal_top_in_middle(),
+                    commit_graph_shifted_lower_merge_in_horizontal_top_in_middle(metrics),
                 ))
                 .w(px(COMMIT_GRAPH_LANE_WIDTH))
                 .h(px(COMMIT_GRAPH_LINE_WIDTH))
@@ -1934,7 +2043,8 @@ pub(crate) fn render_commit_graph_non_commit_connector(
                 source_bend_selector,
                 color,
                 source_bend_spans_occupied_lanes,
-                commit_graph_lower_connector_vertical_shift(),
+                commit_graph_lower_connector_vertical_shift(metrics),
+                metrics,
             ));
     }
 
@@ -1945,6 +2055,7 @@ pub(crate) fn render_commit_graph_non_commit_connector(
             has_incoming && !has_outgoing,
             horizontal_top_y,
             color,
+            metrics,
         ));
     }
 
@@ -1957,6 +2068,7 @@ pub(crate) fn render_commit_graph_non_commit_connector(
                 .unwrap_or(false),
             horizontal_top_y,
             color,
+            metrics,
         ));
     }
 
@@ -1976,7 +2088,7 @@ mod tests {
     use crate::app::test_support::*;
     use crate::graph::{self, GraphConnectorKind};
     use crate::repo::{self, INITIAL_COMMIT_LIMIT};
-    use gpui::{px, TestAppContext, VisualTestContext};
+    use gpui::{px, size, TestAppContext, VisualTestContext};
 
     #[test]
     fn hiding_a_remote_branch_leaves_a_same_named_local_branch_visible() {
@@ -2584,10 +2696,11 @@ mod tests {
 
     #[test]
     fn commit_graph_bend_radius_is_large_enough_for_smooth_elbows() {
+        let metrics = super::GutterMetrics::compact();
         let bend_radius = super::commit_graph_bend_radius();
         let middle_height = super::commit_graph_middle_height();
-        let overlay_height = super::commit_graph_bend_overlay_height();
-        let overlay_top = super::commit_graph_bend_overlay_top();
+        let overlay_height = super::commit_graph_bend_overlay_height(metrics);
+        let overlay_top = super::commit_graph_bend_overlay_top(metrics);
         let line_width = super::commit_graph_line_width();
 
         assert_eq!(bend_radius, 8.);
@@ -2609,8 +2722,9 @@ mod tests {
         // and is a full row tall, so it overlaps the adjacent row where the
         // gutter is now folded into each virtualized commit row. This guards
         // the cross-row continuity that the removed overlay test used to cover.
-        let overlay_top = super::commit_graph_bend_overlay_top();
-        let overlay_height = super::commit_graph_bend_overlay_height();
+        let metrics = super::GutterMetrics::compact();
+        let overlay_top = super::commit_graph_bend_overlay_top(metrics);
+        let overlay_height = super::commit_graph_bend_overlay_height(metrics);
 
         assert!(
             overlay_top < 0.,
@@ -2625,7 +2739,8 @@ mod tests {
 
     #[test]
     fn commit_side_branch_bend_turns_from_horizontal_into_vertical() {
-        let bend = super::commit_graph_merge_in_commit_bend_geometry();
+        let bend =
+            super::commit_graph_merge_in_commit_bend_geometry(super::GutterMetrics::compact());
 
         assert!(
             bend.first_control.x > bend.start.x,
@@ -2647,13 +2762,15 @@ mod tests {
 
     #[test]
     fn commit_side_branch_bend_keeps_original_shape_before_row_boundary_shift() {
-        let bend = super::commit_graph_merge_in_commit_bend_geometry();
+        let bend =
+            super::commit_graph_merge_in_commit_bend_geometry(super::GutterMetrics::compact());
         let radius = super::commit_graph_bend_radius();
         let control = radius * super::COMMIT_GRAPH_BEND_CUBIC_CONTROL;
         let bend_end_x_in_commit = super::commit_graph_commit_bend_overlay_x() + bend.end.x;
         let dot_center_x =
             super::commit_graph_dot_side_line_width() + super::COMMIT_GRAPH_DOT_SIZE / 2.;
-        let bend_end_y_in_middle = super::commit_graph_bend_overlay_top() + bend.end.y;
+        let bend_end_y_in_middle =
+            super::commit_graph_bend_overlay_top(super::GutterMetrics::compact()) + bend.end.y;
         let dot_bottom_y = super::commit_graph_dot_bottom_gap_y();
 
         assert_eq!(
@@ -2689,10 +2806,13 @@ mod tests {
 
     #[test]
     fn commit_side_branch_dot_connector_bridges_bend_endpoint() {
-        let bend = super::commit_graph_merge_in_commit_bend_geometry();
-        let connector = super::commit_graph_merge_in_commit_dot_connector_geometry();
-        let dot_bottom_y =
-            -super::commit_graph_bend_overlay_top() + super::commit_graph_dot_bottom_gap_y();
+        let bend =
+            super::commit_graph_merge_in_commit_bend_geometry(super::GutterMetrics::compact());
+        let connector = super::commit_graph_merge_in_commit_dot_connector_geometry(
+            super::GutterMetrics::compact(),
+        );
+        let dot_bottom_y = -super::commit_graph_bend_overlay_top(super::GutterMetrics::compact())
+            + super::commit_graph_dot_bottom_gap_y();
 
         assert_eq!(
             connector.x + connector.width / 2.,
@@ -2716,11 +2836,16 @@ mod tests {
 
     #[test]
     fn shifted_commit_side_branch_dot_connector_bridges_translated_bend_endpoint() {
-        let bend = super::commit_graph_merge_in_commit_bend_geometry();
-        let connector = super::commit_graph_shifted_merge_in_commit_dot_connector_geometry();
-        let original_connector = super::commit_graph_merge_in_commit_dot_connector_geometry();
-        let shifted_bend_endpoint_y =
-            bend.end.y + super::commit_graph_lower_connector_vertical_shift();
+        let bend =
+            super::commit_graph_merge_in_commit_bend_geometry(super::GutterMetrics::compact());
+        let connector = super::commit_graph_shifted_merge_in_commit_dot_connector_geometry(
+            super::GutterMetrics::compact(),
+        );
+        let original_connector = super::commit_graph_merge_in_commit_dot_connector_geometry(
+            super::GutterMetrics::compact(),
+        );
+        let shifted_bend_endpoint_y = bend.end.y
+            + super::commit_graph_lower_connector_vertical_shift(super::GutterMetrics::compact());
 
         assert_eq!(
             connector.y, original_connector.y,
@@ -2728,7 +2853,10 @@ mod tests {
         );
         assert_eq!(
             connector.height,
-            original_connector.height + super::commit_graph_lower_connector_vertical_shift(),
+            original_connector.height
+                + super::commit_graph_lower_connector_vertical_shift(
+                    super::GutterMetrics::compact()
+                ),
             "dot-side filler should lengthen by the same amount as the bend moved",
         );
         assert!(
@@ -2740,7 +2868,8 @@ mod tests {
 
     #[test]
     fn commit_side_merge_target_bend_turns_from_horizontal_into_vertical() {
-        let bend = super::commit_graph_merge_target_commit_bend_geometry();
+        let bend =
+            super::commit_graph_merge_target_commit_bend_geometry(super::GutterMetrics::compact());
 
         assert!(
             bend.first_control.x < bend.start.x,
@@ -2762,14 +2891,16 @@ mod tests {
 
     #[test]
     fn commit_side_merge_target_bend_keeps_original_shape_before_row_boundary_shift() {
-        let bend = super::commit_graph_merge_target_commit_bend_geometry();
+        let bend =
+            super::commit_graph_merge_target_commit_bend_geometry(super::GutterMetrics::compact());
         let radius = super::commit_graph_bend_radius();
         let control = radius * super::COMMIT_GRAPH_BEND_CUBIC_CONTROL;
         let bend_end_x_in_commit =
             super::commit_graph_merge_target_commit_bend_overlay_x() + bend.end.x;
         let dot_center_x =
             super::commit_graph_dot_side_line_width() + super::COMMIT_GRAPH_DOT_SIZE / 2.;
-        let bend_end_y_in_middle = super::commit_graph_bend_overlay_top() + bend.end.y;
+        let bend_end_y_in_middle =
+            super::commit_graph_bend_overlay_top(super::GutterMetrics::compact()) + bend.end.y;
         let dot_bottom_y = super::commit_graph_dot_bottom_gap_y();
 
         assert_eq!(
@@ -2805,13 +2936,19 @@ mod tests {
 
     #[test]
     fn branch_off_horizontal_component_uses_tangent_bounds_and_baseline() {
-        let adjacent = super::commit_graph_branch_off_source_bend_geometry(false);
+        let adjacent = super::commit_graph_branch_off_source_bend_geometry(
+            false,
+            super::GutterMetrics::compact(),
+        );
         assert!(
             adjacent.horizontal_end.is_some(),
             "adjacent branch-off bends need a short horizontal component between circular bends",
         );
 
-        let spanning = super::commit_graph_branch_off_source_bend_geometry(true);
+        let spanning = super::commit_graph_branch_off_source_bend_geometry(
+            true,
+            super::GutterMetrics::compact(),
+        );
         let horizontal_end = spanning
             .horizontal_end
             .expect("spanning branch-off should draw component 2");
@@ -2824,9 +2961,10 @@ mod tests {
             "component 2 should begin after component 1 reaches its tangent",
         );
         assert_eq!(
-            super::commit_graph_lower_merge_in_horizontal_top_in_middle()
-                + super::commit_graph_line_width() / 2.,
-            super::commit_graph_merge_in_commit_line_y_in_middle(),
+            super::commit_graph_lower_merge_in_horizontal_top_in_middle(
+                super::GutterMetrics::compact()
+            ) + super::commit_graph_line_width() / 2.,
+            super::commit_graph_merge_in_commit_line_y_in_middle(super::GutterMetrics::compact()),
             "component 2 filled segments should be centered on the bend baseline",
         );
     }
@@ -2837,8 +2975,9 @@ mod tests {
             super::COMMIT_GRAPH_LANE_HEIGHT - super::COMMIT_GRAPH_VERTICAL_HEIGHT;
 
         assert_eq!(
-            super::commit_graph_shifted_lower_merge_in_horizontal_top_in_middle()
-                + super::commit_graph_line_width() / 2.,
+            super::commit_graph_shifted_lower_merge_in_horizontal_top_in_middle(
+                super::GutterMetrics::compact()
+            ) + super::commit_graph_line_width() / 2.,
             row_boundary_center_y_in_middle,
             "horizontal lane-change strokes should be centered on the border between graph rows",
         );
@@ -2846,8 +2985,12 @@ mod tests {
 
     #[test]
     fn adjacent_branch_off_horizontal_component_connects_circular_bends() {
-        let source_bend = super::commit_graph_branch_off_source_bend_geometry(false);
-        let commit_bend = super::commit_graph_merge_in_commit_bend_geometry();
+        let source_bend = super::commit_graph_branch_off_source_bend_geometry(
+            false,
+            super::GutterMetrics::compact(),
+        );
+        let commit_bend =
+            super::commit_graph_merge_in_commit_bend_geometry(super::GutterMetrics::compact());
         let radius = super::commit_graph_bend_radius();
 
         let source_horizontal_end = source_bend
@@ -2961,8 +3104,9 @@ mod tests {
         assert_eq!(
             branch_out_horizontal_bounds.origin.y + px(commit_graph_line_width() / 2.),
             merge_target_commit_bend_bounds.origin.y
-                + px(super::commit_graph_lower_connector_vertical_shift()
-                    + commit_graph_merge_in_commit_line_y()),
+                + px(super::commit_graph_lower_connector_vertical_shift(
+                    super::GutterMetrics::compact()
+                ) + commit_graph_merge_in_commit_line_y(super::GutterMetrics::compact())),
             "branch-out horizontal should meet the merge target bend on the lower baseline",
         );
         assert_eq!(
@@ -4213,6 +4357,70 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn gutter_scales_to_the_passed_metrics(cx: &mut TestAppContext) {
+        // Compact (44px) and Table (56px) render the same gutter geometry at
+        // their own row height. The gutter element must take the mode's row
+        // height, and the lane's dot band must stay centered within it, so a
+        // helper left reading the 44 const would leave a visible gap at 56.
+        //
+        // A pure unit check pins the derived vertical extent so the scaling
+        // rule is asserted directly, independent of layout.
+        assert_eq!(
+            GutterMetrics::new(56.).vertical_height,
+            (56. - COMMIT_GRAPH_MIDDLE_HEIGHT) / 2.,
+            "the vertical extent must be derived from the passed lane height",
+        );
+        assert_eq!(
+            GutterMetrics::new(56.).vertical_height,
+            23.,
+            "a 56px row leaves 23px above and below the fixed middle band",
+        );
+        assert_eq!(
+            GutterMetrics::compact().lane_height,
+            COMMIT_GRAPH_LANE_HEIGHT,
+            "the compact metrics preserve the historical 44px geometry",
+        );
+
+        for (mode, expected_height) in [(GraphViewMode::Compact, 44.), (GraphViewMode::Table, 56.)]
+        {
+            let (dir, _shas) = init_repo_with_three_commits();
+            let path = dir.path().to_path_buf();
+            let window = add_app_window_with_graph_view_mode(cx, mode);
+
+            window
+                .update(cx, |app, window, cx| {
+                    app.open_repository_at(path, window, cx);
+                })
+                .expect("open repository");
+            cx.run_until_parked();
+
+            let mut visual = VisualTestContext::from_window(*window, cx);
+            visual.simulate_resize(size(px(900.), px(600.)));
+
+            let gutter = visual
+                .debug_bounds("commit-graph-gutter-1")
+                .expect("first commit row's gutter should be materialized");
+            assert_eq!(
+                gutter.size.height,
+                px(expected_height),
+                "the gutter must take the {mode:?} row height",
+            );
+
+            // The trunk lane's outgoing vertical must reach the bottom edge of
+            // the gutter; if the lane or segment geometry stayed on the 44
+            // const it would stop short at 56.
+            let bottom_vertical = visual
+                .debug_bounds("commit-graph-vertical-1-0-bottom")
+                .expect("trunk outgoing vertical should be materialized");
+            assert_eq!(
+                bottom_vertical.origin.y + bottom_vertical.size.height,
+                gutter.origin.y + gutter.size.height,
+                "the trunk vertical must extend to the {mode:?} gutter's bottom edge",
+            );
+        }
+    }
+
+    #[gpui::test]
     async fn graph_layout_is_cached_until_inputs_change(cx: &mut TestAppContext) {
         let (dir, _main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
         let path = dir.path().to_path_buf();
@@ -4267,5 +4475,67 @@ mod tests {
             after_second + 1,
             "changing hidden branches must recompute the layout exactly once"
         );
+    }
+
+    #[gpui::test]
+    async fn table_mode_renders_two_line_rows(cx: &mut TestAppContext) {
+        let (dir, _sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.view_mode = crate::settings::GraphViewMode::Table;
+                cx.notify();
+            })
+            .expect("open repository in table mode");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let summary = visual.debug_bounds("commit-summary-1").expect("summary");
+        let meta = visual.debug_bounds("commit-meta-1").expect("meta line");
+        // Two lines: summary sits fully above the metadata line.
+        assert!(
+            summary.origin.y + summary.size.height <= meta.origin.y,
+            "summary must sit above the meta line in table mode"
+        );
+    }
+
+    #[gpui::test]
+    async fn selection_bar_switches_view_mode(cx: &mut TestAppContext) {
+        // Compact is active by default; clicking the Table segment flips the
+        // active mode and mirrors it into the persisted settings.
+        let (dir, _sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+
+        // Both segments render; Compact is marked active.
+        visual
+            .debug_bounds("selected-view-switch-compact")
+            .expect("compact segment active by default");
+        let table_segment = visual
+            .debug_bounds("view-switch-table")
+            .expect("table segment present");
+
+        visual.simulate_click(table_segment.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _| {
+                assert_eq!(app.view_mode, crate::settings::GraphViewMode::Table);
+                assert_eq!(
+                    app.settings.graph_view_mode,
+                    crate::settings::GraphViewMode::Table
+                );
+            })
+            .expect("mode flipped and mirrored to settings");
     }
 }

@@ -31,6 +31,24 @@ pub(crate) fn add_app_window_with_store_path(
     })
 }
 
+/// Build an app window forced into a specific commit-graph layout, so gutter
+/// geometry can be asserted at each mode's row height without touching the
+/// on-disk settings store.
+pub(crate) fn add_app_window_with_graph_view_mode(
+    cx: &mut TestAppContext,
+    graph_view_mode: GraphViewMode,
+) -> WindowHandle<App> {
+    cx.update(gpui_component::init);
+    let settings = Settings {
+        recent_repositories: Vec::new(),
+        window_state: None,
+        sidebar_widths: SidebarWidths::default(),
+        ai_enabled: false,
+        graph_view_mode,
+    };
+    cx.add_window(move |window, cx| App::new_with_settings(window, cx, settings.clone()))
+}
+
 /// Build an app window seeded with recent repositories AND sidebar widths, so
 /// restore-on-render behavior can be asserted. Uses no settings store path
 /// (nothing persists to disk).
@@ -45,6 +63,7 @@ pub(crate) fn add_app_window_with_recent_and_widths(
         window_state: None,
         sidebar_widths,
         ai_enabled: false,
+        graph_view_mode: GraphViewMode::default(),
     };
     cx.add_window(move |window, cx| App::new_with_settings(window, cx, settings.clone()))
 }
@@ -62,6 +81,7 @@ pub(crate) fn seed_recent_repositories(
             window_state: None,
             sidebar_widths: SidebarWidths::default(),
             ai_enabled: false,
+            graph_view_mode: GraphViewMode::default(),
         },
     )
     .expect("seed settings store");

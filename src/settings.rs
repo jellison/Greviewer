@@ -15,6 +15,17 @@ use serde::{Deserialize, Serialize};
 /// memory. Older entries past this count are dropped.
 pub const MAX_RECENT_REPOSITORIES: usize = 10;
 
+/// Which commit-graph row layout the graph renders. Persisted so the choice
+/// survives restarts. `Compact` (single-row) is the default and matches the
+/// layout shipped before the switcher existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphViewMode {
+    #[default]
+    Compact,
+    Table,
+}
+
 /// The complete set of persisted user settings. This is the single value
 /// written to and read from disk; add fields here to persist more state.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -31,6 +42,8 @@ pub struct Settings {
     /// Whether AI assistance (ADR-0005) is enabled. Off by default; enabling
     /// requires a configured Claude CLI on the machine.
     pub ai_enabled: bool,
+    /// Which commit-graph layout to render. Defaults to `Compact`.
+    pub graph_view_mode: GraphViewMode,
 }
 
 /// A repository the user has opened before, plus whether its folder could still
@@ -163,6 +176,7 @@ mod tests {
             window_state: None,
             sidebar_widths: SidebarWidths::default(),
             ai_enabled: false,
+            graph_view_mode: GraphViewMode::default(),
         };
 
         save(&path, &settings).expect("save settings");
@@ -219,6 +233,7 @@ mod tests {
                 }),
                 sidebar_widths: SidebarWidths::default(),
                 ai_enabled: false,
+                graph_view_mode: GraphViewMode::default(),
             };
 
             save(&path, &settings).expect("save settings");
@@ -254,6 +269,21 @@ mod tests {
     }
 
     #[test]
+    fn graph_view_mode_defaults_compact_and_round_trips() {
+        // Legacy files with no key load as Compact.
+        let legacy: Settings = serde_json::from_str("{}").expect("legacy parses");
+        assert_eq!(legacy.graph_view_mode, GraphViewMode::Compact);
+
+        let table = Settings {
+            graph_view_mode: GraphViewMode::Table,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&table).expect("serialize");
+        let reloaded: Settings = serde_json::from_str(&json).expect("reload");
+        assert_eq!(reloaded.graph_view_mode, GraphViewMode::Table);
+    }
+
+    #[test]
     fn sidebar_widths_survive_json_round_trip() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("settings.json");
@@ -265,6 +295,7 @@ mod tests {
                 changeset_files: Some(360.0),
             },
             ai_enabled: false,
+            graph_view_mode: GraphViewMode::default(),
         };
 
         save(&path, &settings).expect("save settings");
