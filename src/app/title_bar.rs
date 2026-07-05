@@ -7,6 +7,7 @@ use gpui::{
     div, px, AnyElement, Context, Div, Hsla, InteractiveElement, IntoElement, ParentElement,
     Stateful, StatefulInteractiveElement as _, Styled,
 };
+use gpui_component::input::Input;
 use gpui_component::{Icon, TitleBar, TITLE_BAR_HEIGHT};
 
 use super::{short_sha, worktree_title, App, Mode, ReviewScreen, Selection, MONO_FONT_FAMILY};
@@ -280,6 +281,7 @@ impl App {
 
                 if let ReviewScreen::Changeset { changeset, .. } = &self.review_screen {
                     let label = context_pill_label(&self.selection, changeset);
+                    let review_name = self.current_review().map(|review| review.name.clone());
                     row = row
                         .child(
                             div()
@@ -294,10 +296,17 @@ impl App {
                                 palette().accent,
                                 self.context_popover_open,
                             )
-                            .on_click(cx.listener(|app, _event, _window, cx| {
+                            .on_click(cx.listener(|app, _event, window, cx| {
                                 app.context_popover_open = !app.context_popover_open;
                                 app.repo_switcher_open = false;
                                 app.worktree_switcher_open = false;
+                                let name = app
+                                    .current_review()
+                                    .map(|review| review.name.clone())
+                                    .unwrap_or_default();
+                                app.review_name_input
+                                    .update(cx, |state, cx| state.set_value(name, window, cx));
+                                app.pending_delete_review = None;
                                 cx.notify();
                             }))
                             .flex()
@@ -308,6 +317,12 @@ impl App {
                                     .text_color(palette().text_muted)
                                     .size(px(13.)),
                             )
+                            .children(review_name.map(|name| {
+                                div()
+                                    .debug_selector(|| "title-bar-review-name".to_string())
+                                    .whitespace_nowrap()
+                                    .child(format!("{name} \u{00b7}"))
+                            }))
                             .child(label),
                         );
                 }
@@ -430,6 +445,153 @@ impl App {
                 .into_any_element(),
         );
 
+        // The review row/block: no review controls for the pending changeset
+        // (a review is anchored to a discrete changeset, not the working
+        // tree); a "Start review" affordance when no review is attached yet;
+        // otherwise the full review block (name, dates, complete toggle,
+        // delete).
+        let review_section: Option<AnyElement> = if matches!(self.selection, Selection::Pending) {
+            None
+        } else if let Some(review) = self.current_review() {
+            let review_id = review.id.clone();
+            let completed = review.status == crate::reviews::ReviewStatus::Completed;
+            let mut dates = format!(
+                "Started {} \u{00b7} Active {}",
+                crate::repo::format_unix_date(review.created_at),
+                crate::repo::format_unix_date(review.last_activity_at),
+            );
+            if let Some(completed_at) = review.completed_at {
+                dates.push_str(&format!(
+                    " \u{00b7} Completed {}",
+                    crate::repo::format_unix_date(completed_at)
+                ));
+            }
+            let delete_armed = self.pending_delete_review.as_deref() == Some(review_id.as_str());
+            Some(
+                div()
+                    .debug_selector(|| "review-block".to_string())
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_3()
+                    .border_t_1()
+                    .border_color(palette().border)
+                    .child(
+                        div()
+                            .debug_selector(|| "review-name-input".to_string())
+                            .child(Input::new(&self.review_name_input)),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "review-dates".to_string())
+                            .text_size(px(11.))
+                            .text_color(palette().text_muted)
+                            .child(dates),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("review-complete-toggle")
+                                    .debug_selector(|| "review-complete-toggle".to_string())
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(palette().border)
+                                    .text_size(px(12.))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |app, _event, window, cx| {
+                                        let completed =
+                                            app.current_review().is_some_and(|review| {
+                                                review.status
+                                                    == crate::reviews::ReviewStatus::Completed
+                                            });
+                                        app.set_current_review_completed(!completed, window, cx);
+                                    }))
+                                    .child(if completed {
+                                        "Reopen review"
+                                    } else {
+                                        "Mark complete"
+                                    }),
+                            )
+                            .child(if delete_armed {
+                                div()
+                                    .id("review-delete-armed")
+                                    .debug_selector(|| "review-delete-armed".to_string())
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(palette().danger_border)
+                                    .bg(palette().danger_bg)
+                                    .text_color(palette().danger_fg)
+                                    .text_size(px(12.))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener({
+                                        let review_id = review_id.clone();
+                                        move |app, _event, window, cx| {
+                                            app.delete_review(&review_id, window, cx);
+                                        }
+                                    }))
+                                    .child("Confirm delete")
+                            } else {
+                                div()
+                                    .id("review-delete")
+                                    .debug_selector(|| "review-delete".to_string())
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(palette().border)
+                                    .text_color(palette().danger_fg)
+                                    .text_size(px(12.))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener({
+                                        let review_id = review_id.clone();
+                                        move |app, _event, _window, cx| {
+                                            app.pending_delete_review = Some(review_id.clone());
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .child("Delete review\u{2026}")
+                            }),
+                    )
+                    .into_any_element(),
+            )
+        } else {
+            Some(
+                div()
+                    .id("review-start")
+                    .debug_selector(|| "review-start".to_string())
+                    .mx_2()
+                    .mt_2()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(palette().border)
+                    .text_size(px(12.))
+                    .text_color(palette().accent)
+                    .cursor_pointer()
+                    .on_click(cx.listener(|app, _event, window, cx| {
+                        app.start_review(window, cx);
+                        let name = app
+                            .current_review()
+                            .map(|review| review.name.clone())
+                            .unwrap_or_default();
+                        app.review_name_input
+                            .update(cx, |state, cx| state.set_value(name, window, cx));
+                    }))
+                    .child("Start review")
+                    .into_any_element(),
+            )
+        };
+
         let close = div()
             .id("title-bar-context-close")
             .debug_selector(|| "title-bar-context-close".to_string())
@@ -517,6 +679,7 @@ impl App {
             .child(lines_row)
             .children(kind_row)
             .children(commit_list)
+            .children(review_section)
             .child(close);
 
         let backdrop = div()
@@ -1979,5 +2142,268 @@ mod tests {
                 assert!(!app.context_popover_open);
             })
             .expect("read popover states");
+    }
+
+    const REVIEW_START: &str = "review-start";
+    const REVIEW_BLOCK: &str = "review-block";
+    const REVIEW_DELETE: &str = "review-delete";
+    const REVIEW_DELETE_ARMED: &str = "review-delete-armed";
+    const REVIEW_COMPLETE_TOGGLE: &str = "review-complete-toggle";
+    const REVIEW_NAME: &str = "title-bar-review-name";
+
+    #[gpui::test]
+    async fn start_review_affordance_creates_and_shows_the_review_block(cx: &mut TestAppContext) {
+        let window = open_changeset_window(cx);
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let pill = visual.debug_bounds(PILL).expect("pill bounds");
+        visual.simulate_click(pill.center(), Modifiers::none());
+
+        let start = visual.debug_bounds(REVIEW_START).expect("start affordance");
+        visual.simulate_click(start.center(), Modifiers::none());
+
+        // `debug_bounds` accumulates for the window's lifetime rather than
+        // resetting per frame (see gpui's `Frame::clear`), so a selector that
+        // rendered earlier in this same window can't be asserted absent here.
+        // The review block replacing the affordance is instead verified via
+        // `review_block_replaces_the_start_affordance_for_an_attached_review`
+        // below, which opens the popover fresh on a window whose review
+        // already exists.
+        assert!(visual.debug_bounds(REVIEW_BLOCK).is_some());
+        window
+            .read_with(cx, |app, _cx| {
+                let review = app.current_review().expect("review created");
+                assert_eq!(review.name, "feat: thing");
+            })
+            .expect("review exists");
+    }
+
+    #[gpui::test]
+    async fn review_block_replaces_the_start_affordance_for_an_attached_review(
+        cx: &mut TestAppContext,
+    ) {
+        let window = open_changeset_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.start_review(window, cx);
+                app.context_popover_open = true;
+                cx.notify();
+            })
+            .expect("start review and open popover");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds(REVIEW_BLOCK).is_some());
+        assert!(
+            visual.debug_bounds(REVIEW_START).is_none(),
+            "an attached review shows the block, not the start affordance"
+        );
+    }
+
+    #[gpui::test]
+    async fn pending_changeset_popover_offers_no_review_controls(cx: &mut TestAppContext) {
+        let window = app_window(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                let changeset = changeset_with(crate::repo::PENDING_SHA, vec![file_with(3, 1)]);
+                app.mode = Mode::RepoOpen {
+                    repo: repo_named("Demo", vec![]),
+                };
+                app.review_screen = ReviewScreen::Changeset {
+                    sha: crate::repo::PENDING_SHA.to_string(),
+                    changeset,
+                };
+                app.selection = Selection::Pending;
+                app.context_popover_open = true;
+                cx.notify();
+            })
+            .expect("set pending changeset state");
+
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds(REVIEW_START).is_none());
+        assert!(visual.debug_bounds(REVIEW_BLOCK).is_none());
+    }
+
+    #[gpui::test]
+    async fn delete_control_arms_then_deletes_and_detaches(cx: &mut TestAppContext) {
+        let window = open_changeset_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.start_review(window, cx);
+            })
+            .expect("start");
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let pill = visual.debug_bounds(PILL).expect("pill bounds");
+        visual.simulate_click(pill.center(), Modifiers::none());
+
+        let delete = visual.debug_bounds(REVIEW_DELETE).expect("delete control");
+        visual.simulate_click(delete.center(), Modifiers::none());
+        let armed = visual
+            .debug_bounds(REVIEW_DELETE_ARMED)
+            .expect("armed control");
+        visual.simulate_click(armed.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert!(app.current_review().is_none());
+                // Changeset stays open: deleting only detaches.
+                assert!(matches!(app.review_screen, ReviewScreen::Changeset { .. }));
+            })
+            .expect("deleted and detached");
+    }
+
+    #[gpui::test]
+    async fn complete_toggle_flips_status_and_stays_attached(cx: &mut TestAppContext) {
+        let window = open_changeset_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.start_review(window, cx);
+            })
+            .expect("start");
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let pill = visual.debug_bounds(PILL).expect("pill bounds");
+        visual.simulate_click(pill.center(), Modifiers::none());
+
+        let toggle = visual
+            .debug_bounds(REVIEW_COMPLETE_TOGGLE)
+            .expect("complete toggle");
+        visual.simulate_click(toggle.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                let review = app.current_review().expect("still attached");
+                assert_eq!(review.status, crate::reviews::ReviewStatus::Completed);
+                assert!(review.completed_at.is_some());
+            })
+            .expect("read completed state");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let toggle = visual
+            .debug_bounds(REVIEW_COMPLETE_TOGGLE)
+            .expect("reopen toggle");
+        visual.simulate_click(toggle.center(), Modifiers::none());
+
+        window
+            .read_with(cx, |app, _cx| {
+                let review = app.current_review().expect("still attached");
+                assert_eq!(review.status, crate::reviews::ReviewStatus::Active);
+                assert!(review.completed_at.is_none());
+            })
+            .expect("read reopened state");
+    }
+
+    #[gpui::test]
+    async fn pill_shows_the_review_name_when_attached(cx: &mut TestAppContext) {
+        let window = open_changeset_window(cx);
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.debug_bounds(REVIEW_NAME).is_none(), "no review yet");
+
+        window
+            .update(cx, |app, window, cx| {
+                app.start_review(window, cx);
+            })
+            .expect("start");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let short_bounds = visual.debug_bounds(REVIEW_NAME).expect("name renders");
+
+        // The pill is fluid: a long name widens the box on a single line
+        // rather than wrapping inside a capped width.
+        window
+            .update(cx, |app, window, cx| {
+                assert!(app.rename_current_review(
+                    "a review name comfortably wider than any fixed cap",
+                    window,
+                    cx,
+                ));
+            })
+            .expect("rename to a long name");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let long_bounds = visual.debug_bounds(REVIEW_NAME).expect("renamed renders");
+        assert!(
+            long_bounds.size.width > px(160.),
+            "the name box must grow past the old 160px cap, got {:?}",
+            long_bounds.size.width,
+        );
+        assert_eq!(
+            long_bounds.size.height, short_bounds.size.height,
+            "a long name must stay on one line instead of wrapping",
+        );
+    }
+
+    #[gpui::test]
+    async fn pressing_enter_in_the_review_name_field_rejects_a_blank_rename(
+        cx: &mut TestAppContext,
+    ) {
+        // The rename-input's reset-on-rejection path lives in a `Blur`/`Enter`
+        // subscription that calls `InputState::set_value`, which needs a
+        // `&mut Window` reached through `gpui_component::Root` (see
+        // `pressing_enter_in_the_branch_filter_does_not_open_a_changeset` in
+        // app.rs for the same wrapper requirement), so this test wraps the
+        // app the same way rather than using the plain `app_window` helper.
+        cx.update(gpui_component::init);
+        let mut app_entity: Option<gpui::Entity<App>> = None;
+        let window = cx.add_window(|window, cx| {
+            let app = gpui::AppContext::new(cx, |cx| App::new(window, cx));
+            app_entity = Some(app.clone());
+            gpui_component::Root::new(app, window, cx)
+        });
+        let app_entity = app_entity.expect("app entity captured");
+
+        window
+            .update(cx, |_root, window, cx| {
+                app_entity.update(cx, |app, cx| {
+                    let changeset = changeset_with("abcdef1234567890", vec![file_with(3, 1)]);
+                    app.mode = Mode::RepoOpen {
+                        repo: repo_named(
+                            "Demo",
+                            vec![commit_with("abcdef1234567890", "feat: thing")],
+                        ),
+                    };
+                    app.review_screen = ReviewScreen::Changeset {
+                        sha: "abcdef1234567890".to_string(),
+                        changeset,
+                    };
+                    app.selection = Selection::Single {
+                        sha: "abcdef1234567890".to_string(),
+                    };
+                    app.start_review(window, cx);
+                    // The input is only mounted while the popover renders it
+                    // (see `render_context_popover`), so open it before
+                    // focusing the field.
+                    app.context_popover_open = true;
+                    let name_focus = gpui::Focusable::focus_handle(&app.review_name_input, cx);
+                    window.focus(&name_focus);
+                    app.review_name_input
+                        .update(cx, |state, cx| state.set_value("   ", window, cx));
+                    cx.notify();
+                });
+            })
+            .expect("open changeset, start review, focus and blank the name field");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        app_entity.read_with(cx, |app, cx| {
+            assert_eq!(
+                app.current_review().expect("still attached").name,
+                "feat: thing",
+                "a blank rename is rejected and does not overwrite the review's name"
+            );
+            assert_eq!(
+                app.review_name_input.read(cx).value().as_ref(),
+                "feat: thing",
+                "the input resets to the review's current name after a rejected rename"
+            );
+        });
     }
 }

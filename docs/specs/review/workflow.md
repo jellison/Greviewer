@@ -170,7 +170,7 @@ The user sees a graphical history of the repository's commits with branch lanes 
 
 ## Navigating branches from the sidebar
 
-Graph mode includes a sidebar beside the graph listing the repository's branches and tags. The list is split into a Local section, a Remote section, and a Tags section, in that order. Each section is introduced by a header that bears a distinguishing icon, the section's name, and a count of the refs the section contains; the header also acts as a collapse control for the whole section (see "Collapsing a section" below). The Local section holds the repository's local branches; the Remote section holds remote-tracking branches, grouped under one collapsible folder per remote so multiple remotes stay separate; the Tags section holds the repository's tags. Within any section, names containing `/` nest under collapsible folders (see "Nesting branches in sidebar folders" below). Remote branch entries render visually distinct from local entries, and tag entries carry a tag icon in place of the branch icon. The checked-out branch carries a visual marker. Activating a branch or tag focuses it in the graph: its tip commit becomes the selected commit and the graph scrolls so that commit is visible. The divider between the sidebar and the graph is draggable to resize the sidebar. The sidebar exists only in graph mode; review mode shows the file tree in its place.
+Graph mode includes a sidebar beside the graph listing the repository's branches and tags. The list is split into a Local section, a Remote section, and a Tags section, in that order; when the repository has reviews, a Reviews section precedes all three (see "Listing reviews in the sidebar"). Each section is introduced by a header that bears a distinguishing icon, the section's name, and a count of the refs the section contains; the header also acts as a collapse control for the whole section (see "Collapsing a section" below). The Local section holds the repository's local branches; the Remote section holds remote-tracking branches, grouped under one collapsible folder per remote so multiple remotes stay separate; the Tags section holds the repository's tags. Within any section, names containing `/` nest under collapsible folders (see "Nesting branches in sidebar folders" below). Remote branch entries render visually distinct from local entries, and tag entries carry a tag icon in place of the branch icon. The checked-out branch carries a visual marker. Activating a branch or tag focuses it in the graph: its tip commit becomes the selected commit and the graph scrolls so that commit is visible. The divider between the sidebar and the graph is draggable to resize the sidebar. The sidebar exists only in graph mode; review mode shows the file tree in its place.
 
 **Triggering conditions**
 
@@ -285,7 +285,10 @@ clearing the query restores that collapse state. Matched characters are
 highlighted wherever they fall, across folder rows and the leaf row.
 Section counts report the number of matching refs while filtering. The
 checked-out branch is filtered like any other ref and is not kept visible
-when it does not match.
+when it does not match. The Reviews section, whose rows are not branches or
+tags, has nothing for a branch-name query to match, so it is hidden entirely
+while a filter is active and returns when the query is cleared (see "Listing
+reviews in the sidebar").
 
 **Triggering conditions**
 
@@ -341,6 +344,30 @@ shows every branch and tag. Remote-tracking branches and tags hide and show exac
 - Hiding a ref that makes the current selection invisible resets the
   selection to the checked-out tip.
 - Reopening a repository resets all branches and tags to visible.
+
+## Listing reviews in the sidebar
+
+The branch sidebar carries a Reviews section above the Local, Remote, and Tags sections, listing the reviews the user has started for the open repository. It is a sidebar section like the others — a header with a distinguishing icon, the "Reviews" label, and a count of every review it holds, collapsing and expanding exactly like the Local, Remote, and Tags headers. Active reviews list first, most recently active first; completed reviews are gathered behind a single "Completed" group row beneath them, which reports its count and expands in place, also most recently active first. That group starts collapsed and resets to collapsed each time a repository is opened. Each review row shows its name and a compact identifier of the reviewed changeset, and completed rows render muted, matching the sidebar's other muted rows.
+
+The Reviews section is present only when the repository has at least one review and the sidebar's search field is empty; because a review is neither a branch nor a tag, it disappears while the user filters branches (see "Filtering branches in the sidebar") and returns when the filter is cleared. What each row does — resuming an available review, the muting and message for a review whose commits are gone, and the per-row delete control — is the review lifecycle, specified in [Review Persistence](persistence.md).
+
+**Triggering conditions**
+
+- A repository with at least one review is open and the window is in graph mode with an empty search field.
+- The user activates the "Reviews" section header or the "Completed" group row.
+
+**Observable outcomes**
+
+- The Reviews section sits above Local, Remote, and Tags, listing active reviews first (most recently active first), then a "Completed" group row when any review is completed.
+- The section header shows a distinguishing icon, "Reviews", and the total number of reviews regardless of collapse state or completion.
+- Each review row shows its name and a compact identifier for the commit, range, or comparison it reviews; a completed review's row is muted.
+- Activating the "Completed" group row reveals or hides the completed reviews beneath it, most recently active first.
+
+**Edge cases**
+
+- A repository with no reviews shows no Reviews section at all.
+- Filtering the sidebar by branch name hides the Reviews section entirely; clearing the filter restores it.
+- Reopening a repository always shows the "Completed" group collapsed, regardless of how it was left.
 
 ## Selecting commits to review
 
@@ -449,6 +476,12 @@ identifier is an affordance: activating it opens a popover describing the open c
 offering a control to close it. Graph mode shows only the repository name, with no context
 identifier.
 
+When the open changeset is attached to a review, the window bar also shows the review's
+name beside the changeset identifier, and the popover carries the review's controls —
+starting, naming, completing, reopening, and deleting a review — alongside the changeset
+description. Those controls are the review lifecycle, specified in
+[Review Persistence](persistence.md).
+
 **Triggering conditions**
 
 - The user activates the context identifier in the window bar while a changeset is open.
@@ -474,6 +507,7 @@ identifier.
 - For a comparison, the popover lists the commits the merge would introduce — those reachable
   from the target but not the base — newest first, in the same form, including when only one
   commit would be introduced.
+- When the changeset is attached to a review, the window bar shows the review's name alongside the changeset identifier, and the popover carries the review's controls for naming, completing, reopening, and deleting the review (see "Being in a review" in [Review Persistence](persistence.md)).
 - The popover offers a control that closes the changeset, returning the window to graph mode
   with the prior selection preserved.
 - Dismissing the popover by activating outside it leaves the changeset open.

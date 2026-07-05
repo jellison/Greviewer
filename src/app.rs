@@ -231,6 +231,16 @@ pub struct App {
     pub(crate) tab_drop_zone: Option<(crate::workspace::PaneId, crate::workspace::SplitDirection)>,
     pub file_list_mode: FileListMode,
     pub settings: Settings,
+    /// All persisted reviews (docs/specs/review/persistence.md), loaded once at
+    /// startup. The attachment between the open changeset and its review is
+    /// never stored: it is always `current_review()`'s lookup.
+    pub(crate) reviews: crate::reviews::ReviewStore,
+    /// Review id whose delete control is armed awaiting a confirming second
+    /// activation. Cleared by popover toggles, repo opens, and changeset close.
+    pub(crate) pending_delete_review: Option<String>,
+    /// Bumped on every review mutation so the sidebar row cache can detect
+    /// review changes without comparing lists (mirrors `branches_generation`).
+    reviews_generation: std::cell::Cell<u64>,
     collapsed_file_tree_paths: BTreeSet<String>,
     /// All AI threads and their subprocesses (ADR-0005); killed on changeset
     /// close and app quit so no `claude` process outlives its context.
@@ -283,10 +293,18 @@ pub struct App {
     /// Session-only: cleared whenever a repository is opened. Sections default
     /// to expanded, so an empty set means both sections show their branches.
     collapsed_branch_sections: BTreeSet<String>,
+    /// Whether the Reviews section's "Completed" group is expanded.
+    /// Session-only: resets to collapsed whenever a repository is opened.
+    completed_reviews_expanded: bool,
     /// The branch-sidebar filter query field. Session-only: its value is
     /// cleared when a repository is opened. Purely a sidebar view filter — it
     /// never changes graph contents or the commit selection.
     filter_input: Entity<InputState>,
+    /// The title-bar review-name field, shown in the context popover's
+    /// review block. Seeded with the current review's name whenever the
+    /// popover opens (or a review starts); a rejected (empty) rename on
+    /// commit resets it back to that name.
+    pub(crate) review_name_input: Entity<InputState>,
     focus_handle: FocusHandle,
     /// Whether the title-bar context popover (the diff "switcher") is open.
     context_popover_open: bool,
@@ -497,6 +515,8 @@ struct SidebarRowsSignature {
     collapsed_sections: BTreeSet<String>,
     hidden_branches: BTreeSet<String>,
     query: String,
+    reviews_generation: u64,
+    completed_reviews_expanded: bool,
 }
 
 pub enum Mode {
@@ -531,6 +551,51 @@ pub enum Selection {
 /// the graph, selection bar, and title bar.
 pub(crate) fn short_sha(sha: &str) -> String {
     sha.chars().take(7).collect()
+}
+
+fn now_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The persistent identity of `selection`, or `None` for selections that
+/// cannot carry a review (pending, empty). Range endpoints normalize to
+/// oldest..newest regardless of click order (`shas` is newest-first).
+fn changeset_key_for_selection(selection: &Selection) -> Option<crate::reviews::ChangesetKey> {
+    match selection {
+        Selection::Single { sha } => {
+            Some(crate::reviews::ChangesetKey::Single { sha: sha.clone() })
+        }
+        Selection::Range { shas, .. } => Some(crate::reviews::ChangesetKey::Range {
+            start_sha: shas.last()?.clone(),
+            end_sha: shas.first()?.clone(),
+        }),
+        Selection::Compare {
+            base_sha,
+            target_sha,
+        } => Some(crate::reviews::ChangesetKey::Compare {
+            base_sha: base_sha.clone(),
+            target_sha: target_sha.clone(),
+        }),
+        Selection::Pending | Selection::None => None,
+    }
+}
+
+/// Compact identifier for a persisted changeset, matching the title bar's
+/// conventions: short sha, `old…new`, or `base...target`.
+fn review_changeset_label(key: &crate::reviews::ChangesetKey) -> String {
+    match key {
+        crate::reviews::ChangesetKey::Single { sha } => short_sha(sha),
+        crate::reviews::ChangesetKey::Range { start_sha, end_sha } => {
+            format!("{}\u{2026}{}", short_sha(start_sha), short_sha(end_sha))
+        }
+        crate::reviews::ChangesetKey::Compare {
+            base_sha,
+            target_sha,
+        } => format!("{}...{}", short_sha(base_sha), short_sha(target_sha)),
+    }
 }
 
 /// The graph's default selection: the checked-out (HEAD) commit when one is
@@ -658,6 +723,21 @@ enum BranchTreeRow {
     Section(BranchSectionRow),
     Folder(BranchFolderRow),
     Branch(BranchRow),
+    ReviewEntry(ReviewRow),
+    CompletedReviewsGroup { count: usize, expanded: bool },
+}
+
+/// One persisted review in the sidebar's Reviews section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewRow {
+    id: String,
+    name: String,
+    /// Compact changeset identifier: short sha, `old…new`, or `base...target`.
+    changeset_label: String,
+    completed: bool,
+    /// False when the changeset can no longer be reconstructed; the row
+    /// renders muted and activation reports the problem instead of opening.
+    available: bool,
 }
 
 /// Header introducing the Local or Remote half of the sidebar. Clicking it
@@ -845,6 +925,29 @@ impl App {
         })
         .detach();
 
+        let review_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Review name"));
+        // Enter or blur commits the rename; an empty (rejected) rename resets
+        // the field back to the review's current name rather than leaving
+        // stale text presented as the review's name.
+        cx.subscribe_in(
+            &review_name_input,
+            window,
+            |app, input, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                    let value = input.read(cx).value().to_string();
+                    if !app.rename_current_review(&value, window, cx) {
+                        let name = app
+                            .current_review()
+                            .map(|review| review.name.clone())
+                            .unwrap_or_default();
+                        input.update(cx, |state, cx| state.set_value(name, window, cx));
+                    }
+                }
+                _ => {}
+            },
+        )
+        .detach();
+
         window.focus(&focus_handle);
         cx.on_next_frame(window, |app, window, _cx| {
             window.focus(&app.focus_handle);
@@ -970,6 +1073,9 @@ impl App {
             tab_drop_zone: None,
             file_list_mode: FileListMode::Changed,
             settings,
+            reviews: crate::reviews::ReviewStore::load(crate::reviews::default_store_dir()),
+            pending_delete_review: None,
+            reviews_generation: std::cell::Cell::new(0),
             collapsed_file_tree_paths: BTreeSet::new(),
             ai_sessions,
             notifications,
@@ -994,7 +1100,9 @@ impl App {
             hidden_branches: BTreeSet::new(),
             collapsed_branch_folders: BTreeSet::new(),
             collapsed_branch_sections: BTreeSet::new(),
+            completed_reviews_expanded: false,
             filter_input,
+            review_name_input,
             focus_handle,
             context_popover_open: false,
             repo_switcher_open: false,
@@ -1130,6 +1238,7 @@ impl App {
         self.hidden_branches.clear();
         self.collapsed_branch_folders.clear();
         self.collapsed_branch_sections.clear();
+        self.completed_reviews_expanded = false;
         self.filter_input
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.branches_generation
@@ -1141,6 +1250,7 @@ impl App {
         self.repo_switcher_open = false;
         self.worktree_switcher_open = false;
         self.worktree_entries.clear();
+        self.pending_delete_review = None;
         cx.notify();
     }
 
@@ -1664,6 +1774,294 @@ impl App {
         Ok(commit_ancestry_path(&open_repo.commits, start_sha, end_sha))
     }
 
+    pub(crate) fn open_changeset_review_key(
+        &self,
+    ) -> Option<(std::path::PathBuf, crate::reviews::ChangesetKey)> {
+        if !matches!(self.review_screen, ReviewScreen::Changeset { .. }) {
+            return None;
+        }
+        let Mode::RepoOpen { repo } = &self.mode else {
+            return None;
+        };
+        Some((
+            repo.main_path.clone(),
+            changeset_key_for_selection(&self.selection)?,
+        ))
+    }
+
+    pub(crate) fn current_review(&self) -> Option<&crate::reviews::Review> {
+        let (repo_path, key) = self.open_changeset_review_key()?;
+        self.reviews.find_by_changeset(&repo_path, &key)
+    }
+
+    /// Default name for a new review: the newest commit's summary when it is in
+    /// the loaded history, the merge-preview direction for a comparison, and a
+    /// short-sha fallback otherwise.
+    fn default_review_name(&self) -> String {
+        let Mode::RepoOpen { repo } = &self.mode else {
+            return "Review".to_string();
+        };
+        match &self.selection {
+            Selection::Compare {
+                base_sha,
+                target_sha,
+            } => format!("{} into {}", short_sha(target_sha), short_sha(base_sha)),
+            Selection::Single { sha } => repo
+                .commits
+                .iter()
+                .find(|commit| &commit.sha == sha)
+                .map(|commit| commit.summary.clone())
+                .unwrap_or_else(|| format!("Review {}", short_sha(sha))),
+            Selection::Range { shas, .. } => {
+                let newest = shas.first().cloned().unwrap_or_default();
+                repo.commits
+                    .iter()
+                    .find(|commit| commit.sha == newest)
+                    .map(|commit| commit.summary.clone())
+                    .unwrap_or_else(|| format!("Review {}", short_sha(&newest)))
+            }
+            Selection::Pending | Selection::None => "Review".to_string(),
+        }
+    }
+
+    pub fn start_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((repo_path, key)) = self.open_changeset_review_key() else {
+            return;
+        };
+        if let Some(existing) = self.reviews.find_by_changeset(&repo_path, &key) {
+            let id = existing.id.clone();
+            self.touch_review(&id, window, cx);
+            return;
+        }
+        let review = crate::reviews::Review::new(
+            repo_path,
+            key,
+            self.default_review_name(),
+            now_unix_seconds(),
+        );
+        let result = self.reviews.insert(review);
+        self.after_review_mutation(result, window, cx);
+    }
+
+    /// Bump generation, surface a failed write, repaint. Every review
+    /// mutation funnels through here.
+    fn after_review_mutation(
+        &mut self,
+        result: std::io::Result<()>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reviews_generation
+            .set(self.reviews_generation.get() + 1);
+        if let Err(err) = result {
+            self.push_review_storage_failed(err.to_string(), window, cx);
+        }
+        cx.notify();
+    }
+
+    fn push_review_storage_failed(
+        &mut self,
+        message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.notifications.update(cx, |list, cx| {
+            list.push(
+                Notification::error(format!("Saving review failed: {message}")),
+                window,
+                cx,
+            );
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn touch_review(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let result = self
+            .reviews
+            .mutate(id, |review| review.last_activity_at = now_unix_seconds())
+            .inspect(|&found| debug_assert!(found, "review mutation targeted an unknown id"))
+            .map(|_| ());
+        self.after_review_mutation(result, window, cx);
+    }
+
+    pub fn rename_current_review(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let trimmed = name.trim();
+        let Some(review) = self.current_review() else {
+            return false;
+        };
+        if trimmed.is_empty() {
+            return false;
+        }
+        let id = review.id.clone();
+        let trimmed = trimmed.to_string();
+        let result = self
+            .reviews
+            .mutate(&id, |review| {
+                review.name = trimmed;
+                review.last_activity_at = now_unix_seconds();
+            })
+            .inspect(|&found| debug_assert!(found, "review mutation targeted an unknown id"))
+            .map(|_| ());
+        self.after_review_mutation(result, window, cx);
+        true
+    }
+
+    pub fn set_current_review_completed(
+        &mut self,
+        completed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(review) = self.current_review() else {
+            return;
+        };
+        let id = review.id.clone();
+        let now = now_unix_seconds();
+        let result = self
+            .reviews
+            .mutate(&id, |review| {
+                review.status = if completed {
+                    crate::reviews::ReviewStatus::Completed
+                } else {
+                    crate::reviews::ReviewStatus::Active
+                };
+                review.completed_at = completed.then_some(now);
+                review.last_activity_at = now;
+            })
+            .inspect(|&found| debug_assert!(found, "review mutation targeted an unknown id"))
+            .map(|_| ());
+        self.after_review_mutation(result, window, cx);
+    }
+
+    pub fn delete_review(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_delete_review = None;
+        let result = self.reviews.delete(id).map(|_| ());
+        self.after_review_mutation(result, window, cx);
+    }
+
+    /// Open a persisted review: rebuild its selection, reveal it in the graph,
+    /// and open the changeset. Unavailable reviews surface an error and change
+    /// nothing. Graph mode only (the sidebar exists only there).
+    pub(crate) fn open_review(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(review) = self.reviews.get(id) else {
+            return;
+        };
+        let changeset = review.changeset.clone();
+        let repo_path = match &self.mode {
+            Mode::RepoOpen { repo } => repo.path.clone(),
+            Mode::NoRepo => return,
+        };
+        if !repo::changeset_key_available(&repo_path, &changeset) {
+            self.push_review_unavailable(window, cx);
+            return;
+        }
+        let selection = match &changeset {
+            crate::reviews::ChangesetKey::Single { sha } => {
+                Some(Selection::Single { sha: sha.clone() })
+            }
+            crate::reviews::ChangesetKey::Compare {
+                base_sha,
+                target_sha,
+            } => Some(Selection::Compare {
+                base_sha: base_sha.clone(),
+                target_sha: target_sha.clone(),
+            }),
+            crate::reviews::ChangesetKey::Range { start_sha, end_sha } => {
+                self.range_selection_for_review(start_sha, end_sha, window, cx)
+            }
+        };
+        let Some(selection) = selection else {
+            self.push_review_unavailable(window, cx);
+            return;
+        };
+        self.selection = selection;
+        // Reveal the newest commit when it is already loaded; resume must not
+        // depend on it (a Single/Compare changeset opens straight from shas).
+        if let Mode::RepoOpen { repo } = &self.mode {
+            let visible = visible_commits(repo, &self.hidden_branches);
+            let newest = match &self.selection {
+                Selection::Single { sha } => Some(sha.clone()),
+                Selection::Range { shas, .. } => shas.first().cloned(),
+                Selection::Compare { target_sha, .. } => Some(target_sha.clone()),
+                _ => None,
+            };
+            if let Some(index) =
+                newest.and_then(|sha| visible.iter().position(|commit| commit.sha == sha))
+            {
+                self.scroll_commit_row_into_view(index + 1, visible.len() + 1);
+            }
+        }
+        self.open_changeset(window, cx);
+    }
+
+    /// Rebuild a range selection's sha list from its persisted endpoints,
+    /// paging in older history as needed (mirrors `focus_branch`'s loop).
+    /// `start_sha` is the oldest endpoint and `end_sha` the newest, matching
+    /// the persisted `ChangesetKey::Range` convention; `commit_ancestry_path`
+    /// tries both directions internally, so passing them in this order is
+    /// safe regardless. The returned `shas` come out newest-first, matching
+    /// every other `Selection::Range` construction.
+    fn range_selection_for_review(
+        &mut self,
+        start_sha: &str,
+        end_sha: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Selection> {
+        loop {
+            let (both_loaded, can_load_more, loaded_count) = match &self.mode {
+                Mode::RepoOpen { repo } => (
+                    repo.commits.iter().any(|commit| commit.sha == start_sha)
+                        && repo.commits.iter().any(|commit| commit.sha == end_sha),
+                    repo.has_more_commits,
+                    repo.commits.len(),
+                ),
+                Mode::NoRepo => return None,
+            };
+            if both_loaded {
+                break;
+            }
+            if !can_load_more {
+                return None;
+            }
+            self.load_older_commits(window, cx);
+            let after = match &self.mode {
+                Mode::RepoOpen { repo } => repo.commits.len(),
+                Mode::NoRepo => return None,
+            };
+            if after == loaded_count {
+                return None; // Paging failed; error already surfaced.
+            }
+        }
+        let Mode::RepoOpen { repo } = &self.mode else {
+            return None;
+        };
+        let shas = commit_ancestry_path(&repo.commits, start_sha, end_sha)?;
+        Some(Selection::Range {
+            start_sha: start_sha.to_string(),
+            end_sha: end_sha.to_string(),
+            shas,
+        })
+    }
+
+    fn push_review_unavailable(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.notifications.update(cx, |list, cx| {
+            list.push(
+                Notification::error(
+                    "This review's commits are no longer in the repository.".to_string(),
+                ),
+                window,
+                cx,
+            );
+        });
+        cx.notify();
+    }
+
     fn open_changeset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Re-opening while a changeset is already open would rebuild the
         // workspace and throw away the user's tabs and splits. The spec makes
@@ -1728,6 +2126,11 @@ impl App {
                 let sha = changeset.commit_sha.clone();
                 self.review_screen = ReviewScreen::Changeset { sha, changeset };
                 self.context_popover_open = false;
+                // Resuming an existing review counts as activity.
+                if let Some(review) = self.current_review() {
+                    let id = review.id.clone();
+                    self.touch_review(&id, window, cx);
+                }
                 cx.notify();
             }
             Err(err) => self.push_open_failed(err.to_string(), window, cx),
@@ -1738,6 +2141,7 @@ impl App {
         self.review_screen = ReviewScreen::Graph;
         self.comparison_commit_shas = None;
         self.context_popover_open = false;
+        self.pending_delete_review = None;
         self.workspace.clear();
         self.file_tree_highlight_path = None;
         self.file_tree_hovered = false;
@@ -3673,6 +4077,8 @@ impl App {
             collapsed_sections: self.collapsed_branch_sections.clone(),
             hidden_branches: self.hidden_branches.clone(),
             query: query.to_string(),
+            reviews_generation: self.reviews_generation.get(),
+            completed_reviews_expanded: self.completed_reviews_expanded,
         };
 
         if let Some((cached_signature, rows)) = self.sidebar_rows_cache.borrow().as_ref() {
@@ -3681,19 +4087,83 @@ impl App {
             }
         }
 
-        let rows = Rc::new(build_branch_sidebar_rows(
+        let mut rows = self.review_sidebar_rows(repo, query);
+        // The Reviews section, when present, always contributes at least its
+        // own header, so the branch tree's leading section follows content
+        // and must draw the same top border a stacked non-leading section
+        // would (see `append_branch_section`'s top_border comment).
+        let reviews_precede = !rows.is_empty();
+        let mut branch_rows = build_branch_sidebar_rows(
             &repo.branches,
             &self.collapsed_branch_folders,
             &self.collapsed_branch_sections,
             &self.hidden_branches,
             query,
-        ));
+        );
+        if reviews_precede {
+            if let Some(BranchTreeRow::Section(section)) = branch_rows.first_mut() {
+                section.top_border = true;
+            }
+        }
+        rows.extend(branch_rows);
+        let rows = Rc::new(rows);
 
         #[cfg(test)]
         self.sidebar_rows_recompute_count
             .set(self.sidebar_rows_recompute_count.get() + 1);
 
         *self.sidebar_rows_cache.borrow_mut() = Some((signature, Rc::clone(&rows)));
+        rows
+    }
+
+    /// The Reviews section's rows: a header (count = every review for the
+    /// repo), then active reviews (store order: newest activity first), then
+    /// a collapsed-by-default "Completed" group revealing completed reviews
+    /// when expanded. Availability is computed once here per rebuild, not per
+    /// frame — the memoized `sidebar_rows` cache makes this safe. Omitted
+    /// entirely while filtering or when the repo has no reviews.
+    fn review_sidebar_rows(&self, repo: &repo::OpenRepository, query: &str) -> Vec<BranchTreeRow> {
+        if !query.is_empty() {
+            return Vec::new();
+        }
+        let reviews = self.reviews.for_repo(&repo.main_path);
+        if reviews.is_empty() {
+            return Vec::new();
+        }
+
+        let mut rows = vec![BranchTreeRow::Section(BranchSectionRow {
+            title: "Reviews".to_string(),
+            key: "reviews".to_string(),
+            count: reviews.len(),
+            collapsed: self.collapsed_branch_sections.contains("reviews"),
+            top_border: false,
+        })];
+        if self.collapsed_branch_sections.contains("reviews") {
+            return rows;
+        }
+
+        let (active, completed): (Vec<_>, Vec<_>) = reviews
+            .iter()
+            .partition(|review| review.status == crate::reviews::ReviewStatus::Active);
+        let row = |review: &&crate::reviews::Review| {
+            BranchTreeRow::ReviewEntry(ReviewRow {
+                id: review.id.clone(),
+                name: review.name.clone(),
+                changeset_label: review_changeset_label(&review.changeset),
+                completed: review.status == crate::reviews::ReviewStatus::Completed,
+                available: repo::changeset_key_available(&repo.path, &review.changeset),
+            })
+        };
+        rows.extend(active.iter().map(row));
+        if !completed.is_empty() {
+            rows.push(BranchTreeRow::CompletedReviewsGroup {
+                count: completed.len(),
+                expanded: self.completed_reviews_expanded,
+            });
+            if self.completed_reviews_expanded {
+                rows.extend(completed.iter().map(row));
+            }
+        }
         rows
     }
 
@@ -3815,6 +4285,22 @@ impl App {
                                     .into_any_element(),
                                 BranchTreeRow::Branch(branch_row) => app
                                     .render_branch_row(index, branch_row, &processor_query, cx)
+                                    .into_any_element(),
+                                BranchTreeRow::ReviewEntry(review_row) => {
+                                    // Debug selectors key on the row's position
+                                    // within the Reviews section, not its
+                                    // absolute row index.
+                                    let review_index = rows[..index]
+                                        .iter()
+                                        .filter(|row| matches!(row, BranchTreeRow::ReviewEntry(_)))
+                                        .count();
+                                    app.render_review_row(review_index, review_row, cx)
+                                        .into_any_element()
+                                }
+                                BranchTreeRow::CompletedReviewsGroup { count, expanded } => app
+                                    .render_completed_reviews_group_row(
+                                        index, *count, *expanded, cx,
+                                    )
                                     .into_any_element(),
                             })
                             .collect::<Vec<_>>()
@@ -4068,6 +4554,8 @@ impl App {
         let count_selector = format!("branch-section-count-{fragment}");
         let section_icon = if section.key == "remotes" {
             LucideIcon::Cloud
+        } else if section.key == "reviews" {
+            LucideIcon::SquareDot
         } else {
             LucideIcon::Monitor
         };
@@ -4233,6 +4721,155 @@ impl App {
                         .text_color(palette().text_muted)
                         .size(px(FILE_TREE_STATUS_ICON_SIZE)),
                     ),
+            )
+    }
+
+    /// One review row in the Reviews section. `index` is the row's position
+    /// among review rows in the section (not its absolute sidebar row index),
+    /// matching the `review-row-{index}` debug-selector contract.
+    fn render_review_row(
+        &self,
+        index: usize,
+        row: &ReviewRow,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let muted = !row.available || row.completed;
+        let name_color = if muted {
+            palette().text_muted
+        } else {
+            palette().text
+        };
+        let group_name = format!("review-row-group-{index}");
+        let delete_armed = self.pending_delete_review.as_deref() == Some(row.id.as_str());
+        let id = row.id.clone();
+        let open_id = id.clone();
+        let arm_id = id.clone();
+        let confirm_id = id;
+        let changeset_label = row.changeset_label.clone();
+        let name = row.name.clone();
+
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(FILE_TREE_ROW_HEIGHT + BRANCH_ROW_VERTICAL_PADDING * 2.))
+            .py(px(BRANCH_ROW_VERTICAL_PADDING))
+            .gap_2()
+            .px_3()
+            .bg(palette().surface)
+            .cursor_pointer()
+            .id(("review-row", index))
+            .group(group_name.clone())
+            .debug_selector(move || format!("review-row-{index}"))
+            .hover(|style| style.bg(palette().element_hover))
+            .on_click(cx.listener(move |app, _event: &ClickEvent, window, cx| {
+                app.open_review(&open_id, window, cx);
+            }))
+            .child(
+                Icon::new(LucideIcon::SquareDot)
+                    .text_color(name_color)
+                    .size(px(BRANCH_ROW_ICON_SIZE)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(FILE_TREE_TEXT_SIZE))
+                    .text_color(name_color)
+                    .truncate()
+                    .child(name),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .font_family(MONO_FONT_FAMILY)
+                    .text_color(palette().text_muted)
+                    .text_size(px(FILE_TREE_TEXT_SIZE))
+                    .child(changeset_label),
+            )
+            .child(if delete_armed {
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
+                    .cursor_pointer()
+                    .id(("review-row-delete-armed", index))
+                    .debug_selector(move || format!("review-row-delete-armed-{index}"))
+                    .on_click(cx.listener(move |app, _event: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        app.delete_review(&confirm_id, window, cx);
+                    }))
+                    .child(
+                        Icon::new(LucideIcon::SquareMinus)
+                            .text_color(palette().danger_fg)
+                            .size(px(FILE_TREE_STATUS_ICON_SIZE)),
+                    )
+            } else {
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
+                    .cursor_pointer()
+                    .id(("review-row-delete", index))
+                    .debug_selector(move || format!("review-row-delete-{index}"))
+                    .opacity(0.)
+                    .group_hover(group_name.clone(), |toggle| toggle.opacity(1.))
+                    .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        app.pending_delete_review = Some(arm_id.clone());
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(LucideIcon::SquareMinus)
+                            .text_color(palette().text_muted)
+                            .size(px(FILE_TREE_STATUS_ICON_SIZE)),
+                    )
+            })
+    }
+
+    /// The collapsed-by-default "Completed" group row beneath the Reviews
+    /// section's active rows. Clicking toggles `completed_reviews_expanded`.
+    fn render_completed_reviews_group_row(
+        &self,
+        index: usize,
+        count: usize,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(FILE_TREE_ROW_HEIGHT + BRANCH_ROW_VERTICAL_PADDING * 2.))
+            .py(px(BRANCH_ROW_VERTICAL_PADDING))
+            .gap_2()
+            .px_3()
+            .bg(palette().surface)
+            .cursor_pointer()
+            .id(("reviews-completed-group", index))
+            .debug_selector(|| "reviews-completed-group".to_string())
+            .hover(|style| style.bg(palette().element_hover))
+            .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
+                app.completed_reviews_expanded = !app.completed_reviews_expanded;
+                cx.notify();
+            }))
+            .child(
+                Icon::new(if expanded {
+                    LucideIcon::ChevronDown
+                } else {
+                    LucideIcon::ChevronRight
+                })
+                .text_color(palette().text_muted)
+                .size(px(FILE_TREE_STATUS_ICON_SIZE)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(FILE_TREE_TEXT_SIZE))
+                    .text_color(palette().text_muted)
+                    .truncate()
+                    .child(format!("Completed ({count})")),
             )
     }
 
@@ -5894,9 +6531,9 @@ fn restored_column_width(saved: Option<f32>, default: f32, min: f32, max: f32) -
 #[cfg(test)]
 mod tests {
     use super::{
-        restored_width, selection_summary, App, CloseChangeset, DiffDrag, DiffDragMode,
-        FileListMode, Mode, OpenChangeset, OpenFailed, PreparedFileDiff, ReviewScreen, Selection,
-        FILE_TREE_ROW_HEIGHT, SIDEBAR_MIN_WIDTH,
+        changeset_key_for_selection, restored_width, selection_summary, App, CloseChangeset,
+        DiffDrag, DiffDragMode, FileListMode, Mode, OpenChangeset, OpenFailed, PreparedFileDiff,
+        ReviewScreen, Selection, FILE_TREE_ROW_HEIGHT, SIDEBAR_MIN_WIDTH,
     };
     use crate::repo::{ChangeKind, INITIAL_COMMIT_LIMIT};
     use crate::settings::{
@@ -9917,5 +10554,158 @@ mod tests {
                 assert!(app.pending_summary.is_dirty());
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    async fn starting_a_review_persists_it_and_reopening_resumes_it(cx: &mut TestAppContext) {
+        let (repo_dir, sha) = init_repo_with_one_commit();
+        let reviews_dir = tempfile::tempdir().expect("create tempdir");
+        let window = app_window_with_reviews_dir(cx, reviews_dir.path().to_path_buf());
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(repo_dir.path().to_path_buf(), window, cx);
+            })
+            .expect("open repo");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_changeset(window, cx);
+                app.start_review(window, cx);
+                let review = app.current_review().expect("review attached");
+                assert_eq!(
+                    review.changeset,
+                    crate::reviews::ChangesetKey::Single { sha: sha.clone() }
+                );
+                assert_eq!(review.name, "Add hello.txt"); // newest commit summary
+                assert_eq!(review.status, crate::reviews::ReviewStatus::Active);
+            })
+            .expect("start review");
+
+        // One file landed on disk.
+        let files: Vec<_> = std::fs::read_dir(reviews_dir.path())
+            .expect("read dir")
+            .collect();
+        assert_eq!(files.len(), 1);
+
+        // Starting again on the same changeset resumes rather than duplicating.
+        window
+            .update(cx, |app, window, cx| {
+                let before = app.current_review().expect("still attached").id.clone();
+                app.start_review(window, cx);
+                assert_eq!(app.current_review().expect("attached").id, before);
+            })
+            .expect("resume");
+    }
+
+    #[gpui::test]
+    async fn rename_rejects_empty_and_applies_trimmed_names(cx: &mut TestAppContext) {
+        let (repo_dir, _sha) = init_repo_with_one_commit();
+        let reviews_dir = tempfile::tempdir().expect("create tempdir");
+        let window = app_window_with_reviews_dir(cx, reviews_dir.path().to_path_buf());
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(repo_dir.path().to_path_buf(), window, cx);
+            })
+            .expect("open repo");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_changeset(window, cx);
+                app.start_review(window, cx);
+
+                let original_name = app.current_review().expect("attached").name.clone();
+                let rejected = app.rename_current_review("  ", window, cx);
+                assert!(!rejected);
+                assert_eq!(
+                    app.current_review().expect("attached").name,
+                    original_name,
+                    "rejection must leave the name unchanged"
+                );
+
+                let accepted = app.rename_current_review(" Second pass ", window, cx);
+                assert!(accepted);
+                assert_eq!(app.current_review().expect("attached").name, "Second pass");
+            })
+            .expect("rename review");
+    }
+
+    #[gpui::test]
+    async fn completing_reopening_and_deleting_update_store_and_attachment(
+        cx: &mut TestAppContext,
+    ) {
+        let (repo_dir, _sha) = init_repo_with_one_commit();
+        let reviews_dir = tempfile::tempdir().expect("create tempdir");
+        let window = app_window_with_reviews_dir(cx, reviews_dir.path().to_path_buf());
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(repo_dir.path().to_path_buf(), window, cx);
+            })
+            .expect("open repo");
+        cx.run_until_parked();
+
+        let id = window
+            .update(cx, |app, window, cx| {
+                app.open_changeset(window, cx);
+                app.start_review(window, cx);
+                app.current_review().expect("attached").id.clone()
+            })
+            .expect("start review");
+
+        window
+            .update(cx, |app, window, cx| {
+                app.set_current_review_completed(true, window, cx);
+                let review = app.current_review().expect("still attached");
+                assert_eq!(review.status, crate::reviews::ReviewStatus::Completed);
+                assert!(review.completed_at.is_some());
+            })
+            .expect("complete review");
+
+        window
+            .update(cx, |app, window, cx| {
+                app.set_current_review_completed(false, window, cx);
+                let review = app.current_review().expect("still attached");
+                assert_eq!(review.status, crate::reviews::ReviewStatus::Active);
+                assert!(review.completed_at.is_none());
+            })
+            .expect("reopen review");
+
+        window
+            .update(cx, |app, window, cx| {
+                app.delete_review(&id, window, cx);
+                assert!(app.current_review().is_none());
+                assert!(matches!(app.review_screen, ReviewScreen::Changeset { .. }));
+            })
+            .expect("delete review");
+
+        assert!(!reviews_dir.path().join(format!("{id}.json")).is_file());
+    }
+
+    #[test]
+    fn changeset_keys_normalize_range_endpoints_oldest_to_newest() {
+        let newest = "1".repeat(40);
+        let mid = "2".repeat(40);
+        let oldest = "3".repeat(40);
+
+        let range = Selection::Range {
+            start_sha: newest.clone(),
+            end_sha: oldest.clone(),
+            shas: vec![newest.clone(), mid, oldest.clone()],
+        };
+        let key = changeset_key_for_selection(&range).expect("range yields a key");
+        assert_eq!(
+            key,
+            crate::reviews::ChangesetKey::Range {
+                start_sha: oldest,
+                end_sha: newest,
+            }
+        );
+
+        assert_eq!(changeset_key_for_selection(&Selection::Pending), None);
+        assert_eq!(changeset_key_for_selection(&Selection::None), None);
     }
 }

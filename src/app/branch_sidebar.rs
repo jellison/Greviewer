@@ -414,6 +414,9 @@ mod tests {
                 BranchTreeRow::Section(s) => format!("section:{}:{}", s.title, s.count),
                 BranchTreeRow::Folder(f) => format!("folder:{}", f.path),
                 BranchTreeRow::Branch(b) => format!("branch:{}", b.branch.name),
+                BranchTreeRow::ReviewEntry(_) | BranchTreeRow::CompletedReviewsGroup { .. } => {
+                    unreachable!("build_branch_sidebar_rows never emits review rows")
+                }
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -487,6 +490,9 @@ mod tests {
                 BranchTreeRow::Section(s) => format!("section:{}:{}:{}", s.title, s.key, s.count),
                 BranchTreeRow::Folder(f) => format!("folder:{}", f.path),
                 BranchTreeRow::Branch(b) => format!("ref:{}", b.branch.name),
+                BranchTreeRow::ReviewEntry(_) | BranchTreeRow::CompletedReviewsGroup { .. } => {
+                    unreachable!("build_branch_sidebar_rows never emits review rows")
+                }
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -669,6 +675,9 @@ mod tests {
                 BranchTreeRow::Branch(branch_row) => {
                     format!("branch:{}", branch_row.branch.name)
                 }
+                BranchTreeRow::ReviewEntry(_) | BranchTreeRow::CompletedReviewsGroup { .. } => {
+                    unreachable!("build_branch_tree_rows never emits review rows")
+                }
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -741,6 +750,9 @@ mod tests {
                 }
                 BranchTreeRow::Branch(branch_row) => {
                     format!("branch:{}@{}", branch_row.display_name, branch_row.depth)
+                }
+                BranchTreeRow::ReviewEntry(_) | BranchTreeRow::CompletedReviewsGroup { .. } => {
+                    unreachable!("build_branch_sidebar_rows never emits review rows")
                 }
             })
             .collect::<Vec<_>>();
@@ -853,6 +865,9 @@ mod tests {
                 }
                 BranchTreeRow::Folder(folder) => format!("folder:{}", folder.path),
                 BranchTreeRow::Branch(branch_row) => format!("branch:{}", branch_row.branch.name),
+                BranchTreeRow::ReviewEntry(_) | BranchTreeRow::CompletedReviewsGroup { .. } => {
+                    unreachable!("build_branch_sidebar_rows never emits review rows")
+                }
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -2141,5 +2156,484 @@ mod tests {
                 );
             })
             .expect("filter and compare graph state");
+    }
+
+    fn seeded_review(
+        repo_path: std::path::PathBuf,
+        changeset: crate::reviews::ChangesetKey,
+        name: &str,
+        last_activity_at: i64,
+    ) -> crate::reviews::Review {
+        let mut review = crate::reviews::Review::new(repo_path, changeset, name.to_string(), 1);
+        review.last_activity_at = last_activity_at;
+        review
+    }
+
+    /// Tests seed `app.reviews` directly (bypassing the mutation methods that
+    /// normally bump `reviews_generation` and notify), so the memoized
+    /// sidebar row cache and the render loop would otherwise keep serving
+    /// their pre-seed snapshot. Call this right after mutating `app.reviews`
+    /// in a test.
+    fn bump_reviews_generation(app: &mut App, cx: &mut Context<App>) {
+        app.reviews_generation.set(app.reviews_generation.get() + 1);
+        cx.notify();
+    }
+
+    #[gpui::test]
+    async fn reviews_section_lists_active_then_completed_group(cx: &mut TestAppContext) {
+        let (dir, sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path.clone(), window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let canonical_path = window
+            .read_with(cx, |app, _cx| match &app.mode {
+                Mode::RepoOpen { repo } => repo.main_path.clone(),
+                Mode::NoRepo => panic!("expected RepoOpen mode"),
+            })
+            .expect("read main_path");
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.reviews = crate::reviews::ReviewStore::load(None);
+                let old_active = seeded_review(
+                    canonical_path.clone(),
+                    crate::reviews::ChangesetKey::Single { sha: sha.clone() },
+                    "old active",
+                    10,
+                );
+                let new_active = seeded_review(
+                    canonical_path.clone(),
+                    crate::reviews::ChangesetKey::Single { sha: sha.clone() },
+                    "new active",
+                    20,
+                );
+                let mut done = seeded_review(
+                    canonical_path.clone(),
+                    crate::reviews::ChangesetKey::Single { sha: sha.clone() },
+                    "done",
+                    30,
+                );
+                done.status = crate::reviews::ReviewStatus::Completed;
+                for review in [old_active, new_active, done] {
+                    app.reviews.insert(review).expect("insert review");
+                }
+                bump_reviews_generation(app, cx);
+            })
+            .expect("seed reviews");
+        cx.run_until_parked();
+
+        let rows = window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                app.sidebar_rows(repo, "")
+            })
+            .expect("read sidebar rows");
+
+        let summary = rows
+            .iter()
+            .map(|row| match row {
+                BranchTreeRow::Section(section) => {
+                    format!("section:{}:{}", section.title, section.count)
+                }
+                BranchTreeRow::ReviewEntry(review) => format!("review:{}", review.name),
+                BranchTreeRow::CompletedReviewsGroup { count, .. } => {
+                    format!("completed-group:{count}")
+                }
+                BranchTreeRow::Folder(_) | BranchTreeRow::Branch(_) => "branch-tree".to_string(),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            summary[0], "section:Reviews:3",
+            "the Reviews section leads with a total count of every review"
+        );
+        assert_eq!(
+            &summary[1..3],
+            ["review:new active", "review:old active"],
+            "active reviews list newest-activity first"
+        );
+        assert_eq!(
+            summary[3], "completed-group:1",
+            "the completed group row follows the active rows, collapsed by default"
+        );
+        assert!(
+            !summary.iter().any(|row| row == "review:done"),
+            "the completed review stays hidden while the group is collapsed"
+        );
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let group = visual
+            .debug_bounds("reviews-completed-group")
+            .expect("the completed-group row renders");
+        visual.simulate_click(group.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        let rows_after_expand = window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                app.sidebar_rows(repo, "")
+            })
+            .expect("read sidebar rows after expand");
+        assert!(
+            rows_after_expand.iter().any(|row| matches!(
+                row,
+                BranchTreeRow::ReviewEntry(review) if review.name == "done"
+            )),
+            "expanding the completed group reveals its review row"
+        );
+
+        // Assert that the Reviews section header has no top border (it leads the list),
+        // and the Local branch section that follows the review rows has a top border.
+        let section_borders = rows
+            .iter()
+            .filter_map(|row| match row {
+                BranchTreeRow::Section(section) => {
+                    Some((section.title.clone(), section.top_border))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            section_borders,
+            vec![("Reviews".to_string(), false), ("Local".to_string(), true)],
+            "Reviews section has no top border (leads the list); \
+             Local section has a top border (follows review rows)"
+        );
+    }
+
+    #[gpui::test]
+    async fn reviews_section_is_absent_without_reviews_and_while_filtering(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path.clone(), window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(
+            visual.debug_bounds("branch-section-reviews").is_none(),
+            "no Reviews section without any reviews"
+        );
+
+        let canonical_path = window
+            .read_with(cx, |app, _cx| match &app.mode {
+                Mode::RepoOpen { repo } => repo.main_path.clone(),
+                Mode::NoRepo => panic!("expected RepoOpen mode"),
+            })
+            .expect("read main_path");
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.reviews = crate::reviews::ReviewStore::load(None);
+                let review = seeded_review(
+                    canonical_path,
+                    crate::reviews::ChangesetKey::Single { sha },
+                    "a review",
+                    10,
+                );
+                app.reviews.insert(review).expect("insert review");
+                bump_reviews_generation(app, cx);
+            })
+            .expect("seed one review");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("branch-section-reviews")
+            .expect("the Reviews section appears once a review exists");
+
+        window
+            .update(cx, |app, window, cx| {
+                app.filter_input
+                    .update(cx, |state, cx| state.set_value("nomatch", window, cx));
+            })
+            .expect("set filter query");
+        cx.run_until_parked();
+
+        // `debug_bounds` (see gpui's `Frame::clear`) never removes a selector
+        // once painted, so it cannot prove the section's absence here — assert
+        // against the rebuilt row model instead.
+        window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                let rows = app.sidebar_rows(repo, "nomatch");
+                assert!(
+                    !rows.iter().any(|row| matches!(
+                        row,
+                        BranchTreeRow::Section(section) if section.key == "reviews"
+                    )),
+                    "the Reviews section disappears while the filter query is non-empty"
+                );
+            })
+            .expect("verify the section is absent while filtering");
+
+        window
+            .update(cx, |app, window, cx| {
+                app.filter_input
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+            })
+            .expect("clear filter query");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("branch-section-reviews")
+            .expect("the Reviews section reappears once the filter clears");
+    }
+
+    #[gpui::test]
+    async fn activating_a_review_row_opens_its_changeset_and_bumps_activity(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path.clone(), window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let canonical_path = window
+            .read_with(cx, |app, _cx| match &app.mode {
+                Mode::RepoOpen { repo } => repo.main_path.clone(),
+                Mode::NoRepo => panic!("expected RepoOpen mode"),
+            })
+            .expect("read main_path");
+
+        let seeded_activity = 10;
+        window
+            .update(cx, |app, _window, cx| {
+                app.reviews = crate::reviews::ReviewStore::load(None);
+                let review = seeded_review(
+                    canonical_path,
+                    crate::reviews::ChangesetKey::Single { sha: sha.clone() },
+                    "resume me",
+                    seeded_activity,
+                );
+                app.reviews.insert(review).expect("insert review");
+                bump_reviews_generation(app, cx);
+            })
+            .expect("seed one review");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row = visual
+            .debug_bounds("review-row-0")
+            .expect("the seeded review renders as the first review row");
+        visual.simulate_click(row.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, _cx| {
+                assert_eq!(
+                    app.review_screen,
+                    ReviewScreen::Changeset {
+                        sha: sha.clone(),
+                        changeset: match &app.review_screen {
+                            ReviewScreen::Changeset { changeset, .. } => changeset.clone(),
+                            ReviewScreen::Graph => panic!("expected Changeset"),
+                        },
+                    },
+                    "activating the row opens the changeset at the review's sha"
+                );
+                assert_eq!(app.selection, Selection::Single { sha: sha.clone() });
+                let review = app.reviews.for_repo(&match &app.mode {
+                    Mode::RepoOpen { repo } => repo.main_path.clone(),
+                    Mode::NoRepo => panic!("expected RepoOpen mode"),
+                })[0];
+                assert!(
+                    review.last_activity_at > seeded_activity,
+                    "opening a review bumps its last_activity_at"
+                );
+            })
+            .expect("verify resume opened the changeset and touched activity");
+    }
+
+    #[gpui::test]
+    async fn unavailable_reviews_render_but_do_not_open(cx: &mut TestAppContext) {
+        let (dir, _sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path.clone(), window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let canonical_path = window
+            .read_with(cx, |app, _cx| match &app.mode {
+                Mode::RepoOpen { repo } => repo.main_path.clone(),
+                Mode::NoRepo => panic!("expected RepoOpen mode"),
+            })
+            .expect("read main_path");
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.reviews = crate::reviews::ReviewStore::load(None);
+                let review = seeded_review(
+                    canonical_path,
+                    crate::reviews::ChangesetKey::Single {
+                        sha: "f".repeat(40),
+                    },
+                    "gone",
+                    10,
+                );
+                app.reviews.insert(review).expect("insert review");
+                bump_reviews_generation(app, cx);
+            })
+            .expect("seed unavailable review");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row = visual
+            .debug_bounds("review-row-0")
+            .expect("the unavailable review still renders a row");
+        visual.simulate_click(row.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, cx| {
+                assert_eq!(
+                    app.review_screen,
+                    ReviewScreen::Graph,
+                    "an unavailable review must not open"
+                );
+                assert_eq!(
+                    app.notification_count(cx),
+                    1,
+                    "activating an unavailable review surfaces one error notification"
+                );
+            })
+            .expect("verify unavailable review activation");
+    }
+
+    #[gpui::test]
+    async fn review_row_delete_arms_then_deletes(cx: &mut TestAppContext) {
+        let (dir, sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path.clone(), window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let canonical_path = window
+            .read_with(cx, |app, _cx| match &app.mode {
+                Mode::RepoOpen { repo } => repo.main_path.clone(),
+                Mode::NoRepo => panic!("expected RepoOpen mode"),
+            })
+            .expect("read main_path");
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.reviews = crate::reviews::ReviewStore::load(None);
+                let review = seeded_review(
+                    canonical_path,
+                    crate::reviews::ChangesetKey::Single { sha },
+                    "doomed",
+                    10,
+                );
+                app.reviews.insert(review).expect("insert review");
+                bump_reviews_generation(app, cx);
+            })
+            .expect("seed one review");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let arm = visual
+            .debug_bounds("review-row-delete-0")
+            .expect("the review row exposes a delete control");
+        visual.simulate_click(arm.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, _cx| {
+                assert_eq!(
+                    app.reviews
+                        .for_repo(std::path::Path::new(&{
+                            match &app.mode {
+                                Mode::RepoOpen { repo } => repo.main_path.clone(),
+                                Mode::NoRepo => panic!("expected RepoOpen mode"),
+                            }
+                        }))
+                        .len(),
+                    1,
+                    "the first click only arms the delete control"
+                );
+            })
+            .expect("verify armed state keeps the review");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let confirm = visual
+            .debug_bounds("review-row-delete-armed-0")
+            .expect("the armed delete control renders");
+        visual.simulate_click(confirm.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, _cx| {
+                let repo_path = match &app.mode {
+                    Mode::RepoOpen { repo } => repo.main_path.clone(),
+                    Mode::NoRepo => panic!("expected RepoOpen mode"),
+                };
+                assert!(
+                    app.reviews.for_repo(&repo_path).is_empty(),
+                    "confirming the delete removes the review"
+                );
+            })
+            .expect("verify deletion");
+
+        // `debug_bounds` (see gpui's `Frame::clear`) never removes a selector
+        // once painted, so it cannot prove a row's absence; assert against the
+        // rebuilt row model instead, mirroring `local_branch_rows_present`.
+        window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                let rows = app.sidebar_rows(repo, "");
+                assert!(
+                    !rows.iter().any(|row| matches!(
+                        row,
+                        BranchTreeRow::Section(section) if section.key == "reviews"
+                    )),
+                    "the Reviews section disappears once its only review is deleted"
+                );
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| matches!(row, BranchTreeRow::ReviewEntry(_))),
+                    "the deleted review's row no longer appears in the model"
+                );
+            })
+            .expect("verify the row model drops the deleted review");
     }
 }

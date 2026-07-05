@@ -1,9 +1,11 @@
 //! Persisted user settings.
 //!
-//! All durable user state lives in a single JSON file (`settings.json`) under
-//! the platform configuration directory. [`Settings`] is the one serialized
-//! unit; new fields can be added freely because the struct loads missing fields
-//! as defaults, so an older file stays readable after the schema grows.
+//! Durable user state lives under the platform configuration directory:
+//! `settings.json` (this module's [`Settings`], the one serialized unit for
+//! app-level state) and the `reviews/` directory (see [`crate::reviews`]).
+//! New [`Settings`] fields can be added freely because the struct loads
+//! missing fields as defaults, so an older file stays readable after the
+//! schema grows.
 
 use std::fs;
 use std::io;

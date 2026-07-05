@@ -802,6 +802,40 @@ fn changed_files_between_trees(
     Ok(files)
 }
 
+/// Whether `sha` resolves to a commit in the repository at `path`. Used to
+/// decide review availability; any error (bad repo, bad sha) reads as "no".
+pub fn commit_exists(path: &Path, sha: &str) -> bool {
+    let Ok(repo) = git2::Repository::open(path) else {
+        return false;
+    };
+    let Ok(oid) = git2::Oid::from_str(sha) else {
+        return false;
+    };
+    repo.find_commit(oid).map(|_| ()).is_ok()
+}
+
+/// Whether a persisted review's changeset can still be reconstructed:
+/// every referenced commit resolves, a range's endpoints still share a
+/// linear ancestry, and a comparison's merge base still exists.
+pub fn changeset_key_available(path: &Path, key: &crate::reviews::ChangesetKey) -> bool {
+    match key {
+        crate::reviews::ChangesetKey::Single { sha } => commit_exists(path, sha),
+        crate::reviews::ChangesetKey::Range { start_sha, end_sha } => {
+            commit_exists(path, start_sha)
+                && commit_exists(path, end_sha)
+                && commits_share_linear_ancestry(path, start_sha, end_sha).unwrap_or(false)
+        }
+        crate::reviews::ChangesetKey::Compare {
+            base_sha,
+            target_sha,
+        } => {
+            commit_exists(path, base_sha)
+                && commit_exists(path, target_sha)
+                && matches!(merge_base_sha(path, base_sha, target_sha), Ok(Some(_)))
+        }
+    }
+}
+
 pub fn commits_share_linear_ancestry(
     path: &Path,
     first_sha: &str,
@@ -1423,6 +1457,11 @@ pub fn relative_authored_time(authored_epoch_seconds: i64, now_epoch_seconds: i6
         s if s < YEAR => format!("{}mo", s / MONTH),
         s => format!("{}y", s / YEAR),
     }
+}
+
+/// A unix-seconds timestamp as the same `YYYY-MM-DD` form commit rows use.
+pub(crate) fn format_unix_date(seconds: i64) -> String {
+    format_authored_date(git2::Time::new(seconds, 0))
 }
 
 // Converts days since the Unix epoch to a civil date using Howard Hinnant's
@@ -2341,6 +2380,64 @@ mod tests {
             error.to_string(),
             "Those commits share no common history to compare."
         );
+    }
+
+    #[test]
+    fn commit_exists_distinguishes_real_and_unknown_shas() {
+        let (dir, sha) = init_repo_with_one_commit();
+
+        assert!(commit_exists(dir.path(), &sha));
+        assert!(!commit_exists(dir.path(), &"f".repeat(40)));
+    }
+
+    #[test]
+    fn changeset_key_availability_checks_each_kind() {
+        let (dir, shas) = init_repo_with_linear_history(2);
+        let (newest_sha, oldest_sha) = (&shas[0], &shas[1]);
+        let unknown_sha = "f".repeat(40);
+
+        assert!(changeset_key_available(
+            dir.path(),
+            &crate::reviews::ChangesetKey::Single {
+                sha: newest_sha.clone(),
+            }
+        ));
+        assert!(!changeset_key_available(
+            dir.path(),
+            &crate::reviews::ChangesetKey::Single {
+                sha: unknown_sha.clone(),
+            }
+        ));
+
+        assert!(changeset_key_available(
+            dir.path(),
+            &crate::reviews::ChangesetKey::Range {
+                start_sha: oldest_sha.clone(),
+                end_sha: newest_sha.clone(),
+            }
+        ));
+        assert!(!changeset_key_available(
+            dir.path(),
+            &crate::reviews::ChangesetKey::Range {
+                start_sha: oldest_sha.clone(),
+                end_sha: unknown_sha.clone(),
+            }
+        ));
+
+        assert!(changeset_key_available(
+            dir.path(),
+            &crate::reviews::ChangesetKey::Compare {
+                base_sha: oldest_sha.clone(),
+                target_sha: newest_sha.clone(),
+            }
+        ));
+        assert!(!changeset_key_available(
+            dir.path(),
+            &crate::reviews::ChangesetKey::Compare {
+                base_sha: oldest_sha.clone(),
+                target_sha: unknown_sha.clone(),
+            }
+        ));
     }
 
     #[test]

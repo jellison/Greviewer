@@ -50,6 +50,20 @@ pub(crate) fn add_app_window_with_graph_view_mode(
     cx.add_window(move |window, cx| App::new_with_settings(window, cx, settings.clone()))
 }
 
+/// Open an app window whose review store persists to `reviews_dir`, so
+/// review persistence can be observed by reading files back.
+pub(crate) fn app_window_with_reviews_dir(
+    cx: &mut TestAppContext,
+    reviews_dir: PathBuf,
+) -> WindowHandle<App> {
+    cx.update(gpui_component::init);
+    cx.add_window(move |window, cx| {
+        let mut app = App::new(window, cx);
+        app.reviews = crate::reviews::ReviewStore::load(Some(reviews_dir.clone()));
+        app
+    })
+}
+
 /// Build an app window seeded with recent repositories AND sidebar widths, so
 /// restore-on-render behavior can be asserted. Uses no settings store path
 /// (nothing persists to disk).

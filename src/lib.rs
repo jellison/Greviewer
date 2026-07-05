@@ -13,6 +13,7 @@ pub mod diff_highlight;
 pub mod graph;
 pub mod icons;
 pub mod repo;
+pub mod reviews;
 pub mod settings;
 pub mod theme;
 pub mod window_placement;
