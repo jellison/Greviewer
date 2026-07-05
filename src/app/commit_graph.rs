@@ -4055,12 +4055,12 @@ mod tests {
         let label_cell_bounds = visual
             .debug_bounds("commit-ref-labels-1")
             .expect("commit ref labels cell debug bounds");
-        let summary_bounds = visual
-            .debug_bounds("commit-summary-1")
-            .expect("commit summary debug bounds");
-        // The cap is a fraction of the shared summary·refs cell (summary
-        // width plus the ref cluster plus their inner gap), not the whole row.
-        let shared_cell_width = summary_bounds.size.width + label_cell_bounds.size.width + px(12.);
+        let shared_cell_bounds = visual
+            .debug_bounds("commit-summary-cell-1")
+            .expect("shared summary cell debug bounds");
+        // The cap is a fraction of the shared summary·refs cell, not the
+        // whole row.
+        let shared_cell_width = shared_cell_bounds.size.width;
         assert!(
             label_cell_bounds.size.width <= shared_cell_width * 0.35 + px(1.),
             "the ref cluster must cap at 35% of the shared summary cell: {label_cell_bounds:?} vs shared cell width {shared_cell_width:?}"

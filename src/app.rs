@@ -1346,6 +1346,10 @@ impl App {
             self.settings.window_state = Some(state);
         }
         self.capture_sidebar_widths(cx);
+        // Deliberately written unconditionally, like the sidebar widths
+        // above: a never-dragged session freezes the current defaults into
+        // settings.json, trading future default changes reaching existing
+        // users for not having to track a "user has resized" bit.
         self.settings.graph_column_widths.author = Some(self.author_column_width);
         self.settings.graph_column_widths.when = Some(self.when_column_width);
         self.persist_settings();
@@ -5889,6 +5893,7 @@ impl App {
                     .flex_1()
                     .min_w_0()
                     .gap_3()
+                    .debug_selector(move || format!("commit-summary-cell-{index}"))
                     .child(
                         div()
                             .flex_1()
@@ -5947,7 +5952,7 @@ impl App {
     /// Render the synthetic pending-changes row that always tops the graph
     /// (row 0). Aligns with `render_commit_row`'s column grid — gutter,
     /// shared summary cell, sha, author, when — using placeholders in place
-    /// of commit metadata: an em-dash sha, an italic "working tree" author,
+    /// of commit metadata: an en-dash sha, an italic "working tree" author,
     /// and an empty when cell; its gutter dot renders hollow to read as
     /// distinct from committed rows.
     fn render_pending_row(
@@ -6533,7 +6538,8 @@ mod tests {
     use super::{
         changeset_key_for_selection, restored_width, selection_summary, App, CloseChangeset,
         DiffDrag, DiffDragMode, FileListMode, Mode, OpenChangeset, OpenFailed, PreparedFileDiff,
-        ReviewScreen, Selection, FILE_TREE_ROW_HEIGHT, SIDEBAR_MIN_WIDTH,
+        ReviewScreen, Selection, FILE_TREE_ROW_HEIGHT, SIDEBAR_MIN_WIDTH, WHEN_COLUMN_MAX,
+        WHEN_COLUMN_MIN,
     };
     use crate::repo::{ChangeKind, INITIAL_COMMIT_LIMIT};
     use crate::settings::{
@@ -6752,6 +6758,96 @@ mod tests {
         assert!(
             (saved - after).abs() <= 0.5,
             "persisted {saved}, live {after}"
+        );
+    }
+
+    #[gpui::test]
+    async fn dragging_the_when_handle_resizes_clamps_and_persists_the_column(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store = dir.path().join("settings.json");
+        let (repo_dir, _sha) = init_repo_with_one_commit();
+        let repo_path = repo_dir.path().to_path_buf();
+
+        let window = add_app_window_with_store_path(cx, store.clone());
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(repo_path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let handle = visual
+            .debug_bounds("graph-header-when-handle")
+            .expect("when resize handle renders");
+        let before = window
+            .update(cx, |app, _, _| app.when_column_width)
+            .expect("read width");
+
+        // Drag the divider 40px left: the when column grows 40px.
+        let start = handle.center();
+        let end = point(start.x - px(40.), start.y);
+        simulate_drag(&mut visual, start, end);
+        cx.run_until_parked();
+
+        let after = window
+            .update(cx, |app, _, _| app.when_column_width)
+            .expect("read width");
+        assert!(
+            (after - (before + 40.)).abs() <= 2.,
+            "when width should grow ~40px: {before} -> {after}"
+        );
+
+        // Dragging far left pins the width to the maximum.
+        let handle = visual
+            .debug_bounds("graph-header-when-handle")
+            .expect("when resize handle renders after the resize");
+        simulate_drag(
+            &mut visual,
+            handle.center(),
+            point(px(0.), handle.center().y),
+        );
+        cx.run_until_parked();
+        let clamped = window
+            .update(cx, |app, _, _| app.when_column_width)
+            .expect("read width");
+        assert_eq!(
+            clamped, WHEN_COLUMN_MAX,
+            "far-left drag should clamp to the maximum"
+        );
+
+        // Dragging back right past the column's right edge pins it to the
+        // minimum. The pointer stays inside the window: the handle sits a
+        // full column width from the right edge after the max clamp.
+        let handle = visual
+            .debug_bounds("graph-header-when-handle")
+            .expect("when resize handle renders after the max clamp");
+        let start = handle.center();
+        simulate_drag(
+            &mut visual,
+            start,
+            point(start.x + px(WHEN_COLUMN_MAX - 30.), start.y),
+        );
+        cx.run_until_parked();
+        let clamped = window
+            .update(cx, |app, _, _| app.when_column_width)
+            .expect("read width");
+        assert_eq!(
+            clamped, WHEN_COLUMN_MIN,
+            "far-right drag should clamp to the minimum"
+        );
+
+        // The dragged width survives the session end.
+        assert!(visual.simulate_close(), "window should accept the close");
+        let saved = crate::settings::load(&store)
+            .graph_column_widths
+            .when
+            .expect("when width persisted on close");
+        assert!(
+            (saved - clamped).abs() <= 0.5,
+            "persisted {saved}, live {clamped}"
         );
     }
 
