@@ -11,6 +11,8 @@
 pub mod pane_grid;
 pub mod tab_bar;
 
+pub(crate) use pane_grid::EmptyDragPreview;
+
 /// Anything that can occupy a tab.
 pub trait WorkspaceItem {
     /// Stable identity within a pane. Opening an item whose key is already

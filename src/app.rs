@@ -29,9 +29,9 @@ pub use path_picker::{repository_prompt_options, GpuiPathPicker, PathPicker, Pat
 use gpui::prelude::FluentBuilder;
 use gpui::{
     actions, canvas, div, pattern_slash, point, px, relative, uniform_list, AnyElement, AppContext,
-    Background, Bounds, ClickEvent, Context, Entity, EventEmitter, FocusHandle, HighlightStyle,
-    Hsla, InteractiveElement, IntoElement, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, PathBuilder, Pixels, Point, Render, ScrollHandle,
+    Background, Bounds, ClickEvent, Context, DragMoveEvent, Entity, EventEmitter, FocusHandle,
+    HighlightStyle, Hsla, InteractiveElement, IntoElement, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, PathBuilder, Pixels, Point, Render, ScrollHandle,
     ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledText, TextStyle,
     UniformListScrollHandle, Window,
 };
@@ -52,10 +52,11 @@ use std::{
 
 use crate::icons::LucideIcon;
 use crate::settings::{
-    self, GraphViewMode, RecentRepository, Settings, SidebarWidths, MAX_RECENT_REPOSITORIES,
+    self, GraphColumnWidths, GraphViewMode, RecentRepository, Settings, SidebarWidths,
+    MAX_RECENT_REPOSITORIES,
 };
 use crate::theme::palette;
-use crate::workspace::FileDiffItem;
+use crate::workspace::{EmptyDragPreview, FileDiffItem};
 use crate::{diff_highlight, graph, repo};
 
 actions!(
@@ -171,6 +172,11 @@ pub struct App {
     /// Which commit-graph layout is active. Mirrors `settings.graph_view_mode`;
     /// the switcher updates both together.
     pub view_mode: GraphViewMode,
+    /// Live width of the Compact layout's AUTHOR column; dragged from the
+    /// header, restored from settings, captured back on session end.
+    author_column_width: f32,
+    /// Live width of the Compact layout's WHEN column (see above).
+    when_column_width: f32,
     /// While a comparison changeset is open, the commits a merge of the
     /// target into the base would introduce (base..target), newest first.
     /// Computed once when the changeset opens — the title-bar popover renders
@@ -371,6 +377,19 @@ pub(crate) enum DiffDragMode {
     Line {
         origin: (diff_selection::DiffPoint, diff_selection::DiffPoint),
     },
+}
+
+/// Which Compact-header column a divider drag is resizing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphColumn {
+    Author,
+    When,
+}
+
+/// Dragging the resize handle at the left edge of a header column.
+#[derive(Debug, Clone)]
+struct DraggedColumnHandle {
+    column: GraphColumn,
 }
 
 /// Shared union logic for `Word`/`Line` drag extension: the selection spans
@@ -753,6 +772,7 @@ impl App {
             sidebar_widths: SidebarWidths::default(),
             ai_enabled: false,
             graph_view_mode: GraphViewMode::default(),
+            graph_column_widths: GraphColumnWidths::default(),
         };
         Self::new_with_picker_and_settings(window, cx, Box::new(GpuiPathPicker), settings)
     }
@@ -925,6 +945,18 @@ impl App {
             double_click_anchor: None,
             review_screen: ReviewScreen::Graph,
             view_mode: settings.graph_view_mode,
+            author_column_width: restored_column_width(
+                settings.graph_column_widths.author,
+                COMMIT_AUTHOR_WIDTH,
+                AUTHOR_COLUMN_MIN,
+                AUTHOR_COLUMN_MAX,
+            ),
+            when_column_width: restored_column_width(
+                settings.graph_column_widths.when,
+                COMMIT_TIME_WIDTH,
+                WHEN_COLUMN_MIN,
+                WHEN_COLUMN_MAX,
+            ),
             comparison_commit_shas: None,
             workspace: crate::workspace::Workspace::new(),
             file_tree_highlight_path: None,
@@ -1204,6 +1236,8 @@ impl App {
             self.settings.window_state = Some(state);
         }
         self.capture_sidebar_widths(cx);
+        self.settings.graph_column_widths.author = Some(self.author_column_width);
+        self.settings.graph_column_widths.when = Some(self.when_column_width);
         self.persist_settings();
     }
 
@@ -3114,7 +3148,7 @@ impl App {
         uniform_list(
             "commit-history",
             item_count,
-            cx.processor(move |app, range: std::ops::Range<usize>, window, cx| {
+            cx.processor(move |app, range: std::ops::Range<usize>, _window, cx| {
                 let Mode::RepoOpen { repo } = &app.mode else {
                     return Vec::new();
                 };
@@ -3130,19 +3164,12 @@ impl App {
                 // commit instead of once for the whole page.
                 let head_branch = app.head_branch_name();
                 let worktree_branches = app.worktree_branch_names();
-                let text_system = window.text_system();
-                let font_id = text_system.resolve_font(&gpui::font(MONO_FONT_FAMILY));
-                let glyph_advance = text_system
-                    .advance(font_id, px(10.), '0')
-                    .map(|advance| f32::from(advance.width))
-                    .unwrap_or(6.);
-                let refs_column_width = commit_ref_labels_column_width(
-                    &visible_commits,
-                    &app.hidden_branches,
-                    head_branch.as_deref(),
-                    &worktree_branches,
-                    glyph_advance,
-                );
+                // Epoch seconds once per render pass: every row's WHEN cell
+                // is relative to the same instant.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs() as i64)
+                    .unwrap_or(0);
                 range
                     .map(|index| {
                         if index == 0 {
@@ -3152,7 +3179,6 @@ impl App {
                                         &layout.rows,
                                         layout.max_lanes,
                                         app.selection == Selection::Pending,
-                                        refs_column_width,
                                         cx,
                                     )
                                     .into_any_element(),
@@ -3174,10 +3200,10 @@ impl App {
                                         commit,
                                         &layout,
                                         selected,
-                                        RefsColumnContext {
+                                        CommitRowContext {
                                             head_branch: head_branch.as_deref(),
                                             worktree_branches: &worktree_branches,
-                                            width: refs_column_width,
+                                            now,
                                         },
                                         cx,
                                     )
@@ -3305,6 +3331,9 @@ impl App {
             // fixture there.
             .when_some(selection_summary(&self.selection), |screen, summary| {
                 screen.child(self.render_selection_bar(summary, cx))
+            })
+            .when(self.view_mode == GraphViewMode::Compact, |screen| {
+                screen.child(self.render_graph_header(layout.max_lanes, cx))
             })
             .child(history);
 
@@ -3490,6 +3519,131 @@ impl App {
             })
             .child(div().flex_1())
             .child(self.render_view_switch(cx))
+    }
+
+    /// The invisible drag zone straddling the divider at a resizable header
+    /// column's left edge: `col-resize` cursor, a subtle highlight on hover,
+    /// and live resizing while dragged (see `render_graph_header`'s
+    /// `on_drag_move`).
+    fn render_column_resize_handle(
+        &self,
+        column: GraphColumn,
+        selector: &'static str,
+    ) -> impl IntoElement {
+        div()
+            .id(selector)
+            .absolute()
+            .left(px(-(COMMIT_COLUMN_GAP + COLUMN_HANDLE_WIDTH) / 2.))
+            .top_0()
+            .w(px(COLUMN_HANDLE_WIDTH))
+            .h_full()
+            .cursor_col_resize()
+            .debug_selector(move || selector.to_string())
+            .hover(|handle| handle.bg(palette().accent_bg_hover))
+            .on_drag(
+                DraggedColumnHandle { column },
+                |_drag, _offset, _window, cx| cx.new(|_| EmptyDragPreview),
+            )
+    }
+
+    /// The Compact layout's pinned column header: a blank cell over the graph
+    /// gutter, then muted uppercase labels for the summary·refs cell and each
+    /// metadata column. Compact-only; the Table layout renders no header.
+    fn render_graph_header(
+        &self,
+        max_lanes: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let label = |text: &'static str, selector: &'static str| {
+            div()
+                .text_size(px(GRAPH_HEADER_FONT_SIZE))
+                .text_color(palette().text_muted)
+                .debug_selector(move || selector.to_string())
+                .child(text)
+        };
+
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(px(GRAPH_HEADER_HEIGHT))
+            .gap(px(COMMIT_COLUMN_GAP))
+            .pl_4()
+            .pr(px(COMMIT_ROW_RIGHT_INSET))
+            .border_b_1()
+            .border_color(palette().border)
+            .font_family(MONO_FONT_FAMILY)
+            .id("graph-header")
+            .debug_selector(|| "graph-header".to_string())
+            .child(
+                // Spacer over the graph gutter, so SUMMARY · REFS starts
+                // where the shared cell does.
+                div()
+                    .flex_shrink_0()
+                    .w(px(commit_graph_gutter_width(max_lanes.max(1)))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(label("SUMMARY \u{00b7} REFS", "graph-header-summary")),
+            )
+            .child(
+                div()
+                    .w(px(COMMIT_HASH_WIDTH))
+                    .flex_shrink_0()
+                    .child(label("COMMIT", "graph-header-commit")),
+            )
+            .child(
+                div()
+                    .w(px(self.author_column_width))
+                    .flex_shrink_0()
+                    .relative()
+                    .child(label("AUTHOR", "graph-header-author"))
+                    .child(self.render_column_resize_handle(
+                        GraphColumn::Author,
+                        "graph-header-author-handle",
+                    )),
+            )
+            .child(
+                div()
+                    .w(px(self.when_column_width))
+                    .flex_shrink_0()
+                    .relative()
+                    .flex()
+                    .justify_end()
+                    .child(label("WHEN", "graph-header-when"))
+                    .child(self.render_column_resize_handle(
+                        GraphColumn::When,
+                        "graph-header-when-handle",
+                    )),
+            )
+            .on_drag_move(cx.listener(
+                move |app, event: &DragMoveEvent<DraggedColumnHandle>, _window, cx| {
+                    let column = event.drag(cx).column;
+                    // The pointer rides the divider's center, which sits
+                    // half a column gap left of the resized column's left
+                    // edge. The column's right edge is fixed, so
+                    // width = right edge - (pointer + gap/2). Anything else
+                    // makes the width jump the moment the handle is grabbed.
+                    let right_edge = f32::from(event.bounds.right()) - COMMIT_ROW_RIGHT_INSET;
+                    let pointer_x = f32::from(event.event.position.x);
+                    let column_left = pointer_x + COMMIT_COLUMN_GAP / 2.;
+                    match column {
+                        GraphColumn::When => {
+                            app.when_column_width =
+                                (right_edge - column_left).clamp(WHEN_COLUMN_MIN, WHEN_COLUMN_MAX);
+                        }
+                        GraphColumn::Author => {
+                            let author_right =
+                                right_edge - app.when_column_width - COMMIT_COLUMN_GAP;
+                            app.author_column_width = (author_right - column_left)
+                                .clamp(AUTHOR_COLUMN_MIN, AUTHOR_COLUMN_MAX);
+                        }
+                    }
+                    cx.notify();
+                },
+            ))
     }
 
     /// Width the branch sidebar opens at: the saved width when present and
@@ -5047,7 +5201,7 @@ impl App {
         commit: &repo::CommitInfo,
         layout: &GraphLayout,
         selected: bool,
-        refs_column: RefsColumnContext<'_>,
+        row_context: CommitRowContext<'_>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let debug_selector = if selected {
@@ -5063,7 +5217,7 @@ impl App {
             .w_full()
             .h(px(self.row_height()))
             .font_family(MONO_FONT_FAMILY)
-            .gap_3()
+            .gap(px(COMMIT_COLUMN_GAP))
             .px_4()
             // No background: the selection highlight paints from the list's
             // underlay canvas (see `render_graph_screen`), and an opaque row
@@ -5079,14 +5233,6 @@ impl App {
             .on_click(cx.listener(move |app, event: &ClickEvent, window, cx| {
                 app.handle_commit_row_click(sha.clone(), event, window, cx);
             }))
-            .child(render_commit_ref_labels(
-                index,
-                commit,
-                &self.hidden_branches,
-                refs_column.head_branch,
-                refs_column.worktree_branches,
-                refs_column.width,
-            ))
             .child(render_commit_graph_gutter(
                 index,
                 &layout.rows[index],
@@ -5097,57 +5243,81 @@ impl App {
                 GutterMetrics::new(self.row_height()),
             ))
             .child(
+                // The shared summary·refs cell: summary left, ref pills
+                // right, the summary yielding space (ellipsizing) to the
+                // capped ref cluster when the two collide.
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(palette().text)
+                            .text_size(px(15.))
+                            .truncate()
+                            .debug_selector(move || format!("commit-summary-{index}"))
+                            .child(commit.summary.clone()),
+                    )
+                    .child(render_commit_ref_labels_inline(
+                        index,
+                        commit,
+                        &self.hidden_branches,
+                        row_context.head_branch,
+                        row_context.worktree_branches,
+                    )),
+            )
+            .child(
                 div()
                     .w(px(COMMIT_HASH_WIDTH))
                     .flex_shrink_0()
                     .text_color(palette().commit_hash_fg)
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .font_family(MONO_FONT_FAMILY)
                     .debug_selector(move || format!("commit-hash-{index}"))
                     .child(commit.short_sha.clone()),
             )
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_color(palette().text)
-                    .text_size(px(14.))
-                    .truncate()
-                    .debug_selector(move || format!("commit-summary-{index}"))
-                    .child(commit.summary.clone()),
-            )
-            .child(
-                div()
-                    .w(px(COMMIT_AUTHOR_WIDTH))
+                    .w(px(self.author_column_width))
                     .flex_shrink_0()
                     .min_w_0()
                     .text_color(palette().text_muted)
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .truncate()
                     .debug_selector(move || format!("commit-author-{index}"))
                     .child(commit.author.clone()),
             )
             .child(
                 div()
-                    .w(px(COMMIT_TIME_WIDTH))
+                    .w(px(self.when_column_width))
                     .flex_shrink_0()
+                    .flex()
+                    .justify_end()
                     .text_color(palette().text_muted)
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .debug_selector(move || format!("commit-time-{index}"))
-                    .child(commit.authored_date.clone()),
+                    .child(repo::relative_authored_time(
+                        commit.authored_timestamp,
+                        row_context.now,
+                    )),
             )
     }
 
     /// Render the synthetic pending-changes row that always tops the graph
-    /// (row 0). Mirrors `render_commit_row`'s shell (height, gap, padding,
-    /// click gesture) but has no commit metadata of its own; its gutter dot
-    /// renders hollow to read as distinct from committed rows.
+    /// (row 0). Aligns with `render_commit_row`'s column grid — gutter,
+    /// shared summary cell, sha, author, when — using placeholders in place
+    /// of commit metadata: an em-dash sha, an italic "working tree" author,
+    /// and an empty when cell; its gutter dot renders hollow to read as
+    /// distinct from committed rows.
     fn render_pending_row(
         &self,
         graph_rows: &[graph::GraphRow],
         max_graph_lanes: usize,
         selected: bool,
-        refs_column_width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let debug_selector = if selected {
@@ -5174,7 +5344,7 @@ impl App {
             .w_full()
             .h(px(self.row_height()))
             .font_family(MONO_FONT_FAMILY)
-            .gap_3()
+            .gap(px(COMMIT_COLUMN_GAP))
             .px_4()
             .cursor_pointer()
             .id("pending-row")
@@ -5182,13 +5352,6 @@ impl App {
             .on_click(cx.listener(|app, event: &ClickEvent, window, cx| {
                 app.handle_pending_row_click(event, window, cx);
             }))
-            .child(
-                div()
-                    .w(px(refs_column_width))
-                    .max_w(relative(COMMIT_REF_LABELS_MAX_FRACTION))
-                    .flex_shrink_0()
-                    .debug_selector(|| "pending-ref-labels-spacer".to_string()),
-            )
             .child(render_commit_graph_gutter(
                 0,
                 &graph_rows[0],
@@ -5199,23 +5362,56 @@ impl App {
                 GutterMetrics::new(self.row_height()),
             ))
             .child(
+                // Shared summary cell: the title, then the muted change
+                // summary in the space ref labels occupy on commit rows.
                 div()
+                    .flex()
+                    .items_center()
                     .flex_1()
                     .min_w_0()
-                    .text_color(palette().text)
-                    .text_size(px(14.))
-                    .truncate()
-                    .debug_selector(|| "pending-title".to_string())
-                    .child("Pending changes"),
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(palette().text)
+                            .text_size(px(15.))
+                            .debug_selector(|| "pending-title".to_string())
+                            .child("Pending changes"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(palette().text_muted)
+                            .text_size(px(13.))
+                            .debug_selector(|| "pending-summary".to_string())
+                            .child(summary_text),
+                    ),
             )
             .child(
                 div()
+                    .w(px(COMMIT_HASH_WIDTH))
                     .flex_shrink_0()
                     .text_color(palette().text_muted)
-                    .text_size(px(12.))
-                    .debug_selector(|| "pending-summary".to_string())
-                    .child(summary_text),
+                    .text_size(px(13.))
+                    .font_family(MONO_FONT_FAMILY)
+                    .debug_selector(|| "pending-hash".to_string())
+                    .child("\u{2013}"),
             )
+            .child(
+                div()
+                    .w(px(self.author_column_width))
+                    .flex_shrink_0()
+                    .min_w_0()
+                    .truncate()
+                    .italic()
+                    .text_color(palette().text_muted)
+                    .text_size(px(13.))
+                    .debug_selector(|| "pending-author".to_string())
+                    .child("working tree"),
+            )
+            .child(div().w(px(self.when_column_width)).flex_shrink_0())
     }
 
     /// Two-line "Table" counterpart to `render_commit_row`: a 14px summary
@@ -5431,13 +5627,14 @@ impl App {
     }
 }
 
-/// The refs-column inputs `render_commit_row` needs, computed once per render
-/// pass by the history-list processor and threaded down instead of recomputed
-/// per row (see `render_commit_history_list`).
-struct RefsColumnContext<'a> {
+/// Per-render-pass inputs `render_commit_row` needs, computed once by the
+/// history-list processor and threaded down instead of recomputed per row
+/// (see `render_commit_history_list`).
+struct CommitRowContext<'a> {
     head_branch: Option<&'a str>,
     worktree_branches: &'a BTreeSet<String>,
-    width: f32,
+    /// Epoch seconds at render time, for the relative WHEN column.
+    now: i64,
 }
 
 /// Row height of the single-row Compact layout.
@@ -5449,9 +5646,30 @@ const COMMIT_HASH_WIDTH: f32 = 72.;
 const COMMIT_AUTHOR_WIDTH: f32 = 168.;
 const COMMIT_TIME_WIDTH: f32 = 96.;
 
+/// Flex gap between the Compact row's columns (and the header's cells).
+const COMMIT_COLUMN_GAP: f32 = 24.;
+
+/// Drag bounds for the resizable AUTHOR and WHEN columns. Restored widths
+/// clamp to the same ranges, so a corrupt settings file cannot wedge a
+/// column off-screen.
+const AUTHOR_COLUMN_MIN: f32 = 80.;
+const AUTHOR_COLUMN_MAX: f32 = 400.;
+const WHEN_COLUMN_MIN: f32 = 60.;
+const WHEN_COLUMN_MAX: f32 = 200.;
+
+/// Width of the invisible hit zone straddling a resizable header divider.
+const COLUMN_HANDLE_WIDTH: f32 = 7.;
+
 /// Width reserved on the right edge of the history list for the scrollbar;
 /// the commit rows and the selection underlay both stop short of it.
 const COMMIT_HISTORY_SCROLLBAR_GUTTER: f32 = 12.;
+
+/// Height and label size of the Compact layout's pinned column header.
+const GRAPH_HEADER_HEIGHT: f32 = 28.;
+const GRAPH_HEADER_FONT_SIZE: f32 = 11.;
+/// Right inset shared by the header and the rows: the rows' own padding
+/// plus the scrollbar gutter the list reserves (`COMMIT_HISTORY_SCROLLBAR_GUTTER`).
+const COMMIT_ROW_RIGHT_INSET: f32 = 16. + COMMIT_HISTORY_SCROLLBAR_GUTTER;
 
 /// The rectangles the selection underlay paints behind the selected commit
 /// rows: one row-sized rect per selected index, shifted by the list's current
@@ -5664,6 +5882,15 @@ fn restored_width(saved: Option<f32>, default: f32) -> f32 {
     }
 }
 
+/// Resolve a persisted graph column width: the saved value clamped to the
+/// column's drag bounds, or `default` when nothing sane has been saved.
+fn restored_column_width(saved: Option<f32>, default: f32, min: f32, max: f32) -> f32 {
+    match saved {
+        Some(width) if width.is_finite() => width.clamp(min, max),
+        _ => default,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -5672,10 +5899,12 @@ mod tests {
         FILE_TREE_ROW_HEIGHT, SIDEBAR_MIN_WIDTH,
     };
     use crate::repo::{ChangeKind, INITIAL_COMMIT_LIMIT};
-    use crate::settings::{GraphViewMode, RecentRepository, Settings, SidebarWidths, WindowMode};
-    use crate::workspace::test_util::simulate_double_click;
+    use crate::settings::{
+        GraphColumnWidths, GraphViewMode, RecentRepository, Settings, SidebarWidths, WindowMode,
+    };
+    use crate::workspace::test_util::{simulate_double_click, simulate_drag};
     use git2::{IndexAddOption, Repository, Signature};
-    use gpui::{px, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
+    use gpui::{point, px, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
     use std::{fs, rc::Rc};
 
     use super::test_support::*;
@@ -5805,6 +6034,218 @@ mod tests {
         assert_eq!(restored_width(Some(f32::NAN), 240.), SIDEBAR_MIN_WIDTH);
     }
 
+    #[test]
+    fn restored_column_width_defaults_and_clamps() {
+        use super::restored_column_width;
+        // Unset -> default.
+        assert_eq!(restored_column_width(None, 168., 80., 400.), 168.);
+        // Sane saved value -> itself.
+        assert_eq!(restored_column_width(Some(220.), 168., 80., 400.), 220.);
+        // Out-of-range values clamp to the bounds.
+        assert_eq!(restored_column_width(Some(10.), 168., 80., 400.), 80.);
+        assert_eq!(restored_column_width(Some(9_999.), 168., 80., 400.), 400.);
+        // Corrupt values fall back to the default.
+        assert_eq!(restored_column_width(Some(f32::NAN), 168., 80., 400.), 168.);
+    }
+
+    #[gpui::test]
+    async fn closing_the_window_persists_graph_column_widths(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store = dir.path().join("settings.json");
+        let window = add_app_window_with_store_path(cx, store.clone());
+
+        window
+            .update(cx, |app, _window, _cx| {
+                app.author_column_width = 222.;
+                app.when_column_width = 77.;
+            })
+            .expect("set live widths");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.simulate_close(), "window should accept the close");
+
+        let saved = crate::settings::load(&store).graph_column_widths;
+        assert_eq!(saved.author, Some(222.));
+        assert_eq!(saved.when, Some(77.));
+    }
+
+    #[gpui::test]
+    async fn dragging_the_header_handles_resizes_and_persists_the_columns(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store = dir.path().join("settings.json");
+        let (repo_dir, _sha) = init_repo_with_one_commit();
+        let repo_path = repo_dir.path().to_path_buf();
+
+        let window = add_app_window_with_store_path(cx, store.clone());
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(repo_path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let handle = visual
+            .debug_bounds("graph-header-author-handle")
+            .expect("author resize handle renders");
+        let before = window
+            .update(cx, |app, _, _| app.author_column_width)
+            .expect("read width");
+
+        // Drag the divider 40px left: the author column grows 40px.
+        let start = handle.center();
+        let end = point(start.x - px(40.), start.y);
+        simulate_drag(&mut visual, start, end);
+        cx.run_until_parked();
+
+        let after = window
+            .update(cx, |app, _, _| app.author_column_width)
+            .expect("read width");
+        assert!(
+            (after - (before + 40.)).abs() <= 2.,
+            "author width should grow ~40px: {before} -> {after}"
+        );
+
+        // The dragged width survives the session end.
+        assert!(visual.simulate_close(), "window should accept the close");
+        let saved = crate::settings::load(&store)
+            .graph_column_widths
+            .author
+            .expect("author width persisted on close");
+        assert!(
+            (saved - after).abs() <= 0.5,
+            "persisted {saved}, live {after}"
+        );
+    }
+
+    #[gpui::test]
+    async fn compact_row_orders_summary_refs_sha_author_when(cx: &mut TestAppContext) {
+        let (dir, _main_tip, _root) = init_repo_with_feature_branch();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        // Row 1 is the newest commit (row 0 is the pending row). The checked-out
+        // tip carries a ref label, so the shared cell renders both halves.
+        let gutter = visual
+            .debug_bounds("commit-graph-gutter-1")
+            .expect("gutter renders");
+        let summary = visual
+            .debug_bounds("commit-summary-1")
+            .expect("summary renders");
+        let refs = visual
+            .debug_bounds("commit-ref-labels-1")
+            .expect("ref labels render in the shared cell");
+        let hash = visual.debug_bounds("commit-hash-1").expect("sha renders");
+        let author = visual
+            .debug_bounds("commit-author-1")
+            .expect("author renders");
+        let when = visual.debug_bounds("commit-time-1").expect("when renders");
+
+        // Reading order: gutter, summary, refs (right-aligned in the same
+        // cell), sha, author, when.
+        assert!(gutter.right() <= summary.left(), "gutter leads the row");
+        assert!(
+            summary.left() < refs.left(),
+            "summary sits left of the refs"
+        );
+        assert!(
+            refs.right() <= hash.left(),
+            "refs stay inside the shared cell"
+        );
+        assert!(hash.right() <= author.left(), "sha precedes author");
+        assert!(author.right() <= when.left(), "author precedes when");
+    }
+
+    #[gpui::test]
+    async fn graph_header_renders_in_compact_and_not_in_table(cx: &mut TestAppContext) {
+        let (dir, _sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let header = visual
+            .debug_bounds("graph-header")
+            .expect("compact layout shows the column header");
+        // Header cells align with the row columns they label.
+        let author_cell = visual
+            .debug_bounds("graph-header-author")
+            .expect("author header cell");
+        let author_col = visual
+            .debug_bounds("commit-author-1")
+            .expect("author column");
+        assert_eq!(author_cell.left(), author_col.left(), "AUTHOR aligns");
+        // The header never scrolls with the list: it sits above the rows.
+        // Row 1 is the repo's only commit, which is also HEAD, so
+        // `open_repository_at`'s default selection renders it as
+        // "selected-commit-row-1" rather than "commit-row-1".
+        let row = visual
+            .debug_bounds("selected-commit-row-1")
+            .expect("commit row");
+        assert!(header.bottom() <= row.top(), "header sits above the rows");
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.set_view_mode(crate::settings::GraphViewMode::Table, cx);
+            })
+            .expect("switch to table");
+        cx.run_until_parked();
+        assert!(
+            visual.debug_bounds("graph-header").is_none(),
+            "table layout renders no column header",
+        );
+    }
+
+    #[gpui::test]
+    async fn compact_pending_row_fills_the_metadata_columns_with_placeholders(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, _sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let title = visual.debug_bounds("pending-title").expect("title renders");
+        let hash = visual
+            .debug_bounds("pending-hash")
+            .expect("sha placeholder renders");
+        let author = visual
+            .debug_bounds("pending-author")
+            .expect("working-tree author cell renders");
+        assert!(
+            title.right() <= hash.left(),
+            "title precedes the sha column"
+        );
+        assert!(
+            hash.right() <= author.left(),
+            "sha precedes the author column"
+        );
+        // The commit rows' sha column and the pending placeholder align.
+        let commit_hash = visual.debug_bounds("commit-hash-1").expect("commit sha");
+        assert_eq!(hash.left(), commit_hash.left(), "sha columns align");
+    }
+
     #[gpui::test]
     async fn restores_saved_branch_sidebar_width_on_render(cx: &mut TestAppContext) {
         let (dir, _) = init_repo_with_one_commit();
@@ -5923,6 +6364,7 @@ mod tests {
                 },
                 ai_enabled: false,
                 graph_view_mode: GraphViewMode::default(),
+                graph_column_widths: GraphColumnWidths::default(),
             },
         )
         .expect("seed settings");

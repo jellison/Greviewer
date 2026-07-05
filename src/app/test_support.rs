@@ -6,7 +6,7 @@
 use super::*;
 use crate::graph;
 use crate::repo::{self, ChangeKind};
-use crate::settings::{self, RecentRepository, Settings, SidebarWidths};
+use crate::settings::{self, GraphColumnWidths, RecentRepository, Settings, SidebarWidths};
 use git2::{IndexAddOption, Repository, Signature};
 use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowHandle};
 use std::{collections::BTreeSet, fs, path::PathBuf};
@@ -45,6 +45,7 @@ pub(crate) fn add_app_window_with_graph_view_mode(
         sidebar_widths: SidebarWidths::default(),
         ai_enabled: false,
         graph_view_mode,
+        graph_column_widths: GraphColumnWidths::default(),
     };
     cx.add_window(move |window, cx| App::new_with_settings(window, cx, settings.clone()))
 }
@@ -64,6 +65,7 @@ pub(crate) fn add_app_window_with_recent_and_widths(
         sidebar_widths,
         ai_enabled: false,
         graph_view_mode: GraphViewMode::default(),
+        graph_column_widths: GraphColumnWidths::default(),
     };
     cx.add_window(move |window, cx| App::new_with_settings(window, cx, settings.clone()))
 }
@@ -82,6 +84,7 @@ pub(crate) fn seed_recent_repositories(
             sidebar_widths: SidebarWidths::default(),
             ai_enabled: false,
             graph_view_mode: GraphViewMode::default(),
+            graph_column_widths: GraphColumnWidths::default(),
         },
     )
     .expect("seed settings store");

@@ -19,13 +19,15 @@ pub(crate) fn commit_row_separator_color(selected: bool) -> gpui::Rgba {
     }
 }
 
-pub(crate) fn render_commit_ref_labels(
+/// Ref-label pills for the Compact layout's shared summary·refs cell: a
+/// right-aligned cluster capped at a third of the cell, clipping overflow,
+/// with the full label set (and each label's role) in a hover tooltip.
+pub(crate) fn render_commit_ref_labels_inline(
     row_index: usize,
     commit: &repo::CommitInfo,
     hidden_branches: &BTreeSet<String>,
     head_branch: Option<&str>,
     worktree_branches: &BTreeSet<String>,
-    column_width: f32,
 ) -> impl IntoElement {
     let labels = commit_ref_labels(commit, hidden_branches, head_branch, worktree_branches);
     let tooltip_text: SharedString = commit_ref_tooltip_text(&labels).into();
@@ -34,11 +36,11 @@ pub(crate) fn render_commit_ref_labels(
         .id(("commit-ref-labels", row_index))
         .flex()
         .items_center()
+        .justify_end()
         .gap_1()
-        .w(px(column_width))
+        .flex_shrink_0()
         .max_w(relative(COMMIT_REF_LABELS_MAX_FRACTION))
         .overflow_hidden()
-        .flex_shrink_0()
         .debug_selector(move || format!("commit-ref-labels-{row_index}"))
         .when(!labels.is_empty(), |cell| {
             cell.tooltip(move |window, cx| Tooltip::new(tooltip_text.clone()).build(window, cx))
@@ -80,58 +82,11 @@ pub(crate) fn render_commit_ref_labels_trailing(
         )
 }
 
-/// The refs column's ceiling as a fraction of the history panel width. The
-/// column auto-sizes to its widest visible label row; this cap keeps long
-/// branch names from starving the commit summary on narrow panels.
+/// The ref-label cluster's ceiling as a fraction of the shared summary·refs
+/// cell's width. The cluster clips its overflow (with the full set available
+/// in a hover tooltip); this cap keeps long branch names from starving the
+/// commit summary on narrow panels.
 pub(crate) const COMMIT_REF_LABELS_MAX_FRACTION: f32 = 0.35;
-
-const COMMIT_REF_LABEL_PILL_CHROME: f32 = 10.; // px_1 padding (4+4) + 1px border each side
-const COMMIT_REF_LABEL_ICON_WIDTH: f32 = 10. + 4.; // icon + gap_1 before the text
-const COMMIT_REF_LABELS_PILL_GAP: f32 = 4.; // gap_1 between pills
-
-/// The width one pill lays out at, mirroring `render_commit_ref_label`'s
-/// styles: padding + border chrome, optional leading icon, and the name at
-/// the mono glyph advance.
-pub(crate) fn commit_ref_label_pill_width(label: &CommitRefLabel, glyph_advance: f32) -> f32 {
-    let icon = if commit_ref_label_icon(label).is_some() {
-        COMMIT_REF_LABEL_ICON_WIDTH
-    } else {
-        0.
-    };
-    COMMIT_REF_LABEL_PILL_CHROME + icon + label.name.chars().count() as f32 * glyph_advance
-}
-
-/// The uniform width of the refs column: the widest visible label row among
-/// the loaded commits, or zero when nothing carries a label. Uniformity is
-/// what keeps the graph lanes vertically aligned, so this is computed once
-/// per render pass, not per row. Commits without labels skip label
-/// construction entirely, so the pass stays O(number of refs), not
-/// O(number of commits x allocations).
-pub(crate) fn commit_ref_labels_column_width(
-    commits: &[&repo::CommitInfo],
-    hidden_branches: &BTreeSet<String>,
-    head_branch: Option<&str>,
-    worktree_branches: &BTreeSet<String>,
-    glyph_advance: f32,
-) -> f32 {
-    let mut width: f32 = 0.;
-    for commit in commits {
-        if commit.branch_labels.is_empty() && !commit.is_head {
-            continue;
-        }
-        let labels = commit_ref_labels(commit, hidden_branches, head_branch, worktree_branches);
-        if labels.is_empty() {
-            continue;
-        }
-        let row = labels
-            .iter()
-            .map(|label| commit_ref_label_pill_width(label, glyph_advance))
-            .sum::<f32>()
-            + (labels.len() - 1) as f32 * COMMIT_REF_LABELS_PILL_GAP;
-        width = width.max(row);
-    }
-    width
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitRefLabel {
@@ -260,7 +215,7 @@ pub(crate) fn render_commit_ref_label(row_index: usize, label: CommitRefLabel) -
         .border_color(border_color)
         .bg(background)
         .text_color(text_color)
-        .text_size(px(10.))
+        .text_size(px(11.))
         .font_family(MONO_FONT_FAMILY)
         .max_w(relative(1.))
         .debug_selector(move || selector.clone())
@@ -269,7 +224,7 @@ pub(crate) fn render_commit_ref_label(row_index: usize, label: CommitRefLabel) -
                 div()
                     .flex_shrink_0()
                     .debug_selector(move || icon_selector.clone())
-                    .child(Icon::new(icon).text_color(text_color).size(px(10.))),
+                    .child(Icon::new(icon).text_color(text_color).size(px(11.))),
             )
         })
         .child(div().min_w_0().truncate().child(label.name))
@@ -2334,64 +2289,6 @@ mod tests {
     }
 
     #[test]
-    fn ref_label_column_width_fits_the_widest_visible_label_row() {
-        let advance = 6.;
-        let mut labeled = test_support::commit_info("aaa", &[]);
-        labeled.branch_labels = vec![
-            repo::BranchLabel {
-                name: "main".into(),
-                kind: repo::BranchKind::Local,
-            },
-            repo::BranchLabel {
-                name: "v1".into(),
-                kind: repo::BranchKind::Tag,
-            },
-        ];
-        let plain = test_support::commit_info("bbb", &[]);
-
-        let commits = vec![&labeled, &plain];
-        let width = commit_ref_labels_column_width(
-            &commits,
-            &BTreeSet::new(),
-            None,
-            &BTreeSet::new(),
-            advance,
-        );
-
-        // "main": pad+border 10 + 4 chars * 6 = 34; "v1" (tag icon): 10 + (10 + 4) + 2 * 6 = 36;
-        // inter-pill gap 4 => 74.
-        assert_eq!(width, 74.);
-    }
-
-    #[test]
-    fn ref_label_column_width_is_zero_without_visible_labels() {
-        let plain = test_support::commit_info("aaa", &[]);
-        let mut hidden_only = test_support::commit_info("bbb", &[]);
-        hidden_only.branch_labels = vec![repo::BranchLabel {
-            name: "feature".into(),
-            kind: repo::BranchKind::Local,
-        }];
-        let hidden = BTreeSet::from(["heads/feature".to_string()]);
-
-        let commits = vec![&plain, &hidden_only];
-        let width = commit_ref_labels_column_width(&commits, &hidden, None, &BTreeSet::new(), 6.);
-
-        assert_eq!(width, 0.);
-    }
-
-    #[test]
-    fn ref_label_pill_width_accounts_for_icon_and_glyphs() {
-        let label = CommitRefLabel {
-            name: "main".into(),
-            selector_key: "heads/main".into(),
-            kind: CommitRefLabelKind::Head,
-            marker: Some(CommitRefMarker::CheckedOut),
-        };
-        // pad+border 10 + icon 10 + icon gap 4 + 4 chars * 6 = 48.
-        assert_eq!(commit_ref_label_pill_width(&label, 6.), 48.);
-    }
-
-    #[test]
     fn tooltip_text_lists_every_label_with_its_qualifier() {
         let labels = vec![
             CommitRefLabel {
@@ -3902,14 +3799,20 @@ mod tests {
         );
         assert!(
             labels.size.width > px(0.),
-            "refs column sizes to its labels"
+            "the ref cluster sizes to its labels"
         );
-        assert!(labels.origin.x < graph.origin.x, "refs should be first");
-        assert!(graph.origin.x < hash.origin.x, "graph should follow refs");
-        assert!(hash.origin.x < summary.origin.x, "hash should follow graph");
+        assert!(graph.origin.x < summary.origin.x, "graph leads the row");
         assert!(
-            summary.origin.x < author.origin.x,
-            "summary should precede author"
+            summary.origin.x < labels.origin.x,
+            "summary should precede the ref cluster"
+        );
+        assert!(
+            labels.origin.x + labels.size.width <= hash.origin.x,
+            "the ref cluster stays inside the shared summary cell, left of the hash"
+        );
+        assert!(
+            hash.origin.x < author.origin.x,
+            "hash should precede author"
         );
         assert!(
             author.origin.x < time.origin.x,
@@ -4140,88 +4043,27 @@ mod tests {
         let label_bounds = visual
             .debug_bounds(label_selector)
             .expect("long branch label debug bounds");
-        let graph_bounds = visual
-            .debug_bounds("commit-graph-gutter-1")
-            .expect("commit graph gutter debug bounds");
+        let hash_bounds = visual
+            .debug_bounds("commit-hash-1")
+            .expect("commit hash debug bounds");
 
         assert!(
-            label_bounds.right() <= graph_bounds.origin.x,
-            "the refs column must clip long labels before the graph: {label_bounds:?} vs {graph_bounds:?}"
+            label_bounds.right() <= hash_bounds.origin.x,
+            "the ref cluster must clip long labels before the sha: {label_bounds:?} vs {hash_bounds:?}"
         );
 
         let label_cell_bounds = visual
             .debug_bounds("commit-ref-labels-1")
             .expect("commit ref labels cell debug bounds");
-        let row_bounds = visual
-            .debug_bounds("commit-row-1")
-            .expect("commit row debug bounds");
+        let summary_bounds = visual
+            .debug_bounds("commit-summary-1")
+            .expect("commit summary debug bounds");
+        // The cap is a fraction of the shared summary·refs cell (summary
+        // width plus the ref cluster plus their inner gap), not the whole row.
+        let shared_cell_width = summary_bounds.size.width + label_cell_bounds.size.width + px(12.);
         assert!(
-            label_cell_bounds.size.width <= row_bounds.size.width * 0.35 + px(1.),
-            "refs column must cap at 35% of the row: {label_cell_bounds:?} vs {row_bounds:?}"
-        );
-    }
-
-    #[gpui::test]
-    async fn pending_row_reserves_the_refs_column(cx: &mut TestAppContext) {
-        let (dir, _tip_sha) = init_repo_with_tag();
-        let path = dir.path().to_path_buf();
-        let window = add_app_window(cx);
-
-        window
-            .update(cx, |app, window, cx| {
-                app.open_repository_at(path, window, cx);
-            })
-            .expect("open repo");
-        cx.run_until_parked();
-
-        let mut visual = VisualTestContext::from_window(*window, cx);
-        visual
-            .debug_bounds("pending-ref-labels-spacer")
-            .expect("pending row leading spacer");
-        let pending_gutter = visual
-            .debug_bounds("commit-graph-gutter-0")
-            .expect("pending row gutter");
-        let commit_gutter = visual
-            .debug_bounds("commit-graph-gutter-1")
-            .expect("first commit row gutter");
-        assert_eq!(
-            pending_gutter.origin.x, commit_gutter.origin.x,
-            "graph lanes must stay vertically aligned across the pending row"
-        );
-    }
-
-    #[gpui::test]
-    async fn refs_column_width_is_uniform_across_rows_and_pending_spacer(cx: &mut TestAppContext) {
-        let (dir, _tip_sha) = init_repo_with_tag();
-        let path = dir.path().to_path_buf();
-        let window = add_app_window(cx);
-
-        window
-            .update(cx, |app, window, cx| {
-                app.open_repository_at(path, window, cx);
-            })
-            .expect("open repo");
-        cx.run_until_parked();
-
-        let mut visual = VisualTestContext::from_window(*window, cx);
-        let pending_spacer = visual
-            .debug_bounds("pending-ref-labels-spacer")
-            .expect("pending row leading spacer");
-        let row_1_labels = visual
-            .debug_bounds("commit-ref-labels-1")
-            .expect("first commit row labels cell");
-        let mut widths = vec![pending_spacer.size.width, row_1_labels.size.width];
-        if let Some(row_2_labels) = visual.debug_bounds("commit-ref-labels-2") {
-            widths.push(row_2_labels.size.width);
-        }
-
-        assert!(
-            widths.iter().all(|width| *width == widths[0]),
-            "the refs column must be the same width on every row and the pending spacer: {widths:?}"
-        );
-        assert!(
-            widths[0] > px(0.),
-            "the refs column must size to the widest visible label row"
+            label_cell_bounds.size.width <= shared_cell_width * 0.35 + px(1.),
+            "the ref cluster must cap at 35% of the shared summary cell: {label_cell_bounds:?} vs shared cell width {shared_cell_width:?}"
         );
     }
 

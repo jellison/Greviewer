@@ -44,6 +44,9 @@ pub struct Settings {
     pub ai_enabled: bool,
     /// Which commit-graph layout to render. Defaults to `Compact`.
     pub graph_view_mode: GraphViewMode,
+    /// Widths of the Compact graph layout's resizable columns. Defaults apply
+    /// until the user drags a column divider.
+    pub graph_column_widths: GraphColumnWidths,
 }
 
 /// A repository the user has opened before, plus whether its folder could still
@@ -105,6 +108,18 @@ pub struct SidebarWidths {
     pub branch_sidebar: Option<f32>,
     /// Left width of the changed-files list in the changeset view.
     pub changeset_files: Option<f32>,
+}
+
+/// Persisted widths (in logical pixels) of the Compact graph layout's
+/// resizable columns. A field is `None` until the user has resized that
+/// column, in which case the app falls back to the column's default width.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GraphColumnWidths {
+    /// Width of the AUTHOR column.
+    pub author: Option<f32>,
+    /// Width of the WHEN column.
+    pub when: Option<f32>,
 }
 
 /// Read settings from `path`. Returns [`Settings::default`] when the file is
@@ -177,6 +192,7 @@ mod tests {
             sidebar_widths: SidebarWidths::default(),
             ai_enabled: false,
             graph_view_mode: GraphViewMode::default(),
+            graph_column_widths: GraphColumnWidths::default(),
         };
 
         save(&path, &settings).expect("save settings");
@@ -234,6 +250,7 @@ mod tests {
                 sidebar_widths: SidebarWidths::default(),
                 ai_enabled: false,
                 graph_view_mode: GraphViewMode::default(),
+                graph_column_widths: GraphColumnWidths::default(),
             };
 
             save(&path, &settings).expect("save settings");
@@ -296,6 +313,7 @@ mod tests {
             },
             ai_enabled: false,
             graph_view_mode: GraphViewMode::default(),
+            graph_column_widths: GraphColumnWidths::default(),
         };
 
         save(&path, &settings).expect("save settings");
@@ -310,5 +328,34 @@ mod tests {
         fs::write(&path, r#"{"recent_repositories": []}"#).expect("write file");
 
         assert_eq!(load(&path).sidebar_widths, SidebarWidths::default());
+    }
+
+    #[test]
+    fn graph_column_widths_survive_json_round_trip() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("settings.json");
+        let settings = Settings {
+            graph_column_widths: GraphColumnWidths {
+                author: Some(220.0),
+                when: Some(72.5),
+            },
+            ..Settings::default()
+        };
+
+        save(&path, &settings).expect("save settings");
+
+        assert_eq!(load(&path), settings);
+    }
+
+    #[test]
+    fn settings_without_graph_column_widths_load_as_all_none() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"recent_repositories": []}"#).expect("write file");
+
+        assert_eq!(
+            load(&path).graph_column_widths,
+            GraphColumnWidths::default()
+        );
     }
 }

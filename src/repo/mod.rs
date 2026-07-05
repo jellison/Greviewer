@@ -1402,6 +1402,29 @@ fn format_authored_date(time: git2::Time) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// Compact relative form of an authored timestamp for the graph's WHEN
+/// column: the largest whole unit ("2h", "3d", "1mo"), or "now" under a
+/// minute. Future timestamps (clock skew) clamp to "now".
+pub fn relative_authored_time(authored_epoch_seconds: i64, now_epoch_seconds: i64) -> String {
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 3_600;
+    const DAY: i64 = 86_400;
+    const WEEK: i64 = 7 * DAY;
+    const MONTH: i64 = 30 * DAY;
+    const YEAR: i64 = 365 * DAY;
+
+    let elapsed = (now_epoch_seconds - authored_epoch_seconds).max(0);
+    match elapsed {
+        s if s < MINUTE => "now".to_string(),
+        s if s < HOUR => format!("{}m", s / MINUTE),
+        s if s < DAY => format!("{}h", s / HOUR),
+        s if s < WEEK => format!("{}d", s / DAY),
+        s if s < MONTH => format!("{}w", s / WEEK),
+        s if s < YEAR => format!("{}mo", s / MONTH),
+        s => format!("{}y", s / YEAR),
+    }
+}
+
 // Converts days since the Unix epoch to a civil date using Howard Hinnant's
 // public-domain calendar algorithm.
 fn civil_from_unix_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
@@ -3007,5 +3030,43 @@ mod tests {
         let unique_paths: std::collections::HashSet<_> =
             entries.iter().map(|entry| &entry.path).collect();
         assert_eq!(unique_paths.len(), entries.len(), "no duplicate paths");
+    }
+
+    #[test]
+    fn relative_authored_time_picks_the_largest_whole_unit() {
+        const MINUTE: i64 = 60;
+        const HOUR: i64 = 3_600;
+        const DAY: i64 = 86_400;
+        let now = 1_800_000_000;
+        let cases = [
+            (now, "now"),
+            (now - 59, "now"),
+            (now - MINUTE, "1m"),
+            (now - 59 * MINUTE, "59m"),
+            (now - HOUR, "1h"),
+            (now - 23 * HOUR, "23h"),
+            (now - DAY, "1d"),
+            (now - 6 * DAY, "6d"),
+            (now - 7 * DAY, "1w"),
+            (now - 29 * DAY, "4w"),
+            (now - 30 * DAY, "1mo"),
+            (now - 364 * DAY, "12mo"),
+            (now - 365 * DAY, "1y"),
+            (now - 800 * DAY, "2y"),
+        ];
+        for (authored, expected) in cases {
+            assert_eq!(
+                relative_authored_time(authored, now),
+                expected,
+                "authored {authored} vs now {now}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_authored_time_clamps_future_timestamps_to_now() {
+        // A commit authored "in the future" (clock skew) reads as "now", never
+        // a negative duration.
+        assert_eq!(relative_authored_time(2_000_000_000, 1_800_000_000), "now");
     }
 }
