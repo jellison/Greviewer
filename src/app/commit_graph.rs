@@ -19,18 +19,55 @@ pub(crate) fn commit_row_separator_color(selected: bool) -> gpui::Rgba {
     }
 }
 
+/// Widths the ref-label fit planner needs from the row renderer: the shared
+/// summary·refs cell, the summary's natural text width, and the monospace
+/// advance at the pill type size.
+pub(crate) struct RefLabelFit {
+    pub(crate) cell_width: f32,
+    pub(crate) summary_width: f32,
+    pub(crate) advance: f32,
+}
+
 /// Ref-label pills for the Compact layout's shared summary·refs cell: a
-/// right-aligned cluster capped at a third of the cell, clipping overflow,
-/// with the full label set (and each label's role) in a hover tooltip.
+/// right-aligned cluster that grows into whatever width the summary leaves
+/// behind (and vice versa). Only whole pills render — labels that don't fit
+/// collapse into a "+N" badge whose tooltip lists them — and the full label
+/// set stays available in the cluster-wide hover tooltip.
 pub(crate) fn render_commit_ref_labels_inline(
     row_index: usize,
     commit: &repo::CommitInfo,
     hidden_branches: &BTreeSet<String>,
     head_branch: Option<&str>,
     worktree_branches: &BTreeSet<String>,
+    fit: RefLabelFit,
+    window: &mut gpui::Window,
 ) -> impl IntoElement {
     let labels = commit_ref_labels(commit, hidden_branches, head_branch, worktree_branches);
     let tooltip_text: SharedString = commit_ref_tooltip_text(&labels).into();
+
+    let pill_widths: Vec<f32> = labels
+        .iter()
+        .map(|label| {
+            if label.name.is_ascii() {
+                estimated_ref_pill_width(label, fit.advance)
+            } else {
+                ref_pill_chrome_width(label)
+                    + estimated_mono_text_width(
+                        &label.name,
+                        crate::app::COMMIT_REF_LABEL_FONT_SIZE,
+                        fit.advance,
+                        window,
+                    )
+            }
+        })
+        .collect();
+    let plan = plan_ref_label_fit(fit.cell_width, fit.summary_width, &pill_widths, |hidden| {
+        ref_label_badge_width(hidden, fit.advance)
+    });
+
+    let mut labels = labels;
+    let hidden_labels = labels.split_off(plan.visible.min(labels.len()));
+    let visible_labels = labels;
 
     div()
         .id(("commit-ref-labels", row_index))
@@ -39,18 +76,73 @@ pub(crate) fn render_commit_ref_labels_inline(
         .justify_end()
         .gap_1()
         .flex_shrink_0()
-        .max_w(relative(COMMIT_REF_LABELS_MAX_FRACTION))
-        .overflow_hidden()
         .debug_selector(move || format!("commit-ref-labels-{row_index}"))
-        .when(!labels.is_empty(), |cell| {
+        .when(!visible_labels.is_empty(), |cell| {
             cell.tooltip(move |window, cx| Tooltip::new(tooltip_text.clone()).build(window, cx))
         })
-        .children(
-            labels
-                .into_iter()
-                .map(|label| render_commit_ref_label(row_index, label))
-                .collect::<Vec<_>>(),
-        )
+        .children(visible_labels.into_iter().enumerate().map(|(pill, label)| {
+            let max_width = if pill == 0 {
+                plan.first_pill_max_width
+            } else {
+                None
+            };
+            render_commit_ref_label(row_index, label, max_width)
+        }))
+        .when(plan.hidden > 0, |cell| {
+            cell.child(render_commit_ref_overflow_badge(row_index, hidden_labels))
+        })
+}
+
+/// The "+N" pill that stands in for the ref labels the cell cannot fit
+/// whole. Neutral colors keep it from reading as another ref; its tooltip
+/// lists exactly the labels it hides.
+fn render_commit_ref_overflow_badge(
+    row_index: usize,
+    hidden_labels: Vec<CommitRefLabel>,
+) -> impl IntoElement {
+    let tooltip_text: SharedString = commit_ref_tooltip_text(&hidden_labels).into();
+    div()
+        .id(("commit-ref-overflow", row_index))
+        .flex()
+        .items_center()
+        .flex_shrink_0()
+        .px_1()
+        .py_0p5()
+        .border_1()
+        .border_color(palette().ref_overflow_border)
+        .bg(palette().ref_overflow_bg)
+        .text_color(palette().ref_overflow_fg)
+        .text_size(px(crate::app::COMMIT_REF_LABEL_FONT_SIZE))
+        .font_family(MONO_FONT_FAMILY)
+        .debug_selector(move || format!("commit-ref-overflow-{row_index}"))
+        .tooltip(move |window, cx| Tooltip::new(tooltip_text.clone()).build(window, cx))
+        .child(format!("+{}", hidden_labels.len()))
+}
+
+/// Estimated painted width of `text` in the mono font at `size`: exact
+/// char-count arithmetic for ASCII (every glyph shares `advance`), a real
+/// shaping pass otherwise so CJK and emoji don't skew the fit planner.
+pub(crate) fn estimated_mono_text_width(
+    text: &str,
+    size: f32,
+    advance: f32,
+    window: &mut gpui::Window,
+) -> f32 {
+    if text.is_ascii() {
+        return text.len() as f32 * advance;
+    }
+    let style = gpui::TextStyle {
+        font_family: MONO_FONT_FAMILY.into(),
+        font_size: px(size).into(),
+        ..gpui::TextStyle::default()
+    };
+    let run = style.to_run(text.len());
+    f32::from(
+        window
+            .text_system()
+            .shape_line(text.to_string().into(), px(size), &[run], None)
+            .width,
+    )
 }
 
 /// Ref-label pills for the two-line "Table" layout: a right-aligned group on
@@ -77,16 +169,135 @@ pub(crate) fn render_commit_ref_labels_trailing(
         .children(
             labels
                 .into_iter()
-                .map(|label| render_commit_ref_label(row_index, label))
+                .map(|label| render_commit_ref_label(row_index, label, None))
                 .collect::<Vec<_>>(),
         )
 }
 
-/// The ref-label cluster's ceiling as a fraction of the shared summary·refs
-/// cell's width. The cluster clips its overflow (with the full set available
-/// in a hover tooltip); this cap keeps long branch names from starving the
-/// commit summary on narrow panels.
-pub(crate) const COMMIT_REF_LABELS_MAX_FRACTION: f32 = 0.35;
+/// Gap between the summary and the ref cluster inside the shared cell
+/// (`gap_3` on the cell).
+pub(crate) const REF_LABEL_CELL_GAP: f32 = 12.;
+/// Gap between adjacent ref pills (`gap_1` on the cluster).
+pub(crate) const REF_LABEL_PILL_GAP: f32 = 4.;
+/// Fraction of the shared cell the summary is guaranteed when it and the
+/// labels both want more width than the cell holds. Below this the summary
+/// ellipsizes rather than yielding further.
+pub(crate) const COMMIT_SUMMARY_GUARANTEED_FRACTION: f32 = 0.60;
+/// Width floor for the single pill every commit is guaranteed: even in a
+/// pathologically narrow cell the first label renders (ellipsized) at least
+/// this wide, beside the overflow badge.
+pub(crate) const REF_LABEL_MIN_PILL_WIDTH: f32 = 60.;
+/// Horizontal chrome of one pill: a 1px border and 4px `px_1` padding per
+/// side. Shared by the style below and the width estimate so they cannot
+/// drift apart.
+pub(crate) const REF_LABEL_PILL_CHROME: f32 = 2. * (1. + 4.);
+/// Size of a pill's leading icon and the `gap_1` between it and the name.
+pub(crate) const REF_LABEL_ICON_SIZE: f32 = 11.;
+pub(crate) const REF_LABEL_ICON_GAP: f32 = 4.;
+
+/// How one commit row's ref pills divide the label budget: the first
+/// `visible` labels render whole, the remaining `hidden` collapse into a
+/// "+N" badge, and — only when not even the first pill fits whole —
+/// `first_pill_max_width` caps that single guaranteed pill so it ellipsizes
+/// instead of overflowing.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RefLabelFitPlan {
+    pub(crate) visible: usize,
+    pub(crate) hidden: usize,
+    pub(crate) first_pill_max_width: Option<f32>,
+}
+
+/// Decide which ref pills fit the shared summary·refs cell. The summary and
+/// the cluster grow toward each other: labels may take everything the
+/// summary's natural width leaves behind, but never squeeze the summary
+/// below its guaranteed fraction — except that the one-pill floor wins in
+/// cells too narrow for both guarantees. When any label overflows, badge
+/// space is reserved before fitting pills so the visible set never flips
+/// between "fits without badge" and "overflows with badge".
+pub(crate) fn plan_ref_label_fit(
+    cell_width: f32,
+    summary_width: f32,
+    pill_widths: &[f32],
+    badge_width: impl Fn(usize) -> f32,
+) -> RefLabelFitPlan {
+    let count = pill_widths.len();
+    if count == 0 {
+        return RefLabelFitPlan {
+            visible: 0,
+            hidden: 0,
+            first_pill_max_width: None,
+        };
+    }
+
+    let natural =
+        pill_widths.iter().sum::<f32>() + REF_LABEL_PILL_GAP * count.saturating_sub(1) as f32;
+    let summary_guarantee = summary_width.min(cell_width * COMMIT_SUMMARY_GUARANTEED_FRACTION);
+    let one_pill_floor = pill_widths[0].min(REF_LABEL_MIN_PILL_WIDTH)
+        + if count > 1 {
+            REF_LABEL_PILL_GAP + badge_width(count - 1)
+        } else {
+            0.
+        };
+    let budget =
+        natural.min((cell_width - REF_LABEL_CELL_GAP - summary_guarantee).max(one_pill_floor));
+
+    if natural <= budget {
+        return RefLabelFitPlan {
+            visible: count,
+            hidden: 0,
+            first_pill_max_width: None,
+        };
+    }
+
+    for visible in (1..count).rev() {
+        let pills =
+            pill_widths[..visible].iter().sum::<f32>() + REF_LABEL_PILL_GAP * (visible - 1) as f32;
+        if pills + REF_LABEL_PILL_GAP + badge_width(count - visible) <= budget {
+            return RefLabelFitPlan {
+                visible,
+                hidden: count - visible,
+                first_pill_max_width: None,
+            };
+        }
+    }
+
+    // Not even the first pill fits whole: render it ellipsized in whatever
+    // the badge leaves of the budget.
+    let badge = if count > 1 {
+        REF_LABEL_PILL_GAP + badge_width(count - 1)
+    } else {
+        0.
+    };
+    RefLabelFitPlan {
+        visible: 1,
+        hidden: count - 1,
+        first_pill_max_width: Some(budget - badge),
+    }
+}
+
+/// Width of everything in one ref pill except its name: the border/padding
+/// chrome plus the optional leading icon and its gap.
+pub(crate) fn ref_pill_chrome_width(label: &CommitRefLabel) -> f32 {
+    let icon = if commit_ref_label_icon(label).is_some() {
+        REF_LABEL_ICON_SIZE + REF_LABEL_ICON_GAP
+    } else {
+        0.
+    };
+    REF_LABEL_PILL_CHROME + icon
+}
+
+/// Estimated painted width of one ref pill: chrome, the optional leading
+/// icon, and the name at the monospace advance width. Exact for ASCII names
+/// in the mono font; the renderer measures non-ASCII names with the text
+/// system instead.
+pub(crate) fn estimated_ref_pill_width(label: &CommitRefLabel, advance: f32) -> f32 {
+    ref_pill_chrome_width(label) + label.name.chars().count() as f32 * advance
+}
+
+/// Estimated painted width of the "+N" overflow badge for `hidden` labels.
+pub(crate) fn ref_label_badge_width(hidden: usize, advance: f32) -> f32 {
+    REF_LABEL_PILL_CHROME + format!("+{hidden}").chars().count() as f32 * advance
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitRefLabel {
@@ -197,7 +408,15 @@ pub(crate) fn commit_ref_tooltip_text(labels: &[CommitRefLabel]) -> String {
         .join("\n")
 }
 
-pub(crate) fn render_commit_ref_label(row_index: usize, label: CommitRefLabel) -> gpui::Div {
+/// One ref pill. `max_width`, set only for the single guaranteed pill of a
+/// cell too narrow to show any label whole, caps the pill so its name
+/// ellipsizes; every other pill renders at its natural width (the fit
+/// planner already guaranteed it fits).
+pub(crate) fn render_commit_ref_label(
+    row_index: usize,
+    label: CommitRefLabel,
+    max_width: Option<f32>,
+) -> gpui::Div {
     let fragment = debug_ref_label_fragment(&label.selector_key);
     let selector = format!("commit-ref-label-{row_index}-{fragment}");
     let icon_selector = format!("commit-ref-label-icon-{row_index}-{fragment}");
@@ -215,9 +434,10 @@ pub(crate) fn render_commit_ref_label(row_index: usize, label: CommitRefLabel) -
         .border_color(border_color)
         .bg(background)
         .text_color(text_color)
-        .text_size(px(11.))
+        .text_size(px(crate::app::COMMIT_REF_LABEL_FONT_SIZE))
         .font_family(MONO_FONT_FAMILY)
         .max_w(relative(1.))
+        .when_some(max_width, |pill, width| pill.max_w(px(width)))
         .debug_selector(move || selector.clone())
         .when_some(icon, |pill, icon| {
             pill.child(
@@ -4340,6 +4560,198 @@ mod tests {
         assert!(
             summary.origin.y + summary.size.height <= meta.origin.y,
             "summary must sit above the meta line in table mode"
+        );
+    }
+
+    /// Fixed badge width used by the fit-planner tests so expected budgets
+    /// stay readable; production derives the width from the hidden count.
+    fn fixed_badge(_hidden: usize) -> f32 {
+        20.
+    }
+
+    #[test]
+    fn ref_label_fit_shows_every_pill_when_the_cell_has_slack() {
+        // natural cluster width 308 exceeds the old 35% cap (280 of an
+        // 800px cell) but there is free space, so everything renders.
+        let plan = plan_ref_label_fit(800., 200., &[100., 100., 100.], fixed_badge);
+
+        assert_eq!(plan.visible, 3);
+        assert_eq!(plan.hidden, 0);
+        assert_eq!(plan.first_pill_max_width, None);
+    }
+
+    #[test]
+    fn ref_label_fit_squeezes_the_summary_down_to_its_sixty_percent_floor() {
+        // Summary wants 600 of an 800px cell but is only guaranteed 480
+        // (60%); the labels may fill the remaining 308 and overflow the rest
+        // behind the badge.
+        let plan = plan_ref_label_fit(800., 600., &[200., 200., 200.], fixed_badge);
+
+        // k=2 needs 200+200+4 (pills) + 4+20 (badge) = 428 > 308;
+        // k=1 needs 200 + 4+20 = 224 <= 308.
+        assert_eq!(plan.visible, 1);
+        assert_eq!(plan.hidden, 2);
+        assert_eq!(plan.first_pill_max_width, None);
+    }
+
+    #[test]
+    fn ref_label_fit_only_reserves_the_summary_the_width_it_needs() {
+        // A short summary (100px) must not hoard its 60% guarantee: the
+        // labels may grow into everything it leaves behind.
+        let plan = plan_ref_label_fit(1000., 100., &[300., 300., 300.], fixed_badge);
+
+        // Budget is 1000-12-100 = 888: two pills (604) plus the badge (24)
+        // fit, all three (908) do not.
+        assert_eq!(plan.visible, 2);
+        assert_eq!(plan.hidden, 1);
+        assert_eq!(plan.first_pill_max_width, None);
+    }
+
+    #[test]
+    fn ref_label_fit_reserves_badge_space_before_fitting_pills() {
+        // Budget 308: three bare pills (308) fit exactly, but once any pill
+        // overflows the badge must render, so only two pills (204) plus the
+        // badge (24) survive.
+        let plan = plan_ref_label_fit(800., 10_000., &[100., 100., 100., 100.], fixed_badge);
+
+        assert_eq!(plan.visible, 2);
+        assert_eq!(plan.hidden, 2);
+        assert_eq!(plan.first_pill_max_width, None);
+    }
+
+    #[test]
+    fn ref_label_fit_truncates_a_single_pill_that_cannot_fit_whole() {
+        // One 300px pill in a 68px budget: it renders alone, ellipsized to
+        // the budget, with no badge.
+        let plan = plan_ref_label_fit(200., 500., &[300.], fixed_badge);
+
+        assert_eq!(plan.visible, 1);
+        assert_eq!(plan.hidden, 0);
+        let width = plan.first_pill_max_width.expect("pill must be capped");
+        assert!((width - 68.).abs() < 0.01, "expected ~68, got {width}");
+    }
+
+    #[test]
+    fn ref_label_fit_guarantees_one_truncated_pill_plus_badge_when_nothing_fits() {
+        // The one-pill floor (60 min pill + 4 gap + 20 badge = 84) beats the
+        // summary's guarantee in a pathologically narrow cell: the first
+        // pill renders ellipsized at 60px beside a +1 badge.
+        let plan = plan_ref_label_fit(200., 500., &[300., 300.], fixed_badge);
+
+        assert_eq!(plan.visible, 1);
+        assert_eq!(plan.hidden, 1);
+        assert_eq!(plan.first_pill_max_width, Some(60.));
+    }
+
+    #[test]
+    fn ref_label_fit_handles_a_commit_with_no_labels() {
+        let plan = plan_ref_label_fit(800., 200., &[], fixed_badge);
+
+        assert_eq!(plan.visible, 0);
+        assert_eq!(plan.hidden, 0);
+        assert_eq!(plan.first_pill_max_width, None);
+    }
+
+    #[test]
+    fn estimated_ref_pill_width_covers_border_padding_icon_and_text() {
+        let advance = 7.;
+        let plain_branch = CommitRefLabel {
+            name: "main".to_string(),
+            selector_key: "heads/main".to_string(),
+            kind: CommitRefLabelKind::Branch,
+            marker: None,
+        };
+        // 2 border + 8 padding + 4 chars * 7
+        assert_eq!(estimated_ref_pill_width(&plain_branch, advance), 38.);
+
+        let tag = CommitRefLabel {
+            name: "v0.2".to_string(),
+            selector_key: "tags/v0.2".to_string(),
+            kind: CommitRefLabelKind::Tag,
+            marker: None,
+        };
+        // adds the 11px icon and its 4px gap
+        assert_eq!(estimated_ref_pill_width(&tag, advance), 53.);
+    }
+
+    #[test]
+    fn ref_label_badge_width_grows_with_the_hidden_count() {
+        let advance = 7.;
+        // "+3": 2 border + 8 padding + 2 chars * 7
+        assert_eq!(ref_label_badge_width(3, advance), 24.);
+        // "+12" gains a character
+        assert_eq!(ref_label_badge_width(12, advance), 31.);
+    }
+
+    #[gpui::test]
+    async fn overflowing_ref_labels_collapse_into_a_count_badge(cx: &mut TestAppContext) {
+        // ~200 branches share one commit: only whole pills that fit the
+        // label budget render, the rest collapse into a "+N" badge that
+        // stays clear of the hash column.
+        let dir = init_repo_with_many_branches();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(1200.), px(800.)));
+        cx.run_until_parked();
+
+        let badge = visual
+            .debug_bounds("commit-ref-overflow-1")
+            .expect("badge must render when labels overflow");
+        let hash = visual
+            .debug_bounds("commit-hash-1")
+            .expect("hash cell renders");
+        assert!(
+            badge.origin.x + badge.size.width <= hash.origin.x,
+            "badge must not spill into the hash column"
+        );
+
+        // The checked-out branch sorts first and must render whole; a
+        // late-alphabet sibling has no chance of fitting and must not paint
+        // a clipped pill.
+        let first = visual
+            .debug_bounds("commit-ref-label-1-heads-master")
+            .expect("first pill renders whole");
+        assert!(first.origin.x + first.size.width <= badge.origin.x);
+        assert_eq!(
+            visual.debug_bounds("commit-ref-label-1-heads-branch-199"),
+            None,
+            "overflowed pills must not render at all"
+        );
+    }
+
+    #[gpui::test]
+    async fn ref_labels_with_slack_render_fully_without_a_badge(cx: &mut TestAppContext) {
+        // Two labels (master + feature) on a wide window: everything fits,
+        // so no overflow badge renders and both pills paint whole.
+        let (dir, _master_tip, _feature_tip) = init_repo_with_feature_branch();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(1600.), px(800.)));
+        cx.run_until_parked();
+
+        visual
+            .debug_bounds("commit-ref-label-2-heads-feature")
+            .expect("feature pill renders");
+        assert_eq!(
+            visual.debug_bounds("commit-ref-overflow-2"),
+            None,
+            "no badge when every label fits"
         );
     }
 

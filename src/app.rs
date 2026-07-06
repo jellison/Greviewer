@@ -177,6 +177,11 @@ pub struct App {
     author_column_width: f32,
     /// Live width of the Compact layout's WHEN column (see above).
     when_column_width: f32,
+    /// Painted width of the commit-history list, captured each frame by the
+    /// selection-underlay canvas (which prepaints before the list builds its
+    /// rows) and read back by the row renderer to budget the shared
+    /// summary·refs cell for the ref-label fit planner.
+    commit_history_list_width: Rc<RefCell<f32>>,
     /// While a comparison changeset is open, the commits a merge of the
     /// target into the base would introduce (base..target), newest first.
     /// Computed once when the changeset opens — the title-bar popover renders
@@ -1060,6 +1065,7 @@ impl App {
                 WHEN_COLUMN_MIN,
                 WHEN_COLUMN_MAX,
             ),
+            commit_history_list_width: Rc::new(RefCell::new(0.)),
             comparison_commit_shas: None,
             workspace: crate::workspace::Workspace::new(),
             file_tree_highlight_path: None,
@@ -3556,7 +3562,7 @@ impl App {
         uniform_list(
             "commit-history",
             item_count,
-            cx.processor(move |app, range: std::ops::Range<usize>, _window, cx| {
+            cx.processor(move |app, range: std::ops::Range<usize>, window, cx| {
                 let Mode::RepoOpen { repo } = &app.mode else {
                     return Vec::new();
                 };
@@ -3578,6 +3584,26 @@ impl App {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|elapsed| elapsed.as_secs() as i64)
                     .unwrap_or(0);
+                // Monospace advances measured once per pass; with them the
+                // summary·refs cell budget below is plain arithmetic per row.
+                let text_system = window.text_system();
+                let font_id = text_system.resolve_font(&gpui::font(MONO_FONT_FAMILY));
+                let mono_advance = |size: f32| {
+                    text_system
+                        .advance(font_id, px(size), '0')
+                        .map(|advance| f32::from(advance.width))
+                        // A missing glyph metric only skews the label
+                        // budget; 0.6em is a reasonable monospace advance.
+                        .unwrap_or(size * 0.6)
+                };
+                let ref_advance = mono_advance(COMMIT_REF_LABEL_FONT_SIZE);
+                let summary_advance = mono_advance(COMMIT_SUMMARY_FONT_SIZE);
+                let summary_cell_width = commit_summary_cell_width(
+                    *app.commit_history_list_width.borrow(),
+                    layout.max_lanes,
+                    app.author_column_width,
+                    app.when_column_width,
+                );
                 range
                     .map(|index| {
                         if index == 0 {
@@ -3606,13 +3632,17 @@ impl App {
                                     .render_commit_row(
                                         index,
                                         commit,
-                                        &layout,
                                         selected,
                                         CommitRowContext {
+                                            layout: &layout,
                                             head_branch: head_branch.as_deref(),
                                             worktree_branches: &worktree_branches,
                                             now,
+                                            summary_cell_width,
+                                            ref_advance,
+                                            summary_advance,
                                         },
+                                        window,
                                         cx,
                                     )
                                     .into_any_element(),
@@ -3667,8 +3697,15 @@ impl App {
         }
         let underlay_scroll = self.commit_history_scroll.clone();
         let row_height = self.row_height();
+        // The prepaint callback doubles as the list's width probe: it runs
+        // before the sibling uniform_list builds its rows (children prepaint
+        // in document order), so the same frame's rows read a fresh width
+        // when budgeting the shared summary·refs cell.
+        let list_width = self.commit_history_list_width.clone();
         let selection_underlay = canvas(
-            |_, _, _| {},
+            move |bounds, _, _| {
+                *list_width.borrow_mut() = f32::from(bounds.size.width);
+            },
             move |bounds, _, window, _| {
                 let scroll_offset = underlay_scroll.0.borrow().base_handle.offset();
                 for rect in commit_history_selection_underlay_rects(
@@ -5840,11 +5877,12 @@ impl App {
         &self,
         index: usize,
         commit: &repo::CommitInfo,
-        layout: &GraphLayout,
         selected: bool,
         row_context: CommitRowContext<'_>,
+        window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let layout = row_context.layout;
         let debug_selector = if selected {
             format!("selected-commit-row-{index}")
         } else {
@@ -5885,8 +5923,10 @@ impl App {
             ))
             .child(
                 // The shared summary·refs cell: summary left, ref pills
-                // right, the summary yielding space (ellipsizing) to the
-                // capped ref cluster when the two collide.
+                // right, the two growing toward each other. The fit planner
+                // (see `plan_ref_label_fit`) budgets the cell so only whole
+                // pills render — overflow collapses into a "+N" badge — and
+                // the summary ellipsizes when it loses the contest.
                 div()
                     .flex()
                     .items_center()
@@ -5899,7 +5939,7 @@ impl App {
                             .flex_1()
                             .min_w_0()
                             .text_color(palette().text)
-                            .text_size(px(15.))
+                            .text_size(px(COMMIT_SUMMARY_FONT_SIZE))
                             .truncate()
                             .debug_selector(move || format!("commit-summary-{index}"))
                             .child(commit.summary.clone()),
@@ -5910,6 +5950,17 @@ impl App {
                         &self.hidden_branches,
                         row_context.head_branch,
                         row_context.worktree_branches,
+                        RefLabelFit {
+                            cell_width: row_context.summary_cell_width,
+                            summary_width: estimated_mono_text_width(
+                                &commit.summary,
+                                COMMIT_SUMMARY_FONT_SIZE,
+                                row_context.summary_advance,
+                                window,
+                            ),
+                            advance: row_context.ref_advance,
+                        },
+                        window,
                     )),
             )
             .child(
@@ -6273,10 +6324,20 @@ impl App {
 /// history-list processor and threaded down instead of recomputed per row
 /// (see `render_commit_history_list`).
 struct CommitRowContext<'a> {
+    /// The graph layout the row draws its gutter lanes from.
+    layout: &'a GraphLayout,
     head_branch: Option<&'a str>,
     worktree_branches: &'a BTreeSet<String>,
     /// Epoch seconds at render time, for the relative WHEN column.
     now: i64,
+    /// Width of the shared summary·refs cell (see
+    /// `commit_summary_cell_width`), budgeted between the summary and the
+    /// ref-label cluster by `commit_graph::plan_ref_label_fit`.
+    summary_cell_width: f32,
+    /// Monospace advance width at the ref pills' 11px type size.
+    ref_advance: f32,
+    /// Monospace advance width at the summary's 15px type size.
+    summary_advance: f32,
 }
 
 /// Row height of the single-row Compact layout.
@@ -6290,6 +6351,11 @@ const COMMIT_TIME_WIDTH: f32 = 96.;
 
 /// Flex gap between the Compact row's columns (and the header's cells).
 const COMMIT_COLUMN_GAP: f32 = 24.;
+
+/// Type size of the Compact row's commit summary.
+const COMMIT_SUMMARY_FONT_SIZE: f32 = 15.;
+/// Type size of the ref-label pills and their overflow badge.
+pub(crate) const COMMIT_REF_LABEL_FONT_SIZE: f32 = 11.;
 
 /// Drag bounds for the resizable AUTHOR and WHEN columns. Restored widths
 /// clamp to the same ranges, so a corrupt settings file cannot wedge a
@@ -6312,6 +6378,31 @@ const GRAPH_HEADER_FONT_SIZE: f32 = 11.;
 /// Right inset shared by the header and the rows: the rows' own padding
 /// plus the scrollbar gutter the list reserves (`COMMIT_HISTORY_SCROLLBAR_GUTTER`).
 const COMMIT_ROW_RIGHT_INSET: f32 = 16. + COMMIT_HISTORY_SCROLLBAR_GUTTER;
+
+/// Horizontal padding of a Compact commit row (`px_4`, both sides).
+const COMMIT_ROW_HORIZONTAL_PADDING: f32 = 2. * 16.;
+
+/// Width of the Compact row's shared summary·refs cell, derived from the
+/// history list's painted width minus everything else on the row: the
+/// scrollbar gutter the list reserves, the row padding, the graph gutter,
+/// the fixed hash column, the two resizable columns, and the four column
+/// gaps separating the five cells. This feeds the ref-label fit planner
+/// (see `commit_graph::plan_ref_label_fit`).
+fn commit_summary_cell_width(
+    list_width: f32,
+    lane_count: usize,
+    author_width: f32,
+    when_width: f32,
+) -> f32 {
+    list_width
+        - COMMIT_HISTORY_SCROLLBAR_GUTTER
+        - COMMIT_ROW_HORIZONTAL_PADDING
+        - commit_graph_gutter_width(lane_count.max(1))
+        - COMMIT_HASH_WIDTH
+        - author_width
+        - when_width
+        - 4. * COMMIT_COLUMN_GAP
+}
 
 /// The rectangles the selection underlay paints behind the selected commit
 /// rows: one row-sized rect per selected index, shifted by the list's current
@@ -6551,6 +6642,15 @@ mod tests {
     use std::{fs, rc::Rc};
 
     use super::test_support::*;
+
+    #[test]
+    fn commit_summary_cell_width_subtracts_the_fixed_columns() {
+        // A 1000px list minus the scrollbar gutter (12), row padding (32),
+        // a 3-lane gutter (66), hash (72), author (168), when (96), and the
+        // four 24px column gaps leaves 458 for the shared summary·refs cell.
+        let width = super::commit_summary_cell_width(1000., 3, 168., 96.);
+        assert!((width - 458.).abs() < 0.01, "expected ~458, got {width}");
+    }
 
     #[gpui::test]
     fn closing_the_changeset_cancels_ai_threads(cx: &mut TestAppContext) {
