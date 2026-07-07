@@ -177,6 +177,8 @@ pub struct App {
     author_column_width: f32,
     /// Live width of the Compact layout's WHEN column (see above).
     when_column_width: f32,
+    /// Live width of the Compact layout's PR column (see above).
+    pr_column_width: f32,
     /// Painted width of the commit-history list, captured each frame by the
     /// selection-underlay canvas (which prepaints before the list builds its
     /// rows) and read back by the row renderer to budget the shared
@@ -250,6 +252,22 @@ pub struct App {
     /// All AI threads and their subprocesses (ADR-0005); killed on changeset
     /// close and app quit so no `claude` process outlives its context.
     ai_sessions: Entity<crate::ai::AiSessions>,
+    /// Bitbucket PR session for the open repo's origin, when it maps to a
+    /// Bitbucket Data Center remote. `None` for non-Bitbucket repos.
+    bitbucket: Option<Entity<crate::bitbucket::BitBucketSession>>,
+    /// Coordinates the active session was created for, so a worktree switch
+    /// within the same repo can reuse the session instead of refetching.
+    bitbucket_repo: Option<crate::bitbucket::BitBucketRepo>,
+    /// Sidebar-facing projection of the session's load state (see PrSectionState).
+    bitbucket_state: PrSectionState,
+    /// Latest fetched PR snapshot, swapped on the session's `Loaded` event.
+    pull_requests: Rc<Vec<crate::bitbucket::PullRequest>>,
+    /// Index from source-tip sha to PR indices (ascending id), rebuilt on each
+    /// `Loaded`. Powers O(1) lookups for the graph column and chrome badge.
+    pr_by_source_tip: HashMap<String, Vec<usize>>,
+    /// Bumped whenever the PR snapshot or session state changes, so the sidebar
+    /// row cache rebuilds (mirrors `reviews_generation`).
+    prs_generation: std::cell::Cell<u64>,
     notifications: Entity<NotificationList>,
     path_picker: Box<dyn PathPicker>,
     settings_store_path: Option<PathBuf>,
@@ -405,6 +423,7 @@ pub(crate) enum DiffDragMode {
 /// Which Compact-header column a divider drag is resizing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GraphColumn {
+    Pr,
     Author,
     When,
 }
@@ -522,6 +541,7 @@ struct SidebarRowsSignature {
     query: String,
     reviews_generation: u64,
     completed_reviews_expanded: bool,
+    prs_generation: u64,
 }
 
 pub enum Mode {
@@ -730,6 +750,34 @@ enum BranchTreeRow {
     Branch(BranchRow),
     ReviewEntry(ReviewRow),
     CompletedReviewsGroup { count: usize, expanded: bool },
+    PrSection(PrSectionRow),
+    Pr(PrRow),
+    PrHint(String),
+}
+
+/// The sidebar's Eq-able projection of the Bitbucket session load state, kept
+/// on `App` so the (cx-free) sidebar row builder can read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrSectionState {
+    NotConfigured,
+    Loading,
+    Loaded,
+    Failed(String),
+}
+
+/// Header for the "Active PRs" sidebar section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrSectionRow {
+    count: usize,
+    collapsed: bool,
+    top_border: bool,
+}
+
+/// One PR row: shows `#<id>` and selects the source-tip commit on click.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrRow {
+    id: u64,
+    source_tip_sha: String,
 }
 
 /// One persisted review in the sidebar's Reviews section.
@@ -794,6 +842,13 @@ struct BranchRow {
 pub struct OpenFailed(pub String);
 
 impl EventEmitter<OpenFailed> for App {}
+
+/// Emitted when a clicked PR's source-tip commit is not in the loaded history,
+/// carrying the user-facing notice text (so tests can assert the message).
+#[derive(Debug, Clone)]
+pub struct PullRequestCommitMissing(pub String);
+
+impl EventEmitter<PullRequestCommitMissing> for App {}
 
 /// Emitted immediately before the app asks gpui to quit. The gpui test
 /// platform does not expose a quit flag, so app-shell tests observe this event
@@ -984,6 +1039,27 @@ impl App {
             }
         }
 
+        // Create the PR session for the restored repo on the startup path too,
+        // so the Active PRs section appears on launch — not only after an
+        // explicit open (which goes through apply_open_repository). We build it
+        // as a local here, mirroring `ai_sessions`, because
+        // `spawn_bitbucket_session` needs `&mut self`, which doesn't exist yet
+        // during construction.
+        let mut bitbucket = None;
+        let mut bitbucket_repo = None;
+        if let Mode::RepoOpen { repo } = &mode {
+            if let Some(parsed) = crate::repo::origin_url(&repo.main_path)
+                .as_deref()
+                .and_then(crate::bitbucket::parse_origin)
+            {
+                let session = cx.new(|_| crate::bitbucket::BitBucketSession::new(parsed.clone()));
+                cx.subscribe(&session, Self::on_bitbucket_event).detach();
+                session.update(cx, |session, cx| session.refresh(cx));
+                bitbucket = Some(session);
+                bitbucket_repo = Some(parsed);
+            }
+        }
+
         // Persist window geometry and sidebar widths when the window closes.
         // Two hooks cover the two macOS quit paths, which never both fire for a
         // single window:
@@ -1065,6 +1141,12 @@ impl App {
                 WHEN_COLUMN_MIN,
                 WHEN_COLUMN_MAX,
             ),
+            pr_column_width: restored_column_width(
+                settings.graph_column_widths.pr,
+                COMMIT_PR_WIDTH,
+                PR_COLUMN_MIN,
+                PR_COLUMN_MAX,
+            ),
             commit_history_list_width: Rc::new(RefCell::new(0.)),
             comparison_commit_shas: None,
             workspace: crate::workspace::Workspace::new(),
@@ -1084,6 +1166,12 @@ impl App {
             reviews_generation: std::cell::Cell::new(0),
             collapsed_file_tree_paths: BTreeSet::new(),
             ai_sessions,
+            bitbucket,
+            bitbucket_repo,
+            bitbucket_state: PrSectionState::NotConfigured,
+            pull_requests: Rc::new(Vec::new()),
+            pr_by_source_tip: HashMap::new(),
+            prs_generation: std::cell::Cell::new(0),
             notifications,
             path_picker,
             settings_store_path,
@@ -1257,6 +1345,144 @@ impl App {
         self.worktree_switcher_open = false;
         self.worktree_entries.clear();
         self.pending_delete_review = None;
+        let main_path = match &self.mode {
+            Mode::RepoOpen { repo } => repo.main_path.clone(),
+            Mode::NoRepo => return,
+        };
+        self.spawn_bitbucket_session(&main_path, cx);
+        cx.notify();
+    }
+
+    /// Replace the PR snapshot and rebuild the source-tip index (indices per
+    /// tip ascending by PR id). Bumps the PR generation so the sidebar row
+    /// cache rebuilds.
+    fn set_pull_requests(&mut self, prs: Rc<Vec<crate::bitbucket::PullRequest>>) {
+        let mut index: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, pr) in prs.iter().enumerate() {
+            index.entry(pr.source_tip_sha.clone()).or_default().push(i);
+        }
+        for indices in index.values_mut() {
+            indices.sort_by_key(|&i| prs[i].id);
+        }
+        self.pull_requests = prs;
+        self.pr_by_source_tip = index;
+        self.bump_prs_generation();
+    }
+
+    /// The PR id to badge onto the changeset context pill: the lowest-id PR
+    /// whose source tip is `sha`, or `None`. Indices in `pr_by_source_tip` are
+    /// pre-sorted ascending by id, so the first is the lowest.
+    fn pr_badge_for_commit(&self, sha: &str) -> Option<u64> {
+        let indices = self.pr_by_source_tip.get(sha)?;
+        indices
+            .iter()
+            .filter_map(|&i| self.pull_requests.get(i))
+            .map(|pr| pr.id)
+            .min()
+    }
+
+    /// Bump the PR generation counter (invalidates the memoized sidebar rows).
+    fn bump_prs_generation(&self) {
+        self.prs_generation.set(self.prs_generation.get() + 1);
+    }
+
+    /// Re-fetch pull requests via the current session, if any.
+    fn refresh_pull_requests(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = &self.bitbucket {
+            session.update(cx, |session, cx| session.refresh(cx));
+        }
+    }
+
+    /// Install PR data directly (no Bitbucket session or network). Tests use
+    /// this to exercise the PR-dependent rendering paths hermetically.
+    #[cfg(test)]
+    pub(crate) fn set_pull_requests_for_test(&mut self, prs: Vec<crate::bitbucket::PullRequest>) {
+        self.set_pull_requests(Rc::new(prs));
+    }
+
+    /// Install a Bitbucket session and PR snapshot without touching the network.
+    /// The session is constructed but `refresh` is never called, so no fetch is
+    /// spawned; the Active PRs section shows because `self.bitbucket` is `Some`.
+    #[cfg(test)]
+    fn install_bitbucket_for_test(
+        &mut self,
+        prs: Vec<crate::bitbucket::PullRequest>,
+        state: PrSectionState,
+        cx: &mut Context<Self>,
+    ) {
+        let repo = crate::bitbucket::parse_origin("https://bitbucket.cicd.dc/scm/PROJ/repo.git")
+            .expect("parse test origin");
+        self.bitbucket = Some(cx.new(|_| crate::bitbucket::BitBucketSession::new(repo)));
+        self.bitbucket_state = state;
+        self.set_pull_requests(Rc::new(prs));
+    }
+
+    /// Drop all PR state. Used when opening a repo that is not a Bitbucket
+    /// remote, or before creating a session for a different Bitbucket repo.
+    fn clear_pull_requests(&mut self) {
+        self.bitbucket = None;
+        self.bitbucket_repo = None;
+        self.bitbucket_state = PrSectionState::NotConfigured;
+        self.pull_requests = Rc::new(Vec::new());
+        self.pr_by_source_tip = HashMap::new();
+        self.bump_prs_generation();
+    }
+
+    /// Create a Bitbucket session for the repo at `main_path` if its origin maps
+    /// to a Bitbucket Data Center remote, subscribe to its events, and kick off
+    /// the initial fetch. Reuses the existing session (no refetch) when the
+    /// parsed coordinates are unchanged — e.g. switching worktrees within the
+    /// same repo. Clears PR state when the repo is not a Bitbucket remote.
+    fn spawn_bitbucket_session(&mut self, main_path: &Path, cx: &mut Context<Self>) {
+        let parsed = crate::repo::origin_url(main_path)
+            .as_deref()
+            .and_then(crate::bitbucket::parse_origin);
+        let Some(repo) = parsed else {
+            self.clear_pull_requests();
+            return;
+        };
+        // Same Bitbucket identity as the current session → reuse it (keep the
+        // existing snapshot; do not refetch).
+        if self.bitbucket.is_some() && self.bitbucket_repo.as_ref() == Some(&repo) {
+            return;
+        }
+        self.clear_pull_requests();
+        let session = cx.new(|_| crate::bitbucket::BitBucketSession::new(repo.clone()));
+        cx.subscribe(&session, Self::on_bitbucket_event).detach();
+        session.update(cx, |session, cx| session.refresh(cx));
+        self.bitbucket = Some(session);
+        self.bitbucket_repo = Some(repo);
+    }
+
+    /// React to a session lifecycle event: swap the snapshot on `Loaded`,
+    /// otherwise bump the generation so the sidebar rebuilds to reflect the new
+    /// state (Loading / error). Mirrors the session's authoritative state onto
+    /// `bitbucket_state` so the (cx-free) sidebar row builder can read it.
+    fn on_bitbucket_event(
+        &mut self,
+        _session: Entity<crate::bitbucket::BitBucketSession>,
+        event: &crate::bitbucket::BitBucketSessionEvent,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::bitbucket::{BitBucketError, BitBucketSessionEvent as Event};
+        match event {
+            Event::Loading => {
+                self.bitbucket_state = PrSectionState::Loading;
+                self.bump_prs_generation();
+            }
+            Event::Loaded(prs) => {
+                self.bitbucket_state = PrSectionState::Loaded;
+                self.set_pull_requests(Rc::clone(prs));
+            }
+            Event::Failed(BitBucketError::NotConfigured) => {
+                self.bitbucket_state = PrSectionState::NotConfigured;
+                self.bump_prs_generation();
+            }
+            Event::Failed(error) => {
+                self.bitbucket_state = PrSectionState::Failed(error.to_string());
+                self.bump_prs_generation();
+            }
+        }
         cx.notify();
     }
 
@@ -1358,6 +1584,7 @@ impl App {
         // users for not having to track a "user has resized" bit.
         self.settings.graph_column_widths.author = Some(self.author_column_width);
         self.settings.graph_column_widths.when = Some(self.when_column_width);
+        self.settings.graph_column_widths.pr = Some(self.pr_column_width);
         self.persist_settings();
     }
 
@@ -1542,6 +1769,29 @@ impl App {
         // graph row `commit_index + 1`, and the total row count grows by one.
         self.scroll_commit_row_into_view(commit_index + 1, commit_count + 1);
         cx.notify();
+    }
+
+    /// Select the PR's source-tip commit and scroll to it, reusing branch-click
+    /// navigation (which pages in history to reach it). If the commit is not in
+    /// the loaded history and cannot be paged to, show a transient notice and
+    /// leave selection unchanged (V1 does not fetch missing commits).
+    fn activate_pull_request(
+        &mut self,
+        id: u64,
+        tip_sha: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_branch(tip_sha.clone(), window, cx);
+        let selected = matches!(&self.selection, Selection::Single { sha } if *sha == tip_sha);
+        if !selected {
+            let message = format!("Commit for PR #{id} isn't in the loaded history");
+            self.notifications.update(cx, |list, cx| {
+                list.push(Notification::info(message.clone()), window, cx);
+            });
+            cx.emit(PullRequestCommitMissing(message));
+            cx.notify();
+        }
     }
 
     /// Center the commit row at `index` in the history viewport, clamped to
@@ -3601,6 +3851,7 @@ impl App {
                 let summary_cell_width = commit_summary_cell_width(
                     *app.commit_history_list_width.borrow(),
                     layout.max_lanes,
+                    app.pr_column_width,
                     app.author_column_width,
                     app.when_column_width,
                 );
@@ -3991,6 +4242,32 @@ impl App {
             )
     }
 
+    /// The invisible drag zone straddling the divider at a resizable column's
+    /// RIGHT edge. The PR column anchors to the left of the row, so its
+    /// resize divider (between it and the summary·refs cell) rides its right
+    /// edge — the mirror of [`render_column_resize_handle`], which straddles a
+    /// column's left divider for the right-anchored AUTHOR/WHEN columns.
+    fn render_column_resize_handle_right(
+        &self,
+        column: GraphColumn,
+        selector: &'static str,
+    ) -> impl IntoElement {
+        div()
+            .id(selector)
+            .absolute()
+            .right(px(-(COMMIT_COLUMN_GAP + COLUMN_HANDLE_WIDTH) / 2.))
+            .top_0()
+            .w(px(COLUMN_HANDLE_WIDTH))
+            .h_full()
+            .cursor_col_resize()
+            .debug_selector(move || selector.to_string())
+            .hover(|handle| handle.bg(palette().accent_bg_hover))
+            .on_drag(
+                DraggedColumnHandle { column },
+                |_drag, _offset, _window, cx| cx.new(|_| EmptyDragPreview),
+            )
+    }
+
     /// The Compact layout's pinned column header: a blank cell over the graph
     /// gutter, then muted uppercase labels for the summary·refs cell and each
     /// metadata column. Compact-only; the Table layout renders no header.
@@ -4026,6 +4303,17 @@ impl App {
                 div()
                     .flex_shrink_0()
                     .w(px(commit_graph_gutter_width(max_lanes.max(1)))),
+            )
+            .child(
+                div()
+                    .w(px(self.pr_column_width))
+                    .flex_shrink_0()
+                    .relative()
+                    .child(label("PR", "graph-header-pr"))
+                    .child(self.render_column_resize_handle_right(
+                        GraphColumn::Pr,
+                        "graph-header-pr-handle",
+                    )),
             )
             .child(
                 div()
@@ -4075,6 +4363,24 @@ impl App {
                     let pointer_x = f32::from(event.event.position.x);
                     let column_left = pointer_x + COMMIT_COLUMN_GAP / 2.;
                     match column {
+                        GraphColumn::Pr => {
+                            // The PR column anchors to the LEFT (just right of
+                            // the graph gutter), unlike AUTHOR/WHEN which anchor
+                            // right. Its handle rides its RIGHT edge. `pl_4()`
+                            // = 16px.
+                            let row_left = f32::from(event.bounds.left());
+                            let left_edge = row_left
+                                + 16.
+                                + commit_graph_gutter_width(max_lanes.max(1))
+                                + COMMIT_COLUMN_GAP;
+                            let pointer_x = f32::from(event.event.position.x);
+                            // The pointer rides the divider center, half a gap
+                            // right of the PR cell's right edge, so subtract
+                            // gap/2 to avoid a jump the moment it's grabbed
+                            // (mirrors the AUTHOR/WHEN arms).
+                            app.pr_column_width = (pointer_x - COMMIT_COLUMN_GAP / 2. - left_edge)
+                                .clamp(PR_COLUMN_MIN, PR_COLUMN_MAX);
+                        }
                         GraphColumn::When => {
                             app.when_column_width =
                                 (right_edge - column_left).clamp(WHEN_COLUMN_MIN, WHEN_COLUMN_MAX);
@@ -4120,6 +4426,7 @@ impl App {
             query: query.to_string(),
             reviews_generation: self.reviews_generation.get(),
             completed_reviews_expanded: self.completed_reviews_expanded,
+            prs_generation: self.prs_generation.get(),
         };
 
         if let Some((cached_signature, rows)) = self.sidebar_rows_cache.borrow().as_ref() {
@@ -4146,7 +4453,31 @@ impl App {
                 section.top_border = true;
             }
         }
-        rows.extend(branch_rows);
+        // Splice the Active PRs section between the Local and Remote/Tags
+        // sections. The header draws a top border whenever content precedes it
+        // (a Local section at insert_at > 0, or Reviews above the whole tree),
+        // and the section it displaces gains a top border because PR rows now
+        // sit above it.
+        let pr_rows = self.active_prs_sidebar_rows(query);
+        if pr_rows.is_empty() {
+            rows.extend(branch_rows);
+        } else {
+            let insert_at = branch_rows
+                .iter()
+                .position(|row| {
+                    matches!(row, BranchTreeRow::Section(s) if s.key == "remotes" || s.key == "tags")
+                })
+                .unwrap_or(branch_rows.len());
+            let mut pr_rows = pr_rows;
+            if let Some(BranchTreeRow::PrSection(header)) = pr_rows.first_mut() {
+                header.top_border = insert_at > 0 || reviews_precede;
+            }
+            if let Some(BranchTreeRow::Section(section)) = branch_rows.get_mut(insert_at) {
+                section.top_border = true;
+            }
+            branch_rows.splice(insert_at..insert_at, pr_rows);
+            rows.extend(branch_rows);
+        }
         let rows = Rc::new(rows);
 
         #[cfg(test)]
@@ -4208,9 +4539,81 @@ impl App {
         rows
     }
 
+    /// Rows for the "Active PRs" section. Empty when the repo maps to no
+    /// Bitbucket remote (no session). Otherwise always at least the header;
+    /// body content depends on the session's load state. Suppressed while a
+    /// sidebar filter query is active (like Reviews).
+    fn active_prs_sidebar_rows(&self, query: &str) -> Vec<BranchTreeRow> {
+        if !query.is_empty() {
+            return Vec::new();
+        }
+        if self.bitbucket.is_none() {
+            return Vec::new();
+        }
+        let collapsed = self.collapsed_branch_sections.contains("pr");
+        let mut rows = vec![BranchTreeRow::PrSection(PrSectionRow {
+            count: self.pull_requests.len(),
+            collapsed,
+            top_border: false, // fixed up by the splice in sidebar_rows
+        })];
+        if collapsed {
+            return rows;
+        }
+
+        // Surface a fetch failure even when a prior snapshot is still shown, so
+        // a failed refresh doesn't silently retain stale rows with no error
+        // affordance. The header's refresh control is the retry path.
+        if let PrSectionState::Failed(msg) = &self.bitbucket_state {
+            rows.push(BranchTreeRow::PrHint(msg.clone()));
+        }
+
+        if self.pull_requests.is_empty() {
+            let hint = match &self.bitbucket_state {
+                PrSectionState::NotConfigured => {
+                    Some("Set BITBUCKET_TOKEN to load PRs".to_string())
+                }
+                PrSectionState::Loading => Some("Loading pull requests…".to_string()),
+                PrSectionState::Loaded => Some("No open pull requests".to_string()),
+                PrSectionState::Failed(_) => None, // already surfaced above
+            };
+            if let Some(hint) = hint {
+                rows.push(BranchTreeRow::PrHint(hint));
+            }
+            return rows;
+        }
+        // PRs sorted by descending id (newest first).
+        let mut prs: Vec<&crate::bitbucket::PullRequest> = self.pull_requests.iter().collect();
+        prs.sort_by(|a, b| b.id.cmp(&a.id));
+        rows.extend(prs.into_iter().map(|pr| {
+            BranchTreeRow::Pr(PrRow {
+                id: pr.id,
+                source_tip_sha: pr.source_tip_sha.clone(),
+            })
+        }));
+        rows
+    }
+
     #[cfg(test)]
     pub(crate) fn sidebar_rows_recompute_count(&self) -> u64 {
         self.sidebar_rows_recompute_count.get()
+    }
+
+    /// Compact summary of the Active PRs section's rows for assertions:
+    /// `"section:<count>"`, `"pr:<id>"`, and `"hint:<text>"`.
+    #[cfg(test)]
+    pub(crate) fn active_prs_sidebar_rows_summary(
+        &self,
+        repo: &repo::OpenRepository,
+    ) -> Vec<String> {
+        self.sidebar_rows(repo, "")
+            .iter()
+            .filter_map(|row| match row {
+                BranchTreeRow::PrSection(section) => Some(format!("section:{}", section.count)),
+                BranchTreeRow::Pr(pr) => Some(format!("pr:{}", pr.id)),
+                BranchTreeRow::PrHint(hint) => Some(format!("hint:{hint}")),
+                _ => None,
+            })
+            .collect()
     }
 
     fn render_branch_sidebar(
@@ -4343,6 +4746,15 @@ impl App {
                                         index, *count, *expanded, cx,
                                     )
                                     .into_any_element(),
+                                BranchTreeRow::PrSection(section) => app
+                                    .render_pr_section_row(index, section, cx)
+                                    .into_any_element(),
+                                BranchTreeRow::Pr(pr) => {
+                                    app.render_pr_row(index, pr, cx).into_any_element()
+                                }
+                                BranchTreeRow::PrHint(hint) => {
+                                    app.render_pr_hint_row(index, hint).into_any_element()
+                                }
                             })
                             .collect::<Vec<_>>()
                     }),
@@ -4911,6 +5323,123 @@ impl App {
                     .text_color(palette().text_muted)
                     .truncate()
                     .child(format!("Completed ({count})")),
+            )
+    }
+
+    fn render_pr_section_row(
+        &self,
+        index: usize,
+        section: &PrSectionRow,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(FILE_TREE_ROW_HEIGHT + BRANCH_ROW_VERTICAL_PADDING * 2.))
+            .py(px(BRANCH_ROW_VERTICAL_PADDING))
+            .gap_2()
+            .px_3()
+            .bg(palette().surface)
+            .border_b_1()
+            .when(section.top_border, |header| header.border_t_1())
+            .border_color(palette().border)
+            .cursor_pointer()
+            .id(("pr-section", index))
+            .debug_selector(|| "branch-section-active-prs".to_string())
+            .hover(|style| style.bg(palette().element_hover))
+            .on_click(cx.listener(|app, _event: &ClickEvent, _window, cx| {
+                app.toggle_branch_section("pr".to_string(), cx);
+            }))
+            .child(
+                Icon::new(if section.collapsed {
+                    LucideIcon::ChevronRight
+                } else {
+                    LucideIcon::ChevronDown
+                })
+                .text_color(palette().text_muted)
+                .size(px(FILE_TREE_STATUS_ICON_SIZE)),
+            )
+            .child(
+                Icon::new(LucideIcon::GitPullRequest)
+                    .text_color(palette().text_muted)
+                    .size(px(FILE_TREE_STATUS_ICON_SIZE)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_color(palette().text_muted)
+                    .text_size(px(FILE_TREE_TEXT_SIZE))
+                    .truncate()
+                    .child("ACTIVE PRS"),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(palette().text_muted)
+                    .text_size(px(FILE_TREE_TEXT_SIZE))
+                    .debug_selector(|| "branch-section-count-active-prs".to_string())
+                    .child(section.count.to_string()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
+                    .cursor_pointer()
+                    .id(("pr-section-refresh", index))
+                    .debug_selector(|| "pr-section-refresh".to_string())
+                    .hover(|style| style.text_color(palette().text))
+                    .on_click(cx.listener(|app, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        app.refresh_pull_requests(cx);
+                    }))
+                    .child(
+                        Icon::new(LucideIcon::RefreshCw)
+                            .text_color(palette().text_muted)
+                            .size(px(FILE_TREE_STATUS_ICON_SIZE)),
+                    ),
+            )
+    }
+
+    fn render_pr_hint_row(&self, index: usize, hint: &str) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(FILE_TREE_ROW_HEIGHT))
+            .px_3()
+            .pl_8()
+            .text_color(palette().text_muted)
+            .text_size(px(FILE_TREE_TEXT_SIZE))
+            .debug_selector(move || format!("pr-hint-{index}"))
+            .child(hint.to_string())
+    }
+
+    fn render_pr_row(&self, index: usize, pr: &PrRow, cx: &mut Context<Self>) -> impl IntoElement {
+        let tip_sha = pr.source_tip_sha.clone();
+        let id = pr.id;
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(FILE_TREE_ROW_HEIGHT))
+            .px_3()
+            .pl_8()
+            .gap_2()
+            .cursor_pointer()
+            .id(("pr-row", index))
+            .debug_selector(move || format!("pr-row-{id}"))
+            .hover(|style| style.bg(palette().element_hover))
+            .on_click(cx.listener(move |app, _event: &ClickEvent, window, cx| {
+                app.activate_pull_request(id, tip_sha.clone(), window, cx);
+            }))
+            .child(
+                div()
+                    .text_color(palette().text)
+                    .text_size(px(FILE_TREE_TEXT_SIZE))
+                    .child(format!("#{id}")),
             )
     }
 
@@ -5922,6 +6451,23 @@ impl App {
                 GutterMetrics::new(self.row_height()),
             ))
             .child(
+                div()
+                    .w(px(self.pr_column_width))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .overflow_hidden()
+                    .debug_selector(move || format!("commit-pr-cell-{index}"))
+                    .children(render_commit_pr_pills(
+                        index,
+                        &commit.sha,
+                        &self.pr_by_source_tip,
+                        &self.pull_requests,
+                        self.pr_column_width,
+                    )),
+            )
+            .child(
                 // The shared summary·refs cell: summary left, ref pills
                 // right, the two growing toward each other. The fit planner
                 // (see `plan_ref_label_fit`) budgets the cell so only whole
@@ -6054,6 +6600,7 @@ impl App {
                 CommitDotStyle::Hollow,
                 GutterMetrics::new(self.row_height()),
             ))
+            .child(div().w(px(self.pr_column_width)).flex_shrink_0())
             .child(
                 // Shared summary cell: the title, then the muted change
                 // summary in the space ref labels occupy on commit rows.
@@ -6348,6 +6895,9 @@ const COMMIT_ROW_HEIGHT_TABLE: f32 = 56.;
 const COMMIT_HASH_WIDTH: f32 = 72.;
 const COMMIT_AUTHOR_WIDTH: f32 = 168.;
 const COMMIT_TIME_WIDTH: f32 = 96.;
+const COMMIT_PR_WIDTH: f32 = 64.;
+const PR_COLUMN_MIN: f32 = 40.;
+const PR_COLUMN_MAX: f32 = 200.;
 
 /// Flex gap between the Compact row's columns (and the header's cells).
 const COMMIT_COLUMN_GAP: f32 = 24.;
@@ -6382,15 +6932,45 @@ const COMMIT_ROW_RIGHT_INSET: f32 = 16. + COMMIT_HISTORY_SCROLLBAR_GUTTER;
 /// Horizontal padding of a Compact commit row (`px_4`, both sides).
 const COMMIT_ROW_HORIZONTAL_PADDING: f32 = 2. * 16.;
 
+/// Build the `#<id>` PR pills for a commit whose sha is a PR source tip.
+/// Empty when the commit anchors no PR — the column still renders for stable
+/// layout. Multiple PRs on one commit render ascending by id (the index stores
+/// them pre-sorted).
+fn render_commit_pr_pills(
+    row_index: usize,
+    sha: &str,
+    index: &std::collections::HashMap<String, Vec<usize>>,
+    prs: &[crate::bitbucket::PullRequest],
+    column_width: f32,
+) -> Vec<gpui::Div> {
+    let Some(pr_indices) = index.get(sha) else {
+        return Vec::new();
+    };
+    pr_indices
+        .iter()
+        .filter_map(|&i| prs.get(i))
+        .map(|pr| {
+            let label = crate::app::commit_graph::CommitRefLabel {
+                name: format!("#{}", pr.id),
+                selector_key: format!("pr-{}", pr.id),
+                kind: crate::app::commit_graph::CommitRefLabelKind::PullRequest,
+                marker: None,
+            };
+            crate::app::commit_graph::render_commit_ref_label(row_index, label, Some(column_width))
+        })
+        .collect()
+}
+
 /// Width of the Compact row's shared summary·refs cell, derived from the
 /// history list's painted width minus everything else on the row: the
 /// scrollbar gutter the list reserves, the row padding, the graph gutter,
-/// the fixed hash column, the two resizable columns, and the four column
-/// gaps separating the five cells. This feeds the ref-label fit planner
+/// the fixed hash column, the PR and two resizable columns, and the five
+/// column gaps separating the six cells. This feeds the ref-label fit planner
 /// (see `commit_graph::plan_ref_label_fit`).
 fn commit_summary_cell_width(
     list_width: f32,
     lane_count: usize,
+    pr_width: f32,
     author_width: f32,
     when_width: f32,
 ) -> f32 {
@@ -6399,9 +6979,10 @@ fn commit_summary_cell_width(
         - COMMIT_ROW_HORIZONTAL_PADDING
         - commit_graph_gutter_width(lane_count.max(1))
         - COMMIT_HASH_WIDTH
+        - pr_width
         - author_width
         - when_width
-        - 4. * COMMIT_COLUMN_GAP
+        - 5. * COMMIT_COLUMN_GAP
 }
 
 /// The rectangles the selection underlay paints behind the selected commit
@@ -6628,9 +7209,9 @@ fn restored_column_width(saved: Option<f32>, default: f32, min: f32, max: f32) -
 mod tests {
     use super::{
         changeset_key_for_selection, restored_width, selection_summary, App, CloseChangeset,
-        DiffDrag, DiffDragMode, FileListMode, Mode, OpenChangeset, OpenFailed, PreparedFileDiff,
-        ReviewScreen, Selection, FILE_TREE_ROW_HEIGHT, SIDEBAR_MIN_WIDTH, WHEN_COLUMN_MAX,
-        WHEN_COLUMN_MIN,
+        DiffDrag, DiffDragMode, FileListMode, Mode, OpenChangeset, OpenFailed, PrSectionState,
+        PreparedFileDiff, PullRequestCommitMissing, ReviewScreen, Selection, FILE_TREE_ROW_HEIGHT,
+        PR_COLUMN_MAX, PR_COLUMN_MIN, SIDEBAR_MIN_WIDTH, WHEN_COLUMN_MAX, WHEN_COLUMN_MIN,
     };
     use crate::repo::{ChangeKind, INITIAL_COMMIT_LIMIT};
     use crate::settings::{
@@ -6646,10 +7227,11 @@ mod tests {
     #[test]
     fn commit_summary_cell_width_subtracts_the_fixed_columns() {
         // A 1000px list minus the scrollbar gutter (12), row padding (32),
-        // a 3-lane gutter (66), hash (72), author (168), when (96), and the
-        // four 24px column gaps leaves 458 for the shared summary·refs cell.
-        let width = super::commit_summary_cell_width(1000., 3, 168., 96.);
-        assert!((width - 458.).abs() < 0.01, "expected ~458, got {width}");
+        // a 3-lane gutter (66), hash (72), PR (64), author (168), when (96),
+        // and the five 24px column gaps leaves 370 for the shared
+        // summary·refs cell.
+        let width = super::commit_summary_cell_width(1000., 3, 64., 168., 96.);
+        assert!((width - 370.).abs() < 0.01, "expected ~370, got {width}");
     }
 
     #[gpui::test]
@@ -6952,6 +7534,94 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn dragging_the_pr_handle_resizes_clamps_and_persists_the_column(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store = dir.path().join("settings.json");
+        let (repo_dir, _sha) = init_repo_with_one_commit();
+        let repo_path = repo_dir.path().to_path_buf();
+
+        let window = add_app_window_with_store_path(cx, store.clone());
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(repo_path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let handle = visual
+            .debug_bounds("graph-header-pr-handle")
+            .expect("PR resize handle renders");
+        let before = window
+            .update(cx, |app, _, _| app.pr_column_width)
+            .expect("read width");
+
+        // The PR column anchors left, so its right-edge handle grows the
+        // column when dragged RIGHT. Drag the divider 30px right: the column
+        // grows 30px, with no jump on grab (the divider-offset correction).
+        let start = handle.center();
+        let end = point(start.x + px(30.), start.y);
+        simulate_drag(&mut visual, start, end);
+        cx.run_until_parked();
+
+        let after = window
+            .update(cx, |app, _, _| app.pr_column_width)
+            .expect("read width");
+        assert!(
+            (after - (before + 30.)).abs() <= 2.,
+            "PR width should grow ~30px: {before} -> {after}"
+        );
+
+        // Dragging far right pins the width to the maximum.
+        let handle = visual
+            .debug_bounds("graph-header-pr-handle")
+            .expect("PR resize handle renders after the resize");
+        let start = handle.center();
+        simulate_drag(
+            &mut visual,
+            start,
+            point(start.x + px(PR_COLUMN_MAX), start.y),
+        );
+        cx.run_until_parked();
+        let clamped = window
+            .update(cx, |app, _, _| app.pr_column_width)
+            .expect("read width");
+        assert_eq!(
+            clamped, PR_COLUMN_MAX,
+            "far-right drag should clamp to the maximum"
+        );
+
+        // Dragging back left past the column's left edge pins it to the
+        // minimum.
+        let handle = visual
+            .debug_bounds("graph-header-pr-handle")
+            .expect("PR resize handle renders after the max clamp");
+        let start = handle.center();
+        simulate_drag(&mut visual, start, point(px(0.), start.y));
+        cx.run_until_parked();
+        let clamped = window
+            .update(cx, |app, _, _| app.pr_column_width)
+            .expect("read width");
+        assert_eq!(
+            clamped, PR_COLUMN_MIN,
+            "far-left drag should clamp to the minimum"
+        );
+
+        // The dragged width survives the session end.
+        assert!(visual.simulate_close(), "window should accept the close");
+        let saved = crate::settings::load(&store)
+            .graph_column_widths
+            .pr
+            .expect("PR width persisted on close");
+        assert!(
+            (saved - clamped).abs() <= 0.5,
+            "persisted {saved}, live {clamped}"
+        );
+    }
+
+    #[gpui::test]
     async fn compact_row_orders_summary_refs_sha_author_when(cx: &mut TestAppContext) {
         let (dir, _main_tip, _root) = init_repo_with_feature_branch();
         let path = dir.path().to_path_buf();
@@ -6995,6 +7665,110 @@ mod tests {
         );
         assert!(hash.right() <= author.left(), "sha precedes author");
         assert!(author.right() <= when.left(), "author precedes when");
+    }
+
+    #[gpui::test]
+    async fn pr_pill_renders_on_the_source_tip_commit(cx: &mut TestAppContext) {
+        let (dir, sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        // A PR whose source tip is the loaded HEAD commit anchors a #42 pill.
+        window
+            .update(cx, |app, _window, cx| {
+                app.set_pull_requests_for_test(vec![crate::bitbucket::PullRequest {
+                    id: 42,
+                    source_branch: "feature".to_string(),
+                    target_branch: "main".to_string(),
+                    source_tip_sha: sha.clone(),
+                }]);
+                cx.notify();
+            })
+            .expect("install PR");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        // Row 1 is the newest commit (row 0 is the pending row).
+        let cell = visual
+            .debug_bounds("commit-pr-cell-1")
+            .expect("PR cell renders");
+        let pill = visual
+            .debug_bounds("commit-ref-label-1-pr-42")
+            .expect("PR pill renders on the source-tip row");
+        assert!(
+            pill.left() >= cell.left() - px(1.) && pill.right() <= cell.right() + px(1.),
+            "pill sits inside the PR cell"
+        );
+    }
+
+    #[gpui::test]
+    async fn pr_column_is_empty_for_non_pr_commits(cx: &mut TestAppContext) {
+        let (dir, _sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        // A PR anchored to an unrelated sha leaves the loaded commit's cell bare.
+        window
+            .update(cx, |app, _window, _cx| {
+                app.set_pull_requests_for_test(vec![crate::bitbucket::PullRequest {
+                    id: 7,
+                    source_branch: "feature".to_string(),
+                    target_branch: "main".to_string(),
+                    source_tip_sha: "0000000000000000000000000000000000000000".to_string(),
+                }]);
+            })
+            .expect("install PR");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(
+            visual.debug_bounds("commit-pr-cell-1").is_some(),
+            "the PR column cell always renders for stable layout"
+        );
+        assert!(
+            visual.debug_bounds("commit-ref-label-1-pr-7").is_none(),
+            "no PR pill renders on a commit that anchors no PR"
+        );
+    }
+
+    #[gpui::test]
+    async fn pr_column_width_persists_across_reopen(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let store = dir.path().join("settings.json");
+        let window = add_app_window_with_store_path(cx, store.clone());
+
+        window
+            .update(cx, |app, _window, _cx| {
+                app.pr_column_width = 96.;
+            })
+            .expect("set live width");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(visual.simulate_close(), "window should accept the close");
+
+        let saved = crate::settings::load(&store).graph_column_widths;
+        assert_eq!(saved.pr, Some(96.));
+
+        // A fresh window restores the persisted width.
+        let reopened = add_app_window_with_store_path(cx, store.clone());
+        let restored = reopened
+            .update(cx, |app, _, _| app.pr_column_width)
+            .expect("read restored width");
+        assert_eq!(restored, 96.);
     }
 
     #[gpui::test]
@@ -7537,6 +8311,344 @@ mod tests {
                 );
             })
             .expect("inspect state");
+    }
+
+    fn pr(id: u64, source_tip_sha: &str) -> crate::bitbucket::PullRequest {
+        crate::bitbucket::PullRequest {
+            id,
+            source_branch: format!("feature-{id}"),
+            target_branch: "main".to_string(),
+            source_tip_sha: source_tip_sha.to_string(),
+        }
+    }
+
+    #[gpui::test]
+    async fn active_prs_section_lists_loaded_prs(cx: &mut TestAppContext) {
+        let (dir, _tip) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.install_bitbucket_for_test(
+                    vec![pr(7, "sha7"), pr(42, "sha42")],
+                    PrSectionState::Loaded,
+                    cx,
+                );
+                cx.notify();
+            })
+            .expect("install PRs");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual
+            .debug_bounds("branch-section-active-prs")
+            .expect("Active PRs header renders");
+        let count = visual
+            .debug_bounds("branch-section-count-active-prs")
+            .expect("Active PRs count renders");
+        assert!(count.size.width > px(0.), "count cell renders");
+        let newest = visual
+            .debug_bounds("pr-row-42")
+            .expect("PR #42 row renders");
+        let oldest = visual.debug_bounds("pr-row-7").expect("PR #7 row renders");
+        assert!(
+            newest.top() < oldest.top(),
+            "PRs list descending by id (newest #42 above #7)"
+        );
+    }
+
+    #[gpui::test]
+    async fn active_prs_section_shows_not_configured_hint(cx: &mut TestAppContext) {
+        let (dir, _tip) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.install_bitbucket_for_test(Vec::new(), PrSectionState::NotConfigured, cx);
+                cx.notify();
+            })
+            .expect("install empty PRs");
+        cx.run_until_parked();
+
+        let rows = window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                app.active_prs_sidebar_rows_summary(repo)
+            })
+            .expect("read PR rows");
+        assert!(
+            rows.iter()
+                .any(|row| row == "hint:Set BITBUCKET_TOKEN to load PRs"),
+            "not-configured hint present, got {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.starts_with("pr:")),
+            "no PR rows when empty, got {rows:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn active_prs_section_shows_loaded_empty_hint(cx: &mut TestAppContext) {
+        let (dir, _tip) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.install_bitbucket_for_test(Vec::new(), PrSectionState::Loaded, cx);
+                cx.notify();
+            })
+            .expect("install empty PRs");
+        cx.run_until_parked();
+
+        let rows = window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                app.active_prs_sidebar_rows_summary(repo)
+            })
+            .expect("read PR rows");
+        assert!(
+            rows.iter().any(|row| row == "hint:No open pull requests"),
+            "loaded-empty hint present, got {rows:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn active_prs_section_surfaces_error_over_stale_prs(cx: &mut TestAppContext) {
+        let (dir, _tip) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        // A refresh failed, but the last-good snapshot (PR #5) is still held.
+        window
+            .update(cx, |app, _window, cx| {
+                app.install_bitbucket_for_test(
+                    vec![pr(5, "sha5")],
+                    PrSectionState::Failed("Network error: timed out".to_string()),
+                    cx,
+                );
+                cx.notify();
+            })
+            .expect("install stale PRs with a failed state");
+        cx.run_until_parked();
+
+        let rows = window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                app.active_prs_sidebar_rows_summary(repo)
+            })
+            .expect("read PR rows");
+        assert!(
+            rows.iter()
+                .any(|row| row == "hint:Network error: timed out"),
+            "the fetch error is surfaced even with stale PRs, got {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row == "pr:5"),
+            "the stale PR snapshot stays visible, got {rows:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn startup_restore_creates_the_pr_session(cx: &mut TestAppContext) {
+        // Deterministic regardless of the developer's environment: with no
+        // token the PR session stays NotConfigured and makes no network call.
+        std::env::remove_var("BITBUCKET_TOKEN");
+
+        let (dir, _tip) = init_repo_with_bitbucket_origin();
+        let path = dir.path().to_path_buf();
+
+        // Seed the repo as recent_repositories[0] with available=true so the
+        // constructor's startup-restore path opens it directly, WITHOUT going
+        // through apply_open_repository.
+        let window = add_app_window_with_recent_and_widths(
+            cx,
+            vec![RecentRepository::available(path.clone())],
+            SidebarWidths::default(),
+        );
+        cx.run_until_parked();
+
+        let rows = window
+            .update(cx, |app, _window, _cx| {
+                assert!(
+                    matches!(app.mode, Mode::RepoOpen { .. }),
+                    "startup-restore opened the Bitbucket-origin repo",
+                );
+                assert!(
+                    app.bitbucket.is_some(),
+                    "the PR session was created on the startup path",
+                );
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                app.active_prs_sidebar_rows_summary(repo)
+            })
+            .expect("read PR rows");
+
+        // The Active PRs section renders on launch. With no token the session
+        // settles into NotConfigured: an empty section plus the token hint.
+        assert!(
+            rows.iter().any(|row| row == "section:0"),
+            "Active PRs section appears on the startup path, got {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row == "hint:Set BITBUCKET_TOKEN to load PRs"),
+            "not-configured hint present on the startup path, got {rows:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn clicking_a_pr_selects_its_source_tip(cx: &mut TestAppContext) {
+        let (dir, tip) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let tip_for_pr = tip.clone();
+        window
+            .update(cx, |app, _window, cx| {
+                app.install_bitbucket_for_test(
+                    vec![pr(99, &tip_for_pr)],
+                    PrSectionState::Loaded,
+                    cx,
+                );
+                cx.notify();
+            })
+            .expect("install PR");
+        cx.run_until_parked();
+
+        let before = window
+            .update(cx, |app, _window, cx| app.notification_count(cx))
+            .expect("read notification count");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row = visual
+            .debug_bounds("pr-row-99")
+            .expect("PR #99 row renders");
+        visual.simulate_click(row.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, cx| {
+                assert_eq!(
+                    app.selection,
+                    Selection::Single { sha: tip.clone() },
+                    "clicking the PR selected its source-tip commit"
+                );
+                assert_eq!(
+                    app.notification_count(cx),
+                    before,
+                    "a resolvable PR shows no notice"
+                );
+            })
+            .expect("inspect state");
+    }
+
+    #[gpui::test]
+    async fn clicking_a_pr_with_missing_commit_shows_a_notice(cx: &mut TestAppContext) {
+        let (dir, _tip) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.install_bitbucket_for_test(
+                    vec![pr(13, "0000000000000000000000000000000000000000")],
+                    PrSectionState::Loaded,
+                    cx,
+                );
+                cx.notify();
+            })
+            .expect("install PR");
+        cx.run_until_parked();
+
+        let selection_before = window
+            .update(cx, |app, _window, _cx| app.selection.clone())
+            .expect("read selection before");
+
+        let captured: Rc<std::cell::RefCell<Vec<String>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = Rc::clone(&captured);
+        let _sub = window
+            .update(cx, |_app, _window, cx| {
+                cx.subscribe(
+                    &cx.entity(),
+                    move |_app, _emitter, event: &PullRequestCommitMissing, _cx| {
+                        sink.borrow_mut().push(event.0.clone());
+                    },
+                )
+            })
+            .expect("subscribe to the missing-commit event");
+
+        window
+            .update(cx, |app, window, cx| {
+                app.activate_pull_request(
+                    13,
+                    "0000000000000000000000000000000000000000".to_string(),
+                    window,
+                    cx,
+                );
+            })
+            .expect("activate PR");
+        cx.run_until_parked();
+
+        assert_eq!(
+            captured.borrow().as_slice(),
+            ["Commit for PR #13 isn't in the loaded history".to_string()],
+            "the missing-commit notice carries the PR id"
+        );
+        window
+            .update(cx, |app, _window, _cx| {
+                assert_eq!(
+                    app.selection, selection_before,
+                    "selection unchanged when the PR commit is missing"
+                );
+            })
+            .expect("inspect selection");
     }
 
     #[gpui::test]

@@ -69,6 +69,9 @@ pub struct Palette {
     pub ref_tag_fg: Hsla,
     pub ref_tag_bg: Hsla,
     pub ref_tag_border: Hsla,
+    pub ref_pr_fg: Hsla,
+    pub ref_pr_bg: Hsla,
+    pub ref_pr_border: Hsla,
     /// The "+N" ref-overflow badge: the pill triple in a neutral tone so the
     /// badge reads clearly without posing as another ref family.
     pub ref_overflow_fg: Hsla,
@@ -127,6 +130,9 @@ impl Palette {
             ref_tag_fg: Hsla::from(rgb(0xffcb6b)),
             ref_tag_bg: Hsla::from(rgba(0xffcb6b26)),
             ref_tag_border: Hsla::from(rgba(0xffcb6b66)),
+            ref_pr_fg: Hsla::from(rgb(0xc792ea)),
+            ref_pr_bg: Hsla::from(rgba(0xc792ea26)),
+            ref_pr_border: Hsla::from(rgba(0xc792ea66)),
             ref_overflow_fg: Hsla::from(rgb(0x718ca1)),
             ref_overflow_bg: Hsla::from(rgba(0x718ca126)),
             ref_overflow_border: Hsla::from(rgba(0x718ca166)),
@@ -207,6 +213,9 @@ mod tests {
         assert_eq!(p.ref_overflow_fg, Hsla::from(rgb(0x718ca1)));
         assert_eq!(p.ref_overflow_bg, Hsla::from(rgba(0x718ca126)));
         assert_eq!(p.ref_overflow_border, Hsla::from(rgba(0x718ca166)));
+        assert_eq!(p.ref_pr_fg, Hsla::from(rgb(0xc792ea)));
+        assert_eq!(p.ref_pr_bg, Hsla::from(rgba(0xc792ea26)));
+        assert_eq!(p.ref_pr_border, Hsla::from(rgba(0xc792ea66)));
     }
 
     #[test]

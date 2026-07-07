@@ -34,10 +34,14 @@ pub enum LucideIcon {
     GitBranchPlus,
     /// `git-compare-arrows.svg`
     GitCompareArrows,
+    /// `git-pull-request.svg`
+    GitPullRequest,
     /// `list-tree.svg`
     ListTree,
     /// `monitor.svg`
     Monitor,
+    /// `refresh-cw.svg`
+    RefreshCw,
     /// `rows-2.svg`
     Rows2,
     /// `search.svg`
@@ -71,8 +75,10 @@ impl LucideIcon {
         LucideIcon::GitBranch,
         LucideIcon::GitBranchPlus,
         LucideIcon::GitCompareArrows,
+        LucideIcon::GitPullRequest,
         LucideIcon::ListTree,
         LucideIcon::Monitor,
+        LucideIcon::RefreshCw,
         LucideIcon::Rows2,
         LucideIcon::Search,
         LucideIcon::SquareDot,
@@ -99,8 +105,10 @@ impl IconNamed for LucideIcon {
             LucideIcon::GitBranch => "icons/git-branch.svg",
             LucideIcon::GitBranchPlus => "icons/git-branch-plus.svg",
             LucideIcon::GitCompareArrows => "icons/git-compare-arrows.svg",
+            LucideIcon::GitPullRequest => "icons/git-pull-request.svg",
             LucideIcon::ListTree => "icons/list-tree.svg",
             LucideIcon::Monitor => "icons/monitor.svg",
+            LucideIcon::RefreshCw => "icons/refresh-cw.svg",
             LucideIcon::Rows2 => "icons/rows-2.svg",
             LucideIcon::Search => "icons/search.svg",
             LucideIcon::SquareDot => "icons/square-dot.svg",

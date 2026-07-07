@@ -257,6 +257,21 @@ pub fn open_at(path: &Path) -> Result<OpenRepository, OpenError> {
     })
 }
 
+/// Read the URL of the `origin` remote, if the repository has one. Used to map
+/// the repository to a code-hosting service (e.g. Bitbucket). Returns `None`
+/// when the repo cannot be opened, has no `origin`, or `origin` has no URL.
+///
+/// Reads the stored `remote.origin.url` config value directly rather than
+/// `Remote::url`, so the result is the URL as configured — libgit2's
+/// `Remote::url` applies any `url.<base>.insteadOf` rewrite rules from the
+/// user's git config, which would otherwise make the result depend on local
+/// transport preferences.
+pub fn origin_url(path: &Path) -> Option<String> {
+    let repo = git2::Repository::open(path).ok()?;
+    let config = repo.config().ok()?;
+    config.get_string("remote.origin.url").ok()
+}
+
 /// The primary worktree's root for the repository behind `repo`. The main
 /// worktree resolves to `fallback` (its own root); a linked worktree resolves
 /// through the shared common dir. Any resolution failure degrades to
@@ -3165,5 +3180,27 @@ mod tests {
         // A commit authored "in the future" (clock skew) reads as "now", never
         // a negative duration.
         assert_eq!(relative_authored_time(2_000_000_000, 1_800_000_000), "now");
+    }
+
+    #[test]
+    fn origin_url_reads_the_configured_remote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = git2::Repository::init(dir.path()).expect("init");
+        repo.remote("origin", "https://bitbucket.cicd.dc/scm/PROJ/repo.git")
+            .expect("set remote");
+        drop(repo);
+
+        assert_eq!(
+            origin_url(dir.path()).as_deref(),
+            Some("https://bitbucket.cicd.dc/scm/PROJ/repo.git")
+        );
+    }
+
+    #[test]
+    fn origin_url_is_none_without_a_remote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = git2::Repository::init(dir.path()).expect("init");
+        drop(repo);
+        assert_eq!(origin_url(dir.path()), None);
     }
 }

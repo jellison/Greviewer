@@ -414,7 +414,11 @@ mod tests {
                 BranchTreeRow::Section(s) => format!("section:{}:{}", s.title, s.count),
                 BranchTreeRow::Folder(f) => format!("folder:{}", f.path),
                 BranchTreeRow::Branch(b) => format!("branch:{}", b.branch.name),
-                BranchTreeRow::ReviewEntry(_) | BranchTreeRow::CompletedReviewsGroup { .. } => {
+                BranchTreeRow::ReviewEntry(_)
+                | BranchTreeRow::CompletedReviewsGroup { .. }
+                | BranchTreeRow::PrSection(_)
+                | BranchTreeRow::Pr(_)
+                | BranchTreeRow::PrHint(_) => {
                     unreachable!("build_branch_sidebar_rows never emits review rows")
                 }
             })
@@ -490,7 +494,11 @@ mod tests {
                 BranchTreeRow::Section(s) => format!("section:{}:{}:{}", s.title, s.key, s.count),
                 BranchTreeRow::Folder(f) => format!("folder:{}", f.path),
                 BranchTreeRow::Branch(b) => format!("ref:{}", b.branch.name),
-                BranchTreeRow::ReviewEntry(_) | BranchTreeRow::CompletedReviewsGroup { .. } => {
+                BranchTreeRow::ReviewEntry(_)
+                | BranchTreeRow::CompletedReviewsGroup { .. }
+                | BranchTreeRow::PrSection(_)
+                | BranchTreeRow::Pr(_)
+                | BranchTreeRow::PrHint(_) => {
                     unreachable!("build_branch_sidebar_rows never emits review rows")
                 }
             })
@@ -675,7 +683,11 @@ mod tests {
                 BranchTreeRow::Branch(branch_row) => {
                     format!("branch:{}", branch_row.branch.name)
                 }
-                BranchTreeRow::ReviewEntry(_) | BranchTreeRow::CompletedReviewsGroup { .. } => {
+                BranchTreeRow::ReviewEntry(_)
+                | BranchTreeRow::CompletedReviewsGroup { .. }
+                | BranchTreeRow::PrSection(_)
+                | BranchTreeRow::Pr(_)
+                | BranchTreeRow::PrHint(_) => {
                     unreachable!("build_branch_tree_rows never emits review rows")
                 }
             })
@@ -751,7 +763,11 @@ mod tests {
                 BranchTreeRow::Branch(branch_row) => {
                     format!("branch:{}@{}", branch_row.display_name, branch_row.depth)
                 }
-                BranchTreeRow::ReviewEntry(_) | BranchTreeRow::CompletedReviewsGroup { .. } => {
+                BranchTreeRow::ReviewEntry(_)
+                | BranchTreeRow::CompletedReviewsGroup { .. }
+                | BranchTreeRow::PrSection(_)
+                | BranchTreeRow::Pr(_)
+                | BranchTreeRow::PrHint(_) => {
                     unreachable!("build_branch_sidebar_rows never emits review rows")
                 }
             })
@@ -865,7 +881,11 @@ mod tests {
                 }
                 BranchTreeRow::Folder(folder) => format!("folder:{}", folder.path),
                 BranchTreeRow::Branch(branch_row) => format!("branch:{}", branch_row.branch.name),
-                BranchTreeRow::ReviewEntry(_) | BranchTreeRow::CompletedReviewsGroup { .. } => {
+                BranchTreeRow::ReviewEntry(_)
+                | BranchTreeRow::CompletedReviewsGroup { .. }
+                | BranchTreeRow::PrSection(_)
+                | BranchTreeRow::Pr(_)
+                | BranchTreeRow::PrHint(_) => {
                     unreachable!("build_branch_sidebar_rows never emits review rows")
                 }
             })
@@ -2249,6 +2269,11 @@ mod tests {
                     format!("completed-group:{count}")
                 }
                 BranchTreeRow::Folder(_) | BranchTreeRow::Branch(_) => "branch-tree".to_string(),
+                BranchTreeRow::PrSection(section) => {
+                    format!("pr-section:{}", section.count)
+                }
+                BranchTreeRow::Pr(pr) => format!("pr:{}", pr.id),
+                BranchTreeRow::PrHint(hint) => format!("pr-hint:{hint}"),
             })
             .collect::<Vec<_>>();
 

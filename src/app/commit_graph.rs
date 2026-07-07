@@ -315,6 +315,7 @@ pub(crate) enum CommitRefLabelKind {
     Branch,
     RemoteBranch,
     Tag,
+    PullRequest,
 }
 
 /// Checkout state a ref label advertises beyond its kind: the branch is
@@ -471,6 +472,11 @@ pub(crate) fn commit_ref_label_colors(
             palette().ref_tag_border,
             palette().ref_tag_bg,
             palette().ref_tag_fg,
+        ),
+        CommitRefLabelKind::PullRequest => (
+            palette().ref_pr_border,
+            palette().ref_pr_bg,
+            palette().ref_pr_fg,
         ),
     }
 }
@@ -2382,6 +2388,36 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_labels_use_the_pr_palette_distinct_from_other_refs() {
+        let pr_colors = commit_ref_label_colors(CommitRefLabelKind::PullRequest);
+
+        assert_eq!(
+            pr_colors,
+            (
+                palette().ref_pr_border,
+                palette().ref_pr_bg,
+                palette().ref_pr_fg,
+            ),
+            "pull-request labels draw from the PR palette entries",
+        );
+        assert_ne!(
+            pr_colors,
+            commit_ref_label_colors(CommitRefLabelKind::Head),
+            "pull-request labels must be visually distinct from HEAD labels",
+        );
+        assert_ne!(
+            pr_colors,
+            commit_ref_label_colors(CommitRefLabelKind::Branch),
+            "pull-request labels must be visually distinct from branch labels",
+        );
+        assert_ne!(
+            pr_colors,
+            commit_ref_label_colors(CommitRefLabelKind::Tag),
+            "pull-request labels must be visually distinct from tag labels",
+        );
+    }
+
+    #[test]
     fn commit_ref_labels_hide_only_the_hidden_namespace() {
         let mut commit = commit_info("tip", &[]);
         commit.branch_labels = vec![
@@ -4279,11 +4315,14 @@ mod tests {
             .debug_bounds("commit-summary-cell-1")
             .expect("shared summary cell debug bounds");
         // The cap is a fraction of the shared summary·refs cell, not the
-        // whole row.
+        // whole row. The planner guarantees the summary 60% of the cell (see
+        // `COMMIT_SUMMARY_GUARANTEED_FRACTION`), so the label cluster can never
+        // structurally exceed the remaining 40%.
         let shared_cell_width = shared_cell_bounds.size.width;
         assert!(
-            label_cell_bounds.size.width <= shared_cell_width * 0.35 + px(1.),
-            "the ref cluster must cap at 35% of the shared summary cell: {label_cell_bounds:?} vs shared cell width {shared_cell_width:?}"
+            label_cell_bounds.size.width
+                <= shared_cell_width * (1. - COMMIT_SUMMARY_GUARANTEED_FRACTION) + px(1.),
+            "the ref cluster must cap at 40% of the shared summary cell: {label_cell_bounds:?} vs shared cell width {shared_cell_width:?}"
         );
     }
 

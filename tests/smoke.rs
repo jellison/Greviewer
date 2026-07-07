@@ -61,6 +61,43 @@ async fn boots_to_the_placeholder(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn boots_with_bitbucket_origin(cx: &mut TestAppContext) {
+    // Deterministic regardless of the developer's environment: with no token
+    // the PR session stays NotConfigured and makes no network call.
+    std::env::remove_var("BITBUCKET_TOKEN");
+
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        bind_app_keys(cx);
+    });
+
+    let (dir, _shas) = common::build_repo_with_origin(
+        &[common::CommitSpec {
+            message: "init".to_string(),
+            changes: vec![common::FileChange {
+                path: "README.md".to_string(),
+                content: "hi".to_string(),
+            }],
+        }],
+        "https://bitbucket.cicd.dc/scm/PROJ/repo.git",
+    );
+
+    let picker = QueuedPathPicker::new([PathPickerOutcome::Picked(dir.path().to_path_buf())]);
+    let window = cx.add_window(|window, cx| App::new_with_picker(window, cx, Box::new(picker)));
+    cx.simulate_keystrokes(*window, OPEN_REPOSITORY_KEYSTROKE);
+    cx.run_until_parked();
+
+    window
+        .read_with(cx, |app, _cx| {
+            assert!(
+                matches!(app.mode, Mode::RepoOpen { .. }),
+                "expected the Bitbucket-origin repo to open",
+            );
+        })
+        .expect("read booted window");
+}
+
+#[gpui::test]
 async fn boots_open_repo_renders_head_info(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_component::init(cx);

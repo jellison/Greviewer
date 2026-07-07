@@ -323,7 +323,16 @@ impl App {
                                     .whitespace_nowrap()
                                     .child(format!("{name} \u{00b7}"))
                             }))
-                            .child(label),
+                            .child(label)
+                            .children(
+                                self.pr_badge_for_commit(&changeset.commit_sha).map(|id| {
+                                    div()
+                                        .debug_selector(|| "title-bar-pr-badge".to_string())
+                                        .whitespace_nowrap()
+                                        .text_color(palette().text_muted)
+                                        .child(format!("\u{00b7} #{id}"))
+                                }),
+                            ),
                         );
                 }
 
@@ -2335,6 +2344,98 @@ mod tests {
         assert_eq!(
             long_bounds.size.height, short_bounds.size.height,
             "a long name must stay on one line instead of wrapping",
+        );
+    }
+
+    const PR_BADGE: &str = "title-bar-pr-badge";
+
+    fn pr_with(id: u64, source_tip_sha: &str) -> crate::bitbucket::PullRequest {
+        crate::bitbucket::PullRequest {
+            id,
+            source_branch: "feature".to_string(),
+            target_branch: "main".to_string(),
+            source_tip_sha: source_tip_sha.to_string(),
+        }
+    }
+
+    #[gpui::test]
+    async fn context_pill_shows_pr_badge_when_primary_commit_is_a_source_tip(
+        cx: &mut TestAppContext,
+    ) {
+        let window = open_changeset_window(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                app.install_bitbucket_for_test(
+                    vec![pr_with(42, "abcdef1234567890")],
+                    crate::app::PrSectionState::Loaded,
+                    cx,
+                );
+                cx.notify();
+            })
+            .expect("install PR");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(
+            visual.debug_bounds(PR_BADGE).is_some(),
+            "badge renders when the primary commit is a PR source tip"
+        );
+    }
+
+    #[gpui::test]
+    async fn context_pill_hides_pr_badge_for_non_tip_commit(cx: &mut TestAppContext) {
+        let window = open_changeset_window(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                app.install_bitbucket_for_test(
+                    vec![pr_with(7, "0000000000000000000000000000000000000000")],
+                    crate::app::PrSectionState::Loaded,
+                    cx,
+                );
+                cx.notify();
+            })
+            .expect("install PR");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(
+            visual.debug_bounds(PR_BADGE).is_none(),
+            "no badge when the primary commit is not any PR's source tip"
+        );
+    }
+
+    #[gpui::test]
+    async fn context_pill_badge_uses_lowest_id_when_tips_collide(cx: &mut TestAppContext) {
+        let window = open_changeset_window(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                app.install_bitbucket_for_test(
+                    vec![
+                        pr_with(8, "abcdef1234567890"),
+                        pr_with(3, "abcdef1234567890"),
+                    ],
+                    crate::app::PrSectionState::Loaded,
+                    cx,
+                );
+                cx.notify();
+            })
+            .expect("install PRs");
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _cx| {
+                assert_eq!(
+                    app.pr_badge_for_commit("abcdef1234567890"),
+                    Some(3),
+                    "lowest id wins when several PRs share a source tip"
+                );
+            })
+            .expect("read badge id");
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(
+            visual.debug_bounds(PR_BADGE).is_some(),
+            "badge still renders when several PRs share a tip"
         );
     }
 

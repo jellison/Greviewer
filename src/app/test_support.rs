@@ -144,6 +144,18 @@ pub(crate) fn init_repo_with_one_commit() -> (tempfile::TempDir, String) {
     (dir, oid.to_string())
 }
 
+/// A one-commit repository whose `origin` remote is a Bitbucket Data Center
+/// URL, so `crate::repo::origin_url` + `parse_origin` yield a `BitBucketRepo`.
+/// Used to exercise the PR-session-on-open paths without a real network.
+pub(crate) fn init_repo_with_bitbucket_origin() -> (tempfile::TempDir, String) {
+    let (dir, tip) = init_repo_with_one_commit();
+    let repo = Repository::open(dir.path()).expect("reopen repo");
+    repo.remote("origin", "https://bitbucket.cicd.dc/scm/PROJ/repo.git")
+        .expect("configure Bitbucket origin");
+    drop(repo);
+    (dir, tip)
+}
+
 pub(crate) fn graph_commit(sha: &str, parent_shas: &[&str]) -> graph::GraphCommit {
     graph::GraphCommit {
         sha: sha.to_string(),

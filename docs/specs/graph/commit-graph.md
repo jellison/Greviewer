@@ -2,6 +2,9 @@
 
 This contract defines the drawing of the commit graph: how commits are assigned to lanes, how the lines connecting them are routed, and how color and layering keep many simultaneous branches legible. Which commits appear in the graph, what each row displays, branch hiding, and selection are covered by the review workflow spec (`../review/workflow.md`); this spec governs the picture itself. The graph's job is to let a reviewer trace any branch from tip to merge point with the eye alone, so every rule below exists to keep each branch a single continuous, consistently colored stroke.
 
+A dedicated column beside the graph marks commits that are pull-request source
+tips; see [Pull Requests](../bitbucket/pull-requests.md).
+
 ## Assigning commits to lanes
 
 Every commit occupies exactly one lane — a fixed horizontal position its dot is drawn in. The left-most lane is the trunk: it belongs to the checked-out commit's first-parent history, the chain a reviewer most often follows. The trunk extends upward through fast-forwardable descendants, so a branch tip whose history is a pure first-parent continuation of the checked-out commit draws as more trunk rather than opening a side lane above it. When several tips compete to continue the trunk, the most recently authored chain wins and the rest remain side branches.

@@ -370,6 +370,13 @@ The Reviews section is present only when the repository has at least one review 
 - Filtering the sidebar by branch name hides the Reviews section entirely; clearing the filter restores it.
 - Reopening a repository always shows the "Completed" group collapsed, regardless of how it was left.
 
+## Listing pull requests in the sidebar
+
+When the open repository is hosted on the pull-request server, the sidebar shows
+an "Active PRs" section between the Local and Remote branch groups, listing each
+open pull request by number. See [Pull Requests](../bitbucket/pull-requests.md)
+for the full behavior, including loading, refresh, and click-to-navigate.
+
 ## Selecting commits to review
 
 The user stages a review by selecting a single commit, a contiguous sequential range, or a two-commit comparison from the graph. Selection is tentative: no review activity begins until the user explicitly opens the changeset (described below). Clicking a commit selects it. Shift-clicking a second commit extends the selection to a range, provided the two commits lie on a single ancestry path (one is an ancestor of the other). The selection is the inclusive set of commits between the two endpoints along that path. Double-clicking bypasses tentative selection entirely; it is specified under "Opening the changeset" below.
@@ -512,6 +519,10 @@ description. Those controls are the review lifecycle, specified in
 - The popover offers a control that closes the changeset, returning the window to graph mode
   with the prior selection preserved.
 - Dismissing the popover by activating outside it leaves the changeset open.
+
+When the change set's primary commit is the source tip of an open pull request,
+the context indicator also shows that pull request's number. See
+[Pull Requests](../bitbucket/pull-requests.md).
 
 **Edge cases**
 

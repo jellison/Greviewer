@@ -69,6 +69,25 @@ pub fn build_repo(commits: &[CommitSpec]) -> TempDir {
     dir
 }
 
+/// Build a repo (like `build_repo`) and set an `origin` remote to `origin_url`.
+/// Returns the temp dir plus the created commit SHAs in creation order (oldest
+/// first) so callers can anchor pull requests to real commits.
+pub fn build_repo_with_origin(commits: &[CommitSpec], origin_url: &str) -> (TempDir, Vec<String>) {
+    let dir = build_repo(commits);
+    let repo = Repository::open(dir.path()).expect("reopen repo");
+    repo.remote("origin", origin_url)
+        .expect("set origin remote");
+    let mut walk = repo.revwalk().expect("revwalk");
+    walk.push_head().expect("push head");
+    let mut shas: Vec<String> = walk
+        .filter_map(Result::ok)
+        .map(|oid| oid.to_string())
+        .collect();
+    shas.reverse(); // revwalk yields newest-first; return oldest-first
+    drop(repo);
+    (dir, shas)
+}
+
 pub fn load_fixture(name: &str) -> TempDir {
     let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")

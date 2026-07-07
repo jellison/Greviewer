@@ -122,6 +122,8 @@ pub struct GraphColumnWidths {
     pub author: Option<f32>,
     /// Width of the WHEN column.
     pub when: Option<f32>,
+    /// Width of the PR column.
+    pub pr: Option<f32>,
 }
 
 /// Read settings from `path`. Returns [`Settings::default`] when the file is
@@ -340,6 +342,7 @@ mod tests {
             graph_column_widths: GraphColumnWidths {
                 author: Some(220.0),
                 when: Some(72.5),
+                pr: Some(58.0),
             },
             ..Settings::default()
         };
@@ -359,5 +362,12 @@ mod tests {
             load(&path).graph_column_widths,
             GraphColumnWidths::default()
         );
+    }
+
+    #[test]
+    fn graph_column_widths_pr_defaults_to_none_when_absent() {
+        let widths: GraphColumnWidths =
+            serde_json::from_str(r#"{ "author": 100.0, "when": 90.0 }"#).expect("decode");
+        assert_eq!(widths.pr, None);
     }
 }
