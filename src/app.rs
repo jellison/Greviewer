@@ -773,10 +773,12 @@ struct PrSectionRow {
     top_border: bool,
 }
 
-/// One PR row: shows `#<id>` and selects the source-tip commit on click.
+/// One PR row: shows `#<id> - <title>` and selects the source-tip commit on
+/// click.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PrRow {
     id: u64,
+    title: String,
     source_tip_sha: String,
 }
 
@@ -4587,6 +4589,7 @@ impl App {
         rows.extend(prs.into_iter().map(|pr| {
             BranchTreeRow::Pr(PrRow {
                 id: pr.id,
+                title: pr.title.clone(),
                 source_tip_sha: pr.source_tip_sha.clone(),
             })
         }));
@@ -4611,6 +4614,19 @@ impl App {
                 BranchTreeRow::PrSection(section) => Some(format!("section:{}", section.count)),
                 BranchTreeRow::Pr(pr) => Some(format!("pr:{}", pr.id)),
                 BranchTreeRow::PrHint(hint) => Some(format!("hint:{hint}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The rendered labels of the Active PRs section's PR rows, in list order,
+    /// for asserting the `#<id> - <title>` format.
+    #[cfg(test)]
+    pub(crate) fn active_prs_sidebar_row_labels(&self, repo: &repo::OpenRepository) -> Vec<String> {
+        self.sidebar_rows(repo, "")
+            .iter()
+            .filter_map(|row| match row {
+                BranchTreeRow::Pr(pr) => Some(format!("#{} - {}", pr.id, pr.title)),
                 _ => None,
             })
             .collect()
@@ -5420,6 +5436,7 @@ impl App {
     fn render_pr_row(&self, index: usize, pr: &PrRow, cx: &mut Context<Self>) -> impl IntoElement {
         let tip_sha = pr.source_tip_sha.clone();
         let id = pr.id;
+        let label = format!("#{id} - {}", pr.title);
         div()
             .flex()
             .items_center()
@@ -5437,9 +5454,14 @@ impl App {
             }))
             .child(
                 div()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
                     .text_color(palette().text)
                     .text_size(px(FILE_TREE_TEXT_SIZE))
-                    .child(format!("#{id}")),
+                    .child(label),
             )
     }
 
@@ -7685,6 +7707,7 @@ mod tests {
             .update(cx, |app, _window, cx| {
                 app.set_pull_requests_for_test(vec![crate::bitbucket::PullRequest {
                     id: 42,
+                    title: "Add feature".to_string(),
                     source_branch: "feature".to_string(),
                     target_branch: "main".to_string(),
                     source_tip_sha: sha.clone(),
@@ -7726,6 +7749,7 @@ mod tests {
             .update(cx, |app, _window, _cx| {
                 app.set_pull_requests_for_test(vec![crate::bitbucket::PullRequest {
                     id: 7,
+                    title: "Unrelated PR".to_string(),
                     source_branch: "feature".to_string(),
                     target_branch: "main".to_string(),
                     source_tip_sha: "0000000000000000000000000000000000000000".to_string(),
@@ -8316,6 +8340,7 @@ mod tests {
     fn pr(id: u64, source_tip_sha: &str) -> crate::bitbucket::PullRequest {
         crate::bitbucket::PullRequest {
             id,
+            title: format!("PR {id} title"),
             source_branch: format!("feature-{id}"),
             target_branch: "main".to_string(),
             source_tip_sha: source_tip_sha.to_string(),
@@ -8361,6 +8386,48 @@ mod tests {
         assert!(
             newest.top() < oldest.top(),
             "PRs list descending by id (newest #42 above #7)"
+        );
+    }
+
+    #[gpui::test]
+    async fn active_prs_rows_label_number_and_title(cx: &mut TestAppContext) {
+        let (dir, _tip) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.install_bitbucket_for_test(
+                    vec![pr(7, "sha7"), pr(42, "sha42")],
+                    PrSectionState::Loaded,
+                    cx,
+                );
+                cx.notify();
+            })
+            .expect("install PRs");
+        cx.run_until_parked();
+
+        let labels = window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                app.active_prs_sidebar_row_labels(repo)
+            })
+            .expect("read PR labels");
+        assert_eq!(
+            labels,
+            vec![
+                "#42 - PR 42 title".to_string(),
+                "#7 - PR 7 title".to_string(),
+            ],
+            "PR rows show `#<id> - <title>`, newest first"
         );
     }
 

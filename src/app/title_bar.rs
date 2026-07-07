@@ -2352,6 +2352,7 @@ mod tests {
     fn pr_with(id: u64, source_tip_sha: &str) -> crate::bitbucket::PullRequest {
         crate::bitbucket::PullRequest {
             id,
+            title: format!("PR {id} title"),
             source_branch: "feature".to_string(),
             target_branch: "main".to_string(),
             source_tip_sha: source_tip_sha.to_string(),

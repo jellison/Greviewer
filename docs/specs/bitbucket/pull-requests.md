@@ -29,9 +29,10 @@ retry.
 
 **Observable outcomes.** A collapsible "Active PRs" section sits between the local
 and remote branch groups. Each open pull request appears as a row showing its
-number, newest first. The section header shows how many are open and offers a
-refresh control. While loading, when none are open, or when a token is missing,
-the section explains the current state instead of listing rows.
+number and title as `#{number} - {title}`, newest first; a title too long for the
+row is truncated with an ellipsis. The section header shows how many are open and
+offers a refresh control. While loading, when none are open, or when a token is
+missing, the section explains the current state instead of listing rows.
 
 ## Anchoring pull requests on the graph and window bar
 

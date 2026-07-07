@@ -1,10 +1,10 @@
 //! Domain value and wire DTOs for Bitbucket Data Center pull requests.
 //!
 //! The DTOs mirror the `/rest/api/1.0` JSON shapes; [`PullRequest`] is the lean
-//! domain value the rest of the app consumes. `title` and `web_url` exist on the
-//! wire and are read tolerantly, but are deliberately NOT promoted onto the
-//! domain value in V1 (nothing renders them yet); they graduate to the domain
-//! type when a post-V1 feature consumes them.
+//! domain value the rest of the app consumes. `web_url` exists on the wire and is
+//! read tolerantly, but is deliberately NOT promoted onto the domain value in V1
+//! (nothing renders it yet); it graduates to the domain type when a post-V1
+//! feature consumes it.
 
 use serde::Deserialize;
 
@@ -13,6 +13,8 @@ use serde::Deserialize;
 pub struct PullRequest {
     /// The `#number` shown in every surface.
     pub id: u64,
+    /// `title` — the PR's human-facing title.
+    pub title: String,
     /// `fromRef.displayId` — the source branch short name.
     pub source_branch: String,
     /// `toRef.displayId` — the target branch short name.
@@ -40,6 +42,8 @@ pub(crate) struct PullRequestPage {
 pub(crate) struct PullRequestDto {
     pub id: u64,
     #[serde(default)]
+    pub title: String,
+    #[serde(default)]
     pub from_ref: Option<RefDto>,
     #[serde(default)]
     pub to_ref: Option<RefDto>,
@@ -66,6 +70,7 @@ impl PullRequestDto {
         let to = self.to_ref.unwrap_or_default();
         Some(PullRequest {
             id: self.id,
+            title: self.title,
             source_branch: from.display_id,
             target_branch: to.display_id,
             source_tip_sha: from.latest_commit,
@@ -118,6 +123,7 @@ mod tests {
             prs[0],
             PullRequest {
                 id: 42,
+                title: "Add widget".to_string(),
                 source_branch: "feature/widget".to_string(),
                 target_branch: "main".to_string(),
                 source_tip_sha: "aaaa1111".to_string(),
