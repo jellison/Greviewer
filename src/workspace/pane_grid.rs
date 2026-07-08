@@ -90,6 +90,7 @@ fn render_pane(
             pane,
             changeset,
             &scrolls.tab_bar,
+            app.diff_soft_wrap,
             cx,
         ))
         .child(render_pane_content(app, pane, repo, changeset, cx))
@@ -306,6 +307,7 @@ fn render_pane_content(
                 pane,
                 scroll: &scrolls.diff,
                 hovered: app.hovered_diff_pane == Some(pane),
+                soft_wrap: app.diff_soft_wrap,
             },
             cx,
         ))

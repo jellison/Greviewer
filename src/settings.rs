@@ -49,6 +49,9 @@ pub struct Settings {
     /// Widths of the Compact graph layout's resizable columns. Defaults apply
     /// until the user drags a column divider.
     pub graph_column_widths: GraphColumnWidths,
+    /// Whether the diff view wraps long lines to the code column width instead
+    /// of panning them horizontally. Off by default; applies to every diff.
+    pub diff_soft_wrap: bool,
 }
 
 /// A repository the user has opened before, plus whether its folder could still
@@ -197,6 +200,7 @@ mod tests {
             ai_enabled: false,
             graph_view_mode: GraphViewMode::default(),
             graph_column_widths: GraphColumnWidths::default(),
+            diff_soft_wrap: false,
         };
 
         save(&path, &settings).expect("save settings");
@@ -255,6 +259,7 @@ mod tests {
                 ai_enabled: false,
                 graph_view_mode: GraphViewMode::default(),
                 graph_column_widths: GraphColumnWidths::default(),
+                diff_soft_wrap: false,
             };
 
             save(&path, &settings).expect("save settings");
@@ -305,6 +310,21 @@ mod tests {
     }
 
     #[test]
+    fn diff_soft_wrap_defaults_off_and_round_trips() {
+        // Legacy files with no key load with wrap off.
+        let legacy: Settings = serde_json::from_str("{}").expect("legacy parses");
+        assert!(!legacy.diff_soft_wrap);
+
+        let wrapped = Settings {
+            diff_soft_wrap: true,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&wrapped).expect("serialize");
+        let reloaded: Settings = serde_json::from_str(&json).expect("reload");
+        assert!(reloaded.diff_soft_wrap);
+    }
+
+    #[test]
     fn sidebar_widths_survive_json_round_trip() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("settings.json");
@@ -318,6 +338,7 @@ mod tests {
             ai_enabled: false,
             graph_view_mode: GraphViewMode::default(),
             graph_column_widths: GraphColumnWidths::default(),
+            diff_soft_wrap: false,
         };
 
         save(&path, &settings).expect("save settings");

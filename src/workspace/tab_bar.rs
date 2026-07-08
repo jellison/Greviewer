@@ -73,6 +73,7 @@ pub fn render_tab_bar(
     pane: PaneId,
     changeset: &repo::ChangeSet,
     scroll: &ScrollHandle,
+    soft_wrap: bool,
     cx: &mut Context<App>,
 ) -> AnyElement {
     // The tab row exists only while the pane holds tabs (Zed's model): an
@@ -262,6 +263,7 @@ pub fn render_tab_bar(
                 .gap_1()
                 .px_2()
                 .h_full()
+                .child(soft_wrap_control(pane, soft_wrap, cx))
                 .child(split_control(
                     pane,
                     LucideIcon::Columns2,
@@ -306,6 +308,46 @@ fn split_control(
             Icon::new(icon)
                 .size(px(SPLIT_CONTROL_ICON_SIZE))
                 .text_color(palette().text_muted),
+        )
+}
+
+/// The soft-wrap toggle: a stateful icon button in the tab bar's control
+/// cluster. Active (wrap on) reads as a filled accent square; inactive is
+/// muted like the split controls. Clicking flips the app-wide
+/// `diff_soft_wrap` setting.
+fn soft_wrap_control(pane: PaneId, active: bool, cx: &mut Context<App>) -> impl IntoElement {
+    let id = format!("workspace-soft-wrap-{pane}");
+    let selector = if active {
+        format!("workspace-soft-wrap-active-{pane}")
+    } else {
+        id.clone()
+    };
+    div()
+        .id(SharedString::from(id))
+        .debug_selector(move || selector.clone())
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(SPLIT_CONTROL_SIZE))
+        .h(px(SPLIT_CONTROL_SIZE))
+        .rounded(px(2.))
+        .cursor_pointer()
+        .when(active, |button| button.bg(palette().accent_bg))
+        .when(!active, |button| {
+            button.hover(|button| button.bg(palette().border))
+        })
+        .on_click(cx.listener(move |app, _event: &ClickEvent, _window, cx| {
+            let next = !app.diff_soft_wrap;
+            app.set_diff_soft_wrap(next, cx);
+        }))
+        .child(
+            Icon::new(LucideIcon::WrapText)
+                .size(px(SPLIT_CONTROL_ICON_SIZE))
+                .text_color(if active {
+                    palette().accent
+                } else {
+                    palette().text_muted
+                }),
         )
 }
 
@@ -451,5 +493,39 @@ mod tests {
         window
             .read_with(cx, |app, _cx| assert!(app.workspace.tabs(0).is_empty()))
             .expect("read emptied workspace");
+    }
+
+    #[gpui::test]
+    async fn clicking_soft_wrap_toggle_flips_state(cx: &mut TestAppContext) {
+        use crate::workspace::test_util::{click_file_row, open_changeset};
+        use gpui::Modifiers;
+
+        let (_dir, window, mut visual) = open_changeset(cx);
+        click_file_row(&mut visual, 0);
+        cx.run_until_parked();
+
+        // Off initially: inactive selector present, active absent.
+        let off = visual
+            .debug_bounds("workspace-soft-wrap-0")
+            .expect("inactive soft-wrap toggle present");
+        assert!(
+            visual
+                .debug_bounds("workspace-soft-wrap-active-0")
+                .is_none(),
+            "active selector absent while off"
+        );
+
+        visual.simulate_click(off.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, _cx| {
+                assert!(app.diff_soft_wrap, "click turned wrap on");
+            })
+            .expect("read app");
+
+        visual
+            .debug_bounds("workspace-soft-wrap-active-0")
+            .expect("active selector present after toggle");
     }
 }

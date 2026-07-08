@@ -10,6 +10,13 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+/// Shared per-soft-wrapped-row code-cell bounds, keyed by `(side selector, row
+/// index)`. Written by the per-row canvas in `render_wrapped_row` and read back
+/// to map a pointer or caret column to a wrapped visual position and to size the
+/// wrap width. Held behind `Rc<RefCell<..>>` so the render tree, the mouse
+/// listeners, and the pane's scroll state all share one map.
+pub(crate) type WrapRowOrigins = Rc<RefCell<HashMap<(&'static str, usize), Bounds<Pixels>>>>;
+
 /// Everything one diff side needs to paint and mutate the selection. Built
 /// per render from the caller's pane/key/selection/focus; cheap to clone
 /// (an `Entity` handle plus `Rc`/`ScrollHandle` clones only).
@@ -40,6 +47,14 @@ pub(crate) struct DiffSelectionContext {
     /// closure (see `Context::entity`).
     pub(crate) app: Entity<App>,
     pub(crate) origins: Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
+    /// Per soft-wrapped-row code-cell bounds, keyed by `(side selector, row
+    /// index)`. Written by the per-row canvas in `render_wrapped_row` and read
+    /// back there (and by the drag path) to map a pointer or caret column to a
+    /// wrapped visual position and to size the wrap width. Empty in nowrap
+    /// mode, which uses `origins` and a fixed row height instead. Owned by
+    /// `FileDiffScroll` and cleared on every file switch by its `reset`, so no
+    /// entry ever outlives its file.
+    pub(crate) wrap_row_origins: WrapRowOrigins,
     pub(crate) hscroll: ScrollHandle,
 }
 
@@ -65,8 +80,21 @@ pub(crate) fn render_prepared_file_diff(
     prepared: &Rc<PreparedFileDiff>,
     scroll: &FileDiffScroll,
     hovered: bool,
+    soft_wrap: bool,
     selection_ctx: Option<&DiffSelectionContext>,
 ) -> AnyElement {
+    // Consumed by the wrap-mode rendering below; the nowrap path is unchanged.
+    if soft_wrap {
+        return match prepared.as_ref() {
+            PreparedFileDiff::Single { side, rows, .. } => {
+                render_wrapped_single(prepared, *side, rows, scroll, selection_ctx)
+            }
+            PreparedFileDiff::SideBySide { rows, .. } => {
+                render_wrapped_side_by_side(prepared, rows, scroll, selection_ctx)
+            }
+            PreparedFileDiff::Binary => render_binary_diff_placeholder(),
+        };
+    }
     let p = palette();
     let max_line_chars = prepared.max_line_chars();
     match prepared.as_ref() {
@@ -157,7 +185,482 @@ pub(crate) fn render_prepared_file_diff(
     }
 }
 
-/// The block the counter reports: the first block still at or below the top of
+/// One soft-wrapped diff row for a given side. Reuses the accent bar and gutter
+/// from the nowrap `render_file_diff_line`, but the row grows to fit its wrapped
+/// text (no fixed height) and the code cell wraps via `whitespace_normal`
+/// against its definite flex width rather than panning.
+///
+/// Selection, caret, and hit-testing are wrap-aware. The code cell records its
+/// own painted bounds into `ctx.wrap_row_origins` (a per-row canvas), keyed by
+/// `(pane_selector, row_index)`; those bounds give the wrap width used to place
+/// the caret at its visual `(x, y)` and to map a click's local point to a byte
+/// column across visual rows. The bounds are read from the *previous* frame, so
+/// the very first paint of a row (before any bounds exist) falls back to the
+/// single-line caret x at the first visual row — a one-frame imprecision that
+/// self-corrects once the canvas has run.
+fn render_wrapped_row(
+    pane_selector: &'static str,
+    row_index: usize,
+    mut cell: DiffLineCell,
+    selection: RowSelectionState,
+    window: &mut Window,
+) -> impl IntoElement {
+    let RowSelectionState {
+        ctx: selection_ctx,
+        focused,
+    } = selection;
+    let p = palette();
+    let line_number = cell
+        .line_number
+        .map(|line_number| line_number.to_string())
+        .unwrap_or_default();
+    let pane_offset = match pane_selector {
+        "file-diff-side-old" => 0,
+        "file-diff-side-new" => 1,
+        _ => 2,
+    };
+    let id_index = row_index * 3 + pane_offset;
+    let row_selector = diff_line_debug_selector(cell.status);
+    let accent = diff_line_accent(cell.status);
+
+    let selection = selection_ctx.and_then(|ctx| ctx.selection);
+    // Alignment gaps hold no selectable text, matching the nowrap path.
+    let selectable = cell.status != DiffLineStatus::Empty;
+    let selection_fill = if focused {
+        p.diff_selection_bg
+    } else {
+        p.diff_selection_bg_unfocused
+    };
+    let selection_span = selection
+        .filter(|_| selectable)
+        .and_then(|selection| selection_span_for_row(&selection, row_index, cell.text.len()));
+    if let Some((span, _is_final_row)) = selection_span {
+        // The byte-range overlay follows the wrapped text across visual rows on
+        // its own: `StyledText`'s wrapped background paint splits the fill at
+        // each wrap boundary. The cross-row "newline stub" the nowrap path
+        // draws is a flex sibling of the text, which a wrapping (block) code
+        // cell cannot host without forcing an extra visual row; it is omitted
+        // in wrap mode, where the fill over the text bytes already reads the
+        // selection.
+        cell.highlights =
+            diff_selection::overlay_background(&cell.highlights, span, selection_fill);
+    }
+    let has_text = !cell.text.is_empty();
+
+    // The code cell's previous-frame bounds give the wrap width the text
+    // painted at; `None` before the first paint of this row.
+    let code_bounds = selection_ctx.and_then(|ctx| {
+        ctx.wrap_row_origins
+            .borrow()
+            .get(&(pane_selector, row_index))
+            .copied()
+    });
+    let wrap_width = code_bounds.map(wrap_width_for);
+
+    // Caret: painted at the selection head, gated on focus and the blink
+    // phase, at the head's wrapped visual position. The active-line tint is a
+    // bare-caret cue only and stays a full-row tint in wrap mode.
+    let head_here = selection.filter(|selection| selection.caret().row == row_index);
+    let show_active_line = focused && head_here.is_some_and(|selection| selection.is_caret());
+    let caret_point = head_here
+        .filter(|_| focused && selection_ctx.is_some_and(|ctx| ctx.caret_visible))
+        .map(|selection| {
+            let column = selection.caret().column;
+            match wrap_width {
+                Some(width) => wrapped_point_for_column(window, &cell.text, width, column),
+                None => gpui::point(x_for_column(window, &cell.text, column), px(0.)),
+            }
+        });
+
+    let mouse_down_ctx = selection_ctx.cloned();
+    let gutter_ctx = selection_ctx.cloned();
+    let mouse_down_text = cell.text.clone();
+    let has_line_number = cell.line_number.is_some();
+
+    div()
+        .relative()
+        .flex()
+        .w_full()
+        .bg(diff_line_fill(cell.status))
+        .id(("file-diff-line", id_index))
+        .debug_selector(move || row_selector.to_string())
+        .when(show_active_line, |row| {
+            row.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .bg(p.active_line_bg)
+                    .debug_selector(|| "diff-active-line".to_string()),
+            )
+        })
+        .child(div().w(px(DIFF_ACCENT_WIDTH)).flex_none().when_some(
+            accent,
+            |bar, (color, accent_selector)| {
+                bar.bg(color)
+                    .debug_selector(move || accent_selector.to_string())
+            },
+        ))
+        .child({
+            // Top-aligned so on a multi-visual-row line the number sits on the
+            // first visual row rather than centered against the whole block.
+            let mut gutter_cell = div()
+                .id(("file-diff-line-number", id_index))
+                .flex()
+                .items_start()
+                .justify_end()
+                .w(px(DIFF_LINE_NUMBER_WIDTH))
+                .pr_2()
+                .flex_none()
+                .text_color(p.text_muted)
+                .text_size(px(DIFF_TEXT_SIZE))
+                .line_height(px(DIFF_LINE_HEIGHT))
+                .font_family(MONO_FONT_FAMILY)
+                .debug_selector(move || diff_line_index_selector(pane_selector, row_index))
+                .child(line_number);
+            if has_line_number {
+                gutter_cell = gutter_cell.on_mouse_down(MouseButton::Left, {
+                    let ctx = gutter_ctx.clone();
+                    move |_event: &MouseDownEvent, window, cx| {
+                        let Some(ctx) = ctx.as_ref() else {
+                            return;
+                        };
+                        let point = diff_selection::DiffPoint {
+                            row: row_index,
+                            column: 0,
+                        };
+                        let ctx = ctx.clone();
+                        ctx.app.clone().update(cx, |app, cx| {
+                            app.select_diff_line(&ctx, point, cx);
+                            app.pane_scroll(ctx.pane, cx).focus.focus(window);
+                        });
+                    }
+                });
+            }
+            gutter_cell
+        })
+        .child({
+            // A block (not a flex container): its definite flex-item width is
+            // handed to the `StyledText` child as the wrap width, so a long
+            // line breaks across visual rows instead of overflowing. A flex
+            // container would instead keep the text at its single-line
+            // max-content width. `.relative()` anchors the caret and the
+            // bounds-capturing canvas inside it.
+            let mut code_cell = div()
+                .id(("file-diff-code", id_index))
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .px(px(DIFF_CODE_CELL_PADDING))
+                .text_size(px(DIFF_TEXT_SIZE))
+                .line_height(px(DIFF_LINE_HEIGHT))
+                .whitespace_normal()
+                .debug_selector(move || diff_code_content_selector(pane_selector, row_index))
+                .when(has_text, |content| {
+                    content.child(
+                        StyledText::new(cell.text.clone())
+                            .with_default_highlights(&diff_text_style(), cell.highlights.clone()),
+                    )
+                });
+            if let Some(ctx) = selection_ctx {
+                // Record this row's code-cell bounds for the next frame's
+                // caret placement and this frame's hit-testing. The capture
+                // lives in the canvas *paint* callback, not prepaint: a
+                // variable-height `list` prepaints its items several times per
+                // frame (measurement plus rolled-back autoscroll retries) at
+                // scratch origins, but paints each visible item exactly once at
+                // its final position — so paint is the authoritative bounds.
+                let origins = ctx.wrap_row_origins.clone();
+                let key = (pane_selector, row_index);
+                code_cell = code_cell.child(
+                    canvas(
+                        |_bounds, _window, _cx| {},
+                        move |bounds, _prepaint, _window, _cx| {
+                            origins.borrow_mut().insert(key, bounds);
+                        },
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                );
+            }
+            if let Some(caret_point) = caret_point {
+                code_cell = code_cell.child(
+                    div()
+                        .absolute()
+                        .top(caret_point.y + px(2.))
+                        .h(px(DIFF_LINE_HEIGHT - 4.))
+                        .left(caret_point.x + px(DIFF_CODE_CELL_PADDING) - px(1.))
+                        .w(px(2.))
+                        .bg(p.caret)
+                        .debug_selector(|| "diff-caret".to_string()),
+                );
+            }
+            if selectable {
+                code_cell = code_cell.on_mouse_down(MouseButton::Left, {
+                    let ctx = mouse_down_ctx.clone();
+                    let text = mouse_down_text.clone();
+                    move |event: &MouseDownEvent, window, cx| {
+                        let Some(ctx) = ctx.as_ref() else {
+                            return;
+                        };
+                        let bounds = ctx
+                            .wrap_row_origins
+                            .borrow()
+                            .get(&(pane_selector, row_index))
+                            .copied();
+                        let Some(bounds) = bounds else {
+                            return;
+                        };
+                        let local = local_point_in_cell(bounds, event.position);
+                        let width = wrap_width_for(bounds);
+                        let column = wrapped_column_for_point(window, &text, width, local);
+                        let point = ctx.content.clamp(diff_selection::DiffPoint {
+                            row: row_index,
+                            column,
+                        });
+                        let ctx = ctx.clone();
+                        ctx.app.clone().update(cx, |app, cx| {
+                            app.begin_diff_mouse_selection(&ctx, point, event, window, cx);
+                        });
+                    }
+                });
+            }
+            code_cell
+        })
+}
+
+/// Soft-wrap rendering for a single-side diff: one variable-height `list` whose
+/// items are wrapped rows. The list state persists on the pane so measured
+/// heights survive across renders; its count is synced to the row count here.
+fn render_wrapped_single(
+    prepared: &Rc<PreparedFileDiff>,
+    side: repo::DiffSide,
+    rows: &[DiffRow],
+    scroll: &FileDiffScroll,
+    selection_ctx: Option<&DiffSelectionContext>,
+) -> AnyElement {
+    let p = palette();
+    let selector: &'static str = match side {
+        repo::DiffSide::Old => "file-diff-side-old",
+        repo::DiffSide::New => "file-diff-side-new",
+    };
+    let cells: Vec<DiffLineCell> = rows
+        .iter()
+        .map(|row| match side {
+            repo::DiffSide::Old => row.old.clone(),
+            repo::DiffSide::New => row.new.clone(),
+        })
+        .collect();
+
+    // Specialize the context to this side, exactly like the nowrap Single arm:
+    // `content` becomes this side's prepared rows, and `selection` is filtered
+    // down to the one belonging to this side.
+    let ctx = selection_ctx.map(|ctx| {
+        ctx.clone_for_side(
+            side,
+            diff_selection::DiffSideContent::Prepared {
+                diff: prepared.clone(),
+                side,
+            },
+        )
+    });
+
+    let state = scroll.wrap_list().clone();
+    if state.item_count() != cells.len() {
+        state.reset(cells.len());
+    }
+    let cells = Rc::new(cells);
+
+    div()
+        .flex()
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .bg(p.background)
+        .debug_selector(move || selector.to_string())
+        .when_some(ctx.clone(), |side, ctx| {
+            // A click anywhere on this side lands focus on the pane's handle,
+            // so the caret (gated on pane focus) can paint; the drag handlers
+            // extend an in-flight selection and clear it on mouse-up.
+            attach_wrap_drag_handlers(side, &ctx, selector)
+        })
+        .child(
+            list(state, move |index, window, _cx| {
+                let focused = ctx.as_ref().is_some_and(|ctx| ctx.focus.is_focused(window));
+                render_wrapped_row(
+                    selector,
+                    index,
+                    cells[index].clone(),
+                    RowSelectionState {
+                        ctx: ctx.as_ref(),
+                        focused,
+                    },
+                    window,
+                )
+                .into_any_element()
+            })
+            .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+            .flex_1(),
+        )
+        .into_any_element()
+}
+
+/// Soft-wrap rendering for a side-by-side diff: one variable-height `list`
+/// whose items are full-width row pairs (old column, 1px divider, new column).
+/// Both columns live in the same item, so flex's default `align-items: stretch`
+/// makes the two columns share the pair's measured height even when one side
+/// wraps taller than the other.
+fn render_wrapped_side_by_side(
+    prepared: &Rc<PreparedFileDiff>,
+    rows: &[DiffRow],
+    scroll: &FileDiffScroll,
+    selection_ctx: Option<&DiffSelectionContext>,
+) -> AnyElement {
+    let p = palette();
+    let old_cells: Vec<DiffLineCell> = rows.iter().map(|r| r.old.clone()).collect();
+    let new_cells: Vec<DiffLineCell> = rows.iter().map(|r| r.new.clone()).collect();
+
+    // Per-side contexts, exactly like the nowrap SideBySide arm: each side's
+    // `content` is its own prepared rows, and `selection` survives only on the
+    // side that owns it.
+    let old_ctx = selection_ctx.map(|ctx| {
+        ctx.clone_for_side(
+            repo::DiffSide::Old,
+            diff_selection::DiffSideContent::Prepared {
+                diff: prepared.clone(),
+                side: repo::DiffSide::Old,
+            },
+        )
+    });
+    let new_ctx = selection_ctx.map(|ctx| {
+        ctx.clone_for_side(
+            repo::DiffSide::New,
+            diff_selection::DiffSideContent::Prepared {
+                diff: prepared.clone(),
+                side: repo::DiffSide::New,
+            },
+        )
+    });
+
+    let state = scroll.wrap_list().clone();
+    if state.item_count() != rows.len() {
+        state.reset(rows.len());
+    }
+    let old_cells = Rc::new(old_cells);
+    let new_cells = Rc::new(new_cells);
+
+    div()
+        .flex()
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .child(
+            list(state, move |index, window, _cx| {
+                let old_focused = old_ctx
+                    .as_ref()
+                    .is_some_and(|ctx| ctx.focus.is_focused(window));
+                let new_focused = new_ctx
+                    .as_ref()
+                    .is_some_and(|ctx| ctx.focus.is_focused(window));
+                div()
+                    .flex()
+                    .w_full()
+                    .child(wrapped_side_column(
+                        "file-diff-side-old",
+                        index,
+                        old_cells[index].clone(),
+                        old_ctx.as_ref(),
+                        old_focused,
+                        window,
+                    ))
+                    .child(div().w(px(1.)).flex_none().bg(p.border))
+                    .child(wrapped_side_column(
+                        "file-diff-side-new",
+                        index,
+                        new_cells[index].clone(),
+                        new_ctx.as_ref(),
+                        new_focused,
+                        window,
+                    ))
+                    .into_any_element()
+            })
+            .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+            .flex_1(),
+        )
+        .into_any_element()
+}
+
+/// One side's column within a side-by-side wrapped row pair: the background
+/// wrapper plus the wrapped row. Focus tracking and the drag/mouse-up handlers
+/// live on this per-column wrapper (rather than a whole-side container) because
+/// side-by-side rows interleave both columns inside a single list item, so
+/// there is no single ancestor spanning just one side's rows.
+fn wrapped_side_column(
+    selector: &'static str,
+    row_index: usize,
+    cell: DiffLineCell,
+    ctx: Option<&DiffSelectionContext>,
+    focused: bool,
+    window: &mut Window,
+) -> AnyElement {
+    let p = palette();
+    let column = div()
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .bg(p.background)
+        .debug_selector(move || selector.to_string())
+        .child(
+            render_wrapped_row(
+                selector,
+                row_index,
+                cell,
+                RowSelectionState { ctx, focused },
+                window,
+            )
+            .into_any_element(),
+        );
+    match ctx {
+        Some(ctx) => attach_wrap_drag_handlers(column, ctx, selector).into_any_element(),
+        None => column.into_any_element(),
+    }
+}
+
+/// Attach the soft-wrap side's focus and drag wiring to `element`: `track_focus`
+/// so a click lands pane focus (the caret is gated on it), an `on_mouse_move`
+/// that extends an in-flight selection via `App::drag_diff_wrapped_move`, and
+/// the `on_mouse_up`/`on_mouse_up_out` pair that clears the drag. Shared by the
+/// single-side container and each side-by-side column, which both need the
+/// identical five handlers.
+fn attach_wrap_drag_handlers(
+    element: gpui::Div,
+    ctx: &DiffSelectionContext,
+    selector: &'static str,
+) -> gpui::Div {
+    let element = element.track_focus(&ctx.focus);
+    let element = element.on_mouse_move({
+        let ctx = ctx.clone();
+        move |event: &MouseMoveEvent, window, cx| {
+            let ctx = ctx.clone();
+            ctx.app.clone().update(cx, move |app, cx| {
+                app.drag_diff_wrapped_move(&ctx, selector, event, window, cx);
+            });
+        }
+    });
+    let clear_drag = {
+        let ctx = ctx.clone();
+        move |_event: &MouseUpEvent, _window: &mut Window, cx: &mut gpui::App| {
+            let ctx = ctx.clone();
+            ctx.app.clone().update(cx, move |app, _cx| {
+                app.end_diff_mouse_drag(&ctx);
+            });
+        }
+    };
+    let element = element.on_mouse_up(MouseButton::Left, clear_drag.clone());
+    element.on_mouse_up_out(MouseButton::Left, clear_drag)
+}
+
 /// the viewport (`end_row >= topmost_row`). This reads correctly even when the
 /// diff is scrolled to the bottom and a late block cannot reach the very top —
 /// the block is still visible, so it is still reported. Falls back to the last
@@ -206,6 +709,58 @@ pub(crate) fn topmost_row_for_offset(offset_y: Pixels, row_count: usize) -> usiz
     rows_above.min(row_count - 1)
 }
 
+/// The topmost visible row of the soft-wrap list. Wrap rows are
+/// variable-height, so `ListState` reports the topmost item index directly
+/// (`logical_scroll_top().item_ix`) — no pixel-over-row-height math. Clamped to
+/// the last row, and zero for an empty list. This is the wrap-mode counterpart
+/// of `topmost_row_for_offset`; both feed the shared block-index math.
+pub(crate) fn wrapped_topmost_row(scroll: &FileDiffScroll, row_count: usize) -> usize {
+    if row_count == 0 {
+        return 0;
+    }
+    scroll
+        .wrap_list()
+        .logical_scroll_top()
+        .item_ix
+        .min(row_count - 1)
+}
+
+/// Scroll the soft-wrap list so a change block's `start_row` rests at the top of
+/// the viewport with up to `CHANGE_BLOCK_CONTEXT_ROWS` of context above it. The
+/// wrap-mode counterpart of `set_diff_scroll_top` +
+/// `scroll_offset_for_block_top`: it targets the item index directly rather than
+/// a pixel offset. `ListState::scroll_to` with `offset_in_item: px(0.)` lands
+/// the item flush at the viewport top and updates `logical_scroll_top`
+/// synchronously, so the footer counter reads the new position in the same
+/// frame (no one-action lag).
+pub(crate) fn scroll_wrapped_to_block_top(scroll: &FileDiffScroll, start_row: usize) {
+    let item_ix = start_row.saturating_sub(CHANGE_BLOCK_CONTEXT_ROWS);
+    scroll.wrap_list().scroll_to(gpui::ListOffset {
+        item_ix,
+        offset_in_item: px(0.),
+    });
+}
+
+/// Land wrap row `row` flush at the top of the viewport, no context margin.
+/// Unlike `scroll_wrapped_to_block_top` this targets the row directly, so it is
+/// the wrap-mode seed used when translating a preserved scroll position across
+/// a soft-wrap toggle (the topmost row is already the exact row to restore).
+///
+/// The caller MUST have synced the wrap list's item count to the diff's row
+/// count *before* invoking this. The render's count-sync guard
+/// (`render_wrapped_single` / `render_wrapped_side_by_side`) calls
+/// `ListState::reset(N)` whenever the count differs, and `reset` nulls
+/// `logical_scroll_top` (see gpui `elements/list.rs`), which would silently
+/// discard this seed on the first wrap render after the toggle. Syncing the
+/// count in the toggle path first makes that guard a no-op, so this seed
+/// survives to paint. See `App::set_diff_soft_wrap`.
+pub(crate) fn scroll_wrapped_to_row(scroll: &FileDiffScroll, row: usize) {
+    scroll.wrap_list().scroll_to(gpui::ListOffset {
+        item_ix: row,
+        offset_in_item: px(0.),
+    });
+}
+
 /// The scroll handle and row count that change-block navigation drives for a
 /// prepared diff: the shared handle for a side-by-side diff, or the visible
 /// side's handle for a single-side one. `None` for a binary diff, which has no
@@ -226,12 +781,18 @@ pub(crate) fn change_block_scroll_target(
 }
 
 /// The topmost visible row for a prepared diff at its current scroll position.
-/// `None` for a binary diff.
+/// In soft-wrap mode the variable-height `ListState` reports the topmost item
+/// directly (`wrapped_topmost_row`); in nowrap mode the fixed-height pixel math
+/// (`topmost_row_for_offset`) applies. `None` for a binary diff.
 pub(crate) fn change_block_topmost_row(
     prepared: &PreparedFileDiff,
     scroll: &FileDiffScroll,
+    soft_wrap: bool,
 ) -> Option<usize> {
     let (handle, row_count) = change_block_scroll_target(prepared, scroll)?;
+    if soft_wrap {
+        return Some(wrapped_topmost_row(scroll, row_count));
+    }
     let offset_y = handle.0.borrow().base_handle.offset().y;
     Some(topmost_row_for_offset(offset_y, row_count))
 }
@@ -243,21 +804,38 @@ pub(crate) fn change_block_topmost_row(
 pub(crate) fn change_block_anchor_row(
     prepared: &PreparedFileDiff,
     scroll: &FileDiffScroll,
+    soft_wrap: bool,
 ) -> Option<usize> {
-    Some(change_block_topmost_row(prepared, scroll)? + CHANGE_BLOCK_CONTEXT_ROWS)
+    Some(change_block_topmost_row(prepared, scroll, soft_wrap)? + CHANGE_BLOCK_CONTEXT_ROWS)
 }
 
 /// Whether the diff is scrolled to the bottom, where a late change block cannot
 /// be brought fully to the top. Forward navigation treats this as "past the
 /// last block" so the next step wraps to the first. Requires a real scroll
 /// range, so a short diff that entirely fits is never considered at-bottom.
+///
+/// Nowrap reads the fixed-height pixel offset against its max. Wrap mode has no
+/// fixed row height, so it uses the `ListState`'s measured content height:
+/// at-bottom is when the topmost item's pixel offset is within a row of the
+/// maximum scrollable offset (content height minus viewport height). Both paths
+/// return `false` for a diff that fits without scrolling. A full row of
+/// tolerance (vs. nowrap's 1px) is required because wrap offsets are not
+/// row-quantized: the final block landed flush at the top can leave the content
+/// just short of the absolute maximum, so a 1px threshold would never trip.
 pub(crate) fn change_block_scrolled_to_bottom(
     prepared: &PreparedFileDiff,
     scroll: &FileDiffScroll,
+    soft_wrap: bool,
 ) -> bool {
     let Some((handle, _row_count)) = change_block_scroll_target(prepared, scroll) else {
         return false;
     };
+    if soft_wrap {
+        let list = scroll.wrap_list();
+        let max_offset = list.max_offset_for_scrollbar().height;
+        let current = -list.scroll_px_offset_for_scrollbar().y;
+        return max_offset > px(0.) && current >= max_offset - px(DIFF_LINE_HEIGHT);
+    }
     let state = handle.0.borrow();
     let max_height = state.base_handle.max_offset().height;
     let offset_y = state.base_handle.offset().y;
@@ -269,12 +847,13 @@ pub(crate) fn change_block_scrolled_to_bottom(
 pub(crate) fn current_change_block(
     prepared: &PreparedFileDiff,
     scroll: &FileDiffScroll,
+    soft_wrap: bool,
 ) -> Option<usize> {
     let blocks = prepared.blocks();
     if blocks.is_empty() {
         return None;
     }
-    let topmost = change_block_topmost_row(prepared, scroll)?;
+    let topmost = change_block_topmost_row(prepared, scroll, soft_wrap)?;
     Some(current_block_index(blocks, topmost))
 }
 
@@ -307,13 +886,27 @@ pub(crate) fn diff_scroll_top(handle: &UniformListScrollHandle) -> Pixels {
 /// reviewer lands on the change instead of the file's top. Consumes the
 /// scroll's pending-focus flag (set on open), so it fires once per open and
 /// leaves later manual scrolling untouched. A no-op for a diff with no blocks.
-pub(crate) fn focus_first_change_block(prepared: &PreparedFileDiff, scroll: &FileDiffScroll) {
+///
+/// In soft-wrap mode the jump targets the wrap list's item index
+/// (`scroll_wrapped_to_block_top`); in nowrap mode it sets the fixed-height
+/// pixel offset. The wrap path requires the list's item count to be populated,
+/// so the caller must build the diff content (which resets the list to the row
+/// count) before invoking this.
+pub(crate) fn focus_first_change_block(
+    prepared: &PreparedFileDiff,
+    scroll: &FileDiffScroll,
+    soft_wrap: bool,
+) {
     if !scroll.take_pending_focus() {
         return;
     }
     let Some(first) = prepared.blocks().first() else {
         return;
     };
+    if soft_wrap {
+        scroll_wrapped_to_block_top(scroll, first.start_row);
+        return;
+    }
     let Some((handle, _row_count)) = change_block_scroll_target(prepared, scroll) else {
         return;
     };
@@ -334,9 +927,10 @@ const CHANGE_BLOCK_ICON_SIZE: f32 = 14.;
 pub(crate) fn render_change_block_footer(
     prepared: &PreparedFileDiff,
     scroll: &FileDiffScroll,
+    soft_wrap: bool,
 ) -> Option<AnyElement> {
     let total = prepared.blocks().len();
-    let current = current_change_block(prepared, scroll)?;
+    let current = current_change_block(prepared, scroll, soft_wrap)?;
     let p = palette();
 
     Some(
@@ -1318,6 +1912,10 @@ pub(crate) fn diff_line_index_selector(pane_selector: &str, row_index: usize) ->
 /// shared box that vertically centers the gutter number against its code line.
 pub(crate) const DIFF_LINE_HEIGHT: f32 = 22.;
 
+/// Extra measured area above and below the viewport for the soft-wrap list,
+/// ~9 rows, to avoid pop-in during fast scrolls.
+pub(crate) const DIFF_WRAP_OVERDRAW: f32 = 200.;
+
 /// Width of the status accent bar at a row's left edge.
 pub(crate) const DIFF_ACCENT_WIDTH: f32 = 3.;
 
@@ -1384,6 +1982,148 @@ pub(crate) fn x_for_column(window: &mut Window, text: &str, column: usize) -> Pi
             .text_system()
             .shape_line(text.to_string().into(), px(DIFF_TEXT_SIZE), &[run], None);
     shaped.x_for_index(column)
+}
+
+/// The wrap width a code cell's text laid out at: the captured cell width minus
+/// the padding on both sides, floored at 1px so shaping never gets a
+/// non-positive width. Shared by the caret placement, the click hit-test, and
+/// the drag path so they all size the wrap identically.
+fn wrap_width_for(bounds: Bounds<Pixels>) -> Pixels {
+    (bounds.size.width - px(2. * DIFF_CODE_CELL_PADDING)).max(px(1.))
+}
+
+/// A window position translated into a wrapped code cell's local content frame:
+/// origin at the text's top-left (one cell-padding right of the cell's origin;
+/// wrap mode never pans, so no horizontal pan offset applies). `x` locates the
+/// column within a visual row, `y` the visual row.
+fn local_point_in_cell(bounds: Bounds<Pixels>, position: Point<Pixels>) -> Point<Pixels> {
+    gpui::point(
+        position.x - bounds.origin.x - px(DIFF_CODE_CELL_PADDING),
+        position.y - bounds.origin.y,
+    )
+}
+
+/// Shape `text` wrapped to `wrap_width`, mirroring how `StyledText` lays out a
+/// wrapped diff code cell: one default run (every diff token uses the same mono
+/// font/size, so color-only syntax runs don't change metrics), the same font
+/// size, and no line clamp. Returns the first (and only, since diff cell text
+/// holds no newlines) wrapped line, or `None` if shaping fails.
+fn shape_wrapped(window: &mut Window, text: &str, wrap_width: Pixels) -> Option<gpui::WrappedLine> {
+    let style = diff_text_style();
+    let run = style.to_run(text.len());
+    window
+        .text_system()
+        .shape_text(
+            text.to_string().into(),
+            px(DIFF_TEXT_SIZE),
+            &[run],
+            Some(wrap_width),
+            None,
+        )
+        .ok()
+        .and_then(|lines| lines.into_iter().next())
+}
+
+/// Map a local point within a wrapped code cell's content (origin at the text's
+/// top-left, cell padding and pan already removed) to the nearest column, using
+/// the same wrap width the cell painted at. `WrappedLine::closest_index_for_position`
+/// picks the visual row from `point.y / line_height`, then the byte index from
+/// `point.x` within that row — so a click on the second visual row maps past the
+/// first row's final column. Falls back to the single-line mapping when shaping
+/// fails.
+pub(crate) fn wrapped_column_for_point(
+    window: &mut Window,
+    text: &str,
+    wrap_width: Pixels,
+    point: Point<Pixels>,
+) -> usize {
+    match shape_wrapped(window, text, wrap_width) {
+        Some(line) => match line.closest_index_for_position(point, px(DIFF_LINE_HEIGHT)) {
+            Ok(index) => index,
+            Err(index) => index,
+        },
+        None => column_for_x(window, text, point.x),
+    }
+}
+
+/// The visual (x, y) position of `column` within a wrapped code cell's content
+/// (origin at the text's top-left, no cell padding or pan), using the same wrap
+/// width the cell painted at. The y locates the caret's visual row; the x its
+/// offset within that row. Falls back to `(x_for_column, 0)` — the first visual
+/// row — when shaping fails or the index is out of range, which is acceptable
+/// for a one-frame imprecision that self-corrects once bounds are captured.
+pub(crate) fn wrapped_point_for_column(
+    window: &mut Window,
+    text: &str,
+    wrap_width: Pixels,
+    column: usize,
+) -> Point<Pixels> {
+    match shape_wrapped(window, text, wrap_width)
+        .and_then(|line| line.position_for_index(column, px(DIFF_LINE_HEIGHT)))
+    {
+        Some(position) => position,
+        None => gpui::point(x_for_column(window, text, column), px(0.)),
+    }
+}
+
+/// Map a pointer position during a wrap-mode drag to a `DiffPoint` on
+/// `ctx.content`. Wrap rows are variable-height, so the row cannot be derived
+/// from a fixed row height; instead each row's painted code-cell bounds (stored
+/// in `ctx.wrap_row_origins`) are tested against the pointer's y. The pointer is
+/// clamped to the nearest captured row when it sits above the first or below the
+/// last — so a drag that runs off either end still extends toward that end. The
+/// column then comes from the wrap-aware point mapping within the chosen row's
+/// cell. Returns `None` when no row bounds have been captured yet (nothing to
+/// hit-test against).
+pub(crate) fn wrapped_drag_point(
+    window: &mut Window,
+    ctx: &DiffSelectionContext,
+    selector: &'static str,
+    position: Point<Pixels>,
+) -> Option<diff_selection::DiffPoint> {
+    // Snapshot this side's captured rows, sorted by row index, so the search
+    // and the above/below clamp read in document order. The map is cleared on
+    // every file switch (`FileDiffScroll::reset`), so every entry belongs to
+    // the current file.
+    let rows: Vec<(usize, Bounds<Pixels>)> = {
+        let origins = ctx.wrap_row_origins.borrow();
+        let mut rows: Vec<(usize, Bounds<Pixels>)> = origins
+            .iter()
+            .filter(|((sel, _), _)| *sel == selector)
+            .map(|((_, row), bounds)| (*row, *bounds))
+            .collect();
+        rows.sort_by_key(|(row, _)| *row);
+        rows
+    };
+    let (&(first_row, first_bounds), &(last_row, last_bounds)) = (rows.first()?, rows.last()?);
+
+    // The row whose vertical band contains the pointer, else the clamp ends.
+    let (row, bounds) = if position.y < first_bounds.origin.y {
+        (first_row, first_bounds)
+    } else if position.y >= last_bounds.bottom_left().y {
+        (last_row, last_bounds)
+    } else {
+        rows.iter()
+            .copied()
+            .find(|(_, bounds)| {
+                position.y >= bounds.origin.y && position.y < bounds.bottom_left().y
+            })
+            // Between captured rows (a gap the search missed): fall back to the
+            // last row at or above the pointer.
+            .or_else(|| {
+                rows.iter()
+                    .copied()
+                    .rev()
+                    .find(|(_, bounds)| position.y >= bounds.origin.y)
+            })
+            .unwrap_or((last_row, last_bounds))
+    };
+
+    let text = ctx.content.cell(row).text.clone();
+    let width = wrap_width_for(bounds);
+    let local = local_point_in_cell(bounds, position);
+    let column = wrapped_column_for_point(window, &text, width, local);
+    Some(ctx.content.clamp(diff_selection::DiffPoint { row, column }))
 }
 
 /// A diff side's scroll handles plus its debug selector, bundled for the
@@ -3389,5 +4129,603 @@ mod tests {
             Some((1, 3)),
             "alt-cmd-down stepped to the second block"
         );
+    }
+
+    /// Open `wide.txt` (a short line 0 and a ~400-char line 1) in a single pane
+    /// with soft wrap ON, returning the temp repo (kept alive by the caller),
+    /// the window, and its visual context.
+    fn open_wrapped_wide_diff(
+        cx: &mut TestAppContext,
+    ) -> (tempfile::TempDir, WindowHandle<App>, VisualTestContext) {
+        use gpui::{px, size};
+
+        let (dir, oid_hex) = init_repo_with_long_lines();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.set_diff_soft_wrap(true, cx);
+                app.open_file_preview("wide.txt".to_string(), cx);
+            })
+            .expect("open wide diff with wrap on");
+
+        cx.run_until_parked();
+
+        let visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(320.)));
+        cx.run_until_parked();
+
+        (dir, window, visual)
+    }
+
+    #[gpui::test]
+    async fn soft_wrap_hides_horizontal_scrollbar(cx: &mut TestAppContext) {
+        let (_dir, _window, mut visual) = open_wrapped_wide_diff(cx);
+
+        // Wrapped code content renders on the new side...
+        visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("wrapped code content present");
+        // ...and hovering the pane must not reveal a horizontal scrollbar,
+        // because wrapped rows never overflow horizontally.
+        let side = visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new file diff side debug bounds");
+        visual.simulate_mouse_move(
+            side.origin + gpui::point(px(100.), px(30.)),
+            None,
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+        assert!(
+            visual
+                .debug_bounds("file-diff-side-new-hscrollbar")
+                .is_none(),
+            "wrap mode shows no horizontal scrollbar"
+        );
+    }
+
+    #[gpui::test]
+    async fn soft_wrap_grows_a_long_lines_row(cx: &mut TestAppContext) {
+        let (_dir, _window, mut visual) = open_wrapped_wide_diff(cx);
+
+        // `wide.txt` line 1 (row index 1) is ~400 chars and wraps to several
+        // visual rows; line 0 stays short and occupies a single row. The
+        // wrapped long row must therefore be taller than the short one.
+        let short = visual
+            .debug_bounds("file-diff-code-new-0")
+            .expect("short row code content");
+        let long = visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("long row code content");
+        assert!(
+            long.size.height > short.size.height,
+            "a wrapped long line must be taller than a short line \
+             (long {:?} vs short {:?})",
+            long.size.height,
+            short.size.height
+        );
+    }
+
+    // A click on the SECOND visual row of the wrapped long line must map to a
+    // byte column past the first visual row's end — proving the click's y (not
+    // just its x) drives the wrap-aware mapping. `wide.txt` row 1 is ~400 chars
+    // and wraps to several visual rows in the 700px pane.
+    #[gpui::test]
+    async fn soft_wrap_click_maps_to_second_visual_row(cx: &mut TestAppContext) {
+        use gpui::{point, px};
+
+        let (_dir, window, mut visual) = open_wrapped_wide_diff(cx);
+        let long = visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("long row code content");
+
+        // A click near the left edge of the first visual row lands at (or near)
+        // column 0; the same x on the second visual row must land later.
+        let first_row = point(long.origin.x + px(12.), long.origin.y + px(3.));
+        visual.simulate_click(first_row, Modifiers::default());
+        cx.run_until_parked();
+        let first = read_active_selection(&window, cx).expect("first-row click selects");
+        assert_eq!(first.head.row, 1, "click stayed on the wrapped line's row");
+
+        let second_row = point(
+            long.origin.x + px(12.),
+            long.origin.y + px(DIFF_LINE_HEIGHT + 3.),
+        );
+        visual.simulate_click(second_row, Modifiers::default());
+        cx.run_until_parked();
+        let second = read_active_selection(&window, cx).expect("second-row click selects");
+        assert_eq!(second.head.row, 1, "still the same wrapped line");
+        assert!(
+            second.head.column > first.head.column,
+            "a click on the second visual row maps past the first row's column \
+             (second {} vs first {})",
+            second.head.column,
+            first.head.column
+        );
+        assert!(
+            second.head.column > 0,
+            "the wrapped continuation is not column 0"
+        );
+    }
+
+    // Selecting the whole wrapped long line via its gutter number fills the
+    // wrapped content: the selection spans row 1 from column 0 to line end, and
+    // the row still renders its (now background-overlaid) code content.
+    #[gpui::test]
+    async fn soft_wrap_selection_covers_wrapped_line(cx: &mut TestAppContext) {
+        let (_dir, window, mut visual) = open_wrapped_wide_diff(cx);
+        let gutter = visual
+            .debug_bounds("file-diff-line-new-1")
+            .expect("gutter cell for the long line")
+            .center();
+        visual.simulate_click(gutter, Modifiers::default());
+        cx.run_until_parked();
+
+        let selection = read_active_selection(&window, cx).expect("gutter click selects the line");
+        assert!(!selection.is_caret(), "a whole-line select is a range");
+        assert_eq!(
+            selection.anchor,
+            crate::app::diff_selection::DiffPoint { row: 1, column: 0 }
+        );
+        assert_eq!(selection.head.row, 1);
+        assert!(
+            selection.head.column > 0,
+            "the head sits at the wrapped line's end"
+        );
+        // The wrapped row still renders its code content with the selection fill
+        // overlaid on the text bytes.
+        visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("wrapped code content still present under the fill");
+    }
+
+    // A caret placed mid-line on the wrapped long line paints below the first
+    // visual row — proving the caret's y comes from the wrap-aware mapping.
+    #[gpui::test]
+    async fn soft_wrap_caret_paints_on_wrapped_row(cx: &mut TestAppContext) {
+        use gpui::{point, px};
+
+        let (_dir, _window, mut visual) = open_wrapped_wide_diff(cx);
+        let long = visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("long row code content");
+
+        // Click on the second visual row, then let a frame paint so the caret
+        // reads the captured bounds and lands at the head's wrapped position.
+        let second_row = point(
+            long.origin.x + px(40.),
+            long.origin.y + px(DIFF_LINE_HEIGHT + 3.),
+        );
+        visual.simulate_click(second_row, Modifiers::default());
+        cx.run_until_parked();
+
+        let caret = visual
+            .debug_bounds("diff-caret")
+            .expect("caret paints on the wrapped row");
+        assert!(
+            caret.origin.y >= long.origin.y + px(DIFF_LINE_HEIGHT - 2.),
+            "the caret sits on the second visual row or lower \
+             (caret y {:?} vs first-row top {:?})",
+            caret.origin.y,
+            long.origin.y
+        );
+    }
+
+    // A drag from the first visual row to the second visual row of the wrapped
+    // long line extends a character-mode selection whose head lands past the
+    // anchor — the wrap-aware drag path resolves the moving pointer to a
+    // row+column via the captured per-row bounds.
+    #[gpui::test]
+    async fn soft_wrap_drag_extends_within_wrapped_line(cx: &mut TestAppContext) {
+        use gpui::{point, px};
+
+        let (_dir, window, mut visual) = open_wrapped_wide_diff(cx);
+        let long = visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("long row code content");
+
+        let start = point(long.origin.x + px(12.), long.origin.y + px(3.));
+        let end = point(
+            long.origin.x + px(80.),
+            long.origin.y + px(DIFF_LINE_HEIGHT + 3.),
+        );
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+
+        let selection = read_active_selection(&window, cx).expect("drag created a selection");
+        assert!(!selection.is_caret(), "the drag produced a range");
+        assert_eq!(selection.anchor.row, 1, "anchor stayed on the wrapped line");
+        assert_eq!(selection.head.row, 1, "head stayed on the wrapped line");
+        assert!(
+            selection.head.column > selection.anchor.column,
+            "the drag extended past the anchor onto the second visual row \
+             (head {} vs anchor {})",
+            selection.head.column,
+            selection.anchor.column
+        );
+        let drag_cleared = window
+            .read_with(cx, |app, _| app.diff_drag.is_none())
+            .unwrap();
+        assert!(drag_cleared, "mouse-up ended the drag");
+    }
+
+    fn open_wrapped_multi_block_diff(
+        cx: &mut TestAppContext,
+    ) -> (tempfile::TempDir, WindowHandle<App>, VisualTestContext) {
+        use gpui::{px, size};
+
+        let (dir, oid_hex) = init_repo_with_wrapped_change_blocks();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.set_diff_soft_wrap(true, cx);
+                app.open_file_preview("wrapped_blocks.txt".to_string(), cx);
+            })
+            .expect("open wrapped multi-block diff");
+
+        cx.run_until_parked();
+
+        let visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(360.)));
+        cx.run_until_parked();
+
+        (dir, window, visual)
+    }
+
+    #[gpui::test]
+    async fn soft_wrap_focus_first_change_block_on_open(cx: &mut TestAppContext) {
+        let (_dir, window, _visual) = open_wrapped_multi_block_diff(cx);
+
+        // `wrapped_blocks.txt`'s first change is at line 5 (row index 4), far
+        // enough below the top that landing on it must scroll the wrap list off
+        // row 0. The counter reports the first block.
+        let position = window
+            .read_with(cx, |app, cx| app.active_diff_block_position(cx))
+            .expect("read block position on open");
+        assert_eq!(
+            position,
+            Some((0, 2)),
+            "a freshly opened wrapped diff sits on the first of two blocks"
+        );
+
+        let top = window
+            .read_with(cx, |app, cx| app.file_diff_wrap_topmost_row(cx))
+            .expect("read wrap topmost row")
+            .expect("wrap topmost row present");
+        assert!(
+            top > 0,
+            "opening a wrapped diff scrolls past the top to reveal the first \
+             change block (topmost row {top})"
+        );
+    }
+
+    #[gpui::test]
+    async fn soft_wrap_next_change_block_advances(cx: &mut TestAppContext) {
+        let (_dir, window, mut visual) = open_wrapped_multi_block_diff(cx);
+
+        let before = window
+            .read_with(cx, |app, cx| app.file_diff_wrap_topmost_row(cx))
+            .expect("read wrap topmost row before")
+            .expect("wrap topmost row before present");
+
+        let next = visual
+            .debug_bounds("change-block-next")
+            .expect("next button");
+        visual.simulate_click(next.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        let position = window
+            .read_with(cx, |app, cx| app.active_diff_block_position(cx))
+            .expect("read block position");
+        assert_eq!(
+            position,
+            Some((1, 2)),
+            "next advances to the second block in wrap mode"
+        );
+
+        let after = window
+            .read_with(cx, |app, cx| app.file_diff_wrap_topmost_row(cx))
+            .expect("read wrap topmost row after")
+            .expect("wrap topmost row after present");
+        assert!(
+            after > before,
+            "advancing to the next block scrolls the wrapped diff down \
+             (topmost row {before} -> {after})"
+        );
+    }
+
+    #[gpui::test]
+    async fn soft_wrap_change_block_counter_reports_position(cx: &mut TestAppContext) {
+        let (_dir, window, mut visual) = open_wrapped_multi_block_diff(cx);
+
+        // Advance, then step back, asserting the counter tracks the current
+        // block in the same frame each time (no lag from a deferred scroll).
+        let next = visual
+            .debug_bounds("change-block-next")
+            .expect("next button");
+        visual.simulate_click(next.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            window
+                .read_with(cx, |app, cx| app.active_diff_block_position(cx))
+                .expect("read block position after next"),
+            Some((1, 2)),
+            "the counter reports the second block after advancing"
+        );
+
+        let prev = visual
+            .debug_bounds("change-block-prev")
+            .expect("previous button");
+        visual.simulate_click(prev.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            window
+                .read_with(cx, |app, cx| app.active_diff_block_position(cx))
+                .expect("read block position after previous"),
+            Some((0, 2)),
+            "the counter reports the first block after stepping back"
+        );
+    }
+
+    // An added file renders through the single-side wrap path
+    // (`render_wrapped_single`), which no modified-file fixture exercises —
+    // every modified diff renders side-by-side. Opening `hello.txt` (added)
+    // with wrap ON must render the new-side code cell and, crucially, remain
+    // interactive: a click on that cell must place a caret, proving the
+    // single-side path's per-row mouse-down wiring runs.
+    #[gpui::test]
+    async fn soft_wrap_single_side_added_file_renders_and_selects(cx: &mut TestAppContext) {
+        use gpui::{px, size};
+
+        let (dir, oid_hex) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.set_diff_soft_wrap(true, cx);
+                app.open_file_preview("hello.txt".to_string(), cx);
+            })
+            .expect("open added file with wrap on");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(320.)));
+        cx.run_until_parked();
+
+        // The single-side wrap path renders only the new side.
+        let cell = visual
+            .debug_bounds("file-diff-code-new-0")
+            .expect("single-side wrap renders the new-side code cell");
+        assert!(
+            visual.debug_bounds("file-diff-side-old").is_none(),
+            "an added file's single-side wrap renders no old-side pane"
+        );
+
+        // Clicking the cell must place a caret — the single-side path's
+        // mouse-down wiring is live, not just its rendering.
+        visual.simulate_click(cell.center(), Modifiers::default());
+        cx.run_until_parked();
+        let selection = read_active_selection(&window, cx).expect("click placed a selection");
+        assert_eq!(selection.side, repo::DiffSide::New);
+        assert_eq!(selection.head.row, 0);
+        visual
+            .debug_bounds("diff-caret")
+            .expect("caret paints on the single-side wrapped row");
+    }
+
+    // Toggling wrap ON while a file is already open must rewrap in place: the
+    // wrap `ListState` count resyncs from 0 (never populated in nowrap mode) to
+    // the row count on the mode flip. Every other wrap test sets wrap before
+    // opening, so this is the only coverage of the live toggle.
+    #[gpui::test]
+    async fn toggling_soft_wrap_on_an_open_file_rewraps(cx: &mut TestAppContext) {
+        use gpui::{px, size};
+
+        let (dir, oid_hex) = init_repo_with_long_lines();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        // Open in the DEFAULT (nowrap) mode — no `set_diff_soft_wrap`.
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.open_file_preview("wide.txt".to_string(), cx);
+            })
+            .expect("open wide diff in nowrap mode");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(320.)));
+        cx.run_until_parked();
+
+        // In nowrap mode the long row is a single fixed-height line and the
+        // pane can overflow horizontally.
+        let nowrap_long = visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("nowrap renders the long row's code cell");
+        assert!(
+            (nowrap_long.size.height - px(DIFF_LINE_HEIGHT)).abs() < px(1.),
+            "a nowrap row is one line tall (got {:?})",
+            nowrap_long.size.height
+        );
+
+        // Flip to wrap mode on the already-open file.
+        window
+            .update(cx, |app, _window, cx| {
+                app.set_diff_soft_wrap(true, cx);
+            })
+            .expect("toggle soft wrap on");
+        cx.run_until_parked();
+
+        // The same long row now wraps to several visual rows, so it is taller
+        // than one line — proving the wrap list resynced its count and remeasured.
+        let wrapped_long = visual
+            .debug_bounds("file-diff-code-new-1")
+            .expect("wrap renders the long row's code cell after the toggle");
+        assert!(
+            wrapped_long.size.height > px(DIFF_LINE_HEIGHT),
+            "the long row rewrapped taller than one line after toggling wrap on \
+             (got {:?})",
+            wrapped_long.size.height
+        );
+    }
+
+    // The first toggle from nowrap to wrap must land the same row at the top,
+    // not jump to the file's top. This is the reported bug: nowrap stores scroll
+    // as a pixel offset on a uniform-list handle, wrap as an item index on a
+    // separate `ListState`, and the first wrap render's count-sync guard used to
+    // `reset` (and null) the wrap scroll — so the position was lost. The toggle
+    // path now syncs the count and seeds the row before that render runs.
+    #[gpui::test]
+    async fn toggling_soft_wrap_preserves_scroll_position_nowrap_to_wrap(cx: &mut TestAppContext) {
+        let (_dir, window, mut visual) = open_multi_block_diff(cx);
+
+        // Scroll well down the file by advancing to the last change block; the
+        // topmost row is then unambiguously below the file's top.
+        let next = visual
+            .debug_bounds("change-block-next")
+            .expect("next button");
+        visual.simulate_click(next.center(), Modifiers::none());
+        cx.run_until_parked();
+        visual.simulate_click(next.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        let before = window
+            .read_with(cx, |app, cx| app.file_diff_nowrap_topmost_row(cx))
+            .expect("read nowrap topmost row before toggle")
+            .expect("nowrap topmost row present");
+        assert!(
+            before > 0,
+            "the test must scroll below the top before toggling (row {before})"
+        );
+
+        // First toggle into wrap mode — the buggy path reset this to 0.
+        window
+            .update(cx, |app, _window, cx| app.set_diff_soft_wrap(true, cx))
+            .expect("toggle soft wrap on");
+        cx.run_until_parked();
+
+        let after = window
+            .read_with(cx, |app, cx| app.file_diff_wrap_topmost_row(cx))
+            .expect("read wrap topmost row after toggle")
+            .expect("wrap topmost row present");
+        assert!(
+            after.abs_diff(before) <= 1,
+            "toggling wrap on preserves the topmost row (nowrap {before} -> wrap {after})"
+        );
+    }
+
+    // The symmetric direction: starting in wrap mode scrolled below the top,
+    // toggling wrap OFF must keep the same row at the top of the nowrap view.
+    // Opens the three-block file directly in wrap mode and navigates to the
+    // MIDDLE block, so the target row sits inside both modes' scroll ranges —
+    // near the file bottom the shorter nowrap content clamps earlier than
+    // wrap's rows, which is expected and would mask the preservation tested
+    // here.
+    #[gpui::test]
+    async fn toggling_soft_wrap_preserves_scroll_position_wrap_to_nowrap(cx: &mut TestAppContext) {
+        use gpui::{px, size};
+
+        let (_dir, oid_hex) = init_repo_with_multiple_change_blocks();
+        let path = _dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        // Open the file with wrap ON from the start, so the wrap scroll is
+        // established by wrap's own first-change focus — not by the nowrap ->
+        // wrap translation this test must stay independent of.
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.set_diff_soft_wrap(true, cx);
+                app.open_file_preview("blocks.txt".to_string(), cx);
+            })
+            .expect("open three-block diff in wrap mode");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(360.)));
+        cx.run_until_parked();
+
+        // Advance to the middle of three blocks: well below row 0 but far from
+        // the file bottom, so the row is representable in nowrap too.
+        let next = visual
+            .debug_bounds("change-block-next")
+            .expect("next button");
+        visual.simulate_click(next.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        let before = window
+            .read_with(cx, |app, cx| app.file_diff_wrap_topmost_row(cx))
+            .expect("read wrap topmost row before toggle")
+            .expect("wrap topmost row present");
+        assert!(
+            before > 1,
+            "the test must scroll well below the top before toggling (row {before})"
+        );
+
+        // Toggle wrap OFF; the nowrap view must show the same topmost row.
+        window
+            .update(cx, |app, _window, cx| app.set_diff_soft_wrap(false, cx))
+            .expect("toggle soft wrap off");
+        cx.run_until_parked();
+
+        let after = window
+            .read_with(cx, |app, cx| app.file_diff_nowrap_topmost_row(cx))
+            .expect("read nowrap topmost row after toggle")
+            .expect("nowrap topmost row present");
+        assert!(
+            after.abs_diff(before) <= 1,
+            "toggling wrap off preserves the topmost row (wrap {before} -> nowrap {after})"
+        );
+    }
+
+    // A binary file has no rows to wrap; wrap mode must fall through to the same
+    // placeholder the nowrap path shows, not attempt to build a wrap list.
+    #[gpui::test]
+    async fn soft_wrap_binary_file_shows_placeholder(cx: &mut TestAppContext) {
+        let (dir, oid_hex) = init_repo_with_binary_file();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.set_diff_soft_wrap(true, cx);
+            })
+            .expect("open binary changeset with wrap on");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let row_bounds = visual
+            .debug_bounds("changed-file-row-0")
+            .expect("changed file row debug bounds");
+        visual.simulate_click(row_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        visual
+            .debug_bounds("file-diff-binary")
+            .expect("binary diff shows its placeholder in wrap mode");
     }
 }

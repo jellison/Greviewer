@@ -28,12 +28,12 @@ pub use path_picker::{repository_prompt_options, GpuiPathPicker, PathPicker, Pat
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, canvas, div, pattern_slash, point, px, relative, uniform_list, AnyElement, AppContext,
-    Background, Bounds, ClickEvent, Context, DragMoveEvent, Entity, EventEmitter, FocusHandle,
-    HighlightStyle, Hsla, InteractiveElement, IntoElement, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, PathBuilder, Pixels, Point, Render, ScrollHandle,
-    ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledText, TextStyle,
-    UniformListScrollHandle, Window,
+    actions, canvas, div, list, pattern_slash, point, px, relative, uniform_list, AnyElement,
+    AppContext, Background, Bounds, ClickEvent, Context, DragMoveEvent, Entity, EventEmitter,
+    FocusHandle, HighlightStyle, Hsla, InteractiveElement, IntoElement, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathBuilder, Pixels, Point,
+    Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledText,
+    TextStyle, UniformListScrollHandle, Window,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::notification::{Notification, NotificationList};
@@ -172,6 +172,9 @@ pub struct App {
     /// Which commit-graph layout is active. Mirrors `settings.graph_view_mode`;
     /// the switcher updates both together.
     pub view_mode: GraphViewMode,
+    /// Whether the diff view soft-wraps long lines. Mirrors
+    /// `settings.diff_soft_wrap`; the two stay in sync via `set_diff_soft_wrap`.
+    pub diff_soft_wrap: bool,
     /// Live width of the Compact layout's AUTHOR column; dragged from the
     /// header, restored from settings, captured back on session end.
     author_column_width: f32,
@@ -360,6 +363,20 @@ pub(crate) struct FileDiffScroll {
     /// open. Shared across clones so every reference to a pane's scroll sees
     /// the same pending state.
     pending_focus: Rc<Cell<bool>>,
+    /// Variable-height virtualized list backing soft-wrap mode. Its sum tree
+    /// caches per-row measured heights across renders, so it must persist with
+    /// the pane rather than be rebuilt each frame. Reset to empty when the
+    /// shown file changes (see `reset`); the render repopulates its count.
+    /// Unused in nowrap mode.
+    wrap: gpui::ListState,
+    /// Last painted bounds of each soft-wrapped row's code cell, keyed by
+    /// `(side selector, row index)`. Nowrap captures one rect per whole side
+    /// and derives the row from a fixed row height; wrap rows are
+    /// variable-height, so each row records its own code-cell bounds here (via
+    /// a per-row canvas in `render_wrapped_row`). Read back to map a pointer or
+    /// a caret column to a wrapped visual position, and to size the wrap width.
+    /// Cleared on file switch by `reset`, so no entry can outlive its file.
+    wrap_row_origins: diff_view::WrapRowOrigins,
 }
 
 /// One pane's scroll handles: the tab strip plus the diff content sides.
@@ -398,6 +415,9 @@ pub(crate) struct PaneRenderContext<'a> {
     pub(crate) pane: crate::workspace::PaneId,
     pub(crate) scroll: &'a FileDiffScroll,
     pub(crate) hovered: bool,
+    /// Whether the diff renders with soft wrap on. Sourced from
+    /// `App::diff_soft_wrap`; consumed by `render_prepared_file_diff`.
+    pub(crate) soft_wrap: bool,
 }
 
 /// An in-flight mouse selection drag. Lives from mouse-down to mouse-up.
@@ -470,6 +490,8 @@ impl FileDiffScroll {
             side_by_side: UniformListScrollHandle::new(),
             hscroll: ScrollHandle::new(),
             pending_focus: Rc::new(Cell::new(false)),
+            wrap: gpui::ListState::new(0, gpui::ListAlignment::Top, px(DIFF_WRAP_OVERDRAW)),
+            wrap_row_origins: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -480,12 +502,32 @@ impl FileDiffScroll {
         }
     }
 
+    /// The variable-height list state backing soft-wrap rendering. Persisted on
+    /// the pane so its measured-height sum tree survives across renders.
+    pub(crate) fn wrap_list(&self) -> &gpui::ListState {
+        &self.wrap
+    }
+
+    /// The per-soft-wrapped-row code-cell bounds map, shared into the render
+    /// tree and the mouse listeners. Cleared on file switch by `reset`.
+    pub(crate) fn wrap_row_origins(&self) -> diff_view::WrapRowOrigins {
+        self.wrap_row_origins.clone()
+    }
+
     fn reset(&self) {
         let origin = point(px(0.), px(0.));
         self.old.0.borrow().base_handle.set_offset(origin);
         self.new.0.borrow().base_handle.set_offset(origin);
         self.side_by_side.0.borrow().base_handle.set_offset(origin);
         self.hscroll.set_offset(origin);
+        // Clear the wrap list's cached per-row heights so a newly shown file
+        // measures fresh; the next render repopulates its count.
+        self.wrap.reset(0);
+        // Drop every wrapped row's captured code-cell bounds: they belong to
+        // the outgoing file, and the map is keyed by row index, so a shorter
+        // new file would otherwise read stale entries. The next render
+        // repopulates it as rows paint.
+        self.wrap_row_origins.borrow_mut().clear();
         // A newly shown diff should land on its first change; the next render
         // consumes this to scroll there.
         self.pending_focus.set(true);
@@ -915,6 +957,7 @@ impl App {
             ai_enabled: false,
             graph_view_mode: GraphViewMode::default(),
             graph_column_widths: GraphColumnWidths::default(),
+            diff_soft_wrap: false,
         };
         Self::new_with_picker_and_settings(window, cx, Box::new(GpuiPathPicker), settings)
     }
@@ -1131,6 +1174,7 @@ impl App {
             double_click_anchor: None,
             review_screen: ReviewScreen::Graph,
             view_mode: settings.graph_view_mode,
+            diff_soft_wrap: settings.diff_soft_wrap,
             author_column_width: restored_column_width(
                 settings.graph_column_widths.author,
                 COMMIT_AUTHOR_WIDTH,
@@ -2824,6 +2868,34 @@ impl App {
         }
     }
 
+    /// Wrap-mode counterpart of `drag_diff_mouse_move`. Wrap rows are
+    /// variable-height, so the row can't be derived from a fixed row height and
+    /// a single side rect; `wrapped_drag_point` finds the row by testing the
+    /// pointer's y against each captured per-row code-cell bounds. There is no
+    /// edge autoscroll here — wrap mode's variable heights make the fixed
+    /// nowrap autoscroll math inapplicable, and a drag within the visible rows
+    /// is the common case.
+    fn drag_diff_wrapped_move(
+        &mut self,
+        ctx: &diff_view::DiffSelectionContext,
+        selector: &'static str,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = &self.diff_drag else {
+            return;
+        };
+        if drag.pane != ctx.pane || drag.key != ctx.key {
+            return;
+        }
+        let Some(point) = diff_view::wrapped_drag_point(window, ctx, selector, event.position)
+        else {
+            return;
+        };
+        self.extend_diff_mouse_selection(ctx, point, cx);
+    }
+
     /// End an in-flight diff mouse drag on mouse-up (inside or outside the
     /// side container). A no-op when the drag already belongs to a different
     /// pane+key, or none is armed.
@@ -2973,13 +3045,26 @@ impl App {
         &self,
         cx: &gpui::App,
     ) -> Option<(Rc<PreparedFileDiff>, FileDiffScroll)> {
+        self.pane_prepared_diff(self.workspace.active_pane(), cx)
+    }
+
+    /// The prepared diff and scroll state for the file open in an arbitrary
+    /// pane, or `None` when no changeset is open, the pane shows no file, or the
+    /// file has no diff to prepare. Generalizes `active_pane_prepared_diff` to
+    /// any pane so cross-pane operations (e.g. preserving scroll across a
+    /// soft-wrap toggle) can resolve every pane's diff, not just the active
+    /// one's.
+    fn pane_prepared_diff(
+        &self,
+        pane: crate::workspace::PaneId,
+        cx: &gpui::App,
+    ) -> Option<(Rc<PreparedFileDiff>, FileDiffScroll)> {
         let Mode::RepoOpen { repo } = &self.mode else {
             return None;
         };
         let ReviewScreen::Changeset { changeset, .. } = &self.review_screen else {
             return None;
         };
-        let pane = self.workspace.active_pane();
         let path = self
             .workspace
             .active_item(pane)
@@ -2998,11 +3083,12 @@ impl App {
         let Some((prepared, scroll)) = self.active_pane_prepared_diff(cx) else {
             return;
         };
+        let soft_wrap = self.diff_soft_wrap;
         let blocks = prepared.blocks();
         if blocks.is_empty() {
             return;
         }
-        let Some(anchor) = diff_view::change_block_anchor_row(&prepared, &scroll) else {
+        let Some(anchor) = diff_view::change_block_anchor_row(&prepared, &scroll, soft_wrap) else {
             return;
         };
         let Some((handle, _row_count)) = diff_view::change_block_scroll_target(&prepared, &scroll)
@@ -3011,7 +3097,7 @@ impl App {
         };
 
         let target = if forward {
-            if diff_view::change_block_scrolled_to_bottom(&prepared, &scroll) {
+            if diff_view::change_block_scrolled_to_bottom(&prepared, &scroll, soft_wrap) {
                 // A late block clamped at the bottom counts as the last block,
                 // so the next step wraps to the first rather than sticking.
                 0
@@ -3021,16 +3107,21 @@ impl App {
         } else {
             diff_view::previous_block_index(blocks, anchor)
         };
-        // Set the offset directly (as `FileDiffScroll::reset` does) rather than
-        // via a deferred `scroll_to_item`, so the footer counter reads the new
-        // position in the same frame instead of lagging one behind.
-        diff_view::set_diff_scroll_top(
-            &handle,
-            diff_view::scroll_offset_for_block_top(
-                blocks[target].start_row,
-                diff_view::CHANGE_BLOCK_CONTEXT_ROWS,
-            ),
-        );
+        // Jump synchronously (rather than via a deferred `scroll_to_item`) so
+        // the footer counter reads the new position in the same frame instead
+        // of lagging one behind. Both `set_diff_scroll_top` (nowrap) and
+        // `ListState::scroll_to` (wrap) update their scroll state immediately.
+        if soft_wrap {
+            diff_view::scroll_wrapped_to_block_top(&scroll, blocks[target].start_row);
+        } else {
+            diff_view::set_diff_scroll_top(
+                &handle,
+                diff_view::scroll_offset_for_block_top(
+                    blocks[target].start_row,
+                    diff_view::CHANGE_BLOCK_CONTEXT_ROWS,
+                ),
+            );
+        }
         cx.notify();
     }
 
@@ -3040,7 +3131,7 @@ impl App {
     #[cfg(test)]
     fn active_diff_block_position(&self, cx: &gpui::App) -> Option<(usize, usize)> {
         let (prepared, scroll) = self.active_pane_prepared_diff(cx)?;
-        let current = diff_view::current_change_block(&prepared, &scroll)?;
+        let current = diff_view::current_change_block(&prepared, &scroll, self.diff_soft_wrap)?;
         Some((current, prepared.blocks().len()))
     }
 
@@ -3598,6 +3689,25 @@ impl App {
             .hscroll_offset()
     }
 
+    /// The wrap-mode list's topmost visible item index for the active pane's
+    /// diff. Test-only observation hook for soft-wrap change-block navigation.
+    #[cfg(test)]
+    fn file_diff_wrap_topmost_row(&self, cx: &gpui::App) -> Option<usize> {
+        let (prepared, scroll) = self.active_pane_prepared_diff(cx)?;
+        let (_handle, row_count) = diff_view::change_block_scroll_target(&prepared, &scroll)?;
+        Some(diff_view::wrapped_topmost_row(&scroll, row_count))
+    }
+
+    /// The nowrap-mode topmost visible row for the active pane's diff, derived
+    /// from the fixed-height pixel offset. Test-only counterpart of
+    /// `file_diff_wrap_topmost_row` used to assert scroll position is preserved
+    /// across a soft-wrap toggle.
+    #[cfg(test)]
+    fn file_diff_nowrap_topmost_row(&self, cx: &gpui::App) -> Option<usize> {
+        let (prepared, scroll) = self.active_pane_prepared_diff(cx)?;
+        diff_view::change_block_topmost_row(&prepared, &scroll, false)
+    }
+
     fn render_no_repo(&self, cx: &mut Context<Self>) -> gpui::Div {
         let recent_repositories = if self.settings.recent_repositories.is_empty() {
             None
@@ -4066,6 +4176,92 @@ impl App {
         self.settings.graph_view_mode = mode;
         self.persist_settings();
         cx.notify();
+    }
+
+    /// Sets the diff soft-wrap mode, mirroring it to persisted settings so it
+    /// survives restarts, and repaints. A no-op when the value is unchanged.
+    ///
+    /// Wrap and nowrap store vertical scroll in different representations — a
+    /// pixel offset on a `UniformListScrollHandle` (nowrap) versus an item
+    /// index on a `ListState` (wrap) — so a naive toggle would drop the
+    /// reader's position and jump to the top of the file. To keep the viewport
+    /// stable across the toggle, every pane showing a diff has its topmost
+    /// visible row (the shared unit both modes understand) read in the OLD mode
+    /// and re-seeded in the NEW mode. See
+    /// `docs/specs/*` covering the diff soft-wrap toggle.
+    pub(crate) fn set_diff_soft_wrap(&mut self, value: bool, cx: &mut Context<Self>) {
+        if self.diff_soft_wrap == value {
+            return;
+        }
+        // Capture the mode the panes are currently scrolled in BEFORE flipping,
+        // so each pane's topmost row can be read in that mode below.
+        let old_soft_wrap = self.diff_soft_wrap;
+        self.diff_soft_wrap = value;
+        self.settings.diff_soft_wrap = value;
+        self.persist_settings();
+
+        // Translate each pane's scroll so the row that was at the top before
+        // the toggle is at the top after. Panes with no open file / a binary
+        // diff simply don't resolve and are skipped.
+        for pane in self.workspace.pane_ids() {
+            self.preserve_pane_scroll_across_wrap_toggle(pane, old_soft_wrap, value, cx);
+        }
+
+        cx.notify();
+    }
+
+    /// Re-seed one pane's diff scroll so its pre-toggle topmost row is restored
+    /// in the new soft-wrap mode. A no-op for a pane whose diff can't be
+    /// resolved (no open file, binary diff, no navigable rows).
+    ///
+    /// Cross-mode translation is by row index: the topmost visible row is read
+    /// in the OLD mode, then seeded into the NEW mode's scroll representation.
+    /// Row index is the only unit both modes share, so the row lands flush at
+    /// the viewport top and any partial intra-row scroll offset is not carried
+    /// across — the reviewer keeps their line, not their sub-pixel position.
+    ///
+    /// The wrap seed (`new_soft_wrap == true`) is fragile: the first wrap render
+    /// after the toggle runs a count-sync guard that calls `ListState::reset(N)`
+    /// whenever the list's item count differs from the row count, and `reset`
+    /// nulls the scroll position. So the count MUST be synced here, before the
+    /// seed, so that guard is already a no-op when the render runs — otherwise
+    /// the seed is silently discarded and the diff jumps to the top (the exact
+    /// bug this method fixes). Do not remove the count sync below.
+    fn preserve_pane_scroll_across_wrap_toggle(
+        &self,
+        pane: crate::workspace::PaneId,
+        old_soft_wrap: bool,
+        new_soft_wrap: bool,
+        cx: &gpui::App,
+    ) {
+        let Some((prepared, scroll)) = self.pane_prepared_diff(pane, cx) else {
+            return;
+        };
+        let Some(top) = diff_view::change_block_topmost_row(&prepared, &scroll, old_soft_wrap)
+        else {
+            return;
+        };
+        let Some((handle, row_count)) = diff_view::change_block_scroll_target(&prepared, &scroll)
+        else {
+            return;
+        };
+
+        if new_soft_wrap {
+            // Sync the wrap list's item count to the row count first (see the
+            // doc comment: the render's count-sync guard would otherwise reset
+            // and null the seed). With the count already matching, that guard
+            // is a no-op and this seed survives to paint.
+            let state = scroll.wrap_list();
+            if state.item_count() != row_count {
+                state.reset(row_count);
+            }
+            diff_view::scroll_wrapped_to_row(&scroll, top);
+        } else {
+            // Nowrap: place `top` at the viewport top by setting the pixel
+            // offset to -(row * line height), mirroring the nowrap change-block
+            // jump.
+            diff_view::set_diff_scroll_top(&handle, -px(top as f32 * diff_view::DIFF_LINE_HEIGHT));
+        }
     }
 
     /// One segment of the view switcher. The active segment reads as a filled
@@ -6230,6 +6426,7 @@ impl App {
             caret_visible: self.caret_blink_visible,
             app: cx.entity(),
             origins: scroll.content_origins,
+            wrap_row_origins: scroll.diff.wrap_row_origins(),
             hscroll: scroll.diff.hscroll.clone(),
         }
     }
@@ -6288,28 +6485,37 @@ impl App {
             pane,
             scroll,
             hovered,
+            soft_wrap,
         } = pane_render;
         let rename_source_selector = format!(
             "file-detail-rename-source-{}",
             debug_path_fragment(&file.path)
         );
         let prepared = self.prepared_file_diff(repo, changeset, file);
+        let selection_ctx = self.diff_selection_context(pane, &file.path, cx);
+        let content = match prepared.as_ref() {
+            Ok(prepared) => render_prepared_file_diff(
+                prepared,
+                scroll,
+                hovered,
+                soft_wrap,
+                Some(&selection_ctx),
+            ),
+            Err(err) => render_file_diff_error(err.clone()),
+        };
         if let Ok(prepared) = prepared.as_ref() {
-            // On first display of this diff, land on its first change block
-            // before the footer and content read the scroll offset.
-            focus_first_change_block(prepared, scroll);
+            // On first display of this diff, land on its first change block.
+            // In wrap mode this must run after `render_prepared_file_diff`
+            // above, which resets the wrap list to the diff's row count —
+            // `scroll_wrapped_to_block_top` clamps its target against that
+            // count. The footer below then reads the new position in the same
+            // frame.
+            focus_first_change_block(prepared, scroll, soft_wrap);
         }
         let footer = prepared
             .as_ref()
             .ok()
-            .and_then(|prepared| render_change_block_footer(prepared, scroll));
-        let selection_ctx = self.diff_selection_context(pane, &file.path, cx);
-        let content = match prepared {
-            Ok(prepared) => {
-                render_prepared_file_diff(&prepared, scroll, hovered, Some(&selection_ctx))
-            }
-            Err(err) => render_file_diff_error(err),
-        };
+            .and_then(|prepared| render_change_block_footer(prepared, scroll, soft_wrap));
 
         div()
             .flex()
@@ -6351,6 +6557,7 @@ impl App {
             pane,
             scroll,
             hovered,
+            soft_wrap: _,
         } = pane_render;
         let selection_ctx = self.diff_selection_context(pane, path, cx);
         let content = if changeset.commit_sha == repo::PENDING_SHA {
@@ -7996,6 +8203,7 @@ mod tests {
                 ai_enabled: false,
                 graph_view_mode: GraphViewMode::default(),
                 graph_column_widths: GraphColumnWidths::default(),
+                diff_soft_wrap: false,
             },
         )
         .expect("seed settings");
@@ -8798,6 +9006,28 @@ mod tests {
                 assert_eq!(app.settings.recent_repositories, recent_repositories);
             })
             .expect("read loaded recent repositories");
+    }
+
+    #[gpui::test]
+    async fn toggling_soft_wrap_persists_and_reloads(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_path = dir.path().join("settings.json");
+        let window = cx.add_window(|window, cx| {
+            App::new_with_settings_store_path(window, cx, store_path.clone())
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, cx| {
+                assert!(!app.diff_soft_wrap, "defaults off");
+                app.set_diff_soft_wrap(true, cx);
+                assert!(app.diff_soft_wrap, "flips on");
+            })
+            .expect("update app");
+
+        // Persisted to disk.
+        assert!(crate::settings::load(&store_path).diff_soft_wrap);
     }
 
     #[gpui::test]

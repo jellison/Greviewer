@@ -621,7 +621,7 @@ The diff area can hold several panes at once, arranged by vertical and horizonta
 
 **Observable outcomes**
 
-- A pane shows its tab row only while it holds at least one tab; the row carries split-right and split-down controls at its right edge. A pane with no tabs shows only the select-a-file placeholder, so splitting an empty pane is a keyboard-only action.
+- A pane shows its tab row only while it holds at least one tab; the row carries a soft-wrap toggle and split-right and split-down controls (the soft-wrap toggle is specified under "Inspecting a file's diff"). A pane with no tabs shows only the select-a-file placeholder, so splitting an empty pane is a keyboard-only action.
 - Splitting inserts a new pane next to the source pane — after it for right and down, before it for left and up. The new pane becomes active, takes half the source pane's space, and opens holding the same file the source pane was showing, with the same preview or pinned state; splitting a pane that shows nothing yields an empty pane with the placeholder. Splitting along an existing row or column of panes adds a sibling rather than nesting.
 - Clicking anywhere within a pane — its tab row or its content — makes it the active pane.
 - Single- and double-clicks in the file tree open files in the active pane only. A file may be open in several panes at once, but never twice in the same pane.
@@ -663,7 +663,7 @@ Tabs answer to the mouse: a reviewer can drag one along its own row to reorder, 
 
 ## Inspecting a file's diff
 
-Opening a file in the change set presents its diff. The diff fills the pane edge to edge below the tab bar; the tab itself names the file and colors it by change kind, so the pane adds no header of its own. For files that exist on both sides of the selection (modified or renamed files), the diff is shown side-by-side: the "before" state on the left, the "after" state on the right, with corresponding lines aligned and the two sides separated by a thin divider. The user can scroll both sides; the alignment is preserved as they scroll. Line numbers are shown for each side. Lines longer than the pane extend past its edge; the user scrolls the diff horizontally to read them, and both sides of a side-by-side diff pan together. The line numbers and change accents stay in place at the left edge while the code pans beneath them. While the pointer is over the pane, a horizontal scrollbar appears along the bottom of each side whose content overflows; dragging it pans the diff.
+Opening a file in the change set presents its diff. The diff fills the pane edge to edge below the tab bar; the tab itself names the file and colors it by change kind, so the pane adds no header of its own. For files that exist on both sides of the selection (modified or renamed files), the diff is shown side-by-side: the "before" state on the left, the "after" state on the right, with corresponding lines aligned and the two sides separated by a thin divider. The user can scroll both sides; the alignment is preserved as they scroll. Line numbers are shown for each side. How long lines are handled depends on the soft-wrap setting (see "Wrapping long lines"): with wrapping off — the default — lines longer than the pane extend past its edge and the user scrolls the diff horizontally to read them, both sides of a side-by-side diff panning together, while the line numbers and change accents stay in place at the left edge and the code pans beneath them; while the pointer is over the pane, a horizontal scrollbar appears along the bottom of each side whose content overflows, and dragging it pans the diff.
 
 Code is syntax-highlighted when the file's type is recognized; unrecognized types render as plain text. Changed lines read as color blocks: removed lines carry a red row tint and a red accent bar at the row's left edge, added lines the same in green. Within a modified line pair, the specific tokens that changed carry a stronger tint than the rest of the line, except when the pair differs almost entirely — a near-total rewrite reads as a whole-line change. Alignment gaps, where one side has no counterpart lines, render as a hatched region rather than blank space.
 
@@ -685,17 +685,40 @@ For files that exist on only one side of the selection — added or deleted file
 - Rows with no counterpart line on the other side render as a hatched region. A gap spanning several lines reads as one continuous hatched block: the diagonal stripes flow across it unbroken rather than restarting at each line.
 - Files with a recognized type render syntax-highlighted; unrecognized types render as plain text.
 - Line numbers appear for each side of a side-by-side diff and for the single side of a full-width view.
-- Code wider than the pane is reachable by horizontal scrolling: trackpad panning, shift+wheel, and dragging the horizontal scrollbar all pan the code region.
-- Both sides of a side-by-side diff pan horizontally in lockstep.
-- The accent bar and line-number gutter stay fixed at the pane's left edge while the code pans; panned code slides under the gutter's edge.
-- A horizontal scrollbar overlays the bottom of a side only while the pointer is over the pane and that diff's content overflows horizontally.
+- With wrapping off, code wider than the pane is reachable by horizontal scrolling: trackpad panning, shift+wheel, and dragging the horizontal scrollbar all pan the code region.
+- With wrapping off, both sides of a side-by-side diff pan horizontally in lockstep.
+- With wrapping off, the accent bar and line-number gutter stay fixed at the pane's left edge while the code pans; panned code slides under the gutter's edge.
+- With wrapping off, a horizontal scrollbar overlays the bottom of a side only while the pointer is over the pane and that diff's content overflows horizontally.
 - A purely vertical scroll gesture never pans the diff horizontally, and a purely horizontal one never scrolls the rows.
-- Opening a file shows its diff unpanned; stepping between change blocks preserves the current pan.
+- With wrapping off, opening a file shows its diff unpanned, and stepping between change blocks preserves the current horizontal pan.
 
 **Edge cases**
 
 - Renamed files diff old-path content against new-path content; the file's pre-rename path is surfaced so the user can see what was renamed.
 - Binary files render an explanatory placeholder rather than attempting a textual diff.
+
+## Wrapping long lines
+
+By default a diff pans horizontally for code wider than the pane. The user can instead turn on soft wrap from a control in the diff pane's tab row, alongside the split controls. With wrapping on, a line too long for the pane breaks onto as many rows as it needs so all of it is visible without horizontal scrolling; there is no horizontal scrollbar and no panning. The line number and change accent stay with the line's first visual row. In a side-by-side diff the two sides stay aligned row for row: when a line wraps on one side, its counterpart on the other side keeps pace so corresponding lines never drift apart. The setting is a single preference for the whole application: toggling it affects every diff in every pane at once, and the choice is remembered across sessions, so a reviewer who prefers wrapping sees it on every launch.
+
+Toggling the setting keeps the reviewer's place: in every pane showing a diff, the line at the top of the view before the toggle is still at the top after it, in both directions. The view does not jump to the top of the file or back to the first change block — only the wrapping of long lines changes.
+
+Everything else about the diff behaves the same whether wrapping is on or off. Selecting text, placing and moving the caret, the caret-line tint, syntax highlighting, change tints, and stepping between change blocks all work identically; with wrapping on, a click lands on the character under the pointer even when that character is on a wrapped continuation row, and a selection that spans a wrapped line covers all of its visual rows.
+
+**Triggering conditions**
+
+- The user activates the soft-wrap toggle in a pane's tab row.
+
+**Observable outcomes**
+
+- The soft-wrap toggle reads as on or off at a glance, reflecting the current setting.
+- Turning wrapping on makes every over-long line in every open diff break across visual rows so its full content is visible without horizontal scrolling; no horizontal scrollbar is shown and the diff does not pan.
+- The line number and change accent align with a wrapped line's first visual row.
+- In a side-by-side diff, a row where one side wraps keeps both sides aligned to the same line, the shorter side occupying the taller row's height.
+- A click on a wrapped continuation row places the caret at the character under the pointer, and a selection spanning a wrapped line fills across all of its visual rows.
+- The setting applies to every diff in every pane at once and is restored on the next launch.
+- Toggling the setting preserves the scroll position in every pane showing a diff — the row at the top of the view stays at the top across the toggle, in both directions — rather than jumping to the top of the file or the first change block.
+- Turning wrapping off restores horizontal panning for over-long lines.
 
 ## Selecting text in a diff
 

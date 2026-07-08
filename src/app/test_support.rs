@@ -46,6 +46,7 @@ pub(crate) fn add_app_window_with_graph_view_mode(
         ai_enabled: false,
         graph_view_mode,
         graph_column_widths: GraphColumnWidths::default(),
+        diff_soft_wrap: false,
     };
     cx.add_window(move |window, cx| App::new_with_settings(window, cx, settings.clone()))
 }
@@ -80,6 +81,7 @@ pub(crate) fn add_app_window_with_recent_and_widths(
         ai_enabled: false,
         graph_view_mode: GraphViewMode::default(),
         graph_column_widths: GraphColumnWidths::default(),
+        diff_soft_wrap: false,
     };
     cx.add_window(move |window, cx| App::new_with_settings(window, cx, settings.clone()))
 }
@@ -99,6 +101,7 @@ pub(crate) fn seed_recent_repositories(
             ai_enabled: false,
             graph_view_mode: GraphViewMode::default(),
             graph_column_widths: GraphColumnWidths::default(),
+            diff_soft_wrap: false,
         },
     )
     .expect("seed settings store");
@@ -857,6 +860,36 @@ pub(crate) fn init_repo_with_multiple_change_blocks() -> (tempfile::TempDir, Str
     let updated = lines.join("\n") + "\n";
     fs::write(dir.path().join("blocks.txt"), updated).expect("write updated file");
     let update_oid = commit_all(&repo, "Change three blocks", &[root_oid]);
+
+    drop(repo);
+
+    (dir, update_oid.to_string())
+}
+
+/// A modified file with two well-separated change blocks whose changed lines
+/// are long enough to wrap in a narrow pane. A 60-line file whose lines 5 and
+/// 55 change, each replaced with a ~400-char line, leaving far more than the
+/// merge gap of unchanged context between them. Exercises change-block
+/// navigation under soft wrap, where the changed rows are variable-height.
+pub(crate) fn init_repo_with_wrapped_change_blocks() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let repo = Repository::init(dir.path()).expect("init repo");
+
+    let base = (1..=60)
+        .map(|line| format!("line {line:03}\n"))
+        .collect::<String>();
+    fs::write(dir.path().join("wrapped_blocks.txt"), base).expect("write base file");
+    let root_oid = commit_all(&repo, "Add wrapped_blocks.txt", &[]);
+
+    let long_line = "wide ".repeat(80);
+    let mut lines = (1..=60)
+        .map(|line| format!("line {line:03}"))
+        .collect::<Vec<_>>();
+    lines[4] = format!("line 005 {long_line}");
+    lines[54] = format!("line 055 {long_line}");
+    let updated = lines.join("\n") + "\n";
+    fs::write(dir.path().join("wrapped_blocks.txt"), updated).expect("write updated file");
+    let update_oid = commit_all(&repo, "Change two wide blocks", &[root_oid]);
 
     drop(repo);
 

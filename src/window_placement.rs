@@ -214,6 +214,7 @@ mod tests {
                 ai_enabled: false,
                 graph_view_mode: GraphViewMode::default(),
                 graph_column_widths: GraphColumnWidths::default(),
+                diff_soft_wrap: false,
             };
 
             let (bounds, display_id) = restore_window_options(&settings, cx);
@@ -242,6 +243,7 @@ mod tests {
                 ai_enabled: false,
                 graph_view_mode: GraphViewMode::default(),
                 graph_column_widths: GraphColumnWidths::default(),
+                diff_soft_wrap: false,
             };
 
             let (bounds, display_id) = restore_window_options(&settings, cx);
@@ -276,6 +278,7 @@ mod tests {
                 ai_enabled: false,
                 graph_view_mode: GraphViewMode::default(),
                 graph_column_widths: GraphColumnWidths::default(),
+                diff_soft_wrap: false,
             };
 
             let (bounds, display_id) = restore_window_options(&settings, cx);
@@ -310,6 +313,7 @@ mod tests {
                     ai_enabled: false,
                     graph_view_mode: GraphViewMode::default(),
                     graph_column_widths: GraphColumnWidths::default(),
+                    diff_soft_wrap: false,
                 };
 
                 let (bounds, _display_id) = restore_window_options(&settings, cx);
