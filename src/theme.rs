@@ -32,7 +32,6 @@ pub struct Palette {
     pub accent_bg: Hsla,
     pub accent_bg_hover: Hsla,
     pub row_selected: Hsla,
-    pub current_branch_bg: Hsla,
     pub drop_target: Hsla,
     pub match_highlight_bg: Hsla,
     // Diff status.
@@ -98,7 +97,6 @@ impl Palette {
             accent_bg: Hsla::from(rgba(0x82aaff26)),
             accent_bg_hover: Hsla::from(rgba(0x82aaff40)),
             row_selected: Hsla::from(rgba(0x82aaff26)),
-            current_branch_bg: Hsla::from(rgba(0x82aaff40)),
             drop_target: Hsla::from(rgba(0x82aaff26)),
             match_highlight_bg: Hsla::from(rgba(0xffcb6b40)),
             diff_added_fg: Hsla::from(rgb(0xc3e88d)),

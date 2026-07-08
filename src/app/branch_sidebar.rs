@@ -1605,6 +1605,52 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn head_branch_label_is_bold_and_selection_is_not(cx: &mut TestAppContext) {
+        let (dir, _main_tip, feature_tip) = init_repo_with_unmerged_branch_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        // Select the non-head branch so selection and checkout diverge.
+        window
+            .update(cx, |app, window, cx| {
+                app.focus_branch(feature_tip.clone(), window, cx);
+            })
+            .expect("select feature branch");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        assert!(
+            visual
+                .debug_bounds("current-branch-label-heads-master")
+                .is_some(),
+            "the checked-out branch renders the bold current-branch label"
+        );
+        assert!(
+            visual.debug_bounds("branch-label-heads-master").is_none(),
+            "the checked-out branch must not render the regular label"
+        );
+        assert!(
+            visual
+                .debug_bounds("selected-branch-row-heads-feature")
+                .is_some(),
+            "the selected branch row carries the selected treatment"
+        );
+        assert!(
+            visual
+                .debug_bounds("current-branch-label-heads-feature")
+                .is_none(),
+            "selection alone must not confer the bold current-branch label"
+        );
+    }
+
+    #[gpui::test]
     async fn clicking_a_hidden_branch_row_does_not_focus_it(cx: &mut TestAppContext) {
         let (dir, main_tip, _feature_tip) = init_repo_with_unmerged_branch_commit();
         let path = dir.path().to_path_buf();

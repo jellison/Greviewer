@@ -37,9 +37,9 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     actions, canvas, div, list, pattern_slash, point, px, relative, uniform_list, AnyElement,
     AppContext, Background, Bounds, ClickEvent, Context, DragMoveEvent, Entity, EventEmitter,
-    FocusHandle, HighlightStyle, Hsla, InteractiveElement, IntoElement, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathBuilder, Pixels, Point,
-    Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledText,
+    FocusHandle, FontWeight, HighlightStyle, Hsla, InteractiveElement, IntoElement, Modifiers,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathBuilder, Pixels,
+    Point, Render, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledText,
     TextStyle, UniformListScrollHandle, Window,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -5264,10 +5264,11 @@ impl App {
     /// `highlight` char indices (positions within `text`). With no highlights
     /// this is an ordinary colored text node, identical to the pre-filter
     /// rendering.
-    fn branch_label(&self, text: &str, highlight: &[usize], color: Hsla) -> AnyElement {
+    fn branch_label(&self, text: &str, highlight: &[usize], color: Hsla, bold: bool) -> AnyElement {
         if highlight.is_empty() {
             return div()
                 .text_color(color)
+                .when(bold, |label| label.font_weight(FontWeight::BOLD))
                 .child(text.to_string())
                 .into_any_element();
         }
@@ -5280,6 +5281,11 @@ impl App {
         let base = TextStyle {
             color,
             font_family: MONO_FONT_FAMILY.into(),
+            font_weight: if bold {
+                FontWeight::BOLD
+            } else {
+                FontWeight::default()
+            },
             ..Default::default()
         };
         let highlights = ranges.into_iter().map(|range| {
@@ -5314,12 +5320,10 @@ impl App {
         let show_toggle = !branch.is_head;
         // A hidden branch keeps the icon opaque without hover.
         let always_show = hidden;
-        // The checked-out branch is marked by a subtle background tint instead
-        // of a check icon; an active commit selection still takes precedence.
+        // The checked-out branch is marked by a bold label (applied below);
+        // a background tint signifies selection and nothing else.
         let row_bg = if selected {
             palette().row_selected
-        } else if branch.is_head {
-            palette().current_branch_bg
         } else {
             palette().surface
         };
@@ -5342,6 +5346,11 @@ impl App {
             _ => (LucideIcon::GitBranch, "branch"),
         };
         let icon_selector = format!("{icon_prefix}-icon-{name_fragment}");
+        let label_selector = if branch.is_head {
+            format!("current-branch-label-{name_fragment}")
+        } else {
+            format!("branch-label-{name_fragment}")
+        };
         let group_name = format!("branch-row-group-{name_fragment}");
         let tip_sha = branch.tip_sha.clone();
         let toggle_branch_key = key;
@@ -5396,6 +5405,7 @@ impl App {
                     .min_w_0()
                     .text_size(px(FILE_TREE_TEXT_SIZE))
                     .truncate()
+                    .debug_selector(move || label_selector.clone())
                     .child({
                         let highlight = if query.is_empty() {
                             Vec::new()
@@ -5404,7 +5414,7 @@ impl App {
                                 .map(|idx| final_segment_highlights(&branch.name, &idx))
                                 .unwrap_or_default()
                         };
-                        self.branch_label(&display_name, &highlight, name_color)
+                        self.branch_label(&display_name, &highlight, name_color, branch.is_head)
                     }),
             )
             .when(show_toggle, |row| {
@@ -5588,7 +5598,7 @@ impl App {
                             let idx = prefix_match_indices(display_path, query);
                             final_segment_highlights(display_path, &idx)
                         };
-                        self.branch_label(&folder.name, &highlight, name_color)
+                        self.branch_label(&folder.name, &highlight, name_color, false)
                     }),
             )
             .child(
