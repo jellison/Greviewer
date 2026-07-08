@@ -6,10 +6,17 @@ mod commit_graph;
 pub(crate) mod diff_selection;
 mod diff_view;
 mod file_tree;
+mod guide_panel;
 pub mod menu;
 pub mod path_picker;
+mod status_footer;
 #[cfg(test)]
 mod test_support;
+// Re-exported (not the whole module — most of its helpers return types
+// private to `app`) so `crate::ai`'s unit tests can share the one stub-CLI
+// writer instead of keeping their own copies.
+#[cfg(test)]
+pub(crate) use self::test_support::stub_cli;
 mod title_bar;
 
 use self::branch_filter::*;
@@ -51,10 +58,7 @@ use std::{
 };
 
 use crate::icons::LucideIcon;
-use crate::settings::{
-    self, GraphColumnWidths, GraphViewMode, RecentRepository, Settings, SidebarWidths,
-    MAX_RECENT_REPOSITORIES,
-};
+use crate::settings::{self, GraphViewMode, RecentRepository, Settings, MAX_RECENT_REPOSITORIES};
 use crate::theme::palette;
 use crate::workspace::{EmptyDragPreview, FileDiffItem};
 use crate::{diff_highlight, graph, repo};
@@ -148,6 +152,8 @@ const BRANCH_SIDEBAR_DEFAULT_WIDTH: f32 = 240.;
 /// the history panel while a selection is active).
 const SELECTION_BAR_HEIGHT: f32 = 34.;
 const CHANGESET_FILES_DEFAULT_WIDTH: f32 = 340.;
+/// Default width of the right-docked review-guide panel.
+const CHANGESET_GUIDE_DEFAULT_WIDTH: f32 = 320.;
 /// Smallest width a restored sidebar may take, guarding against a corrupt or
 /// degenerate saved value. The resizable widget clamps further to its own
 /// panel minimum and the container size.
@@ -255,6 +261,10 @@ pub struct App {
     /// All AI threads and their subprocesses (ADR-0005); killed on changeset
     /// close and app quit so no `claude` process outlives its context.
     ai_sessions: Entity<crate::ai::AiSessions>,
+    /// Thread currently generating a review guide for the open changeset.
+    guide_thread: Option<crate::ai::ThreadId>,
+    /// Why the last guide generation failed, for the panel's Failed state.
+    guide_error: Option<String>,
     /// Bitbucket PR session for the open repo's origin, when it maps to a
     /// Bitbucket Data Center remote. `None` for non-Bitbucket repos.
     bitbucket: Option<Entity<crate::bitbucket::BitBucketSession>>,
@@ -288,11 +298,19 @@ pub struct App {
     /// True while the cursor is anywhere over the file-tree panel; gates the
     /// hover-revealed scrollbar overlay.
     file_tree_hovered: bool,
+    /// Vertical scroll handle for the review-guide panel's content.
+    pub(crate) guide_scroll: ScrollHandle,
+    /// True while the cursor is over the guide panel; gates its
+    /// hover-revealed scrollbar, mirroring the file tree's.
+    pub(crate) guide_panel_hovered: bool,
     /// Which workspace pane's diff content the pointer is over, if any.
     /// Drives that pane's hover-revealed horizontal scrollbar overlay,
     /// mirroring the file tree's hover-revealed scrollbars.
     pub(crate) hovered_diff_pane: Option<crate::workspace::PaneId>,
     changeset_resizable: Entity<ResizableState>,
+    /// Split between the changed-files/diff panes and the right-docked
+    /// review-guide panel; only rendered while the guide panel is open.
+    guide_resizable: Entity<ResizableState>,
     graph_resizable: Entity<ResizableState>,
     branch_sidebar_scroll: UniformListScrollHandle,
     /// Bumped whenever `repo.branches` is (re)loaded, so the sidebar row cache
@@ -952,12 +970,7 @@ impl App {
     ) -> Self {
         let settings = Settings {
             recent_repositories,
-            window_state: None,
-            sidebar_widths: SidebarWidths::default(),
-            ai_enabled: false,
-            graph_view_mode: GraphViewMode::default(),
-            graph_column_widths: GraphColumnWidths::default(),
-            diff_soft_wrap: false,
+            ..Settings::default()
         };
         Self::new_with_picker_and_settings(window, cx, Box::new(GpuiPathPicker), settings)
     }
@@ -1012,7 +1025,10 @@ impl App {
     ) -> Self {
         let notifications = cx.new(|cx| NotificationList::new(window, cx));
         let ai_sessions = cx.new(|_| crate::ai::AiSessions::new());
+        cx.subscribe(&ai_sessions, Self::on_ai_sessions_event)
+            .detach();
         let changeset_resizable = cx.new(|_| ResizableState::default());
+        let guide_resizable = cx.new(|_| ResizableState::default());
         let graph_resizable = cx.new(|_| ResizableState::default());
         let focus_handle = cx.focus_handle();
 
@@ -1212,6 +1228,8 @@ impl App {
             reviews_generation: std::cell::Cell::new(0),
             collapsed_file_tree_paths: BTreeSet::new(),
             ai_sessions,
+            guide_thread: None,
+            guide_error: None,
             bitbucket,
             bitbucket_repo,
             bitbucket_state: PrSectionState::NotConfigured,
@@ -1228,8 +1246,11 @@ impl App {
             file_tree_scroll: ScrollHandle::new(),
             file_tree_hscroll: ScrollHandle::new(),
             file_tree_hovered: false,
+            guide_scroll: ScrollHandle::new(),
+            guide_panel_hovered: false,
             hovered_diff_pane: None,
             changeset_resizable,
+            guide_resizable,
             graph_resizable,
             branch_sidebar_scroll: UniformListScrollHandle::new(),
             branches_generation: std::cell::Cell::new(0),
@@ -1350,6 +1371,13 @@ impl App {
         self.refresh_worktree_entries(window, cx);
         self.review_screen = ReviewScreen::Graph;
         self.comparison_commit_shas = None;
+        // AI threads and guide state are scoped to the previously open
+        // changeset/repo (ADR-0005): switching repositories must not leak a
+        // running subprocess or a stale guide onto the new repo's review.
+        self.ai_sessions
+            .update(cx, |sessions, cx| sessions.cancel_all(cx));
+        self.guide_thread = None;
+        self.guide_error = None;
         self.workspace = crate::workspace::Workspace::new();
         self.pane_scrolls.borrow_mut().clear();
         self.diff_selections.clear();
@@ -1636,7 +1664,10 @@ impl App {
 
     /// Read each resizable split's current left-panel width and store it. A
     /// split whose `sizes()` is empty (never rendered this session) is skipped,
-    /// so it never overwrites a previously-saved width with nothing.
+    /// so it never overwrites a previously-saved width with nothing. The
+    /// changeset split additionally only renders while the files panel is
+    /// open (see `render_changeset_screen`), so a collapsed panel's stale
+    /// `sizes()` must not overwrite the persisted width either.
     fn capture_sidebar_widths(&mut self, cx: &gpui::App) {
         if let Some(width) = self
             .graph_resizable
@@ -1648,15 +1679,29 @@ impl App {
         {
             self.settings.sidebar_widths.branch_sidebar = Some(width);
         }
-        if let Some(width) = self
-            .changeset_resizable
-            .read(cx)
-            .sizes()
-            .first()
-            .copied()
-            .map(f32::from)
-        {
-            self.settings.sidebar_widths.changeset_files = Some(width);
+        if self.settings.changeset_panels.files_open {
+            if let Some(width) = self
+                .changeset_resizable
+                .read(cx)
+                .sizes()
+                .first()
+                .copied()
+                .map(f32::from)
+            {
+                self.settings.sidebar_widths.changeset_files = Some(width);
+            }
+        }
+        if self.settings.changeset_panels.guide_open && self.settings.ai_enabled {
+            if let Some(width) = self
+                .guide_resizable
+                .read(cx)
+                .sizes()
+                .last()
+                .copied()
+                .map(f32::from)
+            {
+                self.settings.sidebar_widths.changeset_guide = Some(width);
+            }
         }
     }
 
@@ -2095,6 +2140,15 @@ impl App {
         ))
     }
 
+    /// Whether the currently open changeset can offer a review guide. A
+    /// guide needs a fixed commit range to summarize, so it is never
+    /// available for the pending changeset (docs/specs/ai/review-guide.md,
+    /// "Availability"). Reuses `open_changeset_review_key`, which already
+    /// returns `None` exactly for Pending (and when no changeset is open).
+    pub(crate) fn open_changeset_supports_guide(&self) -> bool {
+        self.open_changeset_review_key().is_some()
+    }
+
     pub(crate) fn current_review(&self) -> Option<&crate::reviews::Review> {
         let (repo_path, key) = self.open_changeset_review_key()?;
         self.reviews.find_by_changeset(&repo_path, &key)
@@ -2139,6 +2193,25 @@ impl App {
             self.touch_review(&id, window, cx);
             return;
         }
+        self.ensure_open_changeset_review(Some(window), cx);
+    }
+
+    /// Create a review for the open changeset if none exists yet. Existing
+    /// reviews are left untouched — no activity bump, unlike `start_review`'s
+    /// explicit "resume" path — so review creation exists in exactly one
+    /// place while guide generation (window-less, via `on_ai_sessions_event`)
+    /// can also call it to attach a guide to a changeset with no review yet.
+    fn ensure_open_changeset_review(
+        &mut self,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((repo_path, key)) = self.open_changeset_review_key() else {
+            return;
+        };
+        if self.reviews.find_by_changeset(&repo_path, &key).is_some() {
+            return;
+        }
         let review = crate::reviews::Review::new(
             repo_path,
             key,
@@ -2150,17 +2223,22 @@ impl App {
     }
 
     /// Bump generation, surface a failed write, repaint. Every review
-    /// mutation funnels through here.
+    /// mutation funnels through here. `window` is `None` for mutations
+    /// triggered off the AI-session event handler, which has no window to
+    /// show a toast in; those failures surface through `guide_error` instead.
     fn after_review_mutation(
         &mut self,
         result: std::io::Result<()>,
-        window: &mut Window,
+        window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
         self.reviews_generation
             .set(self.reviews_generation.get() + 1);
         if let Err(err) = result {
-            self.push_review_storage_failed(err.to_string(), window, cx);
+            match window {
+                Some(window) => self.push_review_storage_failed(err.to_string(), window, cx),
+                None => self.guide_error = Some(format!("Saving review failed: {err}")),
+            }
         }
         cx.notify();
     }
@@ -2187,7 +2265,7 @@ impl App {
             .mutate(id, |review| review.last_activity_at = now_unix_seconds())
             .inspect(|&found| debug_assert!(found, "review mutation targeted an unknown id"))
             .map(|_| ());
-        self.after_review_mutation(result, window, cx);
+        self.after_review_mutation(result, Some(window), cx);
     }
 
     pub fn rename_current_review(
@@ -2213,7 +2291,7 @@ impl App {
             })
             .inspect(|&found| debug_assert!(found, "review mutation targeted an unknown id"))
             .map(|_| ());
-        self.after_review_mutation(result, window, cx);
+        self.after_review_mutation(result, Some(window), cx);
         true
     }
 
@@ -2241,13 +2319,13 @@ impl App {
             })
             .inspect(|&found| debug_assert!(found, "review mutation targeted an unknown id"))
             .map(|_| ());
-        self.after_review_mutation(result, window, cx);
+        self.after_review_mutation(result, Some(window), cx);
     }
 
     pub fn delete_review(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_delete_review = None;
         let result = self.reviews.delete(id).map(|_| ());
-        self.after_review_mutation(result, window, cx);
+        self.after_review_mutation(result, Some(window), cx);
     }
 
     /// Open a persisted review: rebuild its selection, reveal it in the graph,
@@ -2428,6 +2506,8 @@ impl App {
                 self.file_tree_scroll.set_offset(point(px(0.), px(0.)));
                 self.file_tree_hscroll.set_offset(point(px(0.), px(0.)));
                 self.file_tree_hovered = false;
+                self.guide_scroll.set_offset(point(px(0.), px(0.)));
+                self.guide_panel_hovered = false;
                 self.hovered_diff_pane = None;
                 let sha = changeset.commit_sha.clone();
                 self.review_screen = ReviewScreen::Changeset { sha, changeset };
@@ -2451,6 +2531,8 @@ impl App {
         self.workspace.clear();
         self.file_tree_highlight_path = None;
         self.file_tree_hovered = false;
+        self.guide_scroll.set_offset(point(px(0.), px(0.)));
+        self.guide_panel_hovered = false;
         self.hovered_diff_pane = None;
         self.reset_pane_scrolls();
         self.diff_selections.clear();
@@ -2458,6 +2540,10 @@ impl App {
         // (ADR-0005): closing it kills every running session.
         self.ai_sessions
             .update(cx, |sessions, cx| sessions.cancel_all(cx));
+        // Guide generation is scoped to the open changeset too; a stale
+        // thread id or error from the last changeset must not leak in.
+        self.guide_thread = None;
+        self.guide_error = None;
         self.stop_caret_blink();
         self.diff_row_cache.borrow_mut().clear();
         self.read_only_cell_cache.borrow_mut().clear();
@@ -2476,6 +2562,142 @@ impl App {
     /// exclusively through this entity.
     pub fn ai_sessions(&self) -> &Entity<crate::ai::AiSessions> {
         &self.ai_sessions
+    }
+
+    /// Start a guide-generation turn for the open changeset. A no-op when no
+    /// changeset is open (Pending, or Graph screen).
+    pub fn start_guide_generation(&mut self, cx: &mut Context<Self>) {
+        self.guide_error = None;
+        let Some((base_sha, head_sha, repo_root)) = self.open_changeset_range() else {
+            return;
+        };
+        let prompt = crate::ai::prompts::guide_prompt(base_sha.as_deref(), &head_sha);
+        let started = self.ai_sessions.update(cx, |sessions, cx| {
+            sessions.start_thread(
+                repo_root,
+                crate::ai::ThreadKind::Summary,
+                None,
+                prompt,
+                Some(crate::ai::prompts::GUIDE_SCHEMA.to_string()),
+                cx,
+            )
+        });
+        match started {
+            Ok(id) => self.guide_thread = Some(id),
+            Err(err) => {
+                self.guide_error = Some(match err {
+                    crate::ai::StartError::AtCapacity => {
+                        "Too many AI tasks are running. Try again shortly.".to_string()
+                    }
+                    _ => "Couldn't start the AI session.".to_string(),
+                })
+            }
+        }
+        cx.notify();
+    }
+
+    /// Cancel the in-flight guide-generation thread, if any.
+    pub fn cancel_guide_generation(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.guide_thread.take() {
+            self.ai_sessions
+                .update(cx, |sessions, cx| sessions.cancel(id, cx));
+        }
+        cx.notify();
+    }
+
+    /// (base, head, repo_root) for the open changeset — `None` on Pending
+    /// (no review key) or when no changeset is open.
+    fn open_changeset_range(&self) -> Option<(Option<String>, String, PathBuf)> {
+        let (repo_root, _key) = self.open_changeset_review_key()?;
+        let ReviewScreen::Changeset { changeset, .. } = &self.review_screen else {
+            return None;
+        };
+        Some((
+            changeset.base_sha.clone(),
+            changeset.commit_sha.clone(),
+            repo_root,
+        ))
+    }
+
+    fn on_ai_sessions_event(
+        &mut self,
+        sessions: Entity<crate::ai::AiSessions>,
+        event: &crate::ai::AiSessionsEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let crate::ai::AiSessionsEvent::ThreadUpdated(id) = *event;
+        if self.guide_thread != Some(id) {
+            return;
+        }
+        let (status, result) = {
+            let sessions = sessions.read(cx);
+            let Some(thread) = sessions.thread(id) else {
+                return;
+            };
+            (thread.status.clone(), thread.last_result.clone())
+        };
+        match status {
+            crate::ai::ThreadStatus::Idle => {
+                self.guide_thread = None;
+                let Some(text) = result else {
+                    self.guide_error = Some("The AI returned no result.".to_string());
+                    cx.notify();
+                    return;
+                };
+                self.finish_guide_generation(&text, cx);
+            }
+            crate::ai::ThreadStatus::Failed(message) => {
+                self.guide_thread = None;
+                self.guide_error = Some(message);
+            }
+            crate::ai::ThreadStatus::Cancelled => {
+                // Cancel paths (close_changeset, apply_open_repository,
+                // quit_application) already clear guide_thread themselves;
+                // this arm only covers a cancellation event that arrives
+                // after one of those flushes has already run.
+                self.guide_thread = None;
+            }
+            crate::ai::ThreadStatus::Running => {} // ticker re-renders via notify below
+        }
+        cx.notify();
+    }
+
+    /// Parse a completed guide turn's result and persist it on the open
+    /// changeset's review, creating the review first if none exists yet.
+    fn finish_guide_generation(&mut self, text: &str, cx: &mut Context<Self>) {
+        let ReviewScreen::Changeset { changeset, .. } = &self.review_screen else {
+            return;
+        };
+        let paths: HashSet<String> = changeset
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
+        match crate::ai::guide::parse_guide(text, &paths, now_unix_seconds()) {
+            Ok(guide) => {
+                self.ensure_open_changeset_review(None, cx);
+                if let Some(id) = self.current_review().map(|review| review.id.clone()) {
+                    let result = self.reviews.mutate(&id, |review| {
+                        review.guide = Some(guide);
+                        review.last_activity_at = now_unix_seconds();
+                    });
+                    self.after_review_mutation(result.map(|_| ()), None, cx);
+                }
+            }
+            Err(message) => self.guide_error = Some(message),
+        }
+    }
+
+    /// Test seam: swap in a stub CLI program and rebuild the AI-sessions
+    /// entity around it, re-subscribing so `on_ai_sessions_event` still
+    /// fires. The constructor-time subscription stays attached to the old
+    /// (now-unreferenced) entity, which is fine — it will simply never emit
+    /// again.
+    #[cfg(test)]
+    pub(crate) fn set_ai_cli_program(&mut self, program: PathBuf, cx: &mut Context<Self>) {
+        self.ai_sessions = cx.new(|_| crate::ai::AiSessions::with_cli_program(program));
+        cx.subscribe(&self.ai_sessions, Self::on_ai_sessions_event)
+            .detach();
     }
 
     /// The scroll handles for `pane`, created on first use. The returned
@@ -4613,6 +4835,15 @@ impl App {
         )
     }
 
+    /// Width the review-guide panel opens at: the saved width when present
+    /// and sane, otherwise the default. See [`restored_width`].
+    fn changeset_guide_width(&self) -> f32 {
+        restored_width(
+            self.settings.sidebar_widths.changeset_guide,
+            CHANGESET_GUIDE_DEFAULT_WIDTH,
+        )
+    }
+
     /// Returns the memoized flat sidebar row model, recomputing only when the
     /// branch set, collapse state, or hidden-branch set changes.
     fn sidebar_rows(&self, repo: &repo::OpenRepository, query: &str) -> Rc<Vec<BranchTreeRow>> {
@@ -5668,11 +5899,31 @@ impl App {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let body: AnyElement = match self.file_list_entries(repo, changeset) {
-            Ok(entries) => div()
-                .flex()
-                .flex_1()
-                .min_h_0()
-                .child(
+            Ok(entries) => {
+                let panes = crate::workspace::pane_grid::render_pane_group(
+                    self,
+                    self.workspace.layout(),
+                    repo,
+                    changeset,
+                    cx,
+                );
+                let panes: AnyElement = if self.settings.changeset_panels.guide_open
+                    && self.settings.ai_enabled
+                    && self.open_changeset_supports_guide()
+                {
+                    h_resizable("guide-split")
+                        .with_state(&self.guide_resizable)
+                        .child(resizable_panel().child(panes))
+                        .child(
+                            resizable_panel()
+                                .size(px(self.changeset_guide_width()))
+                                .child(self.render_guide_panel(changeset, cx)),
+                        )
+                        .into_any_element()
+                } else {
+                    panes.into_any_element()
+                };
+                let content: AnyElement = if self.settings.changeset_panels.files_open {
                     h_resizable("changeset-split")
                         .with_state(&self.changeset_resizable)
                         .child(
@@ -5680,17 +5931,18 @@ impl App {
                                 .size(px(self.changeset_files_width()))
                                 .child(self.render_file_list(repo, entries, cx)),
                         )
-                        .child(resizable_panel().child(
-                            crate::workspace::pane_grid::render_pane_group(
-                                self,
-                                self.workspace.layout(),
-                                repo,
-                                changeset,
-                                cx,
-                            ),
-                        )),
-                )
-                .into_any_element(),
+                        .child(resizable_panel().child(panes))
+                        .into_any_element()
+                } else {
+                    panes.into_any_element()
+                };
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(content)
+                    .into_any_element()
+            }
             Err(err) => render_file_diff_error(err.to_string()),
         };
 
@@ -5701,6 +5953,7 @@ impl App {
             .h_full()
             .bg(palette().background)
             .child(body)
+            .child(self.render_status_footer(cx))
     }
 
     fn file_list_entries(
@@ -7444,7 +7697,8 @@ mod tests {
     };
     use crate::repo::{ChangeKind, INITIAL_COMMIT_LIMIT};
     use crate::settings::{
-        GraphColumnWidths, GraphViewMode, RecentRepository, Settings, SidebarWidths, WindowMode,
+        ChangesetPanels, GraphColumnWidths, GraphViewMode, RecentRepository, Settings,
+        SidebarWidths, WindowMode,
     };
     use crate::workspace::test_util::{simulate_double_click, simulate_drag};
     use git2::{IndexAddOption, Repository, Signature};
@@ -7514,6 +7768,186 @@ mod tests {
                 assert_eq!(status, crate::ai::ThreadStatus::Cancelled);
             })
             .expect("window update");
+    }
+
+    /// Stub CLI that emits a valid guide JSON result for any prompt. The
+    /// review-order path matches the file `init_repo_with_two_commits` changes.
+    fn guide_stub_transcript(path_in_repo: &str) -> String {
+        format!(
+            r#"echo '{{"type":"system","subtype":"init","session_id":"stub"}}'
+echo '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{}}}}]}}}}'
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"{{\"summary\":\"Behavior summary.\",\"review_order\":[{{\"path\":\"{path_in_repo}\",\"note\":\"read first\"}}]}}"}}'"#
+        )
+    }
+
+    #[gpui::test]
+    async fn generating_a_guide_persists_it_on_the_review(cx: &mut TestAppContext) {
+        let (dir, head_sha) = init_repo_with_two_commits();
+        let repo_path = dir.path().to_path_buf();
+        let changed_path = "hello.txt".to_string();
+        let stub = stub_cli(dir.path(), &guide_stub_transcript(&changed_path));
+        let window = add_app_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.settings.ai_enabled = true;
+                app.set_ai_cli_program(stub.clone(), cx);
+                app.open_repository_at(repo_path.clone(), window, cx);
+                app.select_single_commit(head_sha.clone(), cx);
+                app.open_changeset(window, cx);
+                app.start_guide_generation(cx);
+            })
+            .unwrap();
+
+        // Drain until the turn completes and the guide lands on the review.
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let done = window
+                .read_with(cx, |app, _| {
+                    app.current_review()
+                        .is_some_and(|review| review.guide.is_some())
+                })
+                .unwrap();
+            if done {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        window
+            .read_with(cx, |app, _| {
+                let review = app.current_review().expect("review was auto-created");
+                let guide = review.guide.as_ref().expect("guide persisted");
+                assert_eq!(guide.summary, "Behavior summary.");
+                assert_eq!(guide.review_order.len(), 1);
+                assert_eq!(guide.review_order[0].path, changed_path);
+                assert!(app.guide_thread.is_none(), "generation state cleared");
+                assert!(app.guide_error.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn a_failed_guide_turn_surfaces_an_error(cx: &mut TestAppContext) {
+        let (dir, head_sha) = init_repo_with_two_commits();
+        let repo_path = dir.path().to_path_buf();
+        let stub = stub_cli(dir.path(), "echo 'boom' >&2\nexit 3");
+        let window = add_app_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.settings.ai_enabled = true;
+                app.set_ai_cli_program(stub.clone(), cx);
+                app.open_repository_at(repo_path.clone(), window, cx);
+                app.select_single_commit(head_sha.clone(), cx);
+                app.open_changeset(window, cx);
+                app.start_guide_generation(cx);
+            })
+            .unwrap();
+
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let done = window
+                .read_with(cx, |app, _| app.guide_thread.is_none())
+                .unwrap();
+            if done {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        window
+            .read_with(cx, |app, _| {
+                assert!(app.guide_thread.is_none());
+                assert!(
+                    app.guide_error.as_deref().unwrap().contains("boom"),
+                    "expected the stderr text in the error, got {:?}",
+                    app.guide_error
+                );
+                assert!(app.current_review().and_then(|r| r.guide.clone()).is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn cancelling_guide_generation_clears_state_and_kills_the_thread(cx: &mut TestAppContext) {
+        let (dir, head_sha) = init_repo_with_two_commits();
+        let repo_path = dir.path().to_path_buf();
+        let stub = stub_cli(dir.path(), "sleep 300\nexit 0");
+        let window = add_app_window(cx);
+
+        let id = window
+            .update(cx, |app, window, cx| {
+                app.settings.ai_enabled = true;
+                app.set_ai_cli_program(stub.clone(), cx);
+                app.open_repository_at(repo_path.clone(), window, cx);
+                app.select_single_commit(head_sha.clone(), cx);
+                app.open_changeset(window, cx);
+                app.start_guide_generation(cx);
+                app.guide_thread.expect("guide generation started")
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.cancel_guide_generation(cx);
+                assert!(app.guide_thread.is_none());
+                let status = app
+                    .ai_sessions()
+                    .read(cx)
+                    .thread(id)
+                    .expect("thread exists")
+                    .status
+                    .clone();
+                assert_eq!(status, crate::ai::ThreadStatus::Cancelled);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn switching_repositories_cancels_ai_threads_and_clears_the_guide(cx: &mut TestAppContext) {
+        let (dir, head_sha) = init_repo_with_two_commits();
+        let repo_path = dir.path().to_path_buf();
+        let stub = stub_cli(dir.path(), "sleep 300\nexit 0");
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.settings.ai_enabled = true;
+                app.set_ai_cli_program(stub.clone(), cx);
+                app.open_repository_at(repo_path.clone(), window, cx);
+                app.select_single_commit(head_sha.clone(), cx);
+                app.open_changeset(window, cx);
+                app.start_guide_generation(cx);
+                assert!(app.guide_thread.is_some(), "guide generation started");
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // Open a second, unrelated repo while the first repo's guide turn is
+        // still in flight; the switch must not leak the subprocess or let a
+        // stale guide/error survive onto the new repo's review.
+        let (other_dir, _other_sha) = init_repo_with_one_commit();
+        let other_path = other_dir.path().to_path_buf();
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(other_path, window, cx);
+            })
+            .unwrap();
+
+        window
+            .update(cx, |app, _window, cx| {
+                assert!(
+                    app.guide_thread.is_none(),
+                    "guide thread must be cleared on repo switch"
+                );
+                assert!(app.guide_error.is_none());
+                assert_eq!(
+                    app.ai_sessions().read(cx).running_count(),
+                    0,
+                    "the stub CLI subprocess must be killed on repo switch"
+                );
+            })
+            .unwrap();
     }
 
     #[test]
@@ -8096,6 +8530,7 @@ mod tests {
             SidebarWidths {
                 branch_sidebar: Some(400.),
                 changeset_files: None,
+                changeset_guide: None,
             },
         );
         cx.run_until_parked();
@@ -8199,11 +8634,13 @@ mod tests {
                 sidebar_widths: SidebarWidths {
                     branch_sidebar: None,
                     changeset_files: Some(333.0),
+                    changeset_guide: None,
                 },
                 ai_enabled: false,
                 graph_view_mode: GraphViewMode::default(),
                 graph_column_widths: GraphColumnWidths::default(),
                 diff_soft_wrap: false,
+                changeset_panels: ChangesetPanels::default(),
             },
         )
         .expect("seed settings");

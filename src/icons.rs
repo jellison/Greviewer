@@ -40,12 +40,18 @@ pub enum LucideIcon {
     ListTree,
     /// `monitor.svg`
     Monitor,
+    /// `panel-left.svg`
+    PanelLeft,
+    /// `panel-right.svg`
+    PanelRight,
     /// `refresh-cw.svg`
     RefreshCw,
     /// `rows-2.svg`
     Rows2,
     /// `search.svg`
     Search,
+    /// `sparkles.svg`
+    Sparkles,
     /// `square-dot.svg`
     SquareDot,
     /// `square-minus.svg`
@@ -80,9 +86,12 @@ impl LucideIcon {
         LucideIcon::GitPullRequest,
         LucideIcon::ListTree,
         LucideIcon::Monitor,
+        LucideIcon::PanelLeft,
+        LucideIcon::PanelRight,
         LucideIcon::RefreshCw,
         LucideIcon::Rows2,
         LucideIcon::Search,
+        LucideIcon::Sparkles,
         LucideIcon::SquareDot,
         LucideIcon::SquareMinus,
         LucideIcon::SquarePlus,
@@ -111,9 +120,12 @@ impl IconNamed for LucideIcon {
             LucideIcon::GitPullRequest => "icons/git-pull-request.svg",
             LucideIcon::ListTree => "icons/list-tree.svg",
             LucideIcon::Monitor => "icons/monitor.svg",
+            LucideIcon::PanelLeft => "icons/panel-left.svg",
+            LucideIcon::PanelRight => "icons/panel-right.svg",
             LucideIcon::RefreshCw => "icons/refresh-cw.svg",
             LucideIcon::Rows2 => "icons/rows-2.svg",
             LucideIcon::Search => "icons/search.svg",
+            LucideIcon::Sparkles => "icons/sparkles.svg",
             LucideIcon::SquareDot => "icons/square-dot.svg",
             LucideIcon::SquareMinus => "icons/square-minus.svg",
             LucideIcon::SquarePlus => "icons/square-plus.svg",

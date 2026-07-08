@@ -6,10 +6,18 @@
 use super::*;
 use crate::graph;
 use crate::repo::{self, ChangeKind};
-use crate::settings::{self, GraphColumnWidths, RecentRepository, Settings, SidebarWidths};
+use crate::settings::{
+    self, ChangesetPanels, GraphColumnWidths, RecentRepository, Settings, SidebarWidths,
+};
 use git2::{IndexAddOption, Repository, Signature};
 use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowHandle};
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs,
+    io::Write as _,
+    os::unix::fs::PermissionsExt as _,
+    path::{Path, PathBuf},
+};
 
 /// Open a window holding a freshly constructed `App`, with the
 /// gpui-component theme installed. The theme global is required by themed
@@ -47,6 +55,7 @@ pub(crate) fn add_app_window_with_graph_view_mode(
         graph_view_mode,
         graph_column_widths: GraphColumnWidths::default(),
         diff_soft_wrap: false,
+        changeset_panels: ChangesetPanels::default(),
     };
     cx.add_window(move |window, cx| App::new_with_settings(window, cx, settings.clone()))
 }
@@ -82,6 +91,7 @@ pub(crate) fn add_app_window_with_recent_and_widths(
         graph_view_mode: GraphViewMode::default(),
         graph_column_widths: GraphColumnWidths::default(),
         diff_soft_wrap: false,
+        changeset_panels: ChangesetPanels::default(),
     };
     cx.add_window(move |window, cx| App::new_with_settings(window, cx, settings.clone()))
 }
@@ -102,6 +112,7 @@ pub(crate) fn seed_recent_repositories(
             graph_view_mode: GraphViewMode::default(),
             graph_column_widths: GraphColumnWidths::default(),
             diff_soft_wrap: false,
+            changeset_panels: ChangesetPanels::default(),
         },
     )
     .expect("seed settings store");
@@ -1106,4 +1117,18 @@ pub(crate) fn init_repo_with_head_inside_folder() -> (tempfile::TempDir, String)
         .expect("set HEAD");
     drop(repo);
     (dir, alpha_tip)
+}
+
+/// Write an executable stub script standing in for the `claude` binary.
+/// Shared by `crate::app`'s own tests and the AI-session unit tests in
+/// `crate::ai` (`ai::mod` and `ai::cli`), so there is exactly one copy.
+pub(crate) fn stub_cli(dir: &Path, body: &str) -> PathBuf {
+    let path = dir.join("claude-stub.sh");
+    let mut file = fs::File::create(&path).expect("create stub");
+    writeln!(file, "#!/bin/sh").expect("write shebang");
+    writeln!(file, "{body}").expect("write body");
+    let mut perms = file.metadata().expect("stat").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms).expect("chmod");
+    path
 }

@@ -30,7 +30,7 @@ pub enum GraphViewMode {
 
 /// The complete set of persisted user settings. This is the single value
 /// written to and read from disk; add fields here to persist more state.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Most-recently-opened repositories, newest first.
@@ -41,8 +41,10 @@ pub struct Settings {
     /// Persisted widths of the resizable sidebars. Each entry is `None` until a
     /// width has been measured and saved for that sidebar.
     pub sidebar_widths: SidebarWidths,
-    /// Whether AI assistance (ADR-0005) is enabled. Off by default; enabling
-    /// requires a configured Claude CLI on the machine.
+    /// Whether AI assistance (ADR-0005) is enabled. On by default and kept
+    /// only as an opt-out kill switch: a missing or misconfigured Claude CLI
+    /// surfaces as a visible failure on the AI surfaces themselves, never as
+    /// silently absent features.
     pub ai_enabled: bool,
     /// Which commit-graph layout to render. Defaults to `Compact`.
     pub graph_view_mode: GraphViewMode,
@@ -52,6 +54,25 @@ pub struct Settings {
     /// Whether the diff view wraps long lines to the code column width instead
     /// of panning them horizontally. Off by default; applies to every diff.
     pub diff_soft_wrap: bool,
+    /// Which changeset-screen side panels are open.
+    pub changeset_panels: ChangesetPanels,
+}
+
+/// Hand-written (not derived) so `ai_enabled` can default on while every
+/// other field keeps its type-level default.
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            recent_repositories: Vec::new(),
+            window_state: None,
+            sidebar_widths: SidebarWidths::default(),
+            ai_enabled: true,
+            graph_view_mode: GraphViewMode::default(),
+            graph_column_widths: GraphColumnWidths::default(),
+            diff_soft_wrap: false,
+            changeset_panels: ChangesetPanels::default(),
+        }
+    }
 }
 
 /// A repository the user has opened before, plus whether its folder could still
@@ -113,6 +134,26 @@ pub struct SidebarWidths {
     pub branch_sidebar: Option<f32>,
     /// Left width of the changed-files list in the changeset view.
     pub changeset_files: Option<f32>,
+    /// Right width of the review-guide sidebar in the changeset view.
+    pub changeset_guide: Option<f32>,
+}
+
+/// Which changeset-screen side panels are open. Captured whenever the user
+/// toggles a panel so the layout is restored on the next changeset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChangesetPanels {
+    pub files_open: bool,
+    pub guide_open: bool,
+}
+
+impl Default for ChangesetPanels {
+    fn default() -> Self {
+        Self {
+            files_open: true,
+            guide_open: false,
+        }
+    }
 }
 
 /// Persisted widths (in logical pixels) of the Compact graph layout's
@@ -201,6 +242,7 @@ mod tests {
             graph_view_mode: GraphViewMode::default(),
             graph_column_widths: GraphColumnWidths::default(),
             diff_soft_wrap: false,
+            changeset_panels: ChangesetPanels::default(),
         };
 
         save(&path, &settings).expect("save settings");
@@ -260,6 +302,7 @@ mod tests {
                 graph_view_mode: GraphViewMode::default(),
                 graph_column_widths: GraphColumnWidths::default(),
                 diff_soft_wrap: false,
+                changeset_panels: ChangesetPanels::default(),
             };
 
             save(&path, &settings).expect("save settings");
@@ -280,18 +323,20 @@ mod tests {
     }
 
     #[test]
-    fn ai_enabled_defaults_off_and_round_trips() {
-        // Old settings files (no ai_enabled key) must load with it off.
+    fn ai_enabled_defaults_on_and_opt_out_round_trips() {
+        // Files without the key (fresh installs, pre-AI files) load with AI
+        // assistance on — it is an opt-out kill switch, not an opt-in.
         let legacy: Settings = serde_json::from_str("{}").expect("legacy parses");
-        assert!(!legacy.ai_enabled);
+        assert!(legacy.ai_enabled);
 
-        let enabled = Settings {
-            ai_enabled: true,
+        // An explicit opt-out must survive a round trip.
+        let disabled = Settings {
+            ai_enabled: false,
             ..Settings::default()
         };
-        let json = serde_json::to_string(&enabled).expect("serialize");
+        let json = serde_json::to_string(&disabled).expect("serialize");
         let reloaded: Settings = serde_json::from_str(&json).expect("reload");
-        assert!(reloaded.ai_enabled);
+        assert!(!reloaded.ai_enabled);
     }
 
     #[test]
@@ -334,11 +379,13 @@ mod tests {
             sidebar_widths: SidebarWidths {
                 branch_sidebar: Some(275.5),
                 changeset_files: Some(360.0),
+                changeset_guide: None,
             },
             ai_enabled: false,
             graph_view_mode: GraphViewMode::default(),
             graph_column_widths: GraphColumnWidths::default(),
             diff_soft_wrap: false,
+            changeset_panels: ChangesetPanels::default(),
         };
 
         save(&path, &settings).expect("save settings");
@@ -390,5 +437,32 @@ mod tests {
         let widths: GraphColumnWidths =
             serde_json::from_str(r#"{ "author": 100.0, "when": 90.0 }"#).expect("decode");
         assert_eq!(widths.pr, None);
+    }
+
+    #[test]
+    fn changeset_panels_default_files_open_guide_closed() {
+        let legacy: Settings = serde_json::from_str("{}").expect("legacy parses");
+        assert!(legacy.changeset_panels.files_open);
+        assert!(!legacy.changeset_panels.guide_open);
+    }
+
+    #[test]
+    fn changeset_panels_and_guide_width_round_trip() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("settings.json");
+        let settings = Settings {
+            sidebar_widths: SidebarWidths {
+                branch_sidebar: None,
+                changeset_files: Some(300.0),
+                changeset_guide: Some(340.0),
+            },
+            changeset_panels: ChangesetPanels {
+                files_open: false,
+                guide_open: true,
+            },
+            ..Settings::default()
+        };
+        save(&path, &settings).expect("save settings");
+        assert_eq!(load(&path), settings);
     }
 }

@@ -44,17 +44,26 @@ pub fn parse_event(line: &str) -> CliEvent {
             }
         }
         Some("assistant") => parse_assistant(&value),
-        Some("result") => CliEvent::Result {
-            is_error: value
+        Some("result") => {
+            let is_error = value
                 .get("is_error")
                 .and_then(Value::as_bool)
-                .unwrap_or(true),
-            text: value
+                .unwrap_or(true);
+            let mut text = value
                 .get("result")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
-                .to_string(),
-        },
+                .to_string();
+            // Error results don't always carry a `result` string (e.g.
+            // `error_max_turns`); the subtype is then the only diagnostic,
+            // so surface it rather than a blank failure.
+            if is_error && text.trim().is_empty() {
+                if let Some(subtype) = value.get("subtype").and_then(Value::as_str) {
+                    text = subtype.to_string();
+                }
+            }
+            CliEvent::Result { is_error, text }
+        }
         _ => CliEvent::Ignored,
     }
 }
@@ -349,6 +358,19 @@ mod tests {
     }
 
     #[test]
+    fn error_result_without_text_falls_back_to_its_subtype() {
+        // Real shape: `error_max_turns` results carry no `result` string.
+        let line = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":40,"session_id":"s","uuid":"eee"}"#;
+        match parse_event(line) {
+            CliEvent::Result { is_error, text } => {
+                assert!(is_error);
+                assert_eq!(text, "error_max_turns");
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_error_result() {
         let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"API error","session_id":"s","uuid":"ddd"}"#;
         match parse_event(line) {
@@ -479,21 +501,8 @@ mod tests {
         assert_eq!(flag_value(&args, "--json-schema"), Some(schema));
     }
 
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
+    use crate::app::stub_cli;
     use std::sync::mpsc;
-
-    /// Write an executable stub script standing in for the `claude` binary.
-    fn stub_cli(dir: &std::path::Path, body: &str) -> PathBuf {
-        let path = dir.join("claude-stub.sh");
-        let mut file = std::fs::File::create(&path).expect("create stub");
-        writeln!(file, "#!/bin/sh").expect("write shebang");
-        writeln!(file, "{body}").expect("write body");
-        let mut perms = file.metadata().expect("stat").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).expect("chmod");
-        path
-    }
 
     fn spec_for(program: PathBuf, repo_root: PathBuf) -> TurnSpec {
         TurnSpec {

@@ -77,6 +77,12 @@ pub struct Thread {
     /// Where the thread's turns run; recorded by the session manager on the
     /// first turn so follow-ups can respawn in the same repo.
     pub repo_root: Option<PathBuf>,
+    /// Name of the tool the assistant most recently invoked, while a turn is
+    /// running; cleared when the turn ends. Drives progress tickers.
+    pub latest_activity: Option<String>,
+    /// The CLI result text of the last successful turn. For schema turns
+    /// this is the validated JSON document.
+    pub last_result: Option<String>,
 }
 
 impl Thread {
@@ -89,6 +95,8 @@ impl Thread {
             status: ThreadStatus::Idle,
             has_run_once: false,
             repo_root: None,
+            latest_activity: None,
+            last_result: None,
         }
     }
 

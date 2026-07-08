@@ -41,6 +41,25 @@ pub enum ReviewStatus {
     Completed,
 }
 
+/// One entry in a guide's suggested reading order. `path` is repo-relative,
+/// exactly as the changeset lists it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewGuideEntry {
+    pub path: String,
+    pub note: String,
+}
+
+/// An AI-generated review guide (docs/specs/ai/review-guide.md). Immutable
+/// once generated — regeneration replaces the whole value.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReviewGuide {
+    pub summary: String,
+    pub review_order: Vec<ReviewGuideEntry>,
+    /// Unix seconds, like `Review::created_at`.
+    pub generated_at: i64,
+}
+
 /// One persisted review. Future artifact collections (comments, AI threads,
 /// todos) become new fields on this same document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -56,6 +75,8 @@ pub struct Review {
     pub last_activity_at: i64,
     pub status: ReviewStatus,
     pub completed_at: Option<i64>,
+    /// AI-generated review guide, if one has been generated for this changeset.
+    pub guide: Option<ReviewGuide>,
 }
 
 impl Default for Review {
@@ -69,6 +90,7 @@ impl Default for Review {
             last_activity_at: 0,
             status: ReviewStatus::Active,
             completed_at: None,
+            guide: None,
         }
     }
 }
@@ -84,6 +106,7 @@ impl Review {
             last_activity_at: now,
             status: ReviewStatus::Active,
             completed_at: None,
+            guide: None,
         }
     }
 }
@@ -399,5 +422,47 @@ mod tests {
             .mutate(&id, |review| review.name = "renamed".into())
             .expect("mutate"));
         assert!(store.delete(&id).expect("delete"));
+    }
+
+    #[test]
+    fn review_guide_round_trips_through_the_store() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let reviews_dir = dir.path().join("reviews");
+        let mut store = ReviewStore::load(Some(reviews_dir.clone()));
+        let review = sample(&dir.path().join("repo"), "guided", 1);
+        let id = review.id.clone();
+        store.insert(review).expect("insert");
+
+        let guide = ReviewGuide {
+            summary: "Sessions now expire after inactivity.".to_string(),
+            review_order: vec![ReviewGuideEntry {
+                path: "src/session.rs".to_string(),
+                note: "New expiry module; read first.".to_string(),
+            }],
+            generated_at: 1_750_000_000,
+        };
+        store
+            .mutate(&id, |review| review.guide = Some(guide.clone()))
+            .expect("mutate");
+
+        let reloaded = ReviewStore::load(Some(reviews_dir));
+        assert_eq!(reloaded.get(&id).expect("reload").guide, Some(guide));
+    }
+
+    #[test]
+    fn reviews_without_a_guide_load_with_none() {
+        // A review file written before the guide field existed must still load.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let reviews_dir = dir.path().join("reviews");
+        fs::create_dir_all(&reviews_dir).expect("mkdir");
+        let json = format!(
+            r#"{{"id":"g1","repo_path":"/r","changeset":{{"kind":"single","sha":"{}"}},
+                "name":"n","created_at":1,"last_activity_at":2,"status":"active"}}"#,
+            "c".repeat(40)
+        );
+        fs::write(reviews_dir.join("g1.json"), json).expect("write");
+
+        let store = ReviewStore::load(Some(reviews_dir));
+        assert_eq!(store.get("g1").expect("loads").guide, None);
     }
 }

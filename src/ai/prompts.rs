@@ -16,14 +16,50 @@ const TARGETING: &str = "Inspect the commits through git (`git show`, `git diff`
 `git log`), not the working tree — the checkout may differ from the commits under \
 review. Do not modify the repository in any way.";
 
-pub fn summary_prompt(base_sha: Option<&str>, head_sha: &str) -> String {
+pub fn guide_prompt(base_sha: Option<&str>, head_sha: &str) -> String {
     let range = range_text(base_sha, head_sha);
     format!(
-        "Summarize the changes in {range} of this git repository for a code \
-reviewer who has not read them yet: what changed, why it appears to have \
-changed, and anything surprising. Respond in concise markdown. {TARGETING}"
+        "Prepare a review guide for the changes in {range} of this git \
+repository. Respond with JSON matching the provided schema:\n\
+- `summary`: a brief orientation for a product owner describing what \
+changed in user-visible behavior and business rules, and why. Be ruthless \
+about brevity: at most two short paragraphs and never more than five \
+sentences total — reviewers read this before the diff, not instead of it. \
+The summary must not mention file names, directory paths, line numbers, or \
+code identifiers such as function, type, or variable names.\n\
+- `review_order`: only the critical files — the ones where the behavioral \
+and business-logic changes actually live — ordered so a reviewer builds \
+understanding fastest (foundations before their consumers). Omit mechanical \
+fallout: lockfiles, generated output, formatting-only churn, renames without \
+edits, and call sites touched only to track a changed signature. There is no \
+fixed count: a huge changeset may have many critical files or only a few — \
+let the change decide. List each chosen file exactly once, use its path \
+exactly as `git diff --name-only` prints it for this range, and give each a \
+one-sentence `note` on its place in the reading order.\n\
+{TARGETING}"
     )
 }
+
+/// Schema handed to `--json-schema` for guide turns; the CLI validates the
+/// final result against it, so parsing failures surface as turn errors.
+pub const GUIDE_SCHEMA: &str = r#"{
+  "type": "object",
+  "properties": {
+    "summary": { "type": "string" },
+    "review_order": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "note": { "type": "string" }
+        },
+        "required": ["path", "note"]
+      }
+    }
+  },
+  "required": ["summary", "review_order"]
+}"#;
 
 pub fn ask_prompt(anchor: &Anchor, selected_text: &str, question: &str) -> String {
     let side = match anchor.side {
@@ -93,19 +129,46 @@ mod tests {
     }
 
     #[test]
-    fn summary_prompt_names_the_range_and_git() {
-        let prompt = summary_prompt(Some("abc123"), "def456");
+    fn guide_prompt_names_the_range_and_forbids_code_identifiers() {
+        let prompt = guide_prompt(Some("abc123"), "def456");
         assert!(prompt.contains("abc123..def456"));
-        assert!(prompt.contains("git"));
+        assert!(prompt.contains("product owner"));
+        assert!(prompt.contains("never more than five sentences"));
+        assert!(prompt.contains("must not mention file names"));
+        assert!(prompt.contains("only the critical files"));
+        assert!(prompt.contains("Omit mechanical"));
+        assert!(prompt.contains("review_order"));
         assert!(prompt.contains("not the working tree"));
     }
 
     #[test]
-    fn summary_prompt_handles_root_commits() {
-        // A root commit has no base; the prompt names the single commit.
-        let prompt = summary_prompt(None, "def456");
+    fn guide_prompt_handles_root_commits() {
+        let prompt = guide_prompt(None, "def456");
         assert!(prompt.contains("def456"));
         assert!(!prompt.contains(".."));
+    }
+
+    #[test]
+    fn guide_schema_is_valid_json_requiring_summary_and_order() {
+        let schema: serde_json::Value = serde_json::from_str(GUIDE_SCHEMA).expect("schema parses");
+        let required: Vec<&str> = schema
+            .pointer("/required")
+            .and_then(serde_json::Value::as_array)
+            .expect("top-level required")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(required.contains(&"summary"));
+        assert!(required.contains(&"review_order"));
+        let entry_required: Vec<&str> = schema
+            .pointer("/properties/review_order/items/required")
+            .and_then(serde_json::Value::as_array)
+            .expect("entry required")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(entry_required.contains(&"path"));
+        assert!(entry_required.contains(&"note"));
     }
 
     #[test]

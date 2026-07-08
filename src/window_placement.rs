@@ -8,7 +8,7 @@ use gpui::{point, px, size, App, Bounds, DisplayId, Pixels, Size, Window, Window
 use crate::settings::{Settings, WindowMode, WindowState};
 
 #[cfg(test)]
-use crate::settings::{GraphColumnWidths, GraphViewMode};
+use crate::settings::{ChangesetPanels, GraphColumnWidths, GraphViewMode};
 
 /// Size of a freshly-placed window when there is nothing to restore.
 pub const DEFAULT_WINDOW_SIZE: Size<Pixels> = Size {
@@ -215,6 +215,7 @@ mod tests {
                 graph_view_mode: GraphViewMode::default(),
                 graph_column_widths: GraphColumnWidths::default(),
                 diff_soft_wrap: false,
+                changeset_panels: ChangesetPanels::default(),
             };
 
             let (bounds, display_id) = restore_window_options(&settings, cx);
@@ -244,6 +245,7 @@ mod tests {
                 graph_view_mode: GraphViewMode::default(),
                 graph_column_widths: GraphColumnWidths::default(),
                 diff_soft_wrap: false,
+                changeset_panels: ChangesetPanels::default(),
             };
 
             let (bounds, display_id) = restore_window_options(&settings, cx);
@@ -279,6 +281,7 @@ mod tests {
                 graph_view_mode: GraphViewMode::default(),
                 graph_column_widths: GraphColumnWidths::default(),
                 diff_soft_wrap: false,
+                changeset_panels: ChangesetPanels::default(),
             };
 
             let (bounds, display_id) = restore_window_options(&settings, cx);
@@ -314,6 +317,7 @@ mod tests {
                     graph_view_mode: GraphViewMode::default(),
                     graph_column_widths: GraphColumnWidths::default(),
                     diff_soft_wrap: false,
+                    changeset_panels: ChangesetPanels::default(),
                 };
 
                 let (bounds, _display_id) = restore_window_options(&settings, cx);

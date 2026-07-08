@@ -4,6 +4,7 @@
 //! this module; the rest of the app sees only threads and typed events.
 
 pub mod cli;
+pub mod guide;
 pub mod prompts;
 pub mod thread;
 
@@ -197,9 +198,9 @@ impl AiSessions {
         };
         match event {
             CliEvent::AssistantText { text } => thread.append_assistant_text(text),
-            // Init confirms the CLI accepted our session id; ToolActivity is
-            // carried through for progress UI in later feature work.
-            CliEvent::Init { .. } | CliEvent::ToolActivity { .. } => {}
+            // Init confirms the CLI accepted our session id.
+            CliEvent::Init { .. } => {}
+            CliEvent::ToolActivity { name } => thread.latest_activity = Some(name.clone()),
             CliEvent::Result { .. } | CliEvent::Ignored => return,
         }
         cx.emit(AiSessionsEvent::ThreadUpdated(id));
@@ -215,11 +216,14 @@ impl AiSessions {
         if thread.status == ThreadStatus::Cancelled {
             return;
         }
+        thread.latest_activity = None;
         thread.status = match outcome {
             TurnOutcome::Completed {
-                is_error: false, ..
+                is_error: false,
+                text,
             } => {
                 thread.has_run_once = true;
+                thread.last_result = Some(text);
                 ThreadStatus::Idle
             }
             TurnOutcome::Completed {
@@ -256,21 +260,8 @@ impl Drop for AiSessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::stub_cli;
     use gpui::{AppContext as _, TestAppContext};
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::path::PathBuf;
-
-    fn stub_cli(dir: &std::path::Path, body: &str) -> PathBuf {
-        let path = dir.join("claude-stub.sh");
-        let mut file = std::fs::File::create(&path).expect("create stub");
-        writeln!(file, "#!/bin/sh").expect("write shebang");
-        writeln!(file, "{body}").expect("write body");
-        let mut perms = file.metadata().expect("stat").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).expect("chmod");
-        path
-    }
 
     const HAPPY_TRANSCRIPT: &str = r#"echo '{"type":"system","subtype":"init","session_id":"stub"}'
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"hi there"}]}}'
@@ -445,5 +436,42 @@ exit 0"#,
         });
         assert!(matches!(second, Err(StartError::ThreadBusy)));
         sessions.update(cx, |sessions, cx| sessions.cancel_all(cx));
+    }
+
+    const GUIDE_TRANSCRIPT: &str = r#"echo '{"type":"system","subtype":"init","session_id":"stub"}'
+echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"git show"}}]}}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"{\"summary\":\"s\",\"review_order\":[]}"}'"#;
+
+    #[gpui::test]
+    fn tool_activity_is_surfaced_and_result_text_is_kept(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = stub_cli(dir.path(), GUIDE_TRANSCRIPT);
+        let sessions = cx.new(|_| AiSessions::with_cli_program(program));
+        let id = sessions
+            .update(cx, |sessions, cx| {
+                sessions.start_thread(
+                    dir.path().to_path_buf(),
+                    ThreadKind::Summary,
+                    None,
+                    "guide please".to_string(),
+                    None,
+                    cx,
+                )
+            })
+            .expect("start_thread");
+
+        wait_until(cx, &sessions, |s| {
+            s.thread(id).is_some_and(|t| t.status == ThreadStatus::Idle)
+        });
+
+        sessions.read_with(cx, |sessions, _| {
+            let thread = sessions.thread(id).expect("thread");
+            // Activity was recorded during the run and cleared at the end.
+            assert_eq!(thread.latest_activity, None);
+            assert_eq!(
+                thread.last_result.as_deref(),
+                Some(r#"{"summary":"s","review_order":[]}"#)
+            );
+        });
     }
 }

@@ -584,6 +584,56 @@ The show-all-files toggle reveals every file in the repository at the newest sel
 - The user can manually expand a collapsed folder or collapse an expanded one; manual toggles override the default and persist while the changeset stays open, including across switches between the change-set and all-files views.
 - Collapse-all and expand-all establish a new baseline; subsequent manual folder toggles adjust from there.
 
+## Collapsing panels on the changeset screen
+
+The changeset screen carries a persistent control strip along its edge,
+present whenever a changeset is open. One of its controls shows or hides the
+file list; hiding it leaves the diff area as the screen's only content, and
+showing it again restores the file list exactly as it was. When AI assistance
+is enabled, the strip carries two further controls for a second, independently
+resizable panel docked to the screen's other side: one control reveals that
+panel with the review guide showing, if it is not already open; the other
+shows or hides the panel outright. The reveal control only ever brings the
+panel into view — it is a one-way "show me" action distinct from the
+show/hide control, which toggles the panel open and closed on each
+activation. See [Review Guide](../ai/review-guide.md) for what the panel
+shows once open.
+
+Both panels' shown-or-hidden state, and the width of the AI panel, are
+remembered across changesets and across application relaunches; the file
+list's own width is remembered the same way.
+
+**Triggering conditions**
+
+- A changeset is open.
+- The user activates the file-list show/hide control.
+- The user activates the AI panel's reveal control or its show/hide control,
+  when AI assistance is enabled.
+
+**Observable outcomes**
+
+- The control strip is present on the changeset screen and absent everywhere
+  else.
+- Activating the file-list control shows or hides the file list; the choice
+  is remembered for the next changeset opened, in this session or a later
+  one.
+- With AI assistance enabled, the strip additionally offers the AI panel's
+  reveal and show/hide controls; with AI assistance disabled, neither
+  appears and the AI panel is never shown. The pending changeset never
+  offers the AI panel's controls even with assistance enabled (see the
+  review-guide spec's availability rules).
+- Activating the reveal control shows the AI panel with the review guide
+  active, if it was hidden; it has no effect if the panel is already shown.
+- Activating the show/hide control shows the panel if it is hidden, or hides
+  it if it is shown; the choice is remembered the same way as the file
+  list's.
+
+**Edge cases**
+
+- Turning AI assistance off while its panel is shown hides the panel's
+  controls from the strip; turning assistance back on restores them and the
+  panel returns to whatever shown-or-hidden state was last remembered.
+
 ## Holding files open in tabs
 
 Opened files live in a row of tabs above each pane's diff area. A single click on a file opens it in the active pane's preview tab — a holding slot that subsequent single clicks reuse, so casual browsing never piles up tabs. At most one preview tab exists per pane, and its title renders in italics to signal that the next single click will replace it. Opening a file deliberately — double-clicking it in the tree, or double-clicking the preview tab itself — pins the tab; a pinned tab keeps its file until the user closes it.

@@ -129,6 +129,18 @@ Availability is decided fresh every time the review list is rebuilt, never cache
 - Renaming and deleting an unavailable review behave exactly as they do for an available one.
 - The next list refresh after the commits return shows the review as available again.
 
+## Carrying a review guide
+
+A review may hold one generated review guide: a summary, an ordered list of
+file notes, and when it was generated. A review that has never had a guide
+generated for it simply carries none — there is no guide to show until the
+user generates one. Deleting a review removes any guide it carries along with
+the rest of it. The guide's own contract — what generates it, what it
+contains, and how it is presented — is specified in
+[Review Guide](../ai/review-guide.md); this document is the source of truth
+only for the fact that the guide travels with the review record, exactly like
+its name, dates, and status.
+
 ## What the user can rely on
 
 Reviews are durable. They survive quitting and relaunching the application: a review started in one session is present, with its name, dates, and status intact, in the next. They belong to the repository, not to a particular worktree — every worktree linked to the same repository sees the same set of reviews, and starting a review in one worktree makes it visible from the others.

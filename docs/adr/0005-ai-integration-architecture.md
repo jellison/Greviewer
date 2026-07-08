@@ -206,6 +206,14 @@ configuration UI (CLI path, model, caps), thread persistence via the "start
 a review" feature, and any direct-API fast path (each would arrive as its
 own ADR or spec update).
 
+**Amendment (2026-07-08).** The first AI feature (the review guide) has
+shipped, so the scaffolding-phase default above has served its purpose: AI
+assistance is now enabled by default, and the setting remains only as an
+opt-out kill switch. A missing or misconfigured Claude CLI surfaces as a
+visible failure state on the AI surfaces themselves — the failure message is
+the setup instruction — rather than as silently absent features a new user
+could never discover.
+
 ---
 
 ## References
