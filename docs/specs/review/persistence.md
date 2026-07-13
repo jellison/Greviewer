@@ -141,6 +141,17 @@ contains, and how it is presented — is specified in
 only for the fact that the guide travels with the review record, exactly like
 its name, dates, and status.
 
+## Carrying comments
+
+A review may hold any number of comments, each anchored to a piece of a
+file's diff. A review that has never had a comment added to it simply carries
+none. Deleting a review removes every comment it carries along with the rest
+of it. The comment's own contract — what a comment is, how it is added, seen,
+and selected, and how its anchor is kept or lost across sessions — is
+specified in [Review Comments](comments.md); this document is the source of
+truth only for the fact that comments travel with the review record, exactly
+like its name, dates, and status.
+
 ## What the user can rely on
 
 Reviews are durable. They survive quitting and relaunching the application: a review started in one session is present, with its name, dates, and status intact, in the next. They belong to the repository, not to a particular worktree — every worktree linked to the same repository sees the same set of reviews, and starting a review in one worktree makes it visible from the others.

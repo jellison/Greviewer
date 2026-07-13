@@ -56,6 +56,15 @@ pub(crate) struct DiffSelectionContext {
     /// entry ever outlives its file.
     pub(crate) wrap_row_origins: WrapRowOrigins,
     pub(crate) hscroll: ScrollHandle,
+    /// Comment anchors resolved onto this file's diff: every saved comment plus
+    /// the staged draft (when it targets this file). Shared across both sides;
+    /// each side's rendering filters to `anchor.side == side`. Built once per
+    /// tab by `App::diff_selection_context` and carried through
+    /// `clone_for_side`.
+    pub(crate) anchors: Rc<Vec<AnchorDecoration>>,
+    /// Whether the open changeset can carry comments (a fixed commit range).
+    /// Gates the floating "Comment" pill.
+    pub(crate) can_comment: bool,
 }
 
 impl DiffSelectionContext {
@@ -245,8 +254,6 @@ fn render_wrapped_row(
         cell.highlights =
             diff_selection::overlay_background(&cell.highlights, span, selection_fill);
     }
-    let has_text = !cell.text.is_empty();
-
     // The code cell's previous-frame bounds give the wrap width the text
     // painted at; `None` before the first paint of this row.
     let code_bounds = selection_ctx.and_then(|ctx| {
@@ -256,6 +263,19 @@ fn render_wrapped_row(
             .copied()
     });
     let wrap_width = code_bounds.map(wrap_width_for);
+
+    // Comment-anchor decorations, wrap-aware: the selected fill merged into
+    // the highlights (StyledText splits it at wrap boundaries on its own) and
+    // one underline segment per visual row the span crosses. Before the first
+    // paint (`wrap_width: None`) segments fall back to single-line x math and
+    // self-correct next frame, like the caret.
+    let anchor_underlines: Vec<AnchorUnderline> = selection_ctx
+        .filter(|_| selectable)
+        .map(|ctx| attach_anchor_decorations(window, ctx, row_index, &mut cell, wrap_width))
+        .unwrap_or_default();
+    let pill_app = comment_pill_app(selection_ctx, row_index);
+
+    let has_text = !cell.text.is_empty();
 
     // Caret: painted at the selection head, gated on focus and the blink
     // phase, at the head's wrapped visual position. The active-line tint is a
@@ -384,6 +404,9 @@ fn render_wrapped_row(
                     .size_full(),
                 );
             }
+            for underline in &anchor_underlines {
+                code_cell = code_cell.child(render_anchor_underline(underline));
+            }
             if let Some(caret_point) = caret_point {
                 code_cell = code_cell.child(
                     div()
@@ -419,15 +442,30 @@ fn render_wrapped_row(
                             row: row_index,
                             column,
                         });
+                        // A click landing inside a saved anchor's span also
+                        // selects that comment (and scrolls the comments
+                        // list to its row), matching the nowrap path.
+                        let hit_comment = anchor_comment_at(&ctx.anchors, ctx.side, point, &text);
                         let ctx = ctx.clone();
                         ctx.app.clone().update(cx, |app, cx| {
                             app.begin_diff_mouse_selection(&ctx, point, event, window, cx);
+                            if let Some(id) = hit_comment {
+                                app.select_comment_from_diff(&id, cx);
+                            }
                         });
                     }
                 });
             }
             code_cell
         })
+        // Pinned at the row's right edge; the marker's `top` centers it on
+        // the first visual row, so a wrapped multi-visual-row line is
+        // marked only there.
+        .when(
+            selected_anchor_starts_here(selection_ctx, row_index),
+            |row| row.child(render_anchor_marker()),
+        )
+        .when_some(pill_app, |row, app| row.child(render_comment_pill(app)))
 }
 
 /// Soft-wrap rendering for a single-side diff: one variable-height `list` whose
@@ -869,10 +907,24 @@ pub(crate) fn scroll_offset_for_block_top(start_row: usize, context_rows: usize)
 /// Set a diff side's vertical scroll offset directly, preserving the horizontal
 /// offset. Used to jump to a change block synchronously so the footer counter
 /// reflects the new position in the same frame.
+///
+/// Clamped to `[-max_offset, 0]` so a programmatic target past end-of-file
+/// (e.g. a comment anchor near the last rows, with context rows added past
+/// it) cannot scroll beyond the last row — soft wrap already gets this for
+/// free from `ListState::scroll_to`. Skipped when the list has not painted
+/// yet (`last_item_size` is `None`): an unpainted handle's `max_offset` is
+/// always zero, indistinguishable from genuinely-fits-without-scrolling
+/// content, so clamping then would incorrectly force the offset to zero.
 pub(crate) fn set_diff_scroll_top(handle: &UniformListScrollHandle, offset_y: Pixels) {
     let state = handle.0.borrow();
     let x = state.base_handle.offset().x;
-    state.base_handle.set_offset(point(x, offset_y));
+    let y = if state.last_item_size.is_some() {
+        let max_offset = state.base_handle.max_offset().height;
+        offset_y.clamp(-max_offset, px(0.))
+    } else {
+        offset_y
+    };
+    state.base_handle.set_offset(point(x, y));
 }
 
 /// A diff side's current vertical scroll offset (negative once scrolled
@@ -1633,6 +1685,337 @@ fn selection_span_for_row(
     Some((span_start..span_end, row_index == end.row))
 }
 
+/// A comment anchor resolved for rendering in this file's diff: ordered
+/// flat-row points on one side, plus the render flags the decorations read.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AnchorDecoration {
+    /// `None` for the staged draft, `Some(id)` for a saved comment.
+    pub(crate) comment_id: Option<String>,
+    pub(crate) side: repo::DiffSide,
+    pub(crate) start: diff_selection::DiffPoint,
+    pub(crate) end: diff_selection::DiffPoint,
+    pub(crate) selected: bool,
+    pub(crate) pending: bool,
+}
+
+/// The byte span an anchor covers on `row`, or `None` when the anchor doesn't
+/// touch that row. The multi-row shape mirrors `selection_span_for_row`:
+/// the first row starts at the anchor's start column, the last row ends at its
+/// end column, and interior rows span the whole line.
+pub(crate) fn anchor_span_for_row(
+    anchor: &AnchorDecoration,
+    row: usize,
+    line_len: usize,
+) -> Option<std::ops::Range<usize>> {
+    if row < anchor.start.row || row > anchor.end.row {
+        return None;
+    }
+    let start = if row == anchor.start.row {
+        anchor.start.column.min(line_len)
+    } else {
+        0
+    };
+    let end = if row == anchor.end.row {
+        anchor.end.column.min(line_len)
+    } else {
+        line_len
+    };
+    (start <= end).then_some(start..end)
+}
+
+/// The saved anchor a text click should select when several cover the same
+/// spot: the most specific one — smallest row span, tie-broken by start row,
+/// then side (old before new) — so the choice is deterministic.
+/// Pending drafts have no id and are never candidates.
+pub(crate) fn most_specific_anchor<'a>(
+    candidates: impl IntoIterator<Item = &'a AnchorDecoration>,
+) -> Option<&'a AnchorDecoration> {
+    candidates
+        .into_iter()
+        .filter(|anchor| anchor.comment_id.is_some())
+        .min_by_key(|anchor| {
+            (
+                anchor.end.row - anchor.start.row,
+                anchor.start.row,
+                matches!(anchor.side, repo::DiffSide::New) as u8,
+            )
+        })
+}
+
+/// The selected anchor's gutter marker: a small filled right-pointing
+/// triangle, sized to sit inside the gutter cell's `pr_2` padding strip.
+const ANCHOR_MARKER_WIDTH: f32 = 6.;
+const ANCHOR_MARKER_HEIGHT: f32 = 8.;
+
+/// True when the selected saved anchor on this pane's side starts at
+/// `row_index` — the one row that carries the right-edge marker. The
+/// pending draft is never selected, so it never marks a row; at most one
+/// anchor is selected at a time, so at most one row matches per file view.
+fn selected_anchor_starts_here(ctx: Option<&DiffSelectionContext>, row_index: usize) -> bool {
+    ctx.is_some_and(|ctx| {
+        ctx.anchors.iter().any(|anchor| {
+            anchor.selected
+                && !anchor.pending
+                && anchor.side == ctx.side
+                && anchor.start.row == row_index
+        })
+    })
+}
+
+/// The selected comment's diff-side marker: an accent arrowhead pinned at
+/// the visible right edge of the anchor's start row, pointing left toward
+/// the anchored code (mirroring the sidebar's accent selected-row
+/// treatment). Overlaid absolutely on the row container itself — the row is
+/// `w_full` (pane width) while horizontal panning happens INSIDE its code
+/// cell (`overflow_x_scroll` + the shared `hscroll`), so the marker stays
+/// pinned at the pane's right edge and can never be panned offscreen, and
+/// layout never shifts. Vertically centered on the row's first visual row
+/// (`DIFF_LINE_HEIGHT`), which in wrap mode marks only the start logical
+/// row's first visual row.
+fn render_anchor_marker() -> impl IntoElement {
+    div()
+        .absolute()
+        .top(px((DIFF_LINE_HEIGHT - ANCHOR_MARKER_HEIGHT) / 2.))
+        .right(px(2.))
+        .w(px(ANCHOR_MARKER_WIDTH))
+        .h(px(ANCHOR_MARKER_HEIGHT))
+        .debug_selector(|| "diff-anchor-marker".to_string())
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let origin = bounds.origin;
+                    let width = bounds.size.width;
+                    let height = bounds.size.height;
+                    let mid = origin.y + height * 0.5;
+                    let mut arrow = PathBuilder::fill();
+                    arrow.move_to(gpui::point(origin.x, mid));
+                    arrow.line_to(gpui::point(origin.x + width, origin.y));
+                    arrow.line_to(gpui::point(origin.x + width, origin.y + height));
+                    if let Ok(path) = arrow.build() {
+                        window.paint_path(path, palette().accent);
+                    }
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full(),
+        )
+}
+
+/// One saved anchor's underline segment, positioned within the code cell's
+/// content frame (left already includes the cell padding; `top` locates the
+/// segment's visual row — a wrapped span emits one segment per visual row).
+/// Solid when the anchor is selected, dotted otherwise.
+struct AnchorUnderline {
+    left: Pixels,
+    width: Pixels,
+    top: Pixels,
+    selected: bool,
+}
+
+/// Vertical offset of an underline within its visual row: 1px tall, 2px above
+/// the row's bottom.
+const ANCHOR_UNDERLINE_TOP: f32 = DIFF_LINE_HEIGHT - 3.;
+
+/// The absolute underline element for a saved anchor's span segment: 1px
+/// tall, 2px above its visual row's bottom. Selected anchors paint a solid
+/// `comment_anchor` line; unselected ones a dotted line (1×1 dots every 3px)
+/// via a canvas, so the dots track the horizontally-scrolling code cell for
+/// free (the element lives inside it).
+fn render_anchor_underline(underline: &AnchorUnderline) -> impl IntoElement {
+    let p = palette();
+    let line = div()
+        .absolute()
+        .top(underline.top)
+        .left(underline.left)
+        .w(underline.width)
+        .h(px(1.))
+        .debug_selector(|| "diff-anchor-underline".to_string());
+    if underline.selected {
+        line.bg(p.comment_anchor)
+    } else {
+        line.child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let mut x = bounds.origin.x;
+                    let right = bounds.origin.x + bounds.size.width;
+                    while x < right {
+                        let dot = Bounds::new(
+                            gpui::point(x, bounds.origin.y),
+                            gpui::size(px(1.), px(1.)),
+                        );
+                        window.paint_quad(gpui::fill(dot, p.comment_anchor));
+                        x += px(3.);
+                    }
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full(),
+        )
+    }
+}
+
+/// Merge this row's anchor decorations into `cell.highlights` (the
+/// `comment_anchor_fill` behind a selected saved anchor's span) and return the
+/// underline segments to paint. Shared by the nowrap and soft-wrap row
+/// renderers: `wrap_width` is `Some` in wrap mode, where a span crossing wrap
+/// boundaries emits one segment per visual row, and `None` in nowrap mode
+/// (single-visual-row segments). The pending draft keeps the plain selection
+/// styling and contributes nothing here.
+fn attach_anchor_decorations(
+    window: &mut Window,
+    ctx: &DiffSelectionContext,
+    row_index: usize,
+    cell: &mut DiffLineCell,
+    wrap_width: Option<Pixels>,
+) -> Vec<AnchorUnderline> {
+    let p = palette();
+    let mut underlines = Vec::new();
+    for anchor in ctx.anchors.iter() {
+        if anchor.side != ctx.side || anchor.pending {
+            continue;
+        }
+        let Some(span) = anchor_span_for_row(anchor, row_index, cell.text.len()) else {
+            continue;
+        };
+        if span.is_empty() {
+            continue;
+        }
+        if anchor.selected {
+            cell.highlights = diff_selection::overlay_background(
+                &cell.highlights,
+                span.clone(),
+                p.comment_anchor_fill,
+            );
+        }
+        underlines.extend(underline_segments(
+            window,
+            &cell.text,
+            wrap_width,
+            span,
+            anchor.selected,
+        ));
+    }
+    underlines
+}
+
+/// The underline segments for one anchor span on one row. In nowrap mode
+/// (`wrap_width: None`) the row has a single visual row, so one segment from
+/// the span's start x to its end x. In wrap mode the span may cross wrap
+/// boundaries: the first visual row runs from the start x to the wrap width,
+/// interior rows span the full wrap width, and the last runs from the wrap
+/// origin to the end x.
+fn underline_segments(
+    window: &mut Window,
+    text: &str,
+    wrap_width: Option<Pixels>,
+    span: Range<usize>,
+    selected: bool,
+) -> Vec<AnchorUnderline> {
+    let pad = px(DIFF_CODE_CELL_PADDING);
+    let Some(width) = wrap_width else {
+        let start_x = x_for_column(window, text, span.start);
+        let end_x = x_for_column(window, text, span.end);
+        if end_x <= start_x {
+            return Vec::new();
+        }
+        return vec![AnchorUnderline {
+            left: start_x + pad,
+            width: end_x - start_x,
+            top: px(ANCHOR_UNDERLINE_TOP),
+            selected,
+        }];
+    };
+    let start = wrapped_point_for_column(window, text, width, span.start);
+    let end = wrapped_point_for_column(window, text, width, span.end);
+    let mut segments = Vec::new();
+    if start.y == end.y {
+        if end.x > start.x {
+            segments.push(AnchorUnderline {
+                left: start.x + pad,
+                width: end.x - start.x,
+                top: start.y + px(ANCHOR_UNDERLINE_TOP),
+                selected,
+            });
+        }
+        return segments;
+    }
+    if width > start.x {
+        segments.push(AnchorUnderline {
+            left: start.x + pad,
+            width: width - start.x,
+            top: start.y + px(ANCHOR_UNDERLINE_TOP),
+            selected,
+        });
+    }
+    let mut y = start.y + px(DIFF_LINE_HEIGHT);
+    while y < end.y {
+        segments.push(AnchorUnderline {
+            left: pad,
+            width,
+            top: y + px(ANCHOR_UNDERLINE_TOP),
+            selected,
+        });
+        y += px(DIFF_LINE_HEIGHT);
+    }
+    if end.x > px(0.) {
+        segments.push(AnchorUnderline {
+            left: pad,
+            width: end.x,
+            top: end.y + px(ANCHOR_UNDERLINE_TOP),
+            selected,
+        });
+    }
+    segments
+}
+
+/// The floating "Comment" pill, rendered as an absolute child of the selection
+/// head's row (both diff modes). Living inside the row — rather than a
+/// container overlay — means the pill exists exactly when its row renders, so
+/// it disappears with the row when the selection head scrolls out of view.
+/// `.occlude()` keeps the pill's own click from also landing a caret on the
+/// code cell beneath it, which would clear the selection staging needs.
+fn render_comment_pill(app: Entity<App>) -> impl IntoElement {
+    let p = palette();
+    div()
+        .absolute()
+        .right(px(10.))
+        .top(px(1.))
+        .h(px(20.))
+        .px_2()
+        .flex()
+        .items_center()
+        .rounded(px(4.))
+        .bg(p.element_bg)
+        .border_1()
+        .border_color(p.border)
+        .text_color(p.text)
+        .text_size(px(11.))
+        .cursor_pointer()
+        .id("diff-comment-pill")
+        .debug_selector(|| "diff-comment-pill".to_string())
+        .occlude()
+        .child("Comment")
+        .on_click(move |_event: &gpui::ClickEvent, window, cx| {
+            app.clone()
+                .update(cx, |app, cx| app.stage_comment_draft(window, cx));
+        })
+}
+
+/// Whether this row should host the "Comment" pill: the changeset is
+/// reviewable and the row holds the head of a non-caret selection. Returns the
+/// app handle the pill's click needs.
+fn comment_pill_app(ctx: Option<&DiffSelectionContext>, row_index: usize) -> Option<Entity<App>> {
+    let ctx = ctx.filter(|ctx| ctx.can_comment)?;
+    let selection = ctx.selection.filter(|selection| !selection.is_caret())?;
+    (selection.caret().row == row_index).then(|| ctx.app.clone())
+}
+
 /// A diff side's selection context plus this render's focus snapshot, bundled
 /// so `render_file_diff_line` stays under clippy's argument-count limit.
 /// `focused` is read once per side (in the `uniform_list` item builder, where
@@ -1694,6 +2077,15 @@ pub(crate) fn render_file_diff_line(
         }
         None => false,
     };
+
+    // Comment-anchor decorations for this row, on this side: the selected
+    // fill merged into the highlights plus the underline segments to paint.
+    let anchor_underlines: Vec<AnchorUnderline> = selection_ctx
+        .filter(|_| selectable)
+        .map(|ctx| attach_anchor_decorations(window, ctx, row_index, &mut cell, None))
+        .unwrap_or_default();
+    let pill_app = comment_pill_app(selection_ctx, row_index);
+
     let has_text = !cell.text.is_empty();
 
     // The caret always paints at the selection's head — bare caret or the
@@ -1825,6 +2217,9 @@ pub(crate) fn render_file_diff_line(
                             }
                             content.child(stub)
                         });
+                    for underline in &anchor_underlines {
+                        content = content.child(render_anchor_underline(underline));
+                    }
                     if let Some(caret_x) = caret_x {
                         content = content.child(
                             div()
@@ -1873,13 +2268,48 @@ pub(crate) fn render_file_diff_line(
                         row: row_index,
                         column,
                     });
+                    // A click landing inside a saved anchor's span also selects
+                    // that comment (the first covering one) and scrolls the
+                    // comments list to its row, alongside placing the caret.
+                    let hit_comment = anchor_comment_at(&ctx.anchors, ctx.side, point, &text);
                     let ctx = ctx.clone();
                     ctx.app.clone().update(cx, |app, cx| {
                         app.begin_diff_mouse_selection(&ctx, point, event, window, cx);
+                        if let Some(id) = hit_comment {
+                            app.select_comment_from_diff(&id, cx);
+                        }
                     });
                 }
             })
         })
+        // Pinned at the row's right edge — the row is pane-wide while the
+        // code pans inside its own cell, so hscroll never moves the marker.
+        .when(
+            selected_anchor_starts_here(selection_ctx, row_index),
+            |row| row.child(render_anchor_marker()),
+        )
+        .when_some(pill_app, |row, app| row.child(render_comment_pill(app)))
+}
+
+/// The id of the saved anchor on `side` whose span covers `point`, or `None`
+/// when the click lands on no anchored text. Overlapping anchors resolve via
+/// `most_specific_anchor`; pending drafts are never selectable.
+fn anchor_comment_at(
+    anchors: &[AnchorDecoration],
+    side: repo::DiffSide,
+    point: diff_selection::DiffPoint,
+    text: &str,
+) -> Option<String> {
+    let candidates = anchors.iter().filter(|anchor| {
+        if anchor.side != side || anchor.pending {
+            return false;
+        }
+        let Some(span) = anchor_span_for_row(anchor, point.row, text.len()) else {
+            return false;
+        };
+        (span.start..=span.end).contains(&point.column)
+    });
+    most_specific_anchor(candidates).and_then(|anchor| anchor.comment_id.clone())
 }
 
 /// Per-row debug selector for the panning code content, e.g.
@@ -2285,6 +2715,58 @@ mod tests {
     use crate::app::test_support::*;
     use crate::repo::{ChangeKind, DiffSide};
     use gpui::{px, TestAppContext, VisualTestContext, WindowHandle};
+
+    #[test]
+    fn anchor_spans_cover_only_the_anchored_rows() {
+        let anchor = AnchorDecoration {
+            comment_id: Some("c1".into()),
+            side: repo::DiffSide::New,
+            start: diff_selection::DiffPoint { row: 2, column: 3 },
+            end: diff_selection::DiffPoint { row: 4, column: 2 },
+            selected: false,
+            pending: false,
+        };
+        assert_eq!(anchor_span_for_row(&anchor, 1, 10), None);
+        assert_eq!(anchor_span_for_row(&anchor, 2, 10), Some(3..10));
+        assert_eq!(anchor_span_for_row(&anchor, 3, 10), Some(0..10));
+        assert_eq!(anchor_span_for_row(&anchor, 4, 10), Some(0..2));
+        assert_eq!(anchor_span_for_row(&anchor, 5, 10), None);
+    }
+
+    #[test]
+    fn overlapping_anchor_clicks_prefer_the_most_specific_comment() {
+        let anchor = |id: Option<&str>, side, start_row: usize, end_row: usize| AnchorDecoration {
+            comment_id: id.map(String::from),
+            side,
+            start: diff_selection::DiffPoint {
+                row: start_row,
+                column: 0,
+            },
+            end: diff_selection::DiffPoint {
+                row: end_row,
+                column: 0,
+            },
+            selected: false,
+            pending: false,
+        };
+        // Smallest row span wins.
+        let wide = anchor(Some("wide"), repo::DiffSide::New, 0, 5);
+        let narrow = anchor(Some("narrow"), repo::DiffSide::New, 2, 3);
+        let picked = most_specific_anchor([&wide, &narrow]).expect("candidate");
+        assert_eq!(picked.comment_id.as_deref(), Some("narrow"));
+        // Equal spans tie-break by start row, then old side before new.
+        let later = anchor(Some("later"), repo::DiffSide::New, 3, 4);
+        let earlier = anchor(Some("earlier"), repo::DiffSide::New, 2, 3);
+        let picked = most_specific_anchor([&later, &earlier]).expect("candidate");
+        assert_eq!(picked.comment_id.as_deref(), Some("earlier"));
+        let new_side = anchor(Some("new"), repo::DiffSide::New, 2, 3);
+        let old_side = anchor(Some("old"), repo::DiffSide::Old, 2, 3);
+        let picked = most_specific_anchor([&new_side, &old_side]).expect("candidate");
+        assert_eq!(picked.comment_id.as_deref(), Some("old"));
+        // A pending draft (no id) is never a candidate.
+        let draft = anchor(None, repo::DiffSide::New, 2, 2);
+        assert!(most_specific_anchor([&draft]).is_none());
+    }
 
     #[test]
     fn change_blocks_group_one_contiguous_run() {
@@ -3263,6 +3745,238 @@ mod tests {
         visual
             .debug_bounds("diff-active-line")
             .expect("active line tinted");
+    }
+
+    #[gpui::test]
+    async fn clicking_an_anchored_range_selects_its_comment(cx: &mut TestAppContext) {
+        let (_dir, path, window, mut visual) = open_changeset_with_guide_panel(cx);
+        let comment_id = window
+            .update(cx, |app, window, cx| {
+                app.ensure_open_changeset_review(Some(window), cx);
+                let review_id = app.current_review().expect("review exists").id.clone();
+                // Anchor the whole first line so a click anywhere on row 0's
+                // text lands inside the span.
+                let comment = crate::reviews::ReviewComment {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    path: path.clone(),
+                    anchor: crate::reviews::CommentAnchor {
+                        side: crate::reviews::CommentSide::New,
+                        start_line: 1,
+                        start_col: 0,
+                        end_line: 1,
+                        end_col: 11,
+                        quoted_text: String::new(),
+                    },
+                    body: "note".into(),
+                    created_at: 0,
+                };
+                let comment_id = comment.id.clone();
+                app.reviews
+                    .mutate(&review_id, |review| review.comments.push(comment))
+                    .expect("mutate review");
+                app.open_file_preview(path.clone(), cx);
+                cx.notify();
+                comment_id
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let code = visual
+            .debug_bounds("file-diff-code-new-0")
+            .expect("first code row");
+        visual.simulate_click(code.center(), Modifiers::none());
+        cx.run_until_parked();
+        window
+            .read_with(cx, |app, _| {
+                assert_eq!(
+                    app.selected_comment_id.as_deref(),
+                    Some(comment_id.as_str())
+                )
+            })
+            .unwrap();
+    }
+
+    /// A saved comment anchoring the whole first line of `hello.txt`'s new
+    /// side, seeded on the open changeset. Shared by the anchor-marker tests.
+    fn seed_first_line_anchor_comment(
+        cx: &mut TestAppContext,
+        window: &gpui::WindowHandle<App>,
+        path: &str,
+    ) -> String {
+        window
+            .update(cx, |app, window, cx| {
+                app.ensure_open_changeset_review(Some(window), cx);
+                let review_id = app.current_review().expect("review exists").id.clone();
+                let comment = crate::reviews::ReviewComment {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    path: path.to_string(),
+                    anchor: crate::reviews::CommentAnchor {
+                        side: crate::reviews::CommentSide::New,
+                        start_line: 1,
+                        start_col: 0,
+                        end_line: 1,
+                        end_col: 11,
+                        quoted_text: String::new(),
+                    },
+                    body: "note".into(),
+                    created_at: 0,
+                };
+                let comment_id = comment.id.clone();
+                app.reviews
+                    .mutate(&review_id, |review| review.comments.push(comment))
+                    .expect("mutate review");
+                cx.notify();
+                comment_id
+            })
+            .unwrap()
+    }
+
+    #[gpui::test]
+    async fn selecting_an_anchor_shows_a_right_edge_marker_at_its_start_row(
+        cx: &mut TestAppContext,
+    ) {
+        let (_dir, path, window, mut visual) = open_changeset_with_guide_panel(cx);
+        let comment_id = seed_first_line_anchor_comment(cx, &window, &path);
+        window
+            .update(cx, |app, _window, cx| {
+                app.open_file_preview(path.clone(), cx);
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // An unselected anchor paints no marker (nothing is selected yet, so
+        // this also covers the no-selection case: `debug_bounds` records a
+        // selector permanently once painted, so its absence here proves the
+        // marker never painted).
+        assert!(
+            visual.debug_bounds("diff-anchor-marker").is_none(),
+            "no marker renders while no comment is selected"
+        );
+
+        // Clicking the anchored text selects the comment and grows the
+        // marker at the right edge of the anchor's start row, on its side.
+        let code = visual
+            .debug_bounds("file-diff-code-new-0")
+            .expect("first code row");
+        visual.simulate_click(code.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _| {
+                assert_eq!(
+                    app.selected_comment_id.as_deref(),
+                    Some(comment_id.as_str())
+                )
+            })
+            .unwrap();
+        let marker = visual
+            .debug_bounds("diff-anchor-marker")
+            .expect("selecting the comment paints the right-edge marker");
+        let gutter = visual
+            .debug_bounds("file-diff-line-new-0")
+            .expect("row 0 gutter cell on the new side");
+        let pane = visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new-side pane bounds");
+        assert!(
+            marker.origin.y >= gutter.origin.y
+                && marker.origin.y + marker.size.height <= gutter.origin.y + gutter.size.height,
+            "the marker sits on the anchor's start row \
+             (marker = {marker:?}, gutter = {gutter:?})"
+        );
+        assert!(
+            marker.origin.x + marker.size.width <= pane.origin.x + pane.size.width
+                && marker.origin.x >= pane.origin.x + pane.size.width - px(30.),
+            "the marker is pinned at the pane's right edge \
+             (marker = {marker:?}, pane = {pane:?})"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_right_edge_marker_appears_in_wrap_mode(cx: &mut TestAppContext) {
+        let (_dir, path, window, mut visual) = open_changeset_with_guide_panel(cx);
+        let comment_id = seed_first_line_anchor_comment(cx, &window, &path);
+        window
+            .update(cx, |app, _window, cx| {
+                app.set_diff_soft_wrap(true, cx);
+                app.open_file_preview(path.clone(), cx);
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            visual.debug_bounds("diff-anchor-marker").is_none(),
+            "no marker renders in wrap mode while no comment is selected"
+        );
+
+        let code = visual
+            .debug_bounds("file-diff-code-new-0")
+            .expect("first wrapped code row");
+        visual.simulate_click(code.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _| {
+                assert_eq!(
+                    app.selected_comment_id.as_deref(),
+                    Some(comment_id.as_str())
+                )
+            })
+            .unwrap();
+        let marker = visual
+            .debug_bounds("diff-anchor-marker")
+            .expect("wrap mode paints the right-edge marker too");
+        let gutter = visual
+            .debug_bounds("file-diff-line-new-0")
+            .expect("row 0 gutter cell on the new side");
+        let pane = visual
+            .debug_bounds("file-diff-side-new")
+            .expect("new-side pane bounds");
+        assert!(
+            marker.origin.y >= gutter.origin.y
+                && marker.origin.y + marker.size.height <= gutter.origin.y + px(DIFF_LINE_HEIGHT),
+            "the marker sits on the start row's first visual row \
+             (marker = {marker:?}, gutter = {gutter:?})"
+        );
+        assert!(
+            marker.origin.x + marker.size.width <= pane.origin.x + pane.size.width
+                && marker.origin.x >= pane.origin.x + pane.size.width - px(30.),
+            "the marker is pinned at the pane's right edge in wrap mode \
+             (marker = {marker:?}, pane = {pane:?})"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_range_selection_shows_the_comment_pill(cx: &mut TestAppContext) {
+        // Root-wrapped (see `open_two_commit_changeset_with_root`'s doc
+        // comment): clicking the pill stages a draft, which focuses the
+        // composer's `Input`; a focused `Input` reaches for
+        // `gpui_component::Root` when it paints.
+        let (_dir, path, app_entity, _window, mut visual) = open_two_commit_changeset_with_root(cx);
+        app_entity.update(cx, |app, cx| {
+            let pane = app.workspace.active_pane();
+            app.set_diff_selection(
+                pane,
+                &path,
+                diff_selection::DiffSelection {
+                    side: repo::DiffSide::New,
+                    anchor: diff_selection::DiffPoint { row: 0, column: 0 },
+                    head: diff_selection::DiffPoint { row: 0, column: 3 },
+                    goal_x: None,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let pill = visual
+            .debug_bounds("diff-comment-pill")
+            .expect("pill appears");
+        visual.simulate_click(pill.center(), Modifiers::none());
+        cx.run_until_parked();
+        app_entity.read_with(cx, |app, _| {
+            assert!(app.comment_draft.is_some(), "pill stages a draft")
+        });
     }
 
     #[gpui::test]
@@ -4382,6 +5096,78 @@ mod tests {
         cx.run_until_parked();
 
         (dir, window, visual)
+    }
+
+    /// Like `open_wrapped_multi_block_diff`, but Root-wraps the window (see
+    /// `open_two_commit_changeset_with_root`'s doc comment): staging a draft
+    /// by clicking the comment pill focuses the composer's `Input`, which
+    /// reaches for `gpui_component::Root` when it paints.
+    fn open_wrapped_multi_block_diff_with_root(
+        cx: &mut TestAppContext,
+    ) -> (tempfile::TempDir, Entity<App>, VisualTestContext) {
+        use gpui::{px, size};
+
+        cx.update(gpui_component::init);
+        let (dir, oid_hex) = init_repo_with_wrapped_change_blocks();
+        let path = dir.path().to_path_buf();
+
+        let mut app_entity: Option<Entity<App>> = None;
+        let window = cx.add_window(|window, cx| {
+            let app = gpui::AppContext::new(cx, |cx| App::new(window, cx));
+            app_entity = Some(app.clone());
+            gpui_component::Root::new(app, window, cx)
+        });
+        let app_entity = app_entity.expect("app entity captured");
+
+        window
+            .update(cx, |_root, window, cx| {
+                app_entity.update(cx, |app, cx| {
+                    app.open_repository_at(path, window, cx);
+                    app.select_single_commit(oid_hex, cx);
+                    app.open_changeset(window, cx);
+                    app.set_diff_soft_wrap(true, cx);
+                    app.open_file_preview("wrapped_blocks.txt".to_string(), cx);
+                });
+            })
+            .expect("open wrapped multi-block diff with root");
+
+        cx.run_until_parked();
+
+        let visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(360.)));
+        cx.run_until_parked();
+
+        (dir, app_entity, visual)
+    }
+
+    // `wrapped_blocks.txt`'s first changed line is line 5 (flat row 4 on both
+    // sides); the diff opens scrolled to that block, so row 4 is painted.
+    #[gpui::test]
+    async fn soft_wrap_range_selection_shows_the_comment_pill(cx: &mut TestAppContext) {
+        let (_dir, app_entity, mut visual) = open_wrapped_multi_block_diff_with_root(cx);
+        app_entity.update(cx, |app, cx| {
+            let pane = app.workspace.active_pane();
+            app.set_diff_selection(
+                pane,
+                "wrapped_blocks.txt",
+                diff_selection::DiffSelection {
+                    side: repo::DiffSide::New,
+                    anchor: diff_selection::DiffPoint { row: 4, column: 0 },
+                    head: diff_selection::DiffPoint { row: 4, column: 3 },
+                    goal_x: None,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let pill = visual
+            .debug_bounds("diff-comment-pill")
+            .expect("pill appears in soft-wrap mode");
+        visual.simulate_click(pill.center(), Modifiers::none());
+        cx.run_until_parked();
+        app_entity.read_with(cx, |app, _| {
+            assert!(app.comment_draft.is_some(), "pill stages a draft")
+        });
     }
 
     #[gpui::test]

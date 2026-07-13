@@ -38,6 +38,8 @@ pub enum LucideIcon {
     GitPullRequest,
     /// `list-tree.svg`
     ListTree,
+    /// `message-square.svg`
+    MessageSquare,
     /// `monitor.svg`
     Monitor,
     /// `panel-left.svg`
@@ -85,6 +87,7 @@ impl LucideIcon {
         LucideIcon::GitCompareArrows,
         LucideIcon::GitPullRequest,
         LucideIcon::ListTree,
+        LucideIcon::MessageSquare,
         LucideIcon::Monitor,
         LucideIcon::PanelLeft,
         LucideIcon::PanelRight,
@@ -119,6 +122,7 @@ impl IconNamed for LucideIcon {
             LucideIcon::GitCompareArrows => "icons/git-compare-arrows.svg",
             LucideIcon::GitPullRequest => "icons/git-pull-request.svg",
             LucideIcon::ListTree => "icons/list-tree.svg",
+            LucideIcon::MessageSquare => "icons/message-square.svg",
             LucideIcon::Monitor => "icons/monitor.svg",
             LucideIcon::PanelLeft => "icons/panel-left.svg",
             LucideIcon::PanelRight => "icons/panel-right.svg",

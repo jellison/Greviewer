@@ -48,6 +48,9 @@ pub struct Palette {
     pub diff_selection_bg_unfocused: Hsla,
     pub caret: Hsla,
     pub active_line_bg: Hsla,
+    // Review comment anchors (saved comments; pending drafts use `accent`).
+    pub comment_anchor: Hsla,
+    pub comment_anchor_fill: Hsla,
     // Change kinds.
     pub change_added: Hsla,
     pub change_modified: Hsla,
@@ -111,6 +114,8 @@ impl Palette {
             diff_selection_bg_unfocused: Hsla::from(rgba(0x82aaff26)),
             caret: Hsla::from(rgb(0x82aaff)),
             active_line_bg: Hsla::from(rgba(0xeeffff0f)),
+            comment_anchor: Hsla::from(rgb(0xffcb6b)),
+            comment_anchor_fill: Hsla::from(rgba(0xffcb6b1a)),
             change_added: Hsla::from(rgb(0xc3e88d)),
             change_modified: Hsla::from(rgb(0x82aaff)),
             change_deleted: Hsla::from(rgb(0xf07178)),
@@ -214,6 +219,8 @@ mod tests {
         assert_eq!(p.ref_pr_fg, Hsla::from(rgb(0xc792ea)));
         assert_eq!(p.ref_pr_bg, Hsla::from(rgba(0xc792ea26)));
         assert_eq!(p.ref_pr_border, Hsla::from(rgba(0xc792ea66)));
+        assert_eq!(p.comment_anchor, Hsla::from(rgb(0xffcb6b)));
+        assert_eq!(p.comment_anchor_fill, Hsla::from(rgba(0xffcb6b1a)));
     }
 
     #[test]

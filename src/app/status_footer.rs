@@ -1,13 +1,16 @@
-//! Changeset status footer: a files-panel toggle on the left and, once AI is
-//! enabled, the review-guide controls (sparkle to open the guide, dock
-//! toggle for its panel) on the right. Only ever rendered from
+//! Changeset status footer: a files-panel toggle on the left and, when the
+//! open changeset supports a review guide, the guide controls on the right.
+//! The sparkle (generate/open the guide) additionally requires AI to be
+//! enabled, since it has no AI content to show otherwise; the dock toggle
+//! stays available regardless, since the sidebar it opens also hosts the
+//! always-available Comments tab. Only ever rendered from
 //! `render_changeset_screen`, so its presence alone scopes it to the
 //! changeset screen. See docs/specs for the guide feature (Task 8 renders
 //! the guide panel's own contents; this task only wires the toggles).
 
 use gpui::{div, px, AnyElement, Context, IntoElement, ParentElement, Styled};
 
-use super::App;
+use super::{App, SidebarTab};
 use crate::icons::LucideIcon;
 use crate::theme::palette;
 
@@ -30,34 +33,53 @@ impl App {
             cx,
         );
 
-        let ai_controls: Option<AnyElement> =
-            if self.settings.ai_enabled && self.open_changeset_supports_guide() {
-                Some(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(self.render_file_tree_icon_button(
-                            LucideIcon::Sparkles,
-                            "footer-guide-sparkle",
-                            "Review Guide",
-                            false,
-                            |app, _window, cx| app.open_guide_panel(cx),
-                            cx,
-                        ))
-                        .child(self.render_file_tree_icon_button(
-                            LucideIcon::PanelRight,
-                            "footer-dock-toggle",
-                            "Toggle guide panel",
-                            guide_open,
-                            |app, _window, cx| app.toggle_guide_panel(cx),
-                            cx,
-                        ))
-                        .into_any_element(),
+        let supports_guide = self.open_changeset_supports_guide();
+
+        let sparkle: Option<AnyElement> = if self.settings.ai_enabled && supports_guide {
+            Some(
+                self.render_file_tree_icon_button(
+                    LucideIcon::Sparkles,
+                    "footer-guide-sparkle",
+                    "Review Guide",
+                    false,
+                    |app, _window, cx| app.open_guide_panel(cx),
+                    cx,
                 )
-            } else {
-                None
-            };
+                .into_any_element(),
+            )
+        } else {
+            None
+        };
+
+        let dock_toggle: Option<AnyElement> = if supports_guide {
+            Some(
+                self.render_file_tree_icon_button(
+                    LucideIcon::PanelRight,
+                    "footer-dock-toggle",
+                    "Toggle guide panel",
+                    guide_open,
+                    |app, _window, cx| app.toggle_guide_panel(cx),
+                    cx,
+                )
+                .into_any_element(),
+            )
+        } else {
+            None
+        };
+
+        let ai_controls: Option<AnyElement> = if sparkle.is_some() || dock_toggle.is_some() {
+            Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .children(sparkle)
+                    .children(dock_toggle)
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
 
         div()
             .flex()
@@ -86,13 +108,15 @@ impl App {
         cx.notify();
     }
 
-    /// Opens the guide panel; never closes it (the sparkle is a one-way
-    /// "show me the guide" action, distinct from the dock toggle).
+    /// Opens the guide panel and activates its tab; never closes the panel
+    /// (the sparkle is a one-way "show me the guide" action, distinct from
+    /// the dock toggle, which never touches the active tab).
     pub(crate) fn open_guide_panel(&mut self, cx: &mut Context<Self>) {
         if !self.settings.changeset_panels.guide_open {
             self.settings.changeset_panels.guide_open = true;
             self.persist_settings();
         }
+        self.sidebar_tab = SidebarTab::Review;
         cx.notify();
     }
 }
@@ -163,7 +187,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn ai_controls_render_only_when_ai_is_enabled(cx: &mut TestAppContext) {
+    async fn sparkle_requires_ai_but_dock_toggle_does_not(cx: &mut TestAppContext) {
         let (dir, sha) = init_repo_with_one_commit();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
@@ -182,8 +206,14 @@ mod tests {
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);
-        assert!(visual.debug_bounds("footer-guide-sparkle").is_none());
-        assert!(visual.debug_bounds("footer-dock-toggle").is_none());
+        assert!(
+            visual.debug_bounds("footer-guide-sparkle").is_none(),
+            "sparkle stays hidden while AI is disabled"
+        );
+        assert!(
+            visual.debug_bounds("footer-dock-toggle").is_some(),
+            "dock toggle renders regardless of the AI setting, since it also opens Comments"
+        );
         window
             .update(cx, |app, _window, cx| {
                 app.settings.ai_enabled = true;
@@ -193,6 +223,41 @@ mod tests {
         cx.run_until_parked();
         assert!(visual.debug_bounds("footer-guide-sparkle").is_some());
         assert!(visual.debug_bounds("footer-dock-toggle").is_some());
+    }
+
+    #[gpui::test]
+    async fn sparkle_opens_the_sidebar_on_the_review_tab(cx: &mut TestAppContext) {
+        use crate::app::SidebarTab;
+
+        let (_dir, window, mut visual) = open_simple_changeset(cx);
+        window
+            .update(cx, |app, _window, cx| {
+                app.settings.changeset_panels.guide_open = false;
+                app.sidebar_tab = SidebarTab::Comments;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let sparkle = visual
+            .debug_bounds("footer-guide-sparkle")
+            .expect("sparkle renders with AI enabled");
+        visual.simulate_click(sparkle.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |app, _| {
+                assert!(
+                    app.settings.changeset_panels.guide_open,
+                    "the sparkle reveals the sidebar"
+                );
+                assert_eq!(
+                    app.sidebar_tab,
+                    SidebarTab::Review,
+                    "the sparkle activates the Review tab, since that's what it opens the sidebar to show"
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]

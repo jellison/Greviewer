@@ -7,6 +7,7 @@ description = "A desktop code-review tool for Git commits, written in Rust on to
 repository = "https://gitlab.cicd.dc/justin.ellison/greviewer"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 git2 = "0.20"
 gpui = "0.2"
 gpui-component = { version = "0.5", features = ["tree-sitter-languages"] }

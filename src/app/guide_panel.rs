@@ -1,9 +1,10 @@
-//! Right-docked review-guide panel: renders the AI-generated review guide
-//! for the open changeset. Only rendered from `render_changeset_screen`
-//! while `settings.changeset_panels.guide_open && settings.ai_enabled`.
-//! Builds on Task 6's guide-generation machinery in `src/app.rs`
-//! (`start_guide_generation`, `cancel_guide_generation`, `guide_thread`,
-//! `guide_error`). The behavior spec for this feature lands with Task 9.
+//! The Review tab of the right-docked review sidebar: renders the
+//! AI-generated review guide for the open changeset. Only reachable while
+//! `settings.ai_enabled` (see `review_sidebar`, which owns the sidebar's root
+//! chrome and tab strip). Builds on Task 6's guide-generation machinery in
+//! `src/app.rs` (`start_guide_generation`, `cancel_guide_generation`,
+//! `guide_thread`, `guide_error`). The behavior spec for this feature lands
+//! with Task 9.
 //!
 //! Panel state precedence (top to bottom wins): Running (a guide-generation
 //! thread is in flight) > Failed (the last turn errored) > Done (a guide is
@@ -22,13 +23,13 @@ const GUIDE_PANEL_PADDING: f32 = 12.;
 const GUIDE_NOTE_TEXT_SIZE: f32 = 12.;
 
 impl App {
-    /// Render the review-guide panel's contents (see module docs for the
-    /// state contract).
-    pub(crate) fn render_guide_panel(
+    /// Render the Review tab's contents (see module docs for the state
+    /// contract).
+    pub(crate) fn render_guide_tab(
         &self,
         changeset: &repo::ChangeSet,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         // Cloned so the state checks below don't hold a borrow of
         // `self.reviews` across the `self.render_guide_*` calls, each of
         // which also needs `&self`.
@@ -59,8 +60,7 @@ impl App {
         // Match the file tree's typeface and scale so the two sidebars read
         // as one surface; children inherit unless they set a secondary size.
         div()
-            .id("guide-panel")
-            .font_family(MONO_FONT_FAMILY)
+            .id("guide-tab")
             .flex()
             .flex_col()
             .flex_none()
@@ -69,9 +69,7 @@ impl App {
             .min_h_0()
             .relative()
             .overflow_hidden()
-            .border_l_1()
-            .border_color(palette().border)
-            .bg(palette().surface)
+            .font_family(MONO_FONT_FAMILY)
             .text_size(px(FILE_TREE_TEXT_SIZE))
             .on_hover(cx.listener(|app, hovered: &bool, _window, cx| {
                 if app.guide_panel_hovered != *hovered {
@@ -104,6 +102,7 @@ impl App {
                         ),
                 )
             })
+            .into_any_element()
     }
 
     fn render_guide_running_state(
@@ -466,7 +465,7 @@ fn disambiguated_file_labels(paths: &[&str]) -> Vec<FileLabel> {
 mod tests {
     use super::*;
     use crate::app::test_support::*;
-    use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowHandle};
+    use gpui::{Modifiers, TestAppContext};
 
     #[test]
     fn unique_file_names_need_no_path_suffix() {
@@ -523,37 +522,6 @@ mod tests {
 echo '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{}}}}]}}}}'
 echo '{{"type":"result","subtype":"success","is_error":false,"result":"{{\"summary\":\"Behavior summary.\",\"review_order\":[{{\"path\":\"{path_in_repo}\",\"note\":\"read first\"}}]}}"}}'"#
         )
-    }
-
-    /// Open a two-commit repo's changeset with AI enabled and the guide panel
-    /// docked open. Returns the dir (kept alive), the changed file's path,
-    /// the window, and the visual context.
-    fn open_changeset_with_guide_panel(
-        cx: &mut TestAppContext,
-    ) -> (
-        tempfile::TempDir,
-        String,
-        WindowHandle<App>,
-        VisualTestContext,
-    ) {
-        let (dir, head_sha) = init_repo_with_two_commits();
-        let repo_path = dir.path().to_path_buf();
-        let changed_path = "hello.txt".to_string();
-        let window = add_app_window(cx);
-
-        window
-            .update(cx, |app, window, cx| {
-                app.settings.ai_enabled = true;
-                app.settings.changeset_panels.guide_open = true;
-                app.open_repository_at(repo_path, window, cx);
-                app.select_single_commit(head_sha, cx);
-                app.open_changeset(window, cx);
-            })
-            .expect("open changeset with guide panel");
-        cx.run_until_parked();
-
-        let visual = VisualTestContext::from_window(*window, cx);
-        (dir, changed_path, window, visual)
     }
 
     #[gpui::test]

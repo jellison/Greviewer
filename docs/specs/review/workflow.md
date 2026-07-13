@@ -589,26 +589,37 @@ The show-all-files toggle reveals every file in the repository at the newest sel
 The changeset screen carries a persistent control strip along its edge,
 present whenever a changeset is open. One of its controls shows or hides the
 file list; hiding it leaves the diff area as the screen's only content, and
-showing it again restores the file list exactly as it was. When AI assistance
-is enabled, the strip carries two further controls for a second, independently
-resizable panel docked to the screen's other side: one control reveals that
-panel with the review guide showing, if it is not already open; the other
-shows or hides the panel outright. The reveal control only ever brings the
-panel into view — it is a one-way "show me" action distinct from the
-show/hide control, which toggles the panel open and closed on each
-activation. See [Review Guide](../ai/review-guide.md) for what the panel
-shows once open.
+showing it again restores the file list exactly as it was.
 
-Both panels' shown-or-hidden state, and the width of the AI panel, are
-remembered across changesets and across application relaunches; the file
-list's own width is remembered the same way.
+The strip's other controls govern a second, independently resizable panel
+docked to the screen's other side: the review sidebar, a tabbed surface
+holding the AI-generated review guide and the anchored-comments list side by
+side (see [Review Guide](../ai/review-guide.md) and [Review
+Comments](comments.md) for what each tab shows). A show/hide control toggles
+that whole panel open and closed on each activation; unlike the AI features
+it can host, this control is not gated on AI assistance, since the sidebar's
+Comments tab is available regardless. A separate reveal control brings the
+panel into view if it is not already open and switches the sidebar to the
+guide's tab, so the review guide is reachable and active — a one-way "show
+me" action that never hides the panel, distinct from the show/hide toggle —
+and remains gated on AI assistance being enabled, since its purpose is
+reaching the guide. Both controls, along with every other AI-specific
+affordance, are absent for the pending changeset, which supports neither a
+guide nor a review to attach comments to.
+
+Both panels' shown-or-hidden state, and the sidebar's width, are remembered
+across changesets and across application relaunches; the file list's own
+width is remembered the same way. Which of the sidebar's tabs is showing is
+not itself a state this section governs — see [Review Comments](comments.md)
+for how the tabs behave when AI assistance is off.
 
 **Triggering conditions**
 
 - A changeset is open.
 - The user activates the file-list show/hide control.
-- The user activates the AI panel's reveal control or its show/hide control,
-  when AI assistance is enabled.
+- The user activates the sidebar's show/hide control.
+- The user activates the sidebar's reveal control, when AI assistance is
+  enabled.
 
 **Observable outcomes**
 
@@ -617,22 +628,25 @@ list's own width is remembered the same way.
 - Activating the file-list control shows or hides the file list; the choice
   is remembered for the next changeset opened, in this session or a later
   one.
-- With AI assistance enabled, the strip additionally offers the AI panel's
-  reveal and show/hide controls; with AI assistance disabled, neither
-  appears and the AI panel is never shown. The pending changeset never
-  offers the AI panel's controls even with assistance enabled (see the
-  review-guide spec's availability rules).
-- Activating the reveal control shows the AI panel with the review guide
-  active, if it was hidden; it has no effect if the panel is already shown.
-- Activating the show/hide control shows the panel if it is hidden, or hides
-  it if it is shown; the choice is remembered the same way as the file
+- The sidebar's show/hide control is offered for any changeset built from
+  committed history, regardless of whether AI assistance is enabled; it is
+  absent for the pending changeset, which can hold neither a guide nor
+  comments.
+- The sidebar's reveal control is offered only when AI assistance is enabled
+  and the changeset is built from committed history; activating it shows the
+  sidebar if it was hidden and switches it to the review guide's tab. It
+  never hides the sidebar.
+- Activating the show/hide control shows the sidebar if it is hidden, or
+  hides it if it is shown; the choice is remembered the same way as the file
   list's.
 
 **Edge cases**
 
-- Turning AI assistance off while its panel is shown hides the panel's
-  controls from the strip; turning assistance back on restores them and the
-  panel returns to whatever shown-or-hidden state was last remembered.
+- Turning AI assistance off while the sidebar is shown removes the reveal
+  control from the strip and falls the sidebar back to its Comments tab if
+  the review guide's tab was active; the show/hide control and the sidebar
+  itself remain available. Turning assistance back on restores the reveal
+  control.
 
 ## Holding files open in tabs
 

@@ -2,6 +2,8 @@
 
 mod branch_filter;
 mod branch_sidebar;
+mod comment_anchors;
+mod comments_panel;
 mod commit_graph;
 pub(crate) mod diff_selection;
 mod diff_view;
@@ -9,6 +11,7 @@ mod file_tree;
 mod guide_panel;
 pub mod menu;
 pub mod path_picker;
+mod review_sidebar;
 mod status_footer;
 #[cfg(test)]
 mod test_support;
@@ -108,7 +111,8 @@ actions!(
         DiffSelectDocEnd,
         DiffSelectAll,
         DiffCopy,
-        DiffCancelSelection
+        DiffCancelSelection,
+        DiffAddComment
     ]
 );
 
@@ -162,6 +166,23 @@ const SIDEBAR_MIN_WIDTH: f32 = 120.;
 /// Cache of read-only (unchanged-file) line cells, keyed by file path and the
 /// commit sha the content was read at. See the `read_only_cell_cache` field.
 type ReadOnlyCellCache = RefCell<HashMap<(String, String), Rc<Vec<diff_view::DiffLineCell>>>>;
+
+/// Which tab of the right-docked review sidebar is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidebarTab {
+    Review,
+    Comments,
+}
+
+/// A staged, not-yet-saved comment: the anchor is frozen at staging time.
+#[derive(Debug, Clone)]
+pub(crate) struct CommentDraft {
+    pub path: String,
+    pub anchor: crate::reviews::CommentAnchor,
+    /// The anchor resolved onto the diff at staging time, so the composer row
+    /// can align to the same rows the selection covered.
+    pub resolved: comment_anchors::ResolvedAnchor,
+}
 
 pub struct App {
     pub mode: Mode,
@@ -364,6 +385,33 @@ pub struct App {
     /// repository open (and, in a later slice, window activation and
     /// changeset close); no filesystem watcher in v1.
     pub(crate) pending_summary: repo::PendingSummary,
+    /// Which tab of the right-docked review sidebar is showing.
+    pub(crate) sidebar_tab: SidebarTab,
+    /// The saved comment last selected in the Comments tab, if any.
+    pub(crate) selected_comment_id: Option<String>,
+    /// A staged, not-yet-saved comment, if the composer is open on one.
+    pub(crate) comment_draft: Option<CommentDraft>,
+    /// The Comments tab's composer input, shared across every staged draft.
+    pub(crate) comment_input: Entity<InputState>,
+    /// Vertical scroll handle for the Comments tab's single unified list.
+    pub(crate) comments_list_scroll: ScrollHandle,
+    /// True while the cursor is over the Comments tab's list; gates its
+    /// hover-revealed scrollbar, mirroring the guide panel's.
+    pub(crate) comments_list_hovered: bool,
+    /// Last painted y-origin (window coordinates) of each comment row
+    /// currently rendered in the Comments tab's flat list, keyed by comment
+    /// id. Captured by a canvas in `render_comment_row`; read back when a
+    /// pending list scroll (see `pending_comments_list_scroll`) needs a
+    /// target row's painted position.
+    pub(crate) comment_row_origins: Rc<RefCell<HashMap<String, f32>>>,
+    /// The id of a just-selected comment whose row the comments list should
+    /// bring near its top on the next render. Set only by
+    /// `select_comment_from_diff` (a click on anchored diff text) — a
+    /// sidebar row click never scrolls the list. Consumed by
+    /// `render_comments_tab` once the row's painted origin is known —
+    /// re-rendering until it is. `RefCell` because consumption happens
+    /// during render, which only has `&self`.
+    pub(crate) pending_comments_list_scroll: RefCell<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -484,7 +532,7 @@ fn union_range_selection(
     side: repo::DiffSide,
     origin: (diff_selection::DiffPoint, diff_selection::DiffPoint),
     pointer: (diff_selection::DiffPoint, diff_selection::DiffPoint),
-) -> diff_selection::DiffSelection {
+) -> crate::app::diff_selection::DiffSelection {
     let start = origin.0.min(pointer.0);
     let end = origin.1.max(pointer.1);
     let (anchor, head) = if pointer.0 < origin.0 {
@@ -492,7 +540,7 @@ fn union_range_selection(
     } else {
         (start, end)
     };
-    diff_selection::DiffSelection {
+    crate::app::diff_selection::DiffSelection {
         side,
         anchor,
         head,
@@ -534,8 +582,20 @@ impl FileDiffScroll {
 
     fn reset(&self) {
         let origin = point(px(0.), px(0.));
+        // Drop each uniform-list handle's painted geometry along with its
+        // offset. `set_offset` alone leaves `last_item_size` holding the
+        // outgoing file's measurements; `set_diff_scroll_top`'s clamp reads
+        // `last_item_size` (via `max_offset`) one frame before the new file
+        // paints (the closed-file `select_comment` path), so a shorter
+        // previous file's stale geometry would otherwise clamp a deep anchor
+        // in a longer new file down to (near) zero. Clearing it here makes
+        // the clamp's `last_item_size == None` skip-path apply until the new
+        // file's own paint repopulates it.
+        self.old.0.borrow_mut().last_item_size = None;
         self.old.0.borrow().base_handle.set_offset(origin);
+        self.new.0.borrow_mut().last_item_size = None;
         self.new.0.borrow().base_handle.set_offset(origin);
+        self.side_by_side.0.borrow_mut().last_item_size = None;
         self.side_by_side.0.borrow().base_handle.set_offset(origin);
         self.hscroll.set_offset(origin);
         // Clear the wrap list's cached per-row heights so a newly shown file
@@ -1069,6 +1129,26 @@ impl App {
         )
         .detach();
 
+        let comment_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .auto_grow(3, 8)
+                .placeholder("Add a comment…")
+        });
+        // Cmd+Enter (the composer's "submit" chord) saves the draft; plain
+        // Enter keeps inserting a newline, matching a multi-line composer's
+        // usual behavior.
+        cx.subscribe_in(
+            &comment_input,
+            window,
+            |app, _input, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { secondary: true } = event {
+                    app.save_comment_draft(window, cx);
+                }
+            },
+        )
+        .detach();
+
         window.focus(&focus_handle);
         cx.on_next_frame(window, |app, window, _cx| {
             window.focus(&app.focus_handle);
@@ -1183,6 +1263,12 @@ impl App {
             Mode::RepoOpen { repo } => repo::read_pending_summary(&repo.path).unwrap_or_default(),
             Mode::NoRepo => repo::PendingSummary::default(),
         };
+        // Captured before `settings` moves into the struct literal below.
+        let default_sidebar_tab = if settings.ai_enabled {
+            SidebarTab::Review
+        } else {
+            SidebarTab::Comments
+        };
 
         Self {
             mode,
@@ -1270,6 +1356,14 @@ impl App {
             worktree_switcher_open: false,
             worktree_entries: Vec::new(),
             pending_summary,
+            sidebar_tab: default_sidebar_tab,
+            selected_comment_id: None,
+            comment_draft: None,
+            comment_input,
+            comments_list_scroll: ScrollHandle::new(),
+            comments_list_hovered: false,
+            comment_row_origins: Rc::new(RefCell::new(HashMap::new())),
+            pending_comments_list_scroll: RefCell::new(None),
         }
     }
 
@@ -1378,6 +1472,12 @@ impl App {
             .update(cx, |sessions, cx| sessions.cancel_all(cx));
         self.guide_thread = None;
         self.guide_error = None;
+        // A staged draft or selection names a pane and path scoped to the
+        // previous repo's workspace, cleared below (see `close_changeset`'s
+        // matching comment).
+        self.comment_draft = None;
+        self.selected_comment_id = None;
+        self.pending_comments_list_scroll.borrow_mut().take();
         self.workspace = crate::workspace::Workspace::new();
         self.pane_scrolls.borrow_mut().clear();
         self.diff_selections.clear();
@@ -1691,7 +1791,7 @@ impl App {
                 self.settings.sidebar_widths.changeset_files = Some(width);
             }
         }
-        if self.settings.changeset_panels.guide_open && self.settings.ai_enabled {
+        if self.settings.changeset_panels.guide_open && self.open_changeset_supports_guide() {
             if let Some(width) = self
                 .guide_resizable
                 .read(cx)
@@ -2499,6 +2599,11 @@ impl App {
                 self.workspace = crate::workspace::Workspace::new();
                 self.pane_scrolls.borrow_mut().clear();
                 self.diff_selections.clear();
+                // A staged draft names a pane and path from the previous
+                // workspace, which the reset above just invalidated.
+                self.cancel_comment_draft(window, cx);
+                self.selected_comment_id = None;
+                self.pending_comments_list_scroll.borrow_mut().take();
                 self.stop_caret_blink();
                 self.diff_row_cache.borrow_mut().clear();
                 self.read_only_cell_cache.borrow_mut().clear();
@@ -2529,6 +2634,10 @@ impl App {
         self.context_popover_open = false;
         self.pending_delete_review = None;
         self.workspace.clear();
+        // A staged draft names a pane and path in the just-cleared workspace.
+        self.comment_draft = None;
+        self.selected_comment_id = None;
+        self.pending_comments_list_scroll.borrow_mut().take();
         self.file_tree_highlight_path = None;
         self.file_tree_hovered = false;
         self.guide_scroll.set_offset(point(px(0.), px(0.)));
@@ -2885,7 +2994,7 @@ impl App {
         self.set_diff_selection(
             ctx.pane,
             &ctx.key,
-            diff_selection::DiffSelection {
+            crate::app::diff_selection::DiffSelection {
                 side: ctx.side,
                 anchor,
                 head,
@@ -2916,7 +3025,7 @@ impl App {
         self.set_diff_selection(
             ctx.pane,
             &ctx.key,
-            diff_selection::DiffSelection {
+            crate::app::diff_selection::DiffSelection {
                 side: ctx.side,
                 anchor,
                 head,
@@ -2966,7 +3075,7 @@ impl App {
         self.set_diff_selection(
             ctx.pane,
             &ctx.key,
-            diff_selection::DiffSelection {
+            crate::app::diff_selection::DiffSelection {
                 side: ctx.side,
                 anchor,
                 head: point,
@@ -3556,6 +3665,225 @@ impl App {
         }
         let text = diff_selection::selection_text(&content, &selection);
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+    }
+
+    /// `Cmd+Shift+C`: stages a pending comment on the active selection:
+    /// freezes the anchor, reveals the sidebar on the Comments tab, and
+    /// focuses the composer. No-ops when there is no range selection or the
+    /// open changeset can't carry a review (the pending changeset).
+    pub(crate) fn stage_comment_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.open_changeset_supports_guide() {
+            return;
+        }
+        let Some((_pane, key, content, selection)) = self.active_diff_selection_context() else {
+            return;
+        };
+        let Some(anchor) =
+            comment_anchors::anchor_from_selection(&content, selection.side, &selection)
+        else {
+            return;
+        };
+        let Some(resolved) = comment_anchors::resolve_anchor(&content, &anchor) else {
+            return;
+        };
+        self.comment_draft = Some(CommentDraft {
+            path: key,
+            anchor,
+            resolved,
+        });
+        self.selected_comment_id = None;
+        self.settings.changeset_panels.guide_open = true;
+        self.persist_settings();
+        self.sidebar_tab = SidebarTab::Comments;
+        self.comment_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        window.focus(&gpui::Focusable::focus_handle(&self.comment_input, cx));
+        cx.notify();
+    }
+
+    /// Saves the staged draft as a review comment (creating the review if
+    /// none exists yet, exactly like guide generation does). Empty bodies
+    /// are ignored; the composer stays open for the user to type or cancel.
+    pub(crate) fn save_comment_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.comment_draft.clone() else {
+            return;
+        };
+        let body = self.comment_input.read(cx).value().trim().to_string();
+        if body.is_empty() {
+            return;
+        }
+        self.ensure_open_changeset_review(Some(window), cx);
+        let Some(review_id) = self.current_review().map(|review| review.id.clone()) else {
+            return;
+        };
+        let comment = crate::reviews::ReviewComment {
+            id: uuid::Uuid::new_v4().to_string(),
+            path: draft.path,
+            anchor: draft.anchor,
+            body,
+            created_at: now_unix_seconds(),
+        };
+        let comment_id = comment.id.clone();
+        let result = self
+            .reviews
+            .mutate(&review_id, |review| review.comments.push(comment));
+        self.after_review_mutation(result.map(|_| ()), Some(window), cx);
+        self.comment_draft = None;
+        self.comment_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.select_comment(&comment_id, cx);
+    }
+
+    /// Discards the staged draft without saving.
+    pub(crate) fn cancel_comment_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.comment_draft.take().is_none() {
+            return;
+        }
+        self.comment_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// Selects a saved comment: opens the file's diff (if it isn't already
+    /// the active tab) and scrolls to the anchor. Never scrolls the comments
+    /// list — a sidebar row click moves only the diff (see
+    /// `select_comment_from_diff` for the diff-click direction). A no-op for
+    /// an unknown id.
+    pub(crate) fn select_comment(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(comment) = self
+            .open_changeset_comments()
+            .into_iter()
+            .find(|comment| comment.id == id)
+        else {
+            return;
+        };
+        self.selected_comment_id = Some(id.to_string());
+        self.comment_draft = None;
+        self.open_file_preview(comment.path.clone(), cx);
+        self.scroll_diff_to_comment_anchor(&comment, cx);
+        cx.notify();
+    }
+
+    /// `select_comment` for a click on anchored text in the diff: selecting
+    /// the comment additionally queues the comments list to bring its row
+    /// near the list's top (consumed by `render_comments_tab`). Only the
+    /// diff→list direction scrolls the list; a sidebar row click uses plain
+    /// `select_comment` and leaves the list where it is. A no-op for an
+    /// unknown id.
+    pub(crate) fn select_comment_from_diff(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.select_comment(id, cx);
+        if self.selected_comment_id.as_deref() == Some(id) {
+            *self.pending_comments_list_scroll.borrow_mut() = Some(id.to_string());
+        }
+    }
+
+    /// All saved comments on the open changeset's review, in saved order.
+    /// Empty when no review exists yet.
+    pub(crate) fn open_changeset_comments(&self) -> Vec<crate::reviews::ReviewComment> {
+        self.current_review()
+            .map(|review| review.comments.clone())
+            .unwrap_or_default()
+    }
+
+    /// Saved-comment count for the Comments tab badge. Drafts are excluded —
+    /// only persisted comments count.
+    pub(crate) fn comment_count(&self) -> usize {
+        self.current_review()
+            .map(|review| review.comments.len())
+            .unwrap_or(0)
+    }
+
+    /// The diff content for `path` in the open changeset, independent of any
+    /// stored selection — the counterpart `active_diff_selection_context` uses
+    /// for the active tab, generalized to an arbitrary (possibly inactive)
+    /// path so a comment's anchor can be resolved on the file it names.
+    fn diff_side_content_for_path(
+        &self,
+        path: &str,
+        side: repo::DiffSide,
+    ) -> Option<diff_selection::DiffSideContent> {
+        let Mode::RepoOpen { repo } = &self.mode else {
+            return None;
+        };
+        let ReviewScreen::Changeset { changeset, .. } = &self.review_screen else {
+            return None;
+        };
+        if let Some(file) = changeset.files.iter().find(|file| file.path == path) {
+            let prepared = self.prepared_file_diff(repo, changeset, file).ok()?;
+            Some(diff_selection::DiffSideContent::Prepared {
+                diff: prepared,
+                side,
+            })
+        } else {
+            Some(diff_selection::DiffSideContent::ReadOnly {
+                cells: self.read_only_cells(repo, changeset, path)?,
+            })
+        }
+    }
+
+    /// Scrolls the active pane's diff so `comment`'s anchor is visible.
+    /// Resolves the anchor fresh against the comment's own file (not the
+    /// active selection), so re-selecting an already-open file still lands on
+    /// the right row. A no-op when the anchor no longer resolves, or when the
+    /// file was opened this same frame and its scroll state isn't painted
+    /// yet — a later interaction (or reselecting the comment) restores the
+    /// scroll; a deferred-scroll mechanism was judged unnecessary complexity
+    /// for this slice.
+    fn scroll_diff_to_comment_anchor(
+        &mut self,
+        comment: &crate::reviews::ReviewComment,
+        cx: &mut Context<Self>,
+    ) {
+        let pane = self.workspace.active_pane();
+        let side = comment_anchors::diff_side(comment.anchor.side);
+        let Some(content) = self.diff_side_content_for_path(&comment.path, side) else {
+            return;
+        };
+        let Some(resolved) = comment_anchors::resolve_anchor(&content, &comment.anchor) else {
+            return;
+        };
+        let scroll = self.pane_scroll(pane, cx);
+        // The anchor is about to take over the scroll position, so consume
+        // the pending first-change-block flag `open_file_preview` set on
+        // open — otherwise the next render's `focus_first_change_block`
+        // would overwrite this scroll one frame later. Left alone above when
+        // the anchor doesn't resolve, so a plain file open still lands on
+        // its first change.
+        scroll.diff.take_pending_focus();
+        if self.diff_soft_wrap {
+            // A just-opened file's `reset()` emptied the wrap list
+            // (`wrap.reset(0)`); seeding the scroll against it here would be
+            // silently discarded by the next render's count-sync guard
+            // (`ListState::reset(N)` whenever the item count differs — see
+            // `preserve_pane_scroll_across_wrap_toggle`, which fixes the same
+            // fragility for the wrap-toggle path). Sync the count first so
+            // that guard is already a no-op when the render runs.
+            let row_count = content.len();
+            let state = scroll.diff.wrap_list();
+            if state.item_count() != row_count {
+                state.reset(row_count);
+            }
+            diff_view::scroll_wrapped_to_block_top(&scroll.diff, resolved.start.row);
+        } else {
+            // For a side-by-side diff both sides share one scroll handle
+            // (`change_block_scroll_target` picks it); `handle_for(side)`
+            // only matches the rendered handle for a single-side diff or
+            // read-only content, so fall back to it there.
+            let handle = match &content {
+                diff_selection::DiffSideContent::Prepared { diff, .. } => {
+                    diff_view::change_block_scroll_target(diff, &scroll.diff)
+                        .map(|(handle, _)| handle)
+                        .unwrap_or_else(|| scroll.diff.handle_for(resolved.side).clone())
+                }
+                diff_selection::DiffSideContent::ReadOnly { .. } => {
+                    scroll.diff.handle_for(resolved.side).clone()
+                }
+            };
+            diff_view::set_diff_scroll_top(
+                &handle,
+                diff_view::scroll_offset_for_block_top(resolved.start.row, 3),
+            );
+        }
     }
 
     /// Scroll `pane`'s `key` diff so its caret is on screen on both axes,
@@ -5918,7 +6246,6 @@ impl App {
                     cx,
                 );
                 let panes: AnyElement = if self.settings.changeset_panels.guide_open
-                    && self.settings.ai_enabled
                     && self.open_changeset_supports_guide()
                 {
                     h_resizable("guide-split")
@@ -5927,7 +6254,7 @@ impl App {
                         .child(
                             resizable_panel()
                                 .size(px(self.changeset_guide_width()))
-                                .child(self.render_guide_panel(changeset, cx)),
+                                .child(self.render_review_sidebar(changeset, cx)),
                         )
                         .into_any_element()
                 } else {
@@ -6691,7 +7018,52 @@ impl App {
             origins: scroll.content_origins,
             wrap_row_origins: scroll.diff.wrap_row_origins(),
             hscroll: scroll.diff.hscroll.clone(),
+            anchors: Rc::new(self.anchor_decorations_for_path(path)),
+            can_comment: self.open_changeset_supports_guide(),
         }
+    }
+
+    /// The comment anchors to decorate `path`'s diff with: every saved comment
+    /// on this file resolved onto its side's current rows (unresolvable
+    /// anchors are skipped), plus the staged draft when it targets this file.
+    /// `selected` marks the saved comment matching `selected_comment_id`; the
+    /// draft is always `pending`.
+    fn anchor_decorations_for_path(&self, path: &str) -> Vec<diff_view::AnchorDecoration> {
+        let mut anchors = Vec::new();
+        for comment in self.open_changeset_comments() {
+            if comment.path != path {
+                continue;
+            }
+            let side = comment_anchors::diff_side(comment.anchor.side);
+            let Some(content) = self.diff_side_content_for_path(path, side) else {
+                continue;
+            };
+            let Some(resolved) = comment_anchors::resolve_anchor(&content, &comment.anchor) else {
+                continue;
+            };
+            let selected = self.selected_comment_id.as_deref() == Some(comment.id.as_str());
+            anchors.push(diff_view::AnchorDecoration {
+                comment_id: Some(comment.id.clone()),
+                side: resolved.side,
+                start: resolved.start,
+                end: resolved.end,
+                selected,
+                pending: false,
+            });
+        }
+        if let Some(draft) = &self.comment_draft {
+            if draft.path == path {
+                anchors.push(diff_view::AnchorDecoration {
+                    comment_id: None,
+                    side: draft.resolved.side,
+                    start: draft.resolved.start,
+                    end: draft.resolved.end,
+                    selected: false,
+                    pending: true,
+                });
+            }
+        }
+        anchors
     }
 
     /// The prepared diff for `file` in `changeset`, computed once and cached.
@@ -7702,8 +8074,9 @@ mod tests {
     use super::{
         changeset_key_for_selection, restored_width, selection_summary, App, CloseChangeset,
         DiffDrag, DiffDragMode, FileListMode, Mode, OpenChangeset, OpenFailed, PrSectionState,
-        PreparedFileDiff, PullRequestCommitMissing, ReviewScreen, Selection, FILE_TREE_ROW_HEIGHT,
-        PR_COLUMN_MAX, PR_COLUMN_MIN, SIDEBAR_MIN_WIDTH, WHEN_COLUMN_MAX, WHEN_COLUMN_MIN,
+        PreparedFileDiff, PullRequestCommitMissing, ReviewScreen, Selection, SidebarTab,
+        FILE_TREE_ROW_HEIGHT, PR_COLUMN_MAX, PR_COLUMN_MIN, SIDEBAR_MIN_WIDTH, WHEN_COLUMN_MAX,
+        WHEN_COLUMN_MIN,
     };
     use crate::repo::{ChangeKind, INITIAL_COMMIT_LIMIT};
     use crate::settings::{
@@ -7778,6 +8151,533 @@ mod tests {
                 assert_eq!(status, crate::ai::ThreadStatus::Cancelled);
             })
             .expect("window update");
+    }
+
+    /// Open a two-commit repo's changeset with `hello.txt`'s diff open as the
+    /// active pane's tab, so a range selection can be staged into a comment
+    /// draft. Returns the dir (kept alive), the changed file's path, the
+    /// window, and the visual context — mirrors the shape of
+    /// `guide_panel`'s (module-private) `open_changeset_with_guide_panel`.
+    fn open_two_commit_changeset(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        String,
+        WindowHandle<App>,
+        VisualTestContext,
+    ) {
+        let (dir, head_sha) = init_repo_with_two_commits();
+        let repo_path = dir.path().to_path_buf();
+        let changed_path = "hello.txt".to_string();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(repo_path, window, cx);
+                app.select_single_commit(head_sha, cx);
+                app.open_changeset(window, cx);
+                app.open_file_preview(changed_path.clone(), cx);
+            })
+            .expect("open two-commit changeset");
+        cx.run_until_parked();
+
+        let visual = VisualTestContext::from_window(*window, cx);
+        (dir, changed_path, window, visual)
+    }
+
+    #[gpui::test]
+    async fn staging_saving_and_cancelling_a_comment_draft(cx: &mut TestAppContext) {
+        // Root-wrapped (see `open_two_commit_changeset_with_root`'s doc
+        // comment): staging focuses the composer's `Input`, which reaches
+        // for `gpui_component::Root` when it paints.
+        let (_dir, changed_path, app_entity, window, _visual) =
+            open_two_commit_changeset_with_root(cx);
+        window
+            .update(cx, |_root, window, cx| {
+                app_entity.update(cx, |app, cx| {
+                    let pane = app.workspace.active_pane();
+                    app.set_diff_selection(
+                        pane,
+                        &changed_path,
+                        crate::app::diff_selection::DiffSelection {
+                            side: crate::repo::DiffSide::New,
+                            anchor: crate::app::diff_selection::DiffPoint { row: 0, column: 0 },
+                            head: crate::app::diff_selection::DiffPoint { row: 0, column: 3 },
+                            goal_x: None,
+                        },
+                        cx,
+                    );
+                    app.stage_comment_draft(window, cx);
+                    let draft = app
+                        .comment_draft
+                        .as_ref()
+                        .expect("selection stages a draft");
+                    assert_eq!(
+                        draft.resolved.start,
+                        crate::app::diff_selection::DiffPoint { row: 0, column: 0 },
+                        "draft freezes the resolved anchor's start"
+                    );
+                    assert_eq!(
+                        draft.resolved.end,
+                        crate::app::diff_selection::DiffPoint { row: 0, column: 3 },
+                        "draft freezes the resolved anchor's end"
+                    );
+                    assert_eq!(
+                        app.sidebar_tab,
+                        SidebarTab::Comments,
+                        "staging activates the Comments tab"
+                    );
+                    assert!(
+                        app.settings.changeset_panels.guide_open,
+                        "staging reveals the sidebar"
+                    );
+                    assert_eq!(app.comment_count(), 0, "count stays at zero until saved");
+                });
+            })
+            .unwrap();
+
+        window
+            .update(cx, |_root, window, cx| {
+                app_entity.update(cx, |app, cx| {
+                    app.save_comment_draft(window, cx);
+                    assert!(
+                        app.comment_draft.is_some(),
+                        "an empty body cannot be saved, so the composer stays open"
+                    );
+                    assert_eq!(
+                        app.comment_count(),
+                        0,
+                        "nothing is saved with an empty body"
+                    );
+                });
+            })
+            .unwrap();
+
+        window
+            .update(cx, |_root, window, cx| {
+                app_entity.update(cx, |app, cx| {
+                    app.comment_input.update(cx, |state, cx| {
+                        state.set_value("Should this read PRICES at report time?", window, cx)
+                    });
+                    app.save_comment_draft(window, cx);
+                    assert!(app.comment_draft.is_none(), "saving clears the draft");
+                    assert_eq!(app.comment_count(), 1);
+                    let comments = app.open_changeset_comments();
+                    assert_eq!(comments[0].body, "Should this read PRICES at report time?");
+                    assert_eq!(comments[0].path, changed_path);
+                    assert_eq!(
+                        app.selected_comment_id.as_deref(),
+                        Some(comments[0].id.as_str())
+                    );
+                });
+            })
+            .unwrap();
+
+        window
+            .update(cx, |_root, window, cx| {
+                app_entity.update(cx, |app, cx| {
+                    let pane = app.workspace.active_pane();
+                    app.set_diff_selection(
+                        pane,
+                        &changed_path,
+                        crate::app::diff_selection::DiffSelection {
+                            side: crate::repo::DiffSide::New,
+                            anchor: crate::app::diff_selection::DiffPoint { row: 0, column: 0 },
+                            head: crate::app::diff_selection::DiffPoint { row: 0, column: 2 },
+                            goal_x: None,
+                        },
+                        cx,
+                    );
+                    app.stage_comment_draft(window, cx);
+                    app.cancel_comment_draft(window, cx);
+                    assert!(app.comment_draft.is_none());
+                    assert_eq!(app.comment_count(), 1, "cancel discards without saving");
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn a_caret_only_selection_does_not_stage_a_draft(cx: &mut TestAppContext) {
+        let (_dir, changed_path, window, _visual) = open_two_commit_changeset(cx);
+        window
+            .update(cx, |app, window, cx| {
+                let pane = app.workspace.active_pane();
+                app.set_diff_selection(
+                    pane,
+                    &changed_path,
+                    crate::app::diff_selection::DiffSelection {
+                        side: crate::repo::DiffSide::New,
+                        anchor: crate::app::diff_selection::DiffPoint { row: 0, column: 1 },
+                        head: crate::app::diff_selection::DiffPoint { row: 0, column: 1 },
+                        goal_x: None,
+                    },
+                    cx,
+                );
+                app.stage_comment_draft(window, cx);
+                assert!(app.comment_draft.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn selecting_a_saved_comment_reopens_its_file(cx: &mut TestAppContext) {
+        let (_dir, changed_path, window, _visual) = open_two_commit_changeset(cx);
+        let comment_id = window
+            .update(cx, |app, window, cx| {
+                let pane = app.workspace.active_pane();
+                app.set_diff_selection(
+                    pane,
+                    &changed_path,
+                    crate::app::diff_selection::DiffSelection {
+                        side: crate::repo::DiffSide::New,
+                        anchor: crate::app::diff_selection::DiffPoint { row: 0, column: 0 },
+                        head: crate::app::diff_selection::DiffPoint { row: 0, column: 3 },
+                        goal_x: None,
+                    },
+                    cx,
+                );
+                app.stage_comment_draft(window, cx);
+                app.comment_input
+                    .update(cx, |state, cx| state.set_value("A comment.", window, cx));
+                app.save_comment_draft(window, cx);
+                app.open_changeset_comments()[0].id.clone()
+            })
+            .unwrap();
+
+        // Close the tab and clear the selection, so `select_comment` has to
+        // reopen the file rather than finding it already active.
+        window
+            .update(cx, |app, _window, cx| {
+                app.selected_comment_id = None;
+                app.close_active_workspace_tab(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.select_comment(&comment_id, cx);
+                assert_eq!(
+                    app.selected_comment_id.as_deref(),
+                    Some(comment_id.as_str()),
+                    "selecting a known id sets it"
+                );
+                let pane = app.workspace.active_pane();
+                assert_eq!(
+                    app.workspace
+                        .active_item(pane)
+                        .map(|item| item.path().to_string()),
+                    Some(changed_path.clone()),
+                    "selecting a comment reopens its file"
+                );
+            })
+            .unwrap();
+
+        // An unknown id is a no-op: the current selection is left untouched.
+        window
+            .update(cx, |app, _window, cx| {
+                app.select_comment("does-not-exist", cx);
+                assert_eq!(
+                    app.selected_comment_id.as_deref(),
+                    Some(comment_id.as_str())
+                );
+            })
+            .unwrap();
+    }
+
+    /// `select_comment` reopens the file (setting the pane's pending
+    /// first-change-block flag) and then scrolls to the comment's own
+    /// anchor. A comment on a late line must land on that anchor, not get
+    /// stomped by the next render's first-change-block scroll.
+    #[gpui::test]
+    async fn selecting_a_comment_lands_on_its_anchor_not_the_first_change_block(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, oid_hex) = init_repo_with_long_diff();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        let comment_id = window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.open_file_preview("long.txt".to_string(), cx);
+                app.ensure_open_changeset_review(Some(window), cx);
+                let review_id = app
+                    .current_review()
+                    .expect("review created for the open changeset")
+                    .id
+                    .clone();
+                let comment = test_comment("long.txt", 80);
+                let comment_id = comment.id.clone();
+                let result = app
+                    .reviews
+                    .mutate(&review_id, |review| review.comments.push(comment));
+                app.after_review_mutation(result.map(|_| ()), Some(window), cx);
+                comment_id
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // Close the tab and clear the selection, so `select_comment` has to
+        // reopen the file rather than finding it already active — this is
+        // what arms the pending-focus flag `open_file_preview` sets.
+        window
+            .update(cx, |app, _window, cx| {
+                app.selected_comment_id = None;
+                app.close_active_workspace_tab(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.select_comment(&comment_id, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let offset = window
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_offset(cx))
+            .expect("read new diff scroll offset");
+
+        // Line 80 is 1-based; its row is 79. The anchor target leaves 3 rows
+        // of context above it. The stomp bug instead lands the diff at the
+        // first change block's start (row 0, offset 0).
+        let expected = crate::app::diff_view::scroll_offset_for_block_top(79, 3);
+        assert_eq!(
+            offset.y, expected,
+            "selecting a comment should land on its anchor, not the first change block"
+        );
+    }
+
+    /// Wrap-mode twin of `selecting_a_comment_lands_on_its_anchor_not_the_first_change_block`:
+    /// `open_file_preview`'s `reset()` empties the wrap list (`wrap.reset(0)`),
+    /// so seeding the anchor scroll against it without first syncing the
+    /// list's item count to the diff's row count is silently discarded by the
+    /// next render's count-sync guard (see `preserve_pane_scroll_across_wrap_toggle`
+    /// for the same fragility) — the diff lands at the top of the file instead
+    /// of the anchor.
+    #[gpui::test]
+    async fn selecting_a_comment_lands_on_its_anchor_in_wrap_mode(cx: &mut TestAppContext) {
+        use gpui::size;
+
+        let (dir, oid_hex) = init_repo_with_long_diff();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        let comment_id = window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.set_diff_soft_wrap(true, cx);
+                app.open_file_preview("long.txt".to_string(), cx);
+                app.ensure_open_changeset_review(Some(window), cx);
+                let review_id = app
+                    .current_review()
+                    .expect("review created for the open changeset")
+                    .id
+                    .clone();
+                let comment = test_comment("long.txt", 80);
+                let comment_id = comment.id.clone();
+                let result = app
+                    .reviews
+                    .mutate(&review_id, |review| review.comments.push(comment));
+                app.after_review_mutation(result.map(|_| ()), Some(window), cx);
+                comment_id
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(360.)));
+        cx.run_until_parked();
+
+        // Close the tab and clear the selection, so `select_comment` has to
+        // reopen the file rather than finding it already active — this is
+        // what arms the pending-focus flag and empties the wrap list via
+        // `reset()`.
+        window
+            .update(cx, |app, _window, cx| {
+                app.selected_comment_id = None;
+                app.close_active_workspace_tab(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.select_comment(&comment_id, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let top = window
+            .read_with(cx, |app, cx| app.file_diff_wrap_topmost_row(cx))
+            .expect("read wrap topmost row")
+            .expect("wrap topmost row present");
+
+        // Line 80 is 1-based; its row is 79. The anchor target leaves
+        // `CHANGE_BLOCK_CONTEXT_ROWS` of context above it. The count-sync bug
+        // instead lands the wrap list at the top of the file (row 0).
+        let expected = 79usize.saturating_sub(crate::app::diff_view::CHANGE_BLOCK_CONTEXT_ROWS);
+        assert_eq!(
+            top, expected,
+            "selecting a comment in wrap mode should land on its anchor, not the top of the file"
+        );
+    }
+
+    /// A comment anchored near end-of-file would otherwise compute a scroll
+    /// target past the diff's real scroll range (the raw block-top math adds
+    /// context rows with no bound at the end); the target must clamp to the
+    /// handle's painted max offset instead of overshooting past the last row.
+    #[gpui::test]
+    async fn selecting_a_comment_near_eof_clamps_to_the_scroll_range(cx: &mut TestAppContext) {
+        use gpui::size;
+
+        let (dir, oid_hex) = init_repo_with_long_diff();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        let comment_id = window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                app.open_file_preview("long.txt".to_string(), cx);
+                app.ensure_open_changeset_review(Some(window), cx);
+                let review_id = app
+                    .current_review()
+                    .expect("review created for the open changeset")
+                    .id
+                    .clone();
+                // Last line of the 160-line fixture: its raw anchor target
+                // (row 159, 3 rows of context) scrolls well past the real
+                // end of the content.
+                let comment = test_comment("long.txt", 160);
+                let comment_id = comment.id.clone();
+                let result = app
+                    .reviews
+                    .mutate(&review_id, |review| review.comments.push(comment));
+                app.after_review_mutation(result.map(|_| ()), Some(window), cx);
+                comment_id
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(320.)));
+
+        let max_offset = window
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_max_offset(cx))
+            .expect("read new diff scroll max offset");
+        assert!(
+            max_offset.height > px(0.),
+            "long diff should exceed the visible diff scroll area"
+        );
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.selected_comment_id = None;
+                app.close_active_workspace_tab(cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.select_comment(&comment_id, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let offset = window
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_offset(cx))
+            .expect("read new diff scroll offset");
+
+        assert_eq!(
+            offset.y, -max_offset.height,
+            "an end-of-file anchor should clamp to the max scrollable offset"
+        );
+    }
+
+    /// `FileDiffScroll::reset()` zeroes offsets but, before this fix, left the
+    /// uniform-list handles' `last_item_size` in place — geometry from
+    /// whatever file last painted. A closed-file `select_comment` runs the
+    /// clamp in `set_diff_scroll_top` one frame before the new file paints, so
+    /// a short file shown first (whose content fits without scrolling, giving
+    /// a near-zero `max_offset`) must not leave that stale geometry in place
+    /// to clamp a deep anchor in a subsequently opened long file down to
+    /// (near) zero.
+    #[gpui::test]
+    async fn selecting_a_comment_in_a_longer_file_is_not_clamped_to_a_previously_shown_shorter_file(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::size;
+
+        let (dir, oid_hex) = init_repo_with_short_and_long_files();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        let comment_id = window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+                app.select_single_commit(oid_hex, cx);
+                app.open_changeset(window, cx);
+                // Paint the SHORT file first, so the pane's shared scroll
+                // handles pick up its near-zero geometry.
+                app.open_file_preview("short.txt".to_string(), cx);
+                app.ensure_open_changeset_review(Some(window), cx);
+                let review_id = app
+                    .current_review()
+                    .expect("review created for the open changeset")
+                    .id
+                    .clone();
+                let comment = test_comment("long.txt", 80);
+                let comment_id = comment.id.clone();
+                let result = app
+                    .reviews
+                    .mutate(&review_id, |review| review.comments.push(comment));
+                app.after_review_mutation(result.map(|_| ()), Some(window), cx);
+                comment_id
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let visual = VisualTestContext::from_window(*window, cx);
+        visual.simulate_resize(size(px(700.), px(320.)));
+        cx.run_until_parked();
+
+        let short_max = window
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_max_offset(cx))
+            .expect("read short file's scroll max offset");
+        assert_eq!(
+            short_max.height,
+            px(0.),
+            "the one-line short file should fit without scrolling"
+        );
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.select_comment(&comment_id, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let offset = window
+            .read_with(cx, |app, cx| app.file_diff_new_scroll_offset(cx))
+            .expect("read new diff scroll offset");
+
+        // Line 80 is 1-based; its row is 79, with 3 rows of context above.
+        let expected = crate::app::diff_view::scroll_offset_for_block_top(79, 3);
+        assert_eq!(
+            offset.y, expected,
+            "selecting a comment in a longer file should reach its true anchor, \
+             not clamp against the previously shown shorter file's near-zero range"
+        );
     }
 
     /// Stub CLI that emits a valid guide JSON result for any prompt. The

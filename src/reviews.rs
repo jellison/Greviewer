@@ -60,6 +60,43 @@ pub struct ReviewGuide {
     pub generated_at: i64,
 }
 
+/// Which side of a diff a comment anchor points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommentSide {
+    Old,
+    #[default]
+    New,
+}
+
+/// Where a comment is pinned: a text range on one side of a file's diff.
+/// Lines are 1-based file line numbers on `side`; columns are UTF-8 byte
+/// offsets. `quoted_text` is the exact text the range covered when the
+/// comment was written, kept as the re-resolution fallback when line
+/// numbers drift.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CommentAnchor {
+    pub side: CommentSide,
+    pub start_line: usize,
+    pub start_col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+    pub quoted_text: String,
+}
+
+/// One reviewer comment, anchored to a diff range. Travels with the review
+/// document exactly like the guide does.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReviewComment {
+    pub id: String,
+    pub path: String,
+    pub anchor: CommentAnchor,
+    pub body: String,
+    pub created_at: i64,
+}
+
 /// One persisted review. Future artifact collections (comments, AI threads,
 /// todos) become new fields on this same document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,6 +114,8 @@ pub struct Review {
     pub completed_at: Option<i64>,
     /// AI-generated review guide, if one has been generated for this changeset.
     pub guide: Option<ReviewGuide>,
+    /// Reviewer comments anchored to diff ranges, oldest first.
+    pub comments: Vec<ReviewComment>,
 }
 
 impl Default for Review {
@@ -91,6 +130,7 @@ impl Default for Review {
             status: ReviewStatus::Active,
             completed_at: None,
             guide: None,
+            comments: Vec::new(),
         }
     }
 }
@@ -107,6 +147,7 @@ impl Review {
             status: ReviewStatus::Active,
             completed_at: None,
             guide: None,
+            comments: Vec::new(),
         }
     }
 }
@@ -464,5 +505,65 @@ mod tests {
 
         let store = ReviewStore::load(Some(reviews_dir));
         assert_eq!(store.get("g1").expect("loads").guide, None);
+    }
+
+    #[test]
+    fn review_comments_round_trip_through_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = ReviewStore::load(Some(dir.path().to_path_buf()));
+        let review = Review::new(
+            PathBuf::from("/repo"),
+            ChangesetKey::Single { sha: "abc".into() },
+            "Named".into(),
+            7,
+        );
+        let id = review.id.clone();
+        store.insert(review).expect("insert");
+        store
+            .mutate(&id, |r| {
+                r.comments.push(ReviewComment {
+                    id: "c1".into(),
+                    path: "src/sales.py".into(),
+                    anchor: CommentAnchor {
+                        side: CommentSide::New,
+                        start_line: 62,
+                        start_col: 4,
+                        end_line: 63,
+                        end_col: 10,
+                        quoted_text: "line[\"revenue\"] = round(".into(),
+                    },
+                    body: "Rounding per entry can drift.".into(),
+                    created_at: 99,
+                });
+            })
+            .expect("mutate");
+
+        let reloaded = ReviewStore::load(Some(dir.path().to_path_buf()));
+        let review = reloaded.get(&id).expect("review reloads");
+        assert_eq!(review.comments.len(), 1);
+        let comment = &review.comments[0];
+        assert_eq!(comment.path, "src/sales.py");
+        assert_eq!(comment.anchor.side, CommentSide::New);
+        assert_eq!(comment.anchor.start_line, 62);
+        assert_eq!(comment.anchor.quoted_text, "line[\"revenue\"] = round(");
+        assert_eq!(comment.body, "Rounding per entry can drift.");
+    }
+
+    #[test]
+    fn reviews_without_comments_load_with_an_empty_list() {
+        // A pre-comments review document must deserialize with comments = [].
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let reviews_dir = dir.path().join("reviews");
+        fs::create_dir_all(&reviews_dir).expect("mkdir");
+        let json = format!(
+            r#"{{"id":"old-doc","repo_path":"/repo","changeset":{{"kind":"single","sha":"{}"}},
+                "name":"Old","created_at":1,"last_activity_at":1,"status":"active"}}"#,
+            "abc".repeat(14) + "ab"
+        );
+        fs::write(reviews_dir.join("old-doc.json"), json).expect("write");
+
+        let store = ReviewStore::load(Some(reviews_dir));
+        let review = store.get("old-doc").expect("loads");
+        assert!(review.comments.is_empty());
     }
 }

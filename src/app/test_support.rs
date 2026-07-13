@@ -818,6 +818,34 @@ pub(crate) fn init_repo_with_long_diff() -> (tempfile::TempDir, String) {
     (dir, update_oid.to_string())
 }
 
+/// A two-file changeset pairing a short modified file with a long one, both
+/// in the same commit. Regression fixture for the stale-geometry clamp bug:
+/// painting `short.txt` first leaves its small `last_item_size` on the
+/// pane's shared scroll handles, so a subsequent jump into `long.txt` must
+/// not clamp against that stale (short) geometry.
+pub(crate) fn init_repo_with_short_and_long_files() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let repo = Repository::init(dir.path()).expect("init repo");
+
+    fs::write(dir.path().join("short.txt"), "old short\n").expect("write old short file");
+    let old_text = (1..=160)
+        .map(|line| format!("old line {line:03}\n"))
+        .collect::<String>();
+    fs::write(dir.path().join("long.txt"), old_text).expect("write old long file");
+    let root_oid = commit_all(&repo, "Add short and long files", &[]);
+
+    fs::write(dir.path().join("short.txt"), "new short\n").expect("write new short file");
+    let new_text = (1..=160)
+        .map(|line| format!("new line {line:03}\n"))
+        .collect::<String>();
+    fs::write(dir.path().join("long.txt"), new_text).expect("write new long file");
+    let update_oid = commit_all(&repo, "Update short and long files", &[root_oid]);
+
+    drop(repo);
+
+    (dir, update_oid.to_string())
+}
+
 /// A two-file changeset for horizontal-scroll tests. `wide.txt` is 40 short
 /// lines whose second line becomes ~400 characters wide, so its diff
 /// overflows any reasonable pane while staying vertically scrollable; the old
@@ -945,6 +973,104 @@ pub(crate) fn init_repo_with_renamed_file() -> (tempfile::TempDir, String) {
 
 pub(crate) fn test_debug_selector(selector: String) -> &'static str {
     Box::leak(selector.into_boxed_str())
+}
+
+/// Open a two-commit repo's changeset with AI enabled and the guide panel
+/// docked open. Returns the dir (kept alive), the changed file's path, the
+/// window, and the visual context. Shared by `guide_panel`'s and
+/// `review_sidebar`'s tests.
+pub(crate) fn open_changeset_with_guide_panel(
+    cx: &mut TestAppContext,
+) -> (
+    tempfile::TempDir,
+    String,
+    WindowHandle<App>,
+    VisualTestContext,
+) {
+    let (dir, head_sha) = init_repo_with_two_commits();
+    let repo_path = dir.path().to_path_buf();
+    let changed_path = "hello.txt".to_string();
+    let window = add_app_window(cx);
+
+    window
+        .update(cx, |app, window, cx| {
+            app.settings.ai_enabled = true;
+            app.settings.changeset_panels.guide_open = true;
+            app.open_repository_at(repo_path, window, cx);
+            app.select_single_commit(head_sha, cx);
+            app.open_changeset(window, cx);
+        })
+        .expect("open changeset with guide panel");
+    cx.run_until_parked();
+
+    let visual = VisualTestContext::from_window(*window, cx);
+    (dir, changed_path, window, visual)
+}
+
+/// Like `open_changeset_with_guide_panel`, but Root-wraps the window
+/// (mirroring production's `lib.rs`, which roots every window at
+/// `gpui_component::Root`) instead of using `add_app_window`. Needed by any
+/// test that stages a comment draft: the composer's `Input` focuses itself
+/// on staging, and a focused `Input` reaches for `gpui_component::Root` when
+/// it paints — see `pressing_enter_in_the_branch_filter_does_not_open_a_changeset`
+/// for the same rationale applied to the branch filter's input. Returns the
+/// `App` entity directly (rather than a `WindowHandle<App>`) since the
+/// window's root view is `gpui_component::Root`, not `App`.
+pub(crate) fn open_two_commit_changeset_with_root(
+    cx: &mut TestAppContext,
+) -> (
+    tempfile::TempDir,
+    String,
+    Entity<App>,
+    WindowHandle<gpui_component::Root>,
+    VisualTestContext,
+) {
+    cx.update(gpui_component::init);
+    let (dir, head_sha) = init_repo_with_two_commits();
+    let repo_path = dir.path().to_path_buf();
+    let changed_path = "hello.txt".to_string();
+
+    let mut app_entity: Option<Entity<App>> = None;
+    let window = cx.add_window(|window, cx| {
+        let app = gpui::AppContext::new(cx, |cx| App::new(window, cx));
+        app_entity = Some(app.clone());
+        gpui_component::Root::new(app, window, cx)
+    });
+    let app_entity = app_entity.expect("app entity captured");
+
+    window
+        .update(cx, |_root, window, cx| {
+            app_entity.update(cx, |app, cx| {
+                app.open_repository_at(repo_path, window, cx);
+                app.select_single_commit(head_sha, cx);
+                app.open_changeset(window, cx);
+                app.open_file_preview(changed_path.clone(), cx);
+            });
+        })
+        .expect("open two-commit changeset with root");
+    cx.run_until_parked();
+
+    let visual = VisualTestContext::from_window(*window, cx);
+    (dir, changed_path, app_entity, window, visual)
+}
+
+/// A saved comment fixture for badge/count tests: anchored at `line` on the
+/// new side of `path`, with a fresh random id.
+pub(crate) fn test_comment(path: &str, line: usize) -> crate::reviews::ReviewComment {
+    crate::reviews::ReviewComment {
+        id: uuid::Uuid::new_v4().to_string(),
+        path: path.to_string(),
+        anchor: crate::reviews::CommentAnchor {
+            side: crate::reviews::CommentSide::New,
+            start_line: line,
+            start_col: 0,
+            end_line: line,
+            end_col: 1,
+            quoted_text: String::new(),
+        },
+        body: "test comment".into(),
+        created_at: 0,
+    }
 }
 
 pub(crate) fn commit_all(repo: &Repository, message: &str, parents: &[git2::Oid]) -> git2::Oid {

@@ -24,8 +24,9 @@ below).
 
 **Edge cases**
 
-- With AI assistance turned off, none of the guide's controls or panel appear
-  anywhere on the changeset screen.
+- With AI assistance turned off, the guide's controls and its tab in the
+  review sidebar are absent; the sidebar itself can still be present, showing
+  only the Comments tab (see [Review Comments](../review/comments.md)).
 - Opening the pending changeset never offers a guide, regardless of whether AI
   assistance is on.
 

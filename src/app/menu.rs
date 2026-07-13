@@ -3,13 +3,14 @@
 use gpui::{Action, App as GpuiApp, KeyBinding, Menu, MenuItem, SharedString};
 
 use super::{
-    ActivateNextTab, ActivatePreviousTab, CloseActivePane, CloseActiveTab, DiffCancelSelection,
-    DiffCopy, DiffMoveDocEnd, DiffMoveDocStart, DiffMoveDown, DiffMoveLeft, DiffMoveLineEnd,
-    DiffMoveLineStart, DiffMoveRight, DiffMoveUp, DiffMoveWordLeft, DiffMoveWordRight,
-    DiffSelectAll, DiffSelectDocEnd, DiffSelectDocStart, DiffSelectDown, DiffSelectLeft,
-    DiffSelectLineEnd, DiffSelectLineStart, DiffSelectRight, DiffSelectUp, DiffSelectWordLeft,
-    DiffSelectWordRight, NextChangeBlock, OpenChangeset, OpenRepository, PreviousChangeBlock,
-    QuitApplication, SplitPaneDown, SplitPaneLeft, SplitPaneRight, SplitPaneUp,
+    ActivateNextTab, ActivatePreviousTab, CloseActivePane, CloseActiveTab, DiffAddComment,
+    DiffCancelSelection, DiffCopy, DiffMoveDocEnd, DiffMoveDocStart, DiffMoveDown, DiffMoveLeft,
+    DiffMoveLineEnd, DiffMoveLineStart, DiffMoveRight, DiffMoveUp, DiffMoveWordLeft,
+    DiffMoveWordRight, DiffSelectAll, DiffSelectDocEnd, DiffSelectDocStart, DiffSelectDown,
+    DiffSelectLeft, DiffSelectLineEnd, DiffSelectLineStart, DiffSelectRight, DiffSelectUp,
+    DiffSelectWordLeft, DiffSelectWordRight, NextChangeBlock, OpenChangeset, OpenRepository,
+    PreviousChangeBlock, QuitApplication, SplitPaneDown, SplitPaneLeft, SplitPaneRight,
+    SplitPaneUp,
 };
 
 pub const GREVIEWER_MENU_LABEL: &str = "Greviewer";
@@ -56,6 +57,7 @@ pub const DIFF_SELECT_DOC_END_KEYSTROKE: &str = "cmd-shift-down";
 pub const DIFF_SELECT_ALL_KEYSTROKE: &str = "cmd-a";
 pub const DIFF_COPY_KEYSTROKE: &str = "cmd-c";
 pub const DIFF_CANCEL_SELECTION_KEYSTROKE: &str = "escape";
+pub const DIFF_ADD_COMMENT_KEYSTROKE: &str = "cmd-shift-c";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuSnapshot {
@@ -216,6 +218,11 @@ pub fn bind_app_keys(cx: &mut GpuiApp) {
         KeyBinding::new(
             DIFF_CANCEL_SELECTION_KEYSTROKE,
             DiffCancelSelection,
+            Some(DIFF_PANE_CONTEXT),
+        ),
+        KeyBinding::new(
+            DIFF_ADD_COMMENT_KEYSTROKE,
+            DiffAddComment,
             Some(DIFF_PANE_CONTEXT),
         ),
     ]);
