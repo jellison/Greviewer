@@ -34,6 +34,14 @@ row is truncated with an ellipsis. The section header shows how many are open an
 offers a refresh control. While loading, when none are open, or when a token is
 missing, the section explains the current state instead of listing rows.
 
+The sidebar's search field narrows this section like any other, matching a pull
+request on the whole `#{number} - {title}` label so both its number and its title
+are searchable; the header then counts only the matches, and a query no pull
+request matches removes the section for as long as it stands. The state
+explanations are not pull requests and hold nothing a query can match, so they
+are suppressed while a query is active. See "Searching the sidebar" in
+[Review Workflow](../review/workflow.md) for the shared search behavior.
+
 ## Anchoring pull requests on the graph and window bar
 
 **Observable outcomes.** In the commit graph, a dedicated resizable column marks

@@ -2384,7 +2384,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn reviews_section_is_absent_without_reviews_and_while_filtering(
+    async fn reviews_section_is_absent_without_reviews_and_without_a_match(
         cx: &mut TestAppContext,
     ) {
         let (dir, sha) = init_repo_with_one_commit();
@@ -2434,9 +2434,9 @@ mod tests {
         window
             .update(cx, |app, window, cx| {
                 app.filter_input
-                    .update(cx, |state, cx| state.set_value("nomatch", window, cx));
+                    .update(cx, |state, cx| state.set_value("zzznomatch", window, cx));
             })
-            .expect("set filter query");
+            .expect("set search query");
         cx.run_until_parked();
 
         // `debug_bounds` (see gpui's `Frame::clear`) never removes a selector
@@ -2447,29 +2447,199 @@ mod tests {
                 let Mode::RepoOpen { repo } = &app.mode else {
                     panic!("expected RepoOpen mode");
                 };
-                let rows = app.sidebar_rows(repo, "nomatch");
+                let rows = app.sidebar_rows(repo, "zzznomatch");
                 assert!(
                     !rows.iter().any(|row| matches!(
                         row,
                         BranchTreeRow::Section(section) if section.key == "reviews"
                     )),
-                    "the Reviews section disappears while the filter query is non-empty"
+                    "a query the review's name does not match drops the Reviews section"
                 );
             })
-            .expect("verify the section is absent while filtering");
+            .expect("verify the section is absent without a match");
 
         window
             .update(cx, |app, window, cx| {
                 app.filter_input
                     .update(cx, |state, cx| state.set_value("", window, cx));
             })
-            .expect("clear filter query");
+            .expect("clear search query");
         cx.run_until_parked();
 
         let mut visual = VisualTestContext::from_window(*window, cx);
         visual
             .debug_bounds("branch-section-reviews")
-            .expect("the Reviews section reappears once the filter clears");
+            .expect("the Reviews section reappears once the query clears");
+    }
+
+    /// Seed one active and one completed review, then read the Reviews rows the
+    /// sidebar builds for `query`.
+    fn review_rows_for_query(
+        cx: &mut TestAppContext,
+        window: gpui::WindowHandle<App>,
+        query: &str,
+    ) -> Vec<String> {
+        window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                app.sidebar_rows(repo, query)
+                    .iter()
+                    .filter_map(|row| match row {
+                        BranchTreeRow::Section(section) if section.key == "reviews" => {
+                            Some(format!("section:{}", section.count))
+                        }
+                        BranchTreeRow::ReviewEntry(review) => {
+                            Some(format!("review:{}", review.name))
+                        }
+                        BranchTreeRow::CompletedReviewsGroup { count, .. } => {
+                            Some(format!("completed-group:{count}"))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .expect("read review rows")
+    }
+
+    #[gpui::test]
+    async fn searching_narrows_reviews_by_name_and_reveals_completed_matches(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path.clone(), window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let canonical_path = window
+            .read_with(cx, |app, _cx| match &app.mode {
+                Mode::RepoOpen { repo } => repo.main_path.clone(),
+                Mode::NoRepo => panic!("expected RepoOpen mode"),
+            })
+            .expect("read main_path");
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.reviews = crate::reviews::ReviewStore::load(None);
+                let active = seeded_review(
+                    canonical_path.clone(),
+                    crate::reviews::ChangesetKey::Single { sha: sha.clone() },
+                    "login form",
+                    20,
+                );
+                let unrelated = seeded_review(
+                    canonical_path.clone(),
+                    crate::reviews::ChangesetKey::Single { sha: sha.clone() },
+                    "search bug",
+                    10,
+                );
+                let mut done = seeded_review(
+                    canonical_path,
+                    crate::reviews::ChangesetKey::Single { sha },
+                    "login polish",
+                    30,
+                );
+                done.status = crate::reviews::ReviewStatus::Completed;
+                for review in [active, unrelated, done] {
+                    app.reviews.insert(review).expect("insert review");
+                }
+                bump_reviews_generation(app, cx);
+            })
+            .expect("seed reviews");
+        cx.run_until_parked();
+
+        assert_eq!(
+            review_rows_for_query(cx, window, ""),
+            vec![
+                "section:3".to_string(),
+                "review:login form".to_string(),
+                "review:search bug".to_string(),
+                "completed-group:1".to_string(),
+            ],
+            "with no query the section holds every review and the Completed \
+             group stays collapsed"
+        );
+        assert_eq!(
+            review_rows_for_query(cx, window, "login"),
+            vec![
+                "section:2".to_string(),
+                "review:login form".to_string(),
+                "completed-group:1".to_string(),
+                "review:login polish".to_string(),
+            ],
+            "the query keeps only matching reviews, counts them, and force-expands \
+             the Completed group so its match is on screen"
+        );
+        assert_eq!(
+            review_rows_for_query(cx, window, ""),
+            vec![
+                "section:3".to_string(),
+                "review:login form".to_string(),
+                "review:search bug".to_string(),
+                "completed-group:1".to_string(),
+            ],
+            "clearing the query restores the collapsed Completed group"
+        );
+    }
+
+    #[gpui::test]
+    async fn searching_force_expands_a_collapsed_reviews_section(cx: &mut TestAppContext) {
+        let (dir, sha) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path.clone(), window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        let canonical_path = window
+            .read_with(cx, |app, _cx| match &app.mode {
+                Mode::RepoOpen { repo } => repo.main_path.clone(),
+                Mode::NoRepo => panic!("expected RepoOpen mode"),
+            })
+            .expect("read main_path");
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.reviews = crate::reviews::ReviewStore::load(None);
+                let review = seeded_review(
+                    canonical_path,
+                    crate::reviews::ChangesetKey::Single { sha },
+                    "login form",
+                    10,
+                );
+                app.reviews.insert(review).expect("insert review");
+                bump_reviews_generation(app, cx);
+                app.toggle_branch_section("reviews".to_string(), cx);
+            })
+            .expect("seed a review and collapse the section");
+        cx.run_until_parked();
+
+        assert_eq!(
+            review_rows_for_query(cx, window, ""),
+            vec!["section:1".to_string()],
+            "the collapsed section hides its review row"
+        );
+        assert_eq!(
+            review_rows_for_query(cx, window, "login"),
+            vec!["section:1".to_string(), "review:login form".to_string()],
+            "searching reveals the match inside the collapsed section"
+        );
+        assert_eq!(
+            review_rows_for_query(cx, window, ""),
+            vec!["section:1".to_string()],
+            "clearing the query restores the collapsed state"
+        );
     }
 
     #[gpui::test]

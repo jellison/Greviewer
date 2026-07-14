@@ -46,6 +46,8 @@ pub struct Palette {
     // Diff selection.
     pub diff_selection_bg: Hsla,
     pub diff_selection_bg_unfocused: Hsla,
+    /// The text caret, everywhere it blinks: the diff view paints it directly,
+    /// and `apply_to_gpui_component` hands it to the library's text inputs.
     pub caret: Hsla,
     pub active_line_bg: Hsla,
     // Review comment anchors (saved comments; pending drafts use `accent`).
@@ -187,6 +189,10 @@ pub fn apply_to_gpui_component(cx: &mut App) {
     theme.selection = p.row_selected;
     theme.drop_target = p.drop_target;
     theme.input = p.border;
+    // Left unmapped, the library's inputs blink a near-black caret that is
+    // invisible against the dark surface they sit on. Hand them the same caret
+    // the diff view paints.
+    theme.caret = p.caret;
     theme.scrollbar = Hsla::from(rgba(0x00000000));
     theme.scrollbar_thumb = Hsla::from(rgba(0x546e7a40));
     theme.scrollbar_thumb_hover = Hsla::from(rgba(0x546e7a66));
@@ -244,6 +250,27 @@ mod tests {
             assert_eq!(theme.tab_active, p.background);
             assert_eq!(theme.accent, p.accent);
             assert_eq!(theme.scrollbar_thumb, Hsla::from(rgba(0x546e7a40)));
+        });
+    }
+
+    #[gpui::test]
+    fn library_inputs_blink_the_palette_caret(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            let before = <gpui::App as gpui_component::ActiveTheme>::theme(cx).caret;
+            apply_to_gpui_component(cx);
+
+            let theme = <gpui::App as gpui_component::ActiveTheme>::theme(cx);
+            let p = palette();
+            assert_eq!(
+                theme.caret, p.caret,
+                "the library's inputs must paint the palette's caret"
+            );
+            assert_ne!(
+                before, p.caret,
+                "the library default is not already the palette caret, so the \
+                 mapping is what makes the caret visible on the dark surface"
+            );
         });
     }
 }

@@ -217,8 +217,8 @@ opening a repository expands every section.
 - The count in a section header reports the total number of refs the
   section contains and does not change when the section is collapsed or when
   refs are hidden from the graph. The one exception is while a sidebar
-  filter is active, when the count reports the number of matching refs
-  (see "Filtering branches in the sidebar").
+  search query is active, when the count reports the number of matching refs
+  (see "Searching the sidebar").
 - Reopening a repository expands every section.
 
 ## Nesting branches in sidebar folders
@@ -265,31 +265,40 @@ normal color but also keeps its toggle visible.
   partially hidden folder keeps its toggle shown without muting.
 - Reopening a repository expands all folders and shows all branches.
 
-## Filtering branches in the sidebar
+## Searching the sidebar
 
 The branch sidebar carries an always-visible search field pinned above the
-section list, showing a search icon, the placeholder "Search branches…", and,
-whenever it holds text, a control to clear it. Typing filters the branch tree
-in place. The filter is purely a view concern: it changes only what the
-sidebar shows. The commit graph, the current selection, and every other
-surface are untouched by the filter itself — only the sidebar's ordinary
-actions (activating a branch, hiding a branch, collapsing a section or folder)
-affect the rest of the app, and they behave identically whether or not a
-filter is active.
+section list, showing a search icon, the placeholder "Search…", and, whenever
+it holds text, a control to clear it. A focused field blinks a caret that reads
+clearly against the sidebar, so it is never in doubt whether typing will land
+there. Typing narrows the sidebar in place, and it narrows every section —
+reviews, pull requests, branches, and tags alike — not just the branch tree.
+Search is purely a view concern: it changes only what the sidebar shows. The
+commit graph, the current selection, and every other surface are untouched by
+the query itself — only the sidebar's ordinary actions (activating a branch,
+hiding a branch, collapsing a section or folder) affect the rest of the app, and
+they behave identically whether or not a query is active.
 
-Matching is a case-insensitive subsequence ("fuzzy") test against each ref's
-full display path — a local branch's or tag's own name, and a remote branch's
-name led by its remote (for example `origin/feature/login`). While a filter is
-active, only sections and folders that contain at least one matching ref
-appear, and they render expanded regardless of any saved collapse state;
-clearing the query restores that collapse state. Matched characters are
-highlighted wherever they fall, across folder rows and the leaf row.
-Section counts report the number of matching refs while filtering. The
-checked-out branch is filtered like any other ref and is not kept visible
-when it does not match. The Reviews section, whose rows are not branches or
-tags, has nothing for a branch-name query to match, so it is hidden entirely
-while a filter is active and returns when the query is cleared (see "Listing
-reviews in the sidebar").
+Matching is a case-insensitive subsequence ("fuzzy") test against the text each
+row shows, taken at its fullest: a branch or tag matches on its full display
+path — its own name, and for a remote branch the name led by its remote (for
+example `origin/feature/login`) — even though a nested row displays only its
+final segment; a review matches on its name; a pull request matches on the
+`#<id> - <title>` label its row carries, so both the number and the title are
+searchable. Matched characters are highlighted wherever they fall in the text a
+row displays, across folder rows, branch and tag rows, review rows, and PR rows.
+
+While a query is active, only sections, folders, and groups that hold at least
+one match appear, and every one of them renders expanded regardless of any saved
+collapse state — including the Reviews section's "Completed" group, so a
+completed review that matches is on screen rather than hidden behind it.
+Clearing the query restores that collapse state. Section counts report the
+number of matching entries while a query is active. The checked-out branch is
+narrowed like any other ref and is not kept visible when it does not match. The
+Active PRs section's load-state hints ("Loading pull requests…", "No open pull
+requests", and the token and failure messages) are not pull requests and hold
+nothing a query can match, so they are suppressed while a query is active; a
+section holding no matching PR disappears entirely, hints and all.
 
 **Triggering conditions**
 
@@ -299,21 +308,25 @@ reviews in the sidebar").
 **Observable outcomes**
 
 - With an empty query the sidebar is unchanged: saved collapse state is
-  honored and section counts report every branch each section contains.
-- With a non-empty query, only matching branches and their ancestor folders
-  and sections appear; matched characters are highlighted on both folder and
-  leaf rows.
-- While filtering, section and folder rows render expanded, and each section
-  count reports the number of matching branches it contains.
-- Clearing the query restores the pre-filter view, including any collapsed
-  sections and folders.
-- Applying or changing a filter never alters which commits the graph shows or
+  honored and section counts report every entry each section contains.
+- With a non-empty query, only matching entries and their ancestor folders,
+  groups, and sections appear; matched characters are highlighted on folder,
+  branch, tag, review, and PR rows.
+- A query matching a pull request's number or title keeps that PR's row and
+  drops the others; a query matching a review's name keeps that review's row.
+- While searching, section, folder, and group rows render expanded, and each
+  section count reports the number of matching entries it contains.
+- Clearing the query restores the pre-search view, including any collapsed
+  sections, folders, and the collapsed "Completed" group.
+- Applying or changing a query never alters which commits the graph shows or
   which commit is selected.
 
 **Edge cases**
 
-- A non-empty query that matches no branch shows a "No matching branches"
-  message in place of the tree.
+- A non-empty query that matches nothing anywhere in the sidebar shows a
+  "No matches" message in place of the list.
+- A section whose entries all fail to match disappears, even when other
+  sections still hold matches.
 - Pressing Escape while the field is focused clears the query.
 - The query is not persisted: opening a repository clears the field.
 
@@ -350,11 +363,11 @@ shows every branch and tag. Remote-tracking branches and tags hide and show exac
 
 The branch sidebar carries a Reviews section above the Local, Remote, and Tags sections, listing the reviews the user has started for the open repository. It is a sidebar section like the others — a header with a distinguishing icon, the "Reviews" label, and a count of every review it holds, collapsing and expanding exactly like the Local, Remote, and Tags headers. Active reviews list first, most recently active first; completed reviews are gathered behind a single "Completed" group row beneath them, which reports its count and expands in place, also most recently active first. That group starts collapsed and resets to collapsed each time a repository is opened. Each review row shows its name and a compact identifier of the reviewed changeset, and completed rows render muted, matching the sidebar's other muted rows.
 
-The Reviews section is present only when the repository has at least one review and the sidebar's search field is empty; because a review is neither a branch nor a tag, it disappears while the user filters branches (see "Filtering branches in the sidebar") and returns when the filter is cleared. What each row does — resuming an available review, the muting and message for a review whose commits are gone, and the per-row delete control — is the review lifecycle, specified in [Review Persistence](persistence.md).
+The Reviews section is present whenever the repository has at least one review the sidebar's search query matches; a review matches on its name (see "Searching the sidebar"). What each row does — resuming an available review, the muting and message for a review whose commits are gone, and the per-row delete control — is the review lifecycle, specified in [Review Persistence](persistence.md).
 
 **Triggering conditions**
 
-- A repository with at least one review is open and the window is in graph mode with an empty search field.
+- A repository with at least one review is open and the window is in graph mode.
 - The user activates the "Reviews" section header or the "Completed" group row.
 
 **Observable outcomes**
@@ -367,15 +380,17 @@ The Reviews section is present only when the repository has at least one review 
 **Edge cases**
 
 - A repository with no reviews shows no Reviews section at all.
-- Filtering the sidebar by branch name hides the Reviews section entirely; clearing the filter restores it.
+- A search query no review's name matches hides the Reviews section entirely; clearing the query restores it. A query that does match narrows the section to those reviews, force-expanding the "Completed" group so a matching completed review is visible.
 - Reopening a repository always shows the "Completed" group collapsed, regardless of how it was left.
 
 ## Listing pull requests in the sidebar
 
 When the open repository is hosted on the pull-request server, the sidebar shows
 an "Active PRs" section between the Local and Remote branch groups, listing each
-open pull request by number. See [Pull Requests](../bitbucket/pull-requests.md)
-for the full behavior, including loading, refresh, and click-to-navigate.
+open pull request by number. The sidebar's search field narrows this section
+like any other, matching a PR on its `#<id> - <title>` label (see "Searching the
+sidebar"). See [Pull Requests](../bitbucket/pull-requests.md) for the full
+behavior, including loading, refresh, and click-to-navigate.
 
 ## Selecting commits to review
 
@@ -471,7 +486,7 @@ With a valid selection in place, the user opens the changeset to begin reviewing
 - Opening a comparison whose target is already contained in the base yields an empty change set with the same empty-state message: there is nothing the merge would introduce.
 - Double-clicking a commit inside a selected range opens that single commit's changeset, not the range's.
 - Pressing enter while a changeset is already open has no effect: the open changeset and any tab or split layout the user has built are unchanged.
-- Pressing enter while typing in the branch filter does not open a changeset.
+- Pressing enter while typing in the sidebar's search field does not open a changeset.
 
 ## Seeing diff context in the window bar
 

@@ -902,6 +902,12 @@ struct PrRow {
     source_tip_sha: String,
 }
 
+/// The text a PR row shows, and the text the sidebar search matches against —
+/// one function so the two can never drift apart.
+fn pr_row_label(id: u64, title: &str) -> String {
+    format!("#{id} - {title}")
+}
+
 /// One persisted review in the sidebar's Reviews section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReviewRow {
@@ -1094,7 +1100,7 @@ impl App {
 
         let filter_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Search branches…")
+                .placeholder("Search…")
                 .clean_on_escape()
         });
         // Re-render the sidebar whenever the query changes so the filter
@@ -5249,25 +5255,31 @@ impl App {
     /// repo), then active reviews (store order: newest activity first), then
     /// a collapsed-by-default "Completed" group revealing completed reviews
     /// when expanded. Availability is computed once here per rebuild, not per
-    /// frame — the memoized `sidebar_rows` cache makes this safe. Omitted
-    /// entirely while filtering or when the repo has no reviews.
+    /// frame — the memoized `sidebar_rows` cache makes this safe.
+    ///
+    /// A search query narrows the section to reviews whose name matches, and —
+    /// like a branch section — force-expands the header and the Completed group
+    /// so every match is on screen. A section holding no match is omitted.
     fn review_sidebar_rows(&self, repo: &repo::OpenRepository, query: &str) -> Vec<BranchTreeRow> {
-        if !query.is_empty() {
-            return Vec::new();
-        }
+        let searching = !query.is_empty();
         let reviews = self.reviews.for_repo(&repo.main_path);
+        let reviews = reviews
+            .into_iter()
+            .filter(|review| !searching || fuzzy_match(&review.name, query).is_some())
+            .collect::<Vec<_>>();
         if reviews.is_empty() {
             return Vec::new();
         }
 
+        let collapsed = !searching && self.collapsed_branch_sections.contains("reviews");
         let mut rows = vec![BranchTreeRow::Section(BranchSectionRow {
             title: "Reviews".to_string(),
             key: "reviews".to_string(),
             count: reviews.len(),
-            collapsed: self.collapsed_branch_sections.contains("reviews"),
+            collapsed,
             top_border: false,
         })];
-        if self.collapsed_branch_sections.contains("reviews") {
+        if collapsed {
             return rows;
         }
 
@@ -5285,11 +5297,12 @@ impl App {
         };
         rows.extend(active.iter().map(row));
         if !completed.is_empty() {
+            let expanded = searching || self.completed_reviews_expanded;
             rows.push(BranchTreeRow::CompletedReviewsGroup {
                 count: completed.len(),
-                expanded: self.completed_reviews_expanded,
+                expanded,
             });
-            if self.completed_reviews_expanded {
+            if expanded {
                 rows.extend(completed.iter().map(row));
             }
         }
@@ -5298,18 +5311,34 @@ impl App {
 
     /// Rows for the "Active PRs" section. Empty when the repo maps to no
     /// Bitbucket remote (no session). Otherwise always at least the header;
-    /// body content depends on the session's load state. Suppressed while a
-    /// sidebar filter query is active (like Reviews).
+    /// body content depends on the session's load state.
+    ///
+    /// A search query narrows the section to PRs whose `#<id> - <title>` label
+    /// matches, and — like a branch section — force-expands the header and omits
+    /// the section entirely when nothing matches. The load-state hints are not
+    /// PRs and hold nothing a query can match, so searching suppresses them.
     fn active_prs_sidebar_rows(&self, query: &str) -> Vec<BranchTreeRow> {
-        if !query.is_empty() {
-            return Vec::new();
-        }
         if self.bitbucket.is_none() {
             return Vec::new();
         }
-        let collapsed = self.collapsed_branch_sections.contains("pr");
+        let searching = !query.is_empty();
+
+        // PRs sorted by descending id (newest first), narrowed to the query.
+        let mut prs: Vec<&crate::bitbucket::PullRequest> = self
+            .pull_requests
+            .iter()
+            .filter(|pr| {
+                !searching || fuzzy_match(&pr_row_label(pr.id, &pr.title), query).is_some()
+            })
+            .collect();
+        prs.sort_by(|a, b| b.id.cmp(&a.id));
+        if searching && prs.is_empty() {
+            return Vec::new();
+        }
+
+        let collapsed = !searching && self.collapsed_branch_sections.contains("pr");
         let mut rows = vec![BranchTreeRow::PrSection(PrSectionRow {
-            count: self.pull_requests.len(),
+            count: prs.len(),
             collapsed,
             top_border: false, // fixed up by the splice in sidebar_rows
         })];
@@ -5317,30 +5346,30 @@ impl App {
             return rows;
         }
 
-        // Surface a fetch failure even when a prior snapshot is still shown, so
-        // a failed refresh doesn't silently retain stale rows with no error
-        // affordance. The header's refresh control is the retry path.
-        if let PrSectionState::Failed(msg) = &self.bitbucket_state {
-            rows.push(BranchTreeRow::PrHint(msg.clone()));
+        if !searching {
+            // Surface a fetch failure even when a prior snapshot is still shown,
+            // so a failed refresh doesn't silently retain stale rows with no
+            // error affordance. The header's refresh control is the retry path.
+            if let PrSectionState::Failed(msg) = &self.bitbucket_state {
+                rows.push(BranchTreeRow::PrHint(msg.clone()));
+            }
+
+            if prs.is_empty() {
+                let hint = match &self.bitbucket_state {
+                    PrSectionState::NotConfigured => {
+                        Some("Set BITBUCKET_TOKEN to load PRs".to_string())
+                    }
+                    PrSectionState::Loading => Some("Loading pull requests…".to_string()),
+                    PrSectionState::Loaded => Some("No open pull requests".to_string()),
+                    PrSectionState::Failed(_) => None, // already surfaced above
+                };
+                if let Some(hint) = hint {
+                    rows.push(BranchTreeRow::PrHint(hint));
+                }
+                return rows;
+            }
         }
 
-        if self.pull_requests.is_empty() {
-            let hint = match &self.bitbucket_state {
-                PrSectionState::NotConfigured => {
-                    Some("Set BITBUCKET_TOKEN to load PRs".to_string())
-                }
-                PrSectionState::Loading => Some("Loading pull requests…".to_string()),
-                PrSectionState::Loaded => Some("No open pull requests".to_string()),
-                PrSectionState::Failed(_) => None, // already surfaced above
-            };
-            if let Some(hint) = hint {
-                rows.push(BranchTreeRow::PrHint(hint));
-            }
-            return rows;
-        }
-        // PRs sorted by descending id (newest first).
-        let mut prs: Vec<&crate::bitbucket::PullRequest> = self.pull_requests.iter().collect();
-        prs.sort_by(|a, b| b.id.cmp(&a.id));
         rows.extend(prs.into_iter().map(|pr| {
             BranchTreeRow::Pr(PrRow {
                 id: pr.id,
@@ -5356,14 +5385,16 @@ impl App {
         self.sidebar_rows_recompute_count.get()
     }
 
-    /// Compact summary of the Active PRs section's rows for assertions:
-    /// `"section:<count>"`, `"pr:<id>"`, and `"hint:<text>"`.
+    /// Compact summary of the Active PRs section's rows under `query` (pass `""`
+    /// for the unsearched sidebar): `"section:<count>"`, `"pr:<id>"`, and
+    /// `"hint:<text>"`.
     #[cfg(test)]
     pub(crate) fn active_prs_sidebar_rows_summary(
         &self,
         repo: &repo::OpenRepository,
+        query: &str,
     ) -> Vec<String> {
-        self.sidebar_rows(repo, "")
+        self.sidebar_rows(repo, query)
             .iter()
             .filter_map(|row| match row {
                 BranchTreeRow::PrSection(section) => Some(format!("section:{}", section.count)),
@@ -5381,7 +5412,7 @@ impl App {
         self.sidebar_rows(repo, "")
             .iter()
             .filter_map(|row| match row {
-                BranchTreeRow::Pr(pr) => Some(format!("#{} - {}", pr.id, pr.title)),
+                BranchTreeRow::Pr(pr) => Some(pr_row_label(pr.id, &pr.title)),
                 _ => None,
             })
             .collect()
@@ -5465,8 +5496,8 @@ impl App {
                 // Invariant: `build_branch_sidebar_rows` with a non-empty
                 // branch list and an empty query always emits at least a
                 // section header, so an empty `rows` here can only mean a
-                // non-empty query matched zero branches (an empty repo took
-                // the branch above). Show the no-match message.
+                // non-empty query matched nothing in any section (an empty repo
+                // took the branch above). Show the no-match message.
                 div()
                     .flex()
                     .flex_1()
@@ -5476,7 +5507,7 @@ impl App {
                     .debug_selector(|| "branch-filter-empty".to_string())
                     .text_color(palette().text_muted)
                     .text_size(px(14.))
-                    .child("No matching branches")
+                    .child("No matches")
                     .into_any_element()
             } else {
                 let item_count = rows.len();
@@ -5509,8 +5540,13 @@ impl App {
                                         .iter()
                                         .filter(|row| matches!(row, BranchTreeRow::ReviewEntry(_)))
                                         .count();
-                                    app.render_review_row(review_index, review_row, cx)
-                                        .into_any_element()
+                                    app.render_review_row(
+                                        review_index,
+                                        review_row,
+                                        &processor_query,
+                                        cx,
+                                    )
+                                    .into_any_element()
                                 }
                                 BranchTreeRow::CompletedReviewsGroup { count, expanded } => app
                                     .render_completed_reviews_group_row(
@@ -5520,9 +5556,9 @@ impl App {
                                 BranchTreeRow::PrSection(section) => app
                                     .render_pr_section_row(index, section, cx)
                                     .into_any_element(),
-                                BranchTreeRow::Pr(pr) => {
-                                    app.render_pr_row(index, pr, cx).into_any_element()
-                                }
+                                BranchTreeRow::Pr(pr) => app
+                                    .render_pr_row(index, pr, &processor_query, cx)
+                                    .into_any_element(),
                                 BranchTreeRow::PrHint(hint) => {
                                     app.render_pr_hint_row(index, hint).into_any_element()
                                 }
@@ -5961,10 +5997,22 @@ impl App {
     /// One review row in the Reviews section. `index` is the row's position
     /// among review rows in the section (not its absolute sidebar row index),
     /// matching the `review-row-{index}` debug-selector contract.
+    /// The char indices of `text` that `query` matched, for a row whose whole
+    /// label is the searched text (review and PR rows). Branch rows search the
+    /// full ref path but highlight only its final segment, so they compute
+    /// their own indices; see [`final_segment_highlights`].
+    fn label_highlights(text: &str, query: &str) -> Vec<usize> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        fuzzy_match(text, query).unwrap_or_default()
+    }
+
     fn render_review_row(
         &self,
         index: usize,
         row: &ReviewRow,
+        query: &str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let muted = !row.available || row.completed;
@@ -5981,6 +6029,7 @@ impl App {
         let confirm_id = id;
         let changeset_label = row.changeset_label.clone();
         let name = row.name.clone();
+        let highlight = Self::label_highlights(&name, query);
 
         div()
             .flex()
@@ -6009,9 +6058,8 @@ impl App {
                     .flex_1()
                     .min_w_0()
                     .text_size(px(FILE_TREE_TEXT_SIZE))
-                    .text_color(name_color)
                     .truncate()
-                    .child(name),
+                    .child(self.branch_label(&name, &highlight, name_color, false)),
             )
             .child(
                 div()
@@ -6198,10 +6246,17 @@ impl App {
             .child(hint.to_string())
     }
 
-    fn render_pr_row(&self, index: usize, pr: &PrRow, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_pr_row(
+        &self,
+        index: usize,
+        pr: &PrRow,
+        query: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let tip_sha = pr.source_tip_sha.clone();
         let id = pr.id;
-        let label = format!("#{id} - {}", pr.title);
+        let label = pr_row_label(id, &pr.title);
+        let highlight = Self::label_highlights(&label, query);
         div()
             .flex()
             .items_center()
@@ -6224,9 +6279,8 @@ impl App {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_color(palette().text)
                     .text_size(px(FILE_TREE_TEXT_SIZE))
-                    .child(label),
+                    .child(self.branch_label(&label, &highlight, palette().text, false)),
             )
     }
 
@@ -8072,11 +8126,11 @@ fn restored_column_width(saved: Option<f32>, default: f32, min: f32, max: f32) -
 #[cfg(test)]
 mod tests {
     use super::{
-        changeset_key_for_selection, restored_width, selection_summary, App, CloseChangeset,
-        DiffDrag, DiffDragMode, FileListMode, Mode, OpenChangeset, OpenFailed, PrSectionState,
-        PreparedFileDiff, PullRequestCommitMissing, ReviewScreen, Selection, SidebarTab,
-        FILE_TREE_ROW_HEIGHT, PR_COLUMN_MAX, PR_COLUMN_MIN, SIDEBAR_MIN_WIDTH, WHEN_COLUMN_MAX,
-        WHEN_COLUMN_MIN,
+        changeset_key_for_selection, restored_width, selection_summary, App, BranchTreeRow,
+        CloseChangeset, DiffDrag, DiffDragMode, FileListMode, Mode, OpenChangeset, OpenFailed,
+        PrSectionState, PreparedFileDiff, PullRequestCommitMissing, ReviewScreen, Selection,
+        SidebarTab, FILE_TREE_ROW_HEIGHT, PR_COLUMN_MAX, PR_COLUMN_MIN, SIDEBAR_MIN_WIDTH,
+        WHEN_COLUMN_MAX, WHEN_COLUMN_MIN,
     };
     use crate::repo::{ChangeKind, INITIAL_COMMIT_LIMIT};
     use crate::settings::{
@@ -9893,13 +9947,203 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"{{\"summa
     }
 
     fn pr(id: u64, source_tip_sha: &str) -> crate::bitbucket::PullRequest {
+        pr_titled(id, &format!("PR {id} title"), source_tip_sha)
+    }
+
+    fn pr_titled(id: u64, title: &str, source_tip_sha: &str) -> crate::bitbucket::PullRequest {
         crate::bitbucket::PullRequest {
             id,
-            title: format!("PR {id} title"),
+            title: title.to_string(),
             source_branch: format!("feature-{id}"),
             target_branch: "main".to_string(),
             source_tip_sha: source_tip_sha.to_string(),
         }
+    }
+
+    /// Open a repo with a Bitbucket session holding `prs`, ready to search.
+    async fn app_with_prs(
+        cx: &mut TestAppContext,
+        prs: Vec<crate::bitbucket::PullRequest>,
+        state: PrSectionState,
+    ) -> (tempfile::TempDir, gpui::WindowHandle<App>) {
+        let (dir, _tip) = init_repo_with_one_commit();
+        let path = dir.path().to_path_buf();
+        let window = add_app_window(cx);
+        window
+            .update(cx, |app, window, cx| {
+                app.open_repository_at(path, window, cx);
+            })
+            .expect("open repository");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.install_bitbucket_for_test(prs, state, cx);
+                cx.notify();
+            })
+            .expect("install PRs");
+        cx.run_until_parked();
+        (dir, window)
+    }
+
+    /// The Active PRs rows the sidebar builds for `query`.
+    fn pr_rows_for_query(
+        cx: &mut TestAppContext,
+        window: gpui::WindowHandle<App>,
+        query: &str,
+    ) -> Vec<String> {
+        window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                app.active_prs_sidebar_rows_summary(repo, query)
+            })
+            .expect("read PR rows")
+    }
+
+    #[gpui::test]
+    async fn searching_narrows_prs_by_number_and_by_title(cx: &mut TestAppContext) {
+        let (_dir, window) = app_with_prs(
+            cx,
+            vec![
+                pr_titled(7, "Fix the search bug", "sha7"),
+                pr_titled(42, "Add the login form", "sha42"),
+            ],
+            PrSectionState::Loaded,
+        )
+        .await;
+
+        assert_eq!(
+            pr_rows_for_query(cx, window, "42"),
+            vec!["section:1".to_string(), "pr:42".to_string()],
+            "a query matching one PR's number keeps that PR and counts only it"
+        );
+        assert_eq!(
+            pr_rows_for_query(cx, window, "login"),
+            vec!["section:1".to_string(), "pr:42".to_string()],
+            "a query matching one PR's title keeps that PR"
+        );
+        assert_eq!(
+            pr_rows_for_query(cx, window, "the"),
+            vec![
+                "section:2".to_string(),
+                "pr:42".to_string(),
+                "pr:7".to_string(),
+            ],
+            "a query both titles match keeps both, still newest first"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_highlighted_pr_row_still_renders_its_label(cx: &mut TestAppContext) {
+        let (_dir, window) = app_with_prs(
+            cx,
+            vec![
+                pr_titled(7, "Fix the search bug", "sha7"),
+                pr_titled(42, "Add the login form", "sha42"),
+            ],
+            PrSectionState::Loaded,
+        )
+        .await;
+
+        window
+            .update(cx, |app, window, cx| {
+                app.filter_input
+                    .update(cx, |state, cx| state.set_value("login", window, cx));
+            })
+            .expect("search for a PR");
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(*window, cx);
+        let matched = visual
+            .debug_bounds("pr-row-42")
+            .expect("the matching PR row renders with its highlighted label");
+        assert!(
+            matched.size.width > px(0.),
+            "the highlighted label lays out with width"
+        );
+    }
+
+    #[gpui::test]
+    async fn searching_omits_the_pr_section_when_no_pr_matches(cx: &mut TestAppContext) {
+        let (_dir, window) = app_with_prs(
+            cx,
+            vec![pr_titled(7, "Fix the search bug", "sha7")],
+            PrSectionState::Loaded,
+        )
+        .await;
+
+        // "master" matches the local branch but no PR, so only the PR section
+        // drops out — proving the section is pruned on its own merits.
+        assert!(
+            pr_rows_for_query(cx, window, "master").is_empty(),
+            "a query no PR matches removes the whole Active PRs section"
+        );
+        window
+            .update(cx, |app, _window, _cx| {
+                let Mode::RepoOpen { repo } = &app.mode else {
+                    panic!("expected RepoOpen mode");
+                };
+                assert!(
+                    app.sidebar_rows(repo, "master").iter().any(|row| matches!(
+                        row,
+                        BranchTreeRow::Branch(branch) if branch.branch.name == "master"
+                    )),
+                    "the branch the query does match still renders"
+                );
+            })
+            .expect("read sidebar rows");
+    }
+
+    #[gpui::test]
+    async fn searching_suppresses_the_pr_load_state_hints(cx: &mut TestAppContext) {
+        let (_dir, window) = app_with_prs(cx, Vec::new(), PrSectionState::NotConfigured).await;
+
+        assert!(
+            pr_rows_for_query(cx, window, "")
+                .iter()
+                .any(|row| row == "hint:Set BITBUCKET_TOKEN to load PRs"),
+            "the not-configured hint shows with no query"
+        );
+        assert!(
+            pr_rows_for_query(cx, window, "master").is_empty(),
+            "a hint is not a PR and matches nothing, so searching drops it \
+             along with the section"
+        );
+    }
+
+    #[gpui::test]
+    async fn searching_force_expands_a_collapsed_pr_section(cx: &mut TestAppContext) {
+        let (_dir, window) = app_with_prs(
+            cx,
+            vec![pr_titled(42, "Add the login form", "sha42")],
+            PrSectionState::Loaded,
+        )
+        .await;
+
+        window
+            .update(cx, |app, _window, cx| {
+                app.toggle_branch_section("pr".to_string(), cx);
+            })
+            .expect("collapse the Active PRs section");
+        cx.run_until_parked();
+
+        assert_eq!(
+            pr_rows_for_query(cx, window, ""),
+            vec!["section:1".to_string()],
+            "the collapsed section hides its PR row"
+        );
+        assert_eq!(
+            pr_rows_for_query(cx, window, "login"),
+            vec!["section:1".to_string(), "pr:42".to_string()],
+            "searching reveals the match inside the collapsed section"
+        );
+        assert_eq!(
+            pr_rows_for_query(cx, window, ""),
+            vec!["section:1".to_string()],
+            "clearing the query restores the collapsed state"
+        );
     }
 
     #[gpui::test]
@@ -10011,7 +10255,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"{{\"summa
                 let Mode::RepoOpen { repo } = &app.mode else {
                     panic!("expected RepoOpen mode");
                 };
-                app.active_prs_sidebar_rows_summary(repo)
+                app.active_prs_sidebar_rows_summary(repo, "")
             })
             .expect("read PR rows");
         assert!(
@@ -10050,7 +10294,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"{{\"summa
                 let Mode::RepoOpen { repo } = &app.mode else {
                     panic!("expected RepoOpen mode");
                 };
-                app.active_prs_sidebar_rows_summary(repo)
+                app.active_prs_sidebar_rows_summary(repo, "")
             })
             .expect("read PR rows");
         assert!(
@@ -10089,7 +10333,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"{{\"summa
                 let Mode::RepoOpen { repo } = &app.mode else {
                     panic!("expected RepoOpen mode");
                 };
-                app.active_prs_sidebar_rows_summary(repo)
+                app.active_prs_sidebar_rows_summary(repo, "")
             })
             .expect("read PR rows");
         assert!(
@@ -10135,7 +10379,7 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"{{\"summa
                 let Mode::RepoOpen { repo } = &app.mode else {
                     panic!("expected RepoOpen mode");
                 };
-                app.active_prs_sidebar_rows_summary(repo)
+                app.active_prs_sidebar_rows_summary(repo, "")
             })
             .expect("read PR rows");
 

@@ -84,7 +84,7 @@ Deleting the review attached to an open changeset detaches it: the changeset sta
 
 ## Listing and resuming reviews
 
-Graph mode lists the open repository's reviews in a dedicated section of the branch sidebar, above the branch and tag sections. The section lists every review the user has started for the repository, no matter which of its worktrees it was started from, and it is present only when the repository has at least one review. Because a review is neither a branch nor a tag, the section is absent while the user is filtering the sidebar by branch name — there is nothing for a branch-name query to match — and returns when the filter is cleared.
+Graph mode lists the open repository's reviews in a dedicated section of the branch sidebar, above the branch and tag sections. The section lists every review the user has started for the repository, no matter which of its worktrees it was started from, and it is present only when the repository has at least one review. The sidebar's search field narrows the section like any other: a review matches on its name, and a query no review matches hides the section until it is cleared.
 
 Active reviews list first, most recently active first. Completed reviews are gathered behind a single collapsed "Completed" group beneath them, which reports how many there are and expands in place to reveal them, also most recently active first. A completed review's row is muted. Each row shows the review's name and a compact identifier of the changeset it reviews — a single commit's short identifier, a range's oldest and newest identifiers, or a comparison's base and target identifiers.
 
@@ -94,7 +94,7 @@ Because the sidebar is a review-navigation surface, its full behavior — sectio
 
 **Triggering conditions**
 
-- A repository with at least one review is open, the window is in graph mode, and the sidebar's branch filter is empty.
+- A repository with at least one review is open, the window is in graph mode, and the sidebar's search field is empty or holds a query the review's name matches.
 - The user activates a review row, the "Completed" group, or a review's delete control.
 
 **Observable outcomes**
@@ -107,7 +107,7 @@ Because the sidebar is a review-navigation surface, its full behavior — sectio
 **Edge cases**
 
 - A repository with no reviews shows no Reviews section.
-- Filtering the sidebar by branch name hides the Reviews section entirely; clearing the filter restores it.
+- A search query no review's name matches hides the Reviews section entirely; clearing the query restores it.
 - Deleting the last review removes the Reviews section along with it.
 
 ## Reviews whose commits are gone
