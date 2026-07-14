@@ -26,7 +26,7 @@ below).
 
 - With AI assistance turned off, the guide's controls and its tab in the
   review sidebar are absent; the sidebar itself can still be present, showing
-  only the Comments tab (see [Review Comments](../review/comments.md)).
+  only the Threads tab (see [Review Threads](../review/threads.md)).
 - Opening the pending changeset never offers a guide, regardless of whether AI
   assistance is on.
 

@@ -56,15 +56,18 @@ pub(crate) struct DiffSelectionContext {
     /// entry ever outlives its file.
     pub(crate) wrap_row_origins: WrapRowOrigins,
     pub(crate) hscroll: ScrollHandle,
-    /// Comment anchors resolved onto this file's diff: every saved comment plus
+    /// Thread anchors resolved onto this file's diff: every saved thread plus
     /// the staged draft (when it targets this file). Shared across both sides;
     /// each side's rendering filters to `anchor.side == side`. Built once per
     /// tab by `App::diff_selection_context` and carried through
     /// `clone_for_side`.
     pub(crate) anchors: Rc<Vec<AnchorDecoration>>,
-    /// Whether the open changeset can carry comments (a fixed commit range).
+    /// Whether the open changeset can carry threads (a fixed commit range).
     /// Gates the floating "Comment" pill.
     pub(crate) can_comment: bool,
+    /// Whether the floating "Ask AI" pill shows beside "Comment": the
+    /// changeset can carry threads *and* AI assistance is enabled.
+    pub(crate) can_ask_ai: bool,
 }
 
 impl DiffSelectionContext {
@@ -264,7 +267,7 @@ fn render_wrapped_row(
     });
     let wrap_width = code_bounds.map(wrap_width_for);
 
-    // Comment-anchor decorations, wrap-aware: the selected fill merged into
+    // Thread-anchor decorations, wrap-aware: the selected fill merged into
     // the highlights (StyledText splits it at wrap boundaries on its own) and
     // one underline segment per visual row the span crosses. Before the first
     // paint (`wrap_width: None`) segments fall back to single-line x math and
@@ -273,7 +276,7 @@ fn render_wrapped_row(
         .filter(|_| selectable)
         .map(|ctx| attach_anchor_decorations(window, ctx, row_index, &mut cell, wrap_width))
         .unwrap_or_default();
-    let pill_app = comment_pill_app(selection_ctx, row_index);
+    let pill_app = selection_pill_app(selection_ctx, row_index);
 
     let has_text = !cell.text.is_empty();
 
@@ -443,14 +446,14 @@ fn render_wrapped_row(
                             column,
                         });
                         // A click landing inside a saved anchor's span also
-                        // selects that comment (and scrolls the comments
+                        // selects that thread (and scrolls the threads
                         // list to its row), matching the nowrap path.
-                        let hit_comment = anchor_comment_at(&ctx.anchors, ctx.side, point, &text);
+                        let hit_thread = anchor_thread_at(&ctx.anchors, ctx.side, point, &text);
                         let ctx = ctx.clone();
                         ctx.app.clone().update(cx, |app, cx| {
                             app.begin_diff_mouse_selection(&ctx, point, event, window, cx);
-                            if let Some(id) = hit_comment {
-                                app.select_comment_from_diff(&id, cx);
+                            if let Some(id) = hit_thread {
+                                app.select_thread_from_diff(&id, cx);
                             }
                         });
                     }
@@ -465,7 +468,9 @@ fn render_wrapped_row(
             selected_anchor_starts_here(selection_ctx, row_index),
             |row| row.child(render_anchor_marker()),
         )
-        .when_some(pill_app, |row, app| row.child(render_comment_pill(app)))
+        .when_some(pill_app, |row, (app, show_ask_ai)| {
+            row.child(render_selection_pills(app, show_ask_ai))
+        })
 }
 
 /// Soft-wrap rendering for a single-side diff: one variable-height `list` whose
@@ -909,7 +914,7 @@ pub(crate) fn scroll_offset_for_block_top(start_row: usize, context_rows: usize)
 /// reflects the new position in the same frame.
 ///
 /// Clamped to `[-max_offset, 0]` so a programmatic target past end-of-file
-/// (e.g. a comment anchor near the last rows, with context rows added past
+/// (e.g. a thread anchor near the last rows, with context rows added past
 /// it) cannot scroll beyond the last row — soft wrap already gets this for
 /// free from `ListState::scroll_to`. Skipped when the list has not painted
 /// yet (`last_item_size` is `None`): an unpainted handle's `max_offset` is
@@ -1685,12 +1690,12 @@ fn selection_span_for_row(
     Some((span_start..span_end, row_index == end.row))
 }
 
-/// A comment anchor resolved for rendering in this file's diff: ordered
+/// A thread anchor resolved for rendering in this file's diff: ordered
 /// flat-row points on one side, plus the render flags the decorations read.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AnchorDecoration {
-    /// `None` for the staged draft, `Some(id)` for a saved comment.
-    pub(crate) comment_id: Option<String>,
+    /// `None` for the staged draft, `Some(id)` for a saved thread.
+    pub(crate) thread_id: Option<String>,
     pub(crate) side: repo::DiffSide,
     pub(crate) start: diff_selection::DiffPoint,
     pub(crate) end: diff_selection::DiffPoint,
@@ -1732,7 +1737,7 @@ pub(crate) fn most_specific_anchor<'a>(
 ) -> Option<&'a AnchorDecoration> {
     candidates
         .into_iter()
-        .filter(|anchor| anchor.comment_id.is_some())
+        .filter(|anchor| anchor.thread_id.is_some())
         .min_by_key(|anchor| {
             (
                 anchor.end.row - anchor.start.row,
@@ -1762,7 +1767,7 @@ fn selected_anchor_starts_here(ctx: Option<&DiffSelectionContext>, row_index: us
     })
 }
 
-/// The selected comment's diff-side marker: an accent arrowhead pinned at
+/// The selected thread's diff-side marker: an accent arrowhead pinned at
 /// the visible right edge of the anchor's start row, pointing left toward
 /// the anchored code (mirroring the sidebar's accent selected-row
 /// treatment). Overlaid absolutely on the row container itself — the row is
@@ -1821,7 +1826,7 @@ const ANCHOR_UNDERLINE_TOP: f32 = DIFF_LINE_HEIGHT - 3.;
 
 /// The absolute underline element for a saved anchor's span segment: 1px
 /// tall, 2px above its visual row's bottom. Selected anchors paint a solid
-/// `comment_anchor` line; unselected ones a dotted line (1×1 dots every 3px)
+/// `thread_anchor` line; unselected ones a dotted line (1×1 dots every 3px)
 /// via a canvas, so the dots track the horizontally-scrolling code cell for
 /// free (the element lives inside it).
 fn render_anchor_underline(underline: &AnchorUnderline) -> impl IntoElement {
@@ -1834,7 +1839,7 @@ fn render_anchor_underline(underline: &AnchorUnderline) -> impl IntoElement {
         .h(px(1.))
         .debug_selector(|| "diff-anchor-underline".to_string());
     if underline.selected {
-        line.bg(p.comment_anchor)
+        line.bg(p.thread_anchor)
     } else {
         line.child(
             canvas(
@@ -1847,7 +1852,7 @@ fn render_anchor_underline(underline: &AnchorUnderline) -> impl IntoElement {
                             gpui::point(x, bounds.origin.y),
                             gpui::size(px(1.), px(1.)),
                         );
-                        window.paint_quad(gpui::fill(dot, p.comment_anchor));
+                        window.paint_quad(gpui::fill(dot, p.thread_anchor));
                         x += px(3.);
                     }
                 },
@@ -1861,7 +1866,7 @@ fn render_anchor_underline(underline: &AnchorUnderline) -> impl IntoElement {
 }
 
 /// Merge this row's anchor decorations into `cell.highlights` (the
-/// `comment_anchor_fill` behind a selected saved anchor's span) and return the
+/// `thread_anchor_fill` behind a selected saved anchor's span) and return the
 /// underline segments to paint. Shared by the nowrap and soft-wrap row
 /// renderers: `wrap_width` is `Some` in wrap mode, where a span crossing wrap
 /// boundaries emits one segment per visual row, and `None` in nowrap mode
@@ -1890,7 +1895,7 @@ fn attach_anchor_decorations(
             cell.highlights = diff_selection::overlay_background(
                 &cell.highlights,
                 span.clone(),
-                p.comment_anchor_fill,
+                p.thread_anchor_fill,
             );
         }
         underlines.extend(underline_segments(
@@ -1974,18 +1979,46 @@ fn underline_segments(
     segments
 }
 
-/// The floating "Comment" pill, rendered as an absolute child of the selection
-/// head's row (both diff modes). Living inside the row — rather than a
-/// container overlay — means the pill exists exactly when its row renders, so
-/// it disappears with the row when the selection head scrolls out of view.
-/// `.occlude()` keeps the pill's own click from also landing a caret on the
-/// code cell beneath it, which would clear the selection staging needs.
-fn render_comment_pill(app: Entity<App>) -> impl IntoElement {
-    let p = palette();
+/// The floating selection pills, rendered as an absolute child of the
+/// selection head's row (both diff modes): "Ask AI" (only with AI enabled)
+/// beside the always-present "Comment". Living inside the row — rather than a
+/// container overlay — means the pills exist exactly when the row renders, so
+/// they disappear with the row when the selection head scrolls out of view.
+fn render_selection_pills(app: Entity<App>, show_ask_ai: bool) -> impl IntoElement {
     div()
         .absolute()
         .right(px(10.))
         .top(px(1.))
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .when(show_ask_ai, |row| {
+            row.child(render_selection_pill(
+                app.clone(),
+                "diff-ask-ai-pill",
+                "Ask AI",
+                |app, window, cx| app.stage_agent_thread_draft(window, cx),
+            ))
+        })
+        .child(render_selection_pill(
+            app,
+            "diff-comment-pill",
+            "Comment",
+            |app, window, cx| app.stage_thread_draft(window, cx),
+        ))
+}
+
+/// One floating pill. `.occlude()` keeps the pill's own click from also
+/// landing a caret on the code cell beneath it, which would clear the
+/// selection staging needs.
+fn render_selection_pill(
+    app: Entity<App>,
+    selector: &'static str,
+    label: &'static str,
+    on_click: impl Fn(&mut App, &mut Window, &mut Context<App>) + 'static,
+) -> impl IntoElement {
+    let p = palette();
+    div()
         .h(px(20.))
         .px_2()
         .flex()
@@ -1997,23 +2030,25 @@ fn render_comment_pill(app: Entity<App>) -> impl IntoElement {
         .text_color(p.text)
         .text_size(px(11.))
         .cursor_pointer()
-        .id("diff-comment-pill")
-        .debug_selector(|| "diff-comment-pill".to_string())
+        .id(selector)
+        .debug_selector(move || selector.to_string())
         .occlude()
-        .child("Comment")
+        .child(label)
         .on_click(move |_event: &gpui::ClickEvent, window, cx| {
-            app.clone()
-                .update(cx, |app, cx| app.stage_comment_draft(window, cx));
+            app.clone().update(cx, |app, cx| on_click(app, window, cx));
         })
 }
 
-/// Whether this row should host the "Comment" pill: the changeset is
+/// Whether this row should host the selection pills: the changeset is
 /// reviewable and the row holds the head of a non-caret selection. Returns the
-/// app handle the pill's click needs.
-fn comment_pill_app(ctx: Option<&DiffSelectionContext>, row_index: usize) -> Option<Entity<App>> {
+/// app handle the pills' clicks need, plus whether the "Ask AI" pill shows.
+fn selection_pill_app(
+    ctx: Option<&DiffSelectionContext>,
+    row_index: usize,
+) -> Option<(Entity<App>, bool)> {
     let ctx = ctx.filter(|ctx| ctx.can_comment)?;
     let selection = ctx.selection.filter(|selection| !selection.is_caret())?;
-    (selection.caret().row == row_index).then(|| ctx.app.clone())
+    (selection.caret().row == row_index).then(|| (ctx.app.clone(), ctx.can_ask_ai))
 }
 
 /// A diff side's selection context plus this render's focus snapshot, bundled
@@ -2078,13 +2113,13 @@ pub(crate) fn render_file_diff_line(
         None => false,
     };
 
-    // Comment-anchor decorations for this row, on this side: the selected
+    // Thread-anchor decorations for this row, on this side: the selected
     // fill merged into the highlights plus the underline segments to paint.
     let anchor_underlines: Vec<AnchorUnderline> = selection_ctx
         .filter(|_| selectable)
         .map(|ctx| attach_anchor_decorations(window, ctx, row_index, &mut cell, None))
         .unwrap_or_default();
-    let pill_app = comment_pill_app(selection_ctx, row_index);
+    let pill_app = selection_pill_app(selection_ctx, row_index);
 
     let has_text = !cell.text.is_empty();
 
@@ -2269,14 +2304,14 @@ pub(crate) fn render_file_diff_line(
                         column,
                     });
                     // A click landing inside a saved anchor's span also selects
-                    // that comment (the first covering one) and scrolls the
-                    // comments list to its row, alongside placing the caret.
-                    let hit_comment = anchor_comment_at(&ctx.anchors, ctx.side, point, &text);
+                    // that thread (the first covering one) and scrolls the
+                    // threads list to its row, alongside placing the caret.
+                    let hit_thread = anchor_thread_at(&ctx.anchors, ctx.side, point, &text);
                     let ctx = ctx.clone();
                     ctx.app.clone().update(cx, |app, cx| {
                         app.begin_diff_mouse_selection(&ctx, point, event, window, cx);
-                        if let Some(id) = hit_comment {
-                            app.select_comment_from_diff(&id, cx);
+                        if let Some(id) = hit_thread {
+                            app.select_thread_from_diff(&id, cx);
                         }
                     });
                 }
@@ -2288,13 +2323,15 @@ pub(crate) fn render_file_diff_line(
             selected_anchor_starts_here(selection_ctx, row_index),
             |row| row.child(render_anchor_marker()),
         )
-        .when_some(pill_app, |row, app| row.child(render_comment_pill(app)))
+        .when_some(pill_app, |row, (app, show_ask_ai)| {
+            row.child(render_selection_pills(app, show_ask_ai))
+        })
 }
 
 /// The id of the saved anchor on `side` whose span covers `point`, or `None`
 /// when the click lands on no anchored text. Overlapping anchors resolve via
 /// `most_specific_anchor`; pending drafts are never selectable.
-fn anchor_comment_at(
+fn anchor_thread_at(
     anchors: &[AnchorDecoration],
     side: repo::DiffSide,
     point: diff_selection::DiffPoint,
@@ -2309,7 +2346,7 @@ fn anchor_comment_at(
         };
         (span.start..=span.end).contains(&point.column)
     });
-    most_specific_anchor(candidates).and_then(|anchor| anchor.comment_id.clone())
+    most_specific_anchor(candidates).and_then(|anchor| anchor.thread_id.clone())
 }
 
 /// Per-row debug selector for the panning code content, e.g.
@@ -2719,7 +2756,7 @@ mod tests {
     #[test]
     fn anchor_spans_cover_only_the_anchored_rows() {
         let anchor = AnchorDecoration {
-            comment_id: Some("c1".into()),
+            thread_id: Some("c1".into()),
             side: repo::DiffSide::New,
             start: diff_selection::DiffPoint { row: 2, column: 3 },
             end: diff_selection::DiffPoint { row: 4, column: 2 },
@@ -2734,9 +2771,9 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_anchor_clicks_prefer_the_most_specific_comment() {
+    fn overlapping_anchor_clicks_prefer_the_most_specific_thread() {
         let anchor = |id: Option<&str>, side, start_row: usize, end_row: usize| AnchorDecoration {
-            comment_id: id.map(String::from),
+            thread_id: id.map(String::from),
             side,
             start: diff_selection::DiffPoint {
                 row: start_row,
@@ -2753,16 +2790,16 @@ mod tests {
         let wide = anchor(Some("wide"), repo::DiffSide::New, 0, 5);
         let narrow = anchor(Some("narrow"), repo::DiffSide::New, 2, 3);
         let picked = most_specific_anchor([&wide, &narrow]).expect("candidate");
-        assert_eq!(picked.comment_id.as_deref(), Some("narrow"));
+        assert_eq!(picked.thread_id.as_deref(), Some("narrow"));
         // Equal spans tie-break by start row, then old side before new.
         let later = anchor(Some("later"), repo::DiffSide::New, 3, 4);
         let earlier = anchor(Some("earlier"), repo::DiffSide::New, 2, 3);
         let picked = most_specific_anchor([&later, &earlier]).expect("candidate");
-        assert_eq!(picked.comment_id.as_deref(), Some("earlier"));
+        assert_eq!(picked.thread_id.as_deref(), Some("earlier"));
         let new_side = anchor(Some("new"), repo::DiffSide::New, 2, 3);
         let old_side = anchor(Some("old"), repo::DiffSide::Old, 2, 3);
         let picked = most_specific_anchor([&new_side, &old_side]).expect("candidate");
-        assert_eq!(picked.comment_id.as_deref(), Some("old"));
+        assert_eq!(picked.thread_id.as_deref(), Some("old"));
         // A pending draft (no id) is never a candidate.
         let draft = anchor(None, repo::DiffSide::New, 2, 2);
         assert!(most_specific_anchor([&draft]).is_none());
@@ -3748,35 +3785,41 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn clicking_an_anchored_range_selects_its_comment(cx: &mut TestAppContext) {
+    async fn clicking_an_anchored_range_selects_its_thread(cx: &mut TestAppContext) {
         let (_dir, path, window, mut visual) = open_changeset_with_guide_panel(cx);
-        let comment_id = window
+        let thread_id = window
             .update(cx, |app, window, cx| {
                 app.ensure_open_changeset_review(Some(window), cx);
                 let review_id = app.current_review().expect("review exists").id.clone();
                 // Anchor the whole first line so a click anywhere on row 0's
                 // text lands inside the span.
-                let comment = crate::reviews::ReviewComment {
+                let thread = crate::reviews::ReviewThread {
                     id: uuid::Uuid::new_v4().to_string(),
                     path: path.clone(),
-                    anchor: crate::reviews::CommentAnchor {
-                        side: crate::reviews::CommentSide::New,
+                    anchor: crate::reviews::ThreadAnchor {
+                        side: crate::reviews::ThreadSide::New,
                         start_line: 1,
                         start_col: 0,
                         end_line: 1,
                         end_col: 11,
                         quoted_text: String::new(),
                     },
-                    body: "note".into(),
+                    messages: vec![crate::reviews::ThreadMessage {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        author: crate::reviews::MessageAuthor::Reviewer,
+                        body: "note".into(),
+                        created_at: 0,
+                    }],
                     created_at: 0,
+                    ..Default::default()
                 };
-                let comment_id = comment.id.clone();
+                let thread_id = thread.id.clone();
                 app.reviews
-                    .mutate(&review_id, |review| review.comments.push(comment))
+                    .mutate(&review_id, |review| review.threads.push(thread))
                     .expect("mutate review");
                 app.open_file_preview(path.clone(), cx);
                 cx.notify();
-                comment_id
+                thread_id
             })
             .unwrap();
         cx.run_until_parked();
@@ -3787,17 +3830,14 @@ mod tests {
         cx.run_until_parked();
         window
             .read_with(cx, |app, _| {
-                assert_eq!(
-                    app.selected_comment_id.as_deref(),
-                    Some(comment_id.as_str())
-                )
+                assert_eq!(app.selected_thread_id.as_deref(), Some(thread_id.as_str()))
             })
             .unwrap();
     }
 
-    /// A saved comment anchoring the whole first line of `hello.txt`'s new
+    /// A saved thread anchoring the whole first line of `hello.txt`'s new
     /// side, seeded on the open changeset. Shared by the anchor-marker tests.
-    fn seed_first_line_anchor_comment(
+    fn seed_first_line_anchor_thread(
         cx: &mut TestAppContext,
         window: &gpui::WindowHandle<App>,
         path: &str,
@@ -3806,26 +3846,32 @@ mod tests {
             .update(cx, |app, window, cx| {
                 app.ensure_open_changeset_review(Some(window), cx);
                 let review_id = app.current_review().expect("review exists").id.clone();
-                let comment = crate::reviews::ReviewComment {
+                let thread = crate::reviews::ReviewThread {
                     id: uuid::Uuid::new_v4().to_string(),
                     path: path.to_string(),
-                    anchor: crate::reviews::CommentAnchor {
-                        side: crate::reviews::CommentSide::New,
+                    anchor: crate::reviews::ThreadAnchor {
+                        side: crate::reviews::ThreadSide::New,
                         start_line: 1,
                         start_col: 0,
                         end_line: 1,
                         end_col: 11,
                         quoted_text: String::new(),
                     },
-                    body: "note".into(),
+                    messages: vec![crate::reviews::ThreadMessage {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        author: crate::reviews::MessageAuthor::Reviewer,
+                        body: "note".into(),
+                        created_at: 0,
+                    }],
                     created_at: 0,
+                    ..Default::default()
                 };
-                let comment_id = comment.id.clone();
+                let thread_id = thread.id.clone();
                 app.reviews
-                    .mutate(&review_id, |review| review.comments.push(comment))
+                    .mutate(&review_id, |review| review.threads.push(thread))
                     .expect("mutate review");
                 cx.notify();
-                comment_id
+                thread_id
             })
             .unwrap()
     }
@@ -3835,7 +3881,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let (_dir, path, window, mut visual) = open_changeset_with_guide_panel(cx);
-        let comment_id = seed_first_line_anchor_comment(cx, &window, &path);
+        let thread_id = seed_first_line_anchor_thread(cx, &window, &path);
         window
             .update(cx, |app, _window, cx| {
                 app.open_file_preview(path.clone(), cx);
@@ -3850,10 +3896,10 @@ mod tests {
         // marker never painted).
         assert!(
             visual.debug_bounds("diff-anchor-marker").is_none(),
-            "no marker renders while no comment is selected"
+            "no marker renders while no thread is selected"
         );
 
-        // Clicking the anchored text selects the comment and grows the
+        // Clicking the anchored text selects the thread and grows the
         // marker at the right edge of the anchor's start row, on its side.
         let code = visual
             .debug_bounds("file-diff-code-new-0")
@@ -3863,15 +3909,12 @@ mod tests {
 
         window
             .read_with(cx, |app, _| {
-                assert_eq!(
-                    app.selected_comment_id.as_deref(),
-                    Some(comment_id.as_str())
-                )
+                assert_eq!(app.selected_thread_id.as_deref(), Some(thread_id.as_str()))
             })
             .unwrap();
         let marker = visual
             .debug_bounds("diff-anchor-marker")
-            .expect("selecting the comment paints the right-edge marker");
+            .expect("selecting the thread paints the right-edge marker");
         let gutter = visual
             .debug_bounds("file-diff-line-new-0")
             .expect("row 0 gutter cell on the new side");
@@ -3895,7 +3938,7 @@ mod tests {
     #[gpui::test]
     async fn the_right_edge_marker_appears_in_wrap_mode(cx: &mut TestAppContext) {
         let (_dir, path, window, mut visual) = open_changeset_with_guide_panel(cx);
-        let comment_id = seed_first_line_anchor_comment(cx, &window, &path);
+        let thread_id = seed_first_line_anchor_thread(cx, &window, &path);
         window
             .update(cx, |app, _window, cx| {
                 app.set_diff_soft_wrap(true, cx);
@@ -3907,7 +3950,7 @@ mod tests {
 
         assert!(
             visual.debug_bounds("diff-anchor-marker").is_none(),
-            "no marker renders in wrap mode while no comment is selected"
+            "no marker renders in wrap mode while no thread is selected"
         );
 
         let code = visual
@@ -3918,10 +3961,7 @@ mod tests {
 
         window
             .read_with(cx, |app, _| {
-                assert_eq!(
-                    app.selected_comment_id.as_deref(),
-                    Some(comment_id.as_str())
-                )
+                assert_eq!(app.selected_thread_id.as_deref(), Some(thread_id.as_str()))
             })
             .unwrap();
         let marker = visual
@@ -3975,8 +4015,67 @@ mod tests {
         visual.simulate_click(pill.center(), Modifiers::none());
         cx.run_until_parked();
         app_entity.read_with(cx, |app, _| {
-            assert!(app.comment_draft.is_some(), "pill stages a draft")
+            assert!(app.thread_draft.is_some(), "pill stages a draft")
         });
+    }
+
+    #[gpui::test]
+    async fn ask_ai_pill_requires_ai_enabled(cx: &mut TestAppContext) {
+        // AI off (the default fixture): only the Comment pill shows. Because a
+        // selector never repaints away once painted, absence is only provable
+        // in a window where the Ask AI pill is never rendered — hence a
+        // separate AI-off window here.
+        let (_dir, path, app_entity, _window, mut visual) = open_two_commit_changeset_with_root(cx);
+        app_entity.update(cx, |app, cx| {
+            app.settings.ai_enabled = false;
+            let pane = app.workspace.active_pane();
+            app.set_diff_selection(
+                pane,
+                &path,
+                diff_selection::DiffSelection {
+                    side: repo::DiffSide::New,
+                    anchor: diff_selection::DiffPoint { row: 0, column: 0 },
+                    head: diff_selection::DiffPoint { row: 0, column: 3 },
+                    goal_x: None,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        visual
+            .debug_bounds("diff-comment-pill")
+            .expect("the Comment pill shows regardless of AI");
+        assert!(
+            visual.debug_bounds("diff-ask-ai-pill").is_none(),
+            "no Ask AI pill with AI assistance off"
+        );
+
+        // AI on: the Ask AI pill appears beside Comment.
+        let (_dir2, path2, window2, mut visual2) = open_changeset_with_guide_panel(cx);
+        window2
+            .update(cx, |app, _window, cx| {
+                app.open_file_preview(path2.clone(), cx);
+                let pane = app.workspace.active_pane();
+                app.set_diff_selection(
+                    pane,
+                    &path2,
+                    diff_selection::DiffSelection {
+                        side: repo::DiffSide::New,
+                        anchor: diff_selection::DiffPoint { row: 0, column: 0 },
+                        head: diff_selection::DiffPoint { row: 0, column: 3 },
+                        goal_x: None,
+                    },
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        visual2
+            .debug_bounds("diff-ask-ai-pill")
+            .expect("the Ask AI pill shows with AI assistance on");
+        visual2
+            .debug_bounds("diff-comment-pill")
+            .expect("the Comment pill shows alongside it");
     }
 
     #[gpui::test]
@@ -5166,7 +5265,7 @@ mod tests {
         visual.simulate_click(pill.center(), Modifiers::none());
         cx.run_until_parked();
         app_entity.read_with(cx, |app, _| {
-            assert!(app.comment_draft.is_some(), "pill stages a draft")
+            assert!(app.thread_draft.is_some(), "pill stages a draft")
         });
     }
 

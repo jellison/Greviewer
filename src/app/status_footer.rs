@@ -3,7 +3,7 @@
 //! The sparkle (generate/open the guide) additionally requires AI to be
 //! enabled, since it has no AI content to show otherwise; the dock toggle
 //! stays available regardless, since the sidebar it opens also hosts the
-//! always-available Comments tab. Only ever rendered from
+//! always-available Threads tab. Only ever rendered from
 //! `render_changeset_screen`, so its presence alone scopes it to the
 //! changeset screen. See docs/specs for the guide feature (Task 8 renders
 //! the guide panel's own contents; this task only wires the toggles).
@@ -212,7 +212,7 @@ mod tests {
         );
         assert!(
             visual.debug_bounds("footer-dock-toggle").is_some(),
-            "dock toggle renders regardless of the AI setting, since it also opens Comments"
+            "dock toggle renders regardless of the AI setting, since it also opens Threads"
         );
         window
             .update(cx, |app, _window, cx| {
@@ -233,7 +233,7 @@ mod tests {
         window
             .update(cx, |app, _window, cx| {
                 app.settings.changeset_panels.guide_open = false;
-                app.sidebar_tab = SidebarTab::Comments;
+                app.sidebar_tab = SidebarTab::Threads;
                 cx.notify();
             })
             .unwrap();

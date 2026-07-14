@@ -1010,7 +1010,7 @@ pub(crate) fn open_changeset_with_guide_panel(
 /// Like `open_changeset_with_guide_panel`, but Root-wraps the window
 /// (mirroring production's `lib.rs`, which roots every window at
 /// `gpui_component::Root`) instead of using `add_app_window`. Needed by any
-/// test that stages a comment draft: the composer's `Input` focuses itself
+/// test that stages a thread draft: the composer's `Input` focuses itself
 /// on staging, and a focused `Input` reaches for `gpui_component::Root` when
 /// it paints — see `pressing_enter_in_the_branch_filter_does_not_open_a_changeset`
 /// for the same rationale applied to the branch filter's input. Returns the
@@ -1054,22 +1054,28 @@ pub(crate) fn open_two_commit_changeset_with_root(
     (dir, changed_path, app_entity, window, visual)
 }
 
-/// A saved comment fixture for badge/count tests: anchored at `line` on the
-/// new side of `path`, with a fresh random id.
-pub(crate) fn test_comment(path: &str, line: usize) -> crate::reviews::ReviewComment {
-    crate::reviews::ReviewComment {
+/// A saved thread fixture for badge/count tests: anchored at `line` on the
+/// new side of `path`, with a fresh random id and one Reviewer message.
+pub(crate) fn test_thread(path: &str, line: usize) -> crate::reviews::ReviewThread {
+    crate::reviews::ReviewThread {
         id: uuid::Uuid::new_v4().to_string(),
         path: path.to_string(),
-        anchor: crate::reviews::CommentAnchor {
-            side: crate::reviews::CommentSide::New,
+        anchor: crate::reviews::ThreadAnchor {
+            side: crate::reviews::ThreadSide::New,
             start_line: line,
             start_col: 0,
             end_line: line,
             end_col: 1,
             quoted_text: String::new(),
         },
-        body: "test comment".into(),
+        messages: vec![crate::reviews::ThreadMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            author: crate::reviews::MessageAuthor::Reviewer,
+            body: "test thread".into(),
+            created_at: 0,
+        }],
         created_at: 0,
+        ..Default::default()
     }
 }
 

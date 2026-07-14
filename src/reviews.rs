@@ -60,24 +60,24 @@ pub struct ReviewGuide {
     pub generated_at: i64,
 }
 
-/// Which side of a diff a comment anchor points at.
+/// Which side of a diff a thread anchor points at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CommentSide {
+pub enum ThreadSide {
     Old,
     #[default]
     New,
 }
 
-/// Where a comment is pinned: a text range on one side of a file's diff.
+/// Where a thread is pinned: a text range on one side of a file's diff.
 /// Lines are 1-based file line numbers on `side`; columns are UTF-8 byte
 /// offsets. `quoted_text` is the exact text the range covered when the
-/// comment was written, kept as the re-resolution fallback when line
+/// thread was started, kept as the re-resolution fallback when line
 /// numbers drift.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct CommentAnchor {
-    pub side: CommentSide,
+pub struct ThreadAnchor {
+    pub side: ThreadSide,
     pub start_line: usize,
     pub start_col: usize,
     pub end_line: usize,
@@ -85,19 +85,106 @@ pub struct CommentAnchor {
     pub quoted_text: String,
 }
 
-/// One reviewer comment, anchored to a diff range. Travels with the review
-/// document exactly like the guide does.
+/// Who authored a thread message: the human reviewer, or (from Task 4) an AI
+/// agent replying inline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageAuthor {
+    #[default]
+    Reviewer,
+    Agent,
+}
+
+/// What kind of thread this is. A plain reviewer `Note` (the default, so
+/// every document written before Task 4 loads unchanged), or an `Agent`
+/// thread whose reviewer questions are answered by the AI (see the "Agent
+/// threads" section of docs/specs/review/threads.md). Only the kind and the
+/// messages persist; the live CLI session backing an agent thread is
+/// transient and rebuilt on demand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewThreadKind {
+    #[default]
+    Note,
+    Agent,
+}
+
+/// One message in a thread's conversation. `ReviewThread::messages` holds
+/// these oldest first; a thread's `created_at` is the first message's
+/// timestamp, kept as its own field for backward compatibility with reviews
+/// persisted before threads carried more than one message.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ReviewComment {
+pub struct ThreadMessage {
     pub id: String,
-    pub path: String,
-    pub anchor: CommentAnchor,
+    pub author: MessageAuthor,
     pub body: String,
     pub created_at: i64,
 }
 
-/// One persisted review. Future artifact collections (comments, AI threads,
+/// One reviewer thread, anchored to a diff range. Travels with the review
+/// document exactly like the guide does. A thread is a conversation of one
+/// or more messages, oldest first; `normalize` folds documents persisted
+/// before replies existed (a single top-level `body`) into one Reviewer
+/// message.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReviewThread {
+    pub id: String,
+    pub path: String,
+    pub anchor: ThreadAnchor,
+    /// Whether this is a plain reviewer note or an AI agent thread. Defaults
+    /// to `Note`, so documents persisted before Task 4 load unchanged.
+    pub kind: ReviewThreadKind,
+    /// Oldest first. Never empty after `normalize` has run on a
+    /// successfully loaded thread.
+    pub messages: Vec<ThreadMessage>,
+    /// Legacy single-message body, from before threads carried a
+    /// conversation. Read-only: `normalize` folds it into `messages` and
+    /// clears it; nothing writes it going forward. `pub(crate)` rather than
+    /// public so callers outside this module can't read the stale field,
+    /// while still naming it in `..Default::default()` struct updates (this
+    /// is a single-binary crate — see ADR-0002 — so `pub(crate)` is the
+    /// whole application, not a public API surface).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) body: String,
+    pub created_at: i64,
+}
+
+impl ReviewThread {
+    /// Folds a legacy single-body document into `messages`. Idempotent and
+    /// a no-op once `messages` is non-empty. Called on every load path so
+    /// old review files keep working losslessly.
+    pub fn normalize(&mut self) {
+        if self.messages.is_empty() && !self.body.is_empty() {
+            self.messages.push(ThreadMessage {
+                id: uuid::Uuid::new_v4().to_string(),
+                author: MessageAuthor::Reviewer,
+                body: self.body.clone(),
+                created_at: self.created_at,
+            });
+            self.body.clear();
+        }
+    }
+
+    /// When the thread last saw activity: the latest of the thread's own
+    /// `created_at` and its messages' timestamps (so a thread with no
+    /// messages, or only older-stamped messages, falls back to its own
+    /// creation time).
+    pub fn last_activity_at(&self) -> i64 {
+        self.messages
+            .iter()
+            .map(|message| message.created_at)
+            .fold(self.created_at, i64::max)
+    }
+
+    /// The thread's first (oldest) message, if any.
+    pub fn first_message(&self) -> Option<&ThreadMessage> {
+        self.messages.first()
+    }
+}
+
+/// One persisted review. Future artifact collections (threads, AI threads,
 /// todos) become new fields on this same document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -114,8 +201,9 @@ pub struct Review {
     pub completed_at: Option<i64>,
     /// AI-generated review guide, if one has been generated for this changeset.
     pub guide: Option<ReviewGuide>,
-    /// Reviewer comments anchored to diff ranges, oldest first.
-    pub comments: Vec<ReviewComment>,
+    /// Reviewer threads anchored to diff ranges, oldest first.
+    #[serde(alias = "comments")]
+    pub threads: Vec<ReviewThread>,
 }
 
 impl Default for Review {
@@ -130,7 +218,7 @@ impl Default for Review {
             status: ReviewStatus::Active,
             completed_at: None,
             guide: None,
-            comments: Vec::new(),
+            threads: Vec::new(),
         }
     }
 }
@@ -147,7 +235,7 @@ impl Review {
             status: ReviewStatus::Active,
             completed_at: None,
             guide: None,
-            comments: Vec::new(),
+            threads: Vec::new(),
         }
     }
 }
@@ -174,9 +262,12 @@ impl ReviewStore {
                     let Ok(content) = fs::read_to_string(&path) else {
                         continue;
                     };
-                    let Ok(review) = serde_json::from_str::<Review>(&content) else {
+                    let Ok(mut review) = serde_json::from_str::<Review>(&content) else {
                         continue;
                     };
+                    for thread in &mut review.threads {
+                        thread.normalize();
+                    }
                     reviews.push(review);
                 }
             }
@@ -508,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn review_comments_round_trip_through_the_store() {
+    fn review_threads_round_trip_through_the_store() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut store = ReviewStore::load(Some(dir.path().to_path_buf()));
         let review = Review::new(
@@ -521,18 +612,25 @@ mod tests {
         store.insert(review).expect("insert");
         store
             .mutate(&id, |r| {
-                r.comments.push(ReviewComment {
+                r.threads.push(ReviewThread {
                     id: "c1".into(),
                     path: "src/sales.py".into(),
-                    anchor: CommentAnchor {
-                        side: CommentSide::New,
+                    kind: ReviewThreadKind::Note,
+                    anchor: ThreadAnchor {
+                        side: ThreadSide::New,
                         start_line: 62,
                         start_col: 4,
                         end_line: 63,
                         end_col: 10,
                         quoted_text: "line[\"revenue\"] = round(".into(),
                     },
-                    body: "Rounding per entry can drift.".into(),
+                    messages: vec![ThreadMessage {
+                        id: "m1".into(),
+                        author: MessageAuthor::Reviewer,
+                        body: "Rounding per entry can drift.".into(),
+                        created_at: 99,
+                    }],
+                    body: String::new(),
                     created_at: 99,
                 });
             })
@@ -540,18 +638,19 @@ mod tests {
 
         let reloaded = ReviewStore::load(Some(dir.path().to_path_buf()));
         let review = reloaded.get(&id).expect("review reloads");
-        assert_eq!(review.comments.len(), 1);
-        let comment = &review.comments[0];
-        assert_eq!(comment.path, "src/sales.py");
-        assert_eq!(comment.anchor.side, CommentSide::New);
-        assert_eq!(comment.anchor.start_line, 62);
-        assert_eq!(comment.anchor.quoted_text, "line[\"revenue\"] = round(");
-        assert_eq!(comment.body, "Rounding per entry can drift.");
+        assert_eq!(review.threads.len(), 1);
+        let thread = &review.threads[0];
+        assert_eq!(thread.path, "src/sales.py");
+        assert_eq!(thread.anchor.side, ThreadSide::New);
+        assert_eq!(thread.anchor.start_line, 62);
+        assert_eq!(thread.anchor.quoted_text, "line[\"revenue\"] = round(");
+        assert_eq!(thread.messages.len(), 1);
+        assert_eq!(thread.messages[0].body, "Rounding per entry can drift.");
     }
 
     #[test]
-    fn reviews_without_comments_load_with_an_empty_list() {
-        // A pre-comments review document must deserialize with comments = [].
+    fn reviews_without_threads_load_with_an_empty_list() {
+        // A pre-threads review document must deserialize with threads = [].
         let dir = tempfile::tempdir().expect("create tempdir");
         let reviews_dir = dir.path().join("reviews");
         fs::create_dir_all(&reviews_dir).expect("mkdir");
@@ -564,6 +663,200 @@ mod tests {
 
         let store = ReviewStore::load(Some(reviews_dir));
         let review = store.get("old-doc").expect("loads");
-        assert!(review.comments.is_empty());
+        assert!(review.threads.is_empty());
+    }
+
+    #[test]
+    fn legacy_single_body_threads_normalize_to_one_message() {
+        let mut thread = ReviewThread {
+            id: "t1".into(),
+            path: "src/lib.rs".into(),
+            kind: ReviewThreadKind::Note,
+            anchor: ThreadAnchor::default(),
+            messages: Vec::new(),
+            body: "legacy body".into(),
+            created_at: 42,
+        };
+        thread.normalize();
+        assert_eq!(
+            thread.messages.len(),
+            1,
+            "legacy body folds into one message"
+        );
+        let message = &thread.messages[0];
+        assert_eq!(message.author, MessageAuthor::Reviewer);
+        assert_eq!(message.body, "legacy body");
+        assert_eq!(message.created_at, 42);
+        assert!(
+            !message.id.is_empty(),
+            "normalize assigns the message an id"
+        );
+        assert_eq!(
+            thread.body, "",
+            "the legacy field is cleared once folded into messages"
+        );
+    }
+
+    #[test]
+    fn thread_kind_defaults_to_note_for_legacy_documents() {
+        // A thread document written before the `kind` field existed must
+        // deserialize with kind = Note (agent threads are a Task 4 addition).
+        let json = r#"{"id":"t1","path":"src/lib.rs",
+            "anchor":{"side":"new","start_line":1,"start_col":0,"end_line":1,
+            "end_col":1,"quoted_text":"x"},
+            "messages":[{"id":"m1","author":"reviewer","body":"note","created_at":1}],
+            "created_at":1}"#;
+        let thread: ReviewThread = serde_json::from_str(json).expect("legacy thread loads");
+        assert_eq!(
+            thread.kind,
+            ReviewThreadKind::Note,
+            "a thread with no kind field defaults to Note"
+        );
+    }
+
+    #[test]
+    fn thread_kind_round_trips_through_serde() {
+        let thread = ReviewThread {
+            id: "t1".into(),
+            path: "src/lib.rs".into(),
+            kind: ReviewThreadKind::Agent,
+            anchor: ThreadAnchor::default(),
+            messages: vec![ThreadMessage {
+                id: "m1".into(),
+                author: MessageAuthor::Reviewer,
+                body: "why?".into(),
+                created_at: 1,
+            }],
+            body: String::new(),
+            created_at: 1,
+        };
+        let json = serde_json::to_string(&thread).expect("serialize");
+        assert!(
+            json.contains("\"kind\":\"agent\""),
+            "the agent kind serializes as snake_case: {json}"
+        );
+        let reloaded: ReviewThread = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(reloaded.kind, ReviewThreadKind::Agent, "kind round-trips");
+    }
+
+    #[test]
+    fn threads_with_messages_round_trip() {
+        let thread = ReviewThread {
+            id: "t2".into(),
+            path: "src/lib.rs".into(),
+            kind: ReviewThreadKind::Note,
+            anchor: ThreadAnchor::default(),
+            messages: vec![
+                ThreadMessage {
+                    id: "m1".into(),
+                    author: MessageAuthor::Reviewer,
+                    body: "first".into(),
+                    created_at: 10,
+                },
+                ThreadMessage {
+                    id: "m2".into(),
+                    author: MessageAuthor::Agent,
+                    body: "second".into(),
+                    created_at: 20,
+                },
+            ],
+            body: String::new(),
+            created_at: 10,
+        };
+
+        let json = serde_json::to_string(&thread).expect("serialize");
+        let mut reloaded: ReviewThread = serde_json::from_str(&json).expect("deserialize");
+        reloaded.normalize();
+
+        assert_eq!(
+            reloaded, thread,
+            "new-format threads round trip unchanged and normalize is a no-op"
+        );
+    }
+
+    #[test]
+    fn last_activity_is_the_latest_message() {
+        let thread = ReviewThread {
+            id: "t3".into(),
+            path: "src/lib.rs".into(),
+            kind: ReviewThreadKind::Note,
+            anchor: ThreadAnchor::default(),
+            messages: vec![
+                ThreadMessage {
+                    id: "m1".into(),
+                    author: MessageAuthor::Reviewer,
+                    body: "first".into(),
+                    created_at: 10,
+                },
+                ThreadMessage {
+                    id: "m2".into(),
+                    author: MessageAuthor::Reviewer,
+                    body: "reply".into(),
+                    created_at: 50,
+                },
+            ],
+            body: String::new(),
+            created_at: 10,
+        };
+        assert_eq!(thread.last_activity_at(), 50);
+
+        let empty = ReviewThread {
+            id: "t4".into(),
+            path: "src/lib.rs".into(),
+            kind: ReviewThreadKind::Note,
+            anchor: ThreadAnchor::default(),
+            messages: Vec::new(),
+            body: String::new(),
+            created_at: 99,
+        };
+        assert_eq!(
+            empty.last_activity_at(),
+            99,
+            "with no messages, activity falls back to created_at"
+        );
+    }
+
+    #[test]
+    fn legacy_comments_key_loads_into_threads_and_round_trips_as_threads() {
+        // A review document persisted before the threads rename used the key
+        // "comments", and each thread was a single-body document (before
+        // messages existed). It must still load — both legacy layers folded
+        // — and the next save must re-emit "threads" with a "messages" array
+        // (not "comments" or a top-level "body").
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let reviews_dir = dir.path().join("reviews");
+        fs::create_dir_all(&reviews_dir).expect("mkdir");
+        let json = format!(
+            r#"{{"id":"legacy-doc","repo_path":"/repo","changeset":{{"kind":"single","sha":"{}"}},
+                "name":"Legacy","created_at":1,"last_activity_at":1,"status":"active",
+                "comments":[{{"id":"c1","path":"src/lib.rs","anchor":{{"side":"new",
+                "start_line":1,"start_col":0,"end_line":1,"end_col":1,"quoted_text":"x"}},
+                "body":"legacy body","created_at":2}}]}}"#,
+            "d".repeat(40)
+        );
+        fs::write(reviews_dir.join("legacy-doc.json"), json).expect("write");
+
+        let mut store = ReviewStore::load(Some(reviews_dir.clone()));
+        let review = store.get("legacy-doc").expect("loads");
+        assert_eq!(review.threads.len(), 1);
+        assert_eq!(review.threads[0].messages.len(), 1);
+        assert_eq!(review.threads[0].messages[0].body, "legacy body");
+        assert_eq!(
+            review.threads[0].messages[0].author,
+            MessageAuthor::Reviewer
+        );
+
+        // Trigger a save (no-op mutation) and confirm the on-disk shape is
+        // fully migrated: "threads"/"messages", no "comments" key, and the
+        // legacy top-level "body" is dropped now that it's empty (the
+        // reviewer's text moved into the message).
+        store
+            .mutate("legacy-doc", |_| {})
+            .expect("mutate triggers save");
+        let raw = fs::read_to_string(reviews_dir.join("legacy-doc.json")).expect("read saved");
+        assert!(raw.contains("\"threads\""));
+        assert!(!raw.contains("\"comments\""));
+        assert!(raw.contains("\"messages\""));
+        assert!(raw.contains("\"legacy body\""));
     }
 }

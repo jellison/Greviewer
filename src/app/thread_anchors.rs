@@ -1,4 +1,4 @@
-//! Converting between diff selections and persisted comment anchors.
+//! Converting between diff selections and persisted thread anchors.
 //!
 //! A persisted anchor names 1-based file line numbers on one diff side plus
 //! the quoted text; at runtime we resolve it back onto flat diff-row indices
@@ -7,19 +7,19 @@
 
 use crate::app::diff_selection::{self, DiffPoint, DiffSelection, DiffSideContent};
 use crate::repo;
-use crate::reviews::{CommentAnchor, CommentSide};
+use crate::reviews::{ThreadAnchor, ThreadSide};
 
-pub(crate) fn comment_side(side: repo::DiffSide) -> CommentSide {
+pub(crate) fn thread_side(side: repo::DiffSide) -> ThreadSide {
     match side {
-        repo::DiffSide::Old => CommentSide::Old,
-        repo::DiffSide::New => CommentSide::New,
+        repo::DiffSide::Old => ThreadSide::Old,
+        repo::DiffSide::New => ThreadSide::New,
     }
 }
 
-pub(crate) fn diff_side(side: CommentSide) -> repo::DiffSide {
+pub(crate) fn diff_side(side: ThreadSide) -> repo::DiffSide {
     match side {
-        CommentSide::Old => repo::DiffSide::Old,
-        CommentSide::New => repo::DiffSide::New,
+        ThreadSide::Old => repo::DiffSide::Old,
+        ThreadSide::New => repo::DiffSide::New,
     }
 }
 
@@ -39,15 +39,15 @@ pub(crate) fn anchor_from_selection(
     content: &DiffSideContent,
     side: repo::DiffSide,
     selection: &DiffSelection,
-) -> Option<CommentAnchor> {
+) -> Option<ThreadAnchor> {
     if selection.is_caret() {
         return None;
     }
     let (start, end) = selection.range();
     let start_line = content.cell(start.row).line_number?;
     let end_line = content.cell(end.row).line_number?;
-    Some(CommentAnchor {
-        side: comment_side(side),
+    Some(ThreadAnchor {
+        side: thread_side(side),
         start_line,
         start_col: start.column,
         end_line,
@@ -61,7 +61,7 @@ pub(crate) fn anchor_from_selection(
 /// falls back to searching for the quoted text's first line.
 pub(crate) fn resolve_anchor(
     content: &DiffSideContent,
-    anchor: &CommentAnchor,
+    anchor: &ThreadAnchor,
 ) -> Option<ResolvedAnchor> {
     let side = diff_side(anchor.side);
     if let Some(resolved) = resolve_by_line_numbers(content, anchor, side) {
@@ -80,7 +80,7 @@ fn clamped_point(content: &DiffSideContent, row: usize, column: usize) -> DiffPo
 
 fn resolve_by_line_numbers(
     content: &DiffSideContent,
-    anchor: &CommentAnchor,
+    anchor: &ThreadAnchor,
     side: repo::DiffSide,
 ) -> Option<ResolvedAnchor> {
     let start_row = row_for_line(content, anchor.start_line)?;
@@ -101,7 +101,7 @@ fn resolve_by_line_numbers(
 
 fn resolve_by_quoted_text(
     content: &DiffSideContent,
-    anchor: &CommentAnchor,
+    anchor: &ThreadAnchor,
     side: repo::DiffSide,
 ) -> Option<ResolvedAnchor> {
     let first_line = anchor.quoted_text.lines().next()?;
@@ -127,8 +127,8 @@ fn resolve_by_quoted_text(
 
 /// "name.rs:12" for single-line anchors, "name.rs:12–14" (en dash) for
 /// ranges: the file's basename joined to the anchor's persisted line
-/// reference, as shown in a comment row's meta line.
-pub(crate) fn comment_location_label(path: &str, anchor: &CommentAnchor) -> String {
+/// reference, as shown in a thread row's meta line.
+pub(crate) fn thread_location_label(path: &str, anchor: &ThreadAnchor) -> String {
     let name = path.rsplit('/').next().unwrap_or(path);
     if anchor.start_line == anchor.end_line {
         format!("{name}:{}", anchor.start_line)
@@ -142,7 +142,7 @@ mod tests {
     use crate::app::diff_selection::{DiffPoint, DiffSelection, DiffSideContent};
     use crate::app::diff_view;
     use crate::repo;
-    use crate::reviews::{CommentAnchor, CommentSide};
+    use crate::reviews::{ThreadAnchor, ThreadSide};
     use std::rc::Rc;
 
     use super::*;
@@ -164,7 +164,7 @@ mod tests {
         };
         let anchor = anchor_from_selection(&content, repo::DiffSide::New, &selection)
             .expect("range selection anchors");
-        assert_eq!(anchor.side, CommentSide::New);
+        assert_eq!(anchor.side, ThreadSide::New);
         assert_eq!((anchor.start_line, anchor.start_col), (2, 2));
         assert_eq!((anchor.end_line, anchor.end_col), (3, 4));
         assert_eq!(anchor.quoted_text, "avo\nchar");
@@ -185,8 +185,8 @@ mod tests {
     #[test]
     fn anchor_resolves_by_line_number() {
         let content = content("alpha\nbravo\ncharlie\n");
-        let anchor = CommentAnchor {
-            side: CommentSide::New,
+        let anchor = ThreadAnchor {
+            side: ThreadSide::New,
             start_line: 2,
             start_col: 1,
             end_line: 2,
@@ -201,8 +201,8 @@ mod tests {
     #[test]
     fn anchor_falls_back_to_quoted_text_when_line_numbers_miss() {
         let content = content("alpha\nbravo\ncharlie\n");
-        let anchor = CommentAnchor {
-            side: CommentSide::New,
+        let anchor = ThreadAnchor {
+            side: ThreadSide::New,
             start_line: 900, // drifted
             start_col: 1,
             end_line: 900,
@@ -217,8 +217,8 @@ mod tests {
     #[test]
     fn unresolvable_anchor_returns_none() {
         let content = content("alpha\n");
-        let anchor = CommentAnchor {
-            side: CommentSide::New,
+        let anchor = ThreadAnchor {
+            side: ThreadSide::New,
             start_line: 900,
             start_col: 0,
             end_line: 900,
@@ -229,23 +229,23 @@ mod tests {
     }
 
     #[test]
-    fn comment_location_labels() {
-        let single = CommentAnchor {
+    fn thread_location_labels() {
+        let single = ThreadAnchor {
             start_line: 60,
             end_line: 60,
             ..Default::default()
         };
-        let multi = CommentAnchor {
+        let multi = ThreadAnchor {
             start_line: 62,
             end_line: 63,
             ..Default::default()
         };
         assert_eq!(
-            comment_location_label("src/deep/name.rs", &single),
+            thread_location_label("src/deep/name.rs", &single),
             "name.rs:60"
         );
         assert_eq!(
-            comment_location_label("name.rs", &multi),
+            thread_location_label("name.rs", &multi),
             "name.rs:62\u{2013}63"
         );
     }

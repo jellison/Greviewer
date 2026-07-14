@@ -50,9 +50,9 @@ pub struct Palette {
     /// and `apply_to_gpui_component` hands it to the library's text inputs.
     pub caret: Hsla,
     pub active_line_bg: Hsla,
-    // Review comment anchors (saved comments; pending drafts use `accent`).
-    pub comment_anchor: Hsla,
-    pub comment_anchor_fill: Hsla,
+    // Review thread anchors (saved threads; pending drafts use `accent`).
+    pub thread_anchor: Hsla,
+    pub thread_anchor_fill: Hsla,
     // Change kinds.
     pub change_added: Hsla,
     pub change_modified: Hsla,
@@ -116,8 +116,8 @@ impl Palette {
             diff_selection_bg_unfocused: Hsla::from(rgba(0x82aaff26)),
             caret: Hsla::from(rgb(0x82aaff)),
             active_line_bg: Hsla::from(rgba(0xeeffff0f)),
-            comment_anchor: Hsla::from(rgb(0xffcb6b)),
-            comment_anchor_fill: Hsla::from(rgba(0xffcb6b1a)),
+            thread_anchor: Hsla::from(rgb(0xffcb6b)),
+            thread_anchor_fill: Hsla::from(rgba(0xffcb6b1a)),
             change_added: Hsla::from(rgb(0xc3e88d)),
             change_modified: Hsla::from(rgb(0x82aaff)),
             change_deleted: Hsla::from(rgb(0xf07178)),
@@ -184,7 +184,18 @@ pub fn apply_to_gpui_component(cx: &mut App) {
     theme.popover = p.surface;
     theme.popover_foreground = p.text;
     theme.muted_foreground = p.text_muted;
-    theme.accent = p.accent;
+    // `theme.accent` is gpui-component's only hook for inline-code chip
+    // backgrounds (`TextView`'s markdown renderer paints inline code with
+    // `cx.theme().accent` and nothing else — `HighlightStyle` has no font
+    // hook, so this can't also fix the font). Greviewer doesn't instantiate
+    // any of the other crate widgets that read `theme.accent` (`Select`,
+    // `Calendar`, `ToggleButton`, `ListItem`, `MenuItem`, or the
+    // code-action/completion popovers on `Input`, none of which this app
+    // uses), so retinting it here only affects inline code. Use a subtle
+    // near-white chip in the vein of `active_line_bg` rather than the loud
+    // accent blue. Deliberately does not read `p.accent` — that stays the
+    // app's own accent color for selection/highlights elsewhere.
+    theme.accent = Hsla::from(rgba(0xeeffff1a));
     theme.ring = p.accent;
     theme.selection = p.row_selected;
     theme.drop_target = p.drop_target;
@@ -196,6 +207,13 @@ pub fn apply_to_gpui_component(cx: &mut App) {
     theme.scrollbar = Hsla::from(rgba(0x00000000));
     theme.scrollbar_thumb = Hsla::from(rgba(0x546e7a40));
     theme.scrollbar_thumb_hover = Hsla::from(rgba(0x546e7a66));
+    // Fenced code blocks (`CodeBlock` in the markdown renderer) use the
+    // crate's mono font hooks; point them at the app's own monospace font
+    // instead of the crate default (Menlo), a touch smaller than the 12px
+    // message body (`BODY_TEXT_SIZE` in `app/threads_panel.rs`) so it sits
+    // comfortably in the narrow sidebar.
+    theme.mono_font_family = crate::app::MONO_FONT_FAMILY.into();
+    theme.mono_font_size = gpui::px(11.);
 }
 
 #[cfg(test)]
@@ -225,8 +243,8 @@ mod tests {
         assert_eq!(p.ref_pr_fg, Hsla::from(rgb(0xc792ea)));
         assert_eq!(p.ref_pr_bg, Hsla::from(rgba(0xc792ea26)));
         assert_eq!(p.ref_pr_border, Hsla::from(rgba(0xc792ea66)));
-        assert_eq!(p.comment_anchor, Hsla::from(rgb(0xffcb6b)));
-        assert_eq!(p.comment_anchor_fill, Hsla::from(rgba(0xffcb6b1a)));
+        assert_eq!(p.thread_anchor, Hsla::from(rgb(0xffcb6b)));
+        assert_eq!(p.thread_anchor_fill, Hsla::from(rgba(0xffcb6b1a)));
     }
 
     #[test]
@@ -248,8 +266,26 @@ mod tests {
             assert_eq!(theme.sidebar, p.surface);
             assert_eq!(theme.tab_bar, p.surface);
             assert_eq!(theme.tab_active, p.background);
-            assert_eq!(theme.accent, p.accent);
+            // Inline-code background (gpui-component's `TextView` has no
+            // other hook for it) is retinted to a subtle near-white chip
+            // instead of the loud accent blue, and must stay decoupled from
+            // the app's own `p.accent` (used for selection/accent
+            // elsewhere) and from `theme.ring` (the focus ring, assigned
+            // separately below).
+            assert_eq!(theme.accent, Hsla::from(rgba(0xeeffff1a)));
+            assert_ne!(theme.accent, p.accent);
+            assert_eq!(theme.ring, p.accent);
             assert_eq!(theme.scrollbar_thumb, Hsla::from(rgba(0x546e7a40)));
+            assert_eq!(theme.caret, p.caret);
+            // Fenced code blocks (`CodeBlock` in gpui-component's markdown
+            // renderer) should render in the app's monospace font, not the
+            // crate default (Menlo), and a touch smaller than the 12px
+            // message body so code sits comfortably in the narrow sidebar.
+            assert_eq!(
+                theme.mono_font_family,
+                gpui::SharedString::from(crate::app::MONO_FONT_FAMILY)
+            );
+            assert_eq!(theme.mono_font_size, gpui::px(11.));
         });
     }
 

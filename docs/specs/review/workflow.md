@@ -608,24 +608,24 @@ showing it again restores the file list exactly as it was.
 
 The strip's other controls govern a second, independently resizable panel
 docked to the screen's other side: the review sidebar, a tabbed surface
-holding the AI-generated review guide and the anchored-comments list side by
+holding the AI-generated review guide and the anchored-threads list side by
 side (see [Review Guide](../ai/review-guide.md) and [Review
-Comments](comments.md) for what each tab shows). A show/hide control toggles
+Threads](threads.md) for what each tab shows). A show/hide control toggles
 that whole panel open and closed on each activation; unlike the AI features
 it can host, this control is not gated on AI assistance, since the sidebar's
-Comments tab is available regardless. A separate reveal control brings the
+Threads tab is available regardless. A separate reveal control brings the
 panel into view if it is not already open and switches the sidebar to the
 guide's tab, so the review guide is reachable and active — a one-way "show
 me" action that never hides the panel, distinct from the show/hide toggle —
 and remains gated on AI assistance being enabled, since its purpose is
 reaching the guide. Both controls, along with every other AI-specific
 affordance, are absent for the pending changeset, which supports neither a
-guide nor a review to attach comments to.
+guide nor a review to attach threads to.
 
 Both panels' shown-or-hidden state, and the sidebar's width, are remembered
 across changesets and across application relaunches; the file list's own
 width is remembered the same way. Which of the sidebar's tabs is showing is
-not itself a state this section governs — see [Review Comments](comments.md)
+not itself a state this section governs — see [Review Threads](threads.md)
 for how the tabs behave when AI assistance is off.
 
 **Triggering conditions**
@@ -646,7 +646,7 @@ for how the tabs behave when AI assistance is off.
 - The sidebar's show/hide control is offered for any changeset built from
   committed history, regardless of whether AI assistance is enabled; it is
   absent for the pending changeset, which can hold neither a guide nor
-  comments.
+  threads.
 - The sidebar's reveal control is offered only when AI assistance is enabled
   and the changeset is built from committed history; activating it shows the
   sidebar if it was hidden and switches it to the review guide's tab. It
@@ -658,7 +658,7 @@ for how the tabs behave when AI assistance is off.
 **Edge cases**
 
 - Turning AI assistance off while the sidebar is shown removes the reveal
-  control from the strip and falls the sidebar back to its Comments tab if
+  control from the strip and falls the sidebar back to its Threads tab if
   the review guide's tab was active; the show/hide control and the sidebar
   itself remain available. Turning assistance back on restores the reveal
   control.

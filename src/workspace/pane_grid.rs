@@ -21,7 +21,7 @@ use super::tab_bar::DraggedTab;
 use super::{AxisNode, PaneGroup, PaneId, SplitAxis, SplitDirection};
 use crate::app::menu::DIFF_PANE_CONTEXT;
 use crate::app::{
-    App, DiffAddComment, DiffCancelSelection, DiffCopy, DiffMoveDocEnd, DiffMoveDocStart,
+    App, DiffAddThread, DiffCancelSelection, DiffCopy, DiffMoveDocEnd, DiffMoveDocStart,
     DiffMoveDown, DiffMoveLeft, DiffMoveLineEnd, DiffMoveLineStart, DiffMoveRight, DiffMoveUp,
     DiffMoveWordLeft, DiffMoveWordRight, DiffSelectAll, DiffSelectDocEnd, DiffSelectDocStart,
     DiffSelectDown, DiffSelectLeft, DiffSelectLineEnd, DiffSelectLineStart, DiffSelectRight,
@@ -230,8 +230,8 @@ fn render_pane_content(
         .on_action(cx.listener(|app, _: &DiffCancelSelection, _window, cx| {
             app.cancel_diff_selection(cx);
         }))
-        .on_action(cx.listener(|app, _: &DiffAddComment, window, cx| {
-            app.stage_comment_draft(window, cx);
+        .on_action(cx.listener(|app, _: &DiffAddThread, window, cx| {
+            app.stage_thread_draft(window, cx);
         }))
         .on_hover(cx.listener(move |app, hovered: &bool, _window, cx| {
             if *hovered {

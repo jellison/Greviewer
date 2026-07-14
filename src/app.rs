@@ -2,8 +2,6 @@
 
 mod branch_filter;
 mod branch_sidebar;
-mod comment_anchors;
-mod comments_panel;
 mod commit_graph;
 pub(crate) mod diff_selection;
 mod diff_view;
@@ -15,6 +13,8 @@ mod review_sidebar;
 mod status_footer;
 #[cfg(test)]
 mod test_support;
+mod thread_anchors;
+mod threads_panel;
 // Re-exported (not the whole module — most of its helpers return types
 // private to `app`) so `crate::ai`'s unit tests can share the one stub-CLI
 // writer instead of keeping their own copies.
@@ -112,7 +112,7 @@ actions!(
         DiffSelectAll,
         DiffCopy,
         DiffCancelSelection,
-        DiffAddComment
+        DiffAddThread
     ]
 );
 
@@ -171,17 +171,43 @@ type ReadOnlyCellCache = RefCell<HashMap<(String, String), Rc<Vec<diff_view::Dif
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SidebarTab {
     Review,
-    Comments,
+    Threads,
 }
 
-/// A staged, not-yet-saved comment: the anchor is frozen at staging time.
+/// A staged, not-yet-saved thread: the anchor is frozen at staging time.
 #[derive(Debug, Clone)]
-pub(crate) struct CommentDraft {
+pub(crate) struct ThreadDraft {
     pub path: String,
-    pub anchor: crate::reviews::CommentAnchor,
+    pub anchor: crate::reviews::ThreadAnchor,
     /// The anchor resolved onto the diff at staging time, so the composer row
     /// can align to the same rows the selection covered.
-    pub resolved: comment_anchors::ResolvedAnchor,
+    pub resolved: thread_anchors::ResolvedAnchor,
+    /// Whether saving this draft creates a plain reviewer note or an AI agent
+    /// thread (the "Ask AI" affordance stages an `Agent` draft).
+    pub kind: crate::reviews::ReviewThreadKind,
+}
+
+/// Shown on an agent thread's Retry affordance when the session pool is full,
+/// mirroring the guide panel's capacity copy.
+const AGENT_AT_CAPACITY_MESSAGE: &str = "Too many AI tasks are running. Try again shortly.";
+/// Shown when an agent turn couldn't be spawned for any other reason.
+const AGENT_START_FAILED_MESSAGE: &str = "Couldn't start the AI session.";
+
+/// The full prior exchange of an agent thread, oldest first, formatted as
+/// `Reviewer:`/`AI:` lines for a fresh (re-seeded) CLI session's prompt.
+fn agent_thread_transcript(thread: &crate::reviews::ReviewThread) -> String {
+    thread
+        .messages
+        .iter()
+        .map(|message| {
+            let who = match message.author {
+                crate::reviews::MessageAuthor::Reviewer => "Reviewer",
+                crate::reviews::MessageAuthor::Agent => "AI",
+            };
+            format!("{who}: {}", message.body)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub struct App {
@@ -286,6 +312,20 @@ pub struct App {
     guide_thread: Option<crate::ai::ThreadId>,
     /// Why the last guide generation failed, for the panel's Failed state.
     guide_error: Option<String>,
+    /// Agent-thread turns currently in flight, keyed by `ReviewThread.id` →
+    /// the AI `ThreadId` running it. Present only while a turn runs; dropped
+    /// when it completes, fails, or is cancelled. Drives the running ticker
+    /// and blocks replies while a turn is in flight.
+    agent_thread_runs: HashMap<String, crate::ai::ThreadId>,
+    /// The CLI session bound to each agent thread for the current changeset
+    /// session, kept after a turn completes so a follow-up resumes it
+    /// (`send_turn`) instead of re-seeding. Transient: dropped on cancel and
+    /// cleared on changeset close — after an app restart a follow-up starts a
+    /// fresh session seeded with the transcript.
+    agent_thread_sessions: HashMap<String, crate::ai::ThreadId>,
+    /// Why the last agent turn for a thread failed (or couldn't start), for
+    /// the thread's Retry affordance. Keyed by `ReviewThread.id`.
+    agent_thread_errors: HashMap<String, String>,
     /// Bitbucket PR session for the open repo's origin, when it maps to a
     /// Bitbucket Data Center remote. `None` for non-Bitbucket repos.
     bitbucket: Option<Entity<crate::bitbucket::BitBucketSession>>,
@@ -387,31 +427,43 @@ pub struct App {
     pub(crate) pending_summary: repo::PendingSummary,
     /// Which tab of the right-docked review sidebar is showing.
     pub(crate) sidebar_tab: SidebarTab,
-    /// The saved comment last selected in the Comments tab, if any.
-    pub(crate) selected_comment_id: Option<String>,
-    /// A staged, not-yet-saved comment, if the composer is open on one.
-    pub(crate) comment_draft: Option<CommentDraft>,
-    /// The Comments tab's composer input, shared across every staged draft.
-    pub(crate) comment_input: Entity<InputState>,
-    /// Vertical scroll handle for the Comments tab's single unified list.
-    pub(crate) comments_list_scroll: ScrollHandle,
-    /// True while the cursor is over the Comments tab's list; gates its
+    /// The saved thread last selected in the Threads tab, if any.
+    pub(crate) selected_thread_id: Option<String>,
+    /// A staged, not-yet-saved thread, if the composer is open on one.
+    pub(crate) thread_draft: Option<ThreadDraft>,
+    /// The Threads tab's composer input, shared across every staged draft.
+    pub(crate) thread_input: Entity<InputState>,
+    /// The id of the thread whose reply composer is open, if any. Exclusive
+    /// with `thread_draft`: staging a new-thread draft cancels an open
+    /// reply, and starting a reply cancels a new-thread draft.
+    pub(crate) reply_draft_thread_id: Option<String>,
+    /// The reply composer's input, shared across every open reply.
+    pub(crate) reply_input: Entity<InputState>,
+    /// Vertical scroll handle for the Threads tab's single unified list.
+    pub(crate) threads_list_scroll: ScrollHandle,
+    /// True while the cursor is over the Threads tab's list; gates its
     /// hover-revealed scrollbar, mirroring the guide panel's.
-    pub(crate) comments_list_hovered: bool,
-    /// Last painted y-origin (window coordinates) of each comment row
-    /// currently rendered in the Comments tab's flat list, keyed by comment
-    /// id. Captured by a canvas in `render_comment_row`; read back when a
-    /// pending list scroll (see `pending_comments_list_scroll`) needs a
+    pub(crate) threads_list_hovered: bool,
+    /// Last painted y-origin (window coordinates) of each thread row
+    /// currently rendered in the Threads tab's flat list, keyed by thread
+    /// id. Captured by a canvas in `render_thread_row`; read back when a
+    /// pending list scroll (see `pending_threads_list_scroll`) needs a
     /// target row's painted position.
-    pub(crate) comment_row_origins: Rc<RefCell<HashMap<String, f32>>>,
-    /// The id of a just-selected comment whose row the comments list should
+    pub(crate) thread_row_origins: Rc<RefCell<HashMap<String, f32>>>,
+    /// The id of a just-selected thread whose row the threads list should
     /// bring near its top on the next render. Set only by
-    /// `select_comment_from_diff` (a click on anchored diff text) — a
+    /// `select_thread_from_diff` (a click on anchored diff text) — a
     /// sidebar row click never scrolls the list. Consumed by
-    /// `render_comments_tab` once the row's painted origin is known —
+    /// `render_threads_tab` once the row's painted origin is known —
     /// re-rendering until it is. `RefCell` because consumption happens
     /// during render, which only has `&self`.
-    pub(crate) pending_comments_list_scroll: RefCell<Option<String>>,
+    pub(crate) pending_threads_list_scroll: RefCell<Option<String>>,
+    /// Thread ids the reviewer has collapsed to their header in the Threads
+    /// tab. Session-only, mirroring `collapsed_file_tree_paths`: cleared
+    /// whenever a repository is opened, never persisted, and unrelated to
+    /// which thread is selected. A thread not in this set renders expanded,
+    /// so a newly saved thread always starts expanded.
+    pub(crate) collapsed_thread_ids: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -586,7 +638,7 @@ impl FileDiffScroll {
         // offset. `set_offset` alone leaves `last_item_size` holding the
         // outgoing file's measurements; `set_diff_scroll_top`'s clamp reads
         // `last_item_size` (via `max_offset`) one frame before the new file
-        // paints (the closed-file `select_comment` path), so a shorter
+        // paints (the closed-file `select_thread` path), so a shorter
         // previous file's stale geometry would otherwise clamp a deep anchor
         // in a longer new file down to (near) zero. Clearing it here makes
         // the clamp's `last_item_size == None` skip-path apply until the new
@@ -1135,7 +1187,7 @@ impl App {
         )
         .detach();
 
-        let comment_input = cx.new(|cx| {
+        let thread_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
                 .auto_grow(3, 8)
@@ -1145,11 +1197,29 @@ impl App {
         // Enter keeps inserting a newline, matching a multi-line composer's
         // usual behavior.
         cx.subscribe_in(
-            &comment_input,
+            &thread_input,
             window,
             |app, _input, event: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { secondary: true } = event {
-                    app.save_comment_draft(window, cx);
+                    app.submit_thread_draft(window, cx);
+                }
+            },
+        )
+        .detach();
+
+        let reply_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .auto_grow(2, 8)
+                .placeholder("Reply…")
+        });
+        // Mirrors `thread_input`'s Cmd+Enter submit chord.
+        cx.subscribe_in(
+            &reply_input,
+            window,
+            |app, _input, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { secondary: true } = event {
+                    app.save_thread_reply(window, cx);
                 }
             },
         )
@@ -1273,7 +1343,7 @@ impl App {
         let default_sidebar_tab = if settings.ai_enabled {
             SidebarTab::Review
         } else {
-            SidebarTab::Comments
+            SidebarTab::Threads
         };
 
         Self {
@@ -1322,6 +1392,9 @@ impl App {
             ai_sessions,
             guide_thread: None,
             guide_error: None,
+            agent_thread_runs: HashMap::new(),
+            agent_thread_sessions: HashMap::new(),
+            agent_thread_errors: HashMap::new(),
             bitbucket,
             bitbucket_repo,
             bitbucket_state: PrSectionState::NotConfigured,
@@ -1363,13 +1436,16 @@ impl App {
             worktree_entries: Vec::new(),
             pending_summary,
             sidebar_tab: default_sidebar_tab,
-            selected_comment_id: None,
-            comment_draft: None,
-            comment_input,
-            comments_list_scroll: ScrollHandle::new(),
-            comments_list_hovered: false,
-            comment_row_origins: Rc::new(RefCell::new(HashMap::new())),
-            pending_comments_list_scroll: RefCell::new(None),
+            selected_thread_id: None,
+            thread_draft: None,
+            thread_input,
+            reply_draft_thread_id: None,
+            reply_input,
+            threads_list_scroll: ScrollHandle::new(),
+            threads_list_hovered: false,
+            thread_row_origins: Rc::new(RefCell::new(HashMap::new())),
+            pending_threads_list_scroll: RefCell::new(None),
+            collapsed_thread_ids: BTreeSet::new(),
         }
     }
 
@@ -1478,12 +1554,16 @@ impl App {
             .update(cx, |sessions, cx| sessions.cancel_all(cx));
         self.guide_thread = None;
         self.guide_error = None;
+        self.agent_thread_runs.clear();
+        self.agent_thread_sessions.clear();
+        self.agent_thread_errors.clear();
         // A staged draft or selection names a pane and path scoped to the
         // previous repo's workspace, cleared below (see `close_changeset`'s
         // matching comment).
-        self.comment_draft = None;
-        self.selected_comment_id = None;
-        self.pending_comments_list_scroll.borrow_mut().take();
+        self.thread_draft = None;
+        self.reply_draft_thread_id = None;
+        self.selected_thread_id = None;
+        self.pending_threads_list_scroll.borrow_mut().take();
         self.workspace = crate::workspace::Workspace::new();
         self.pane_scrolls.borrow_mut().clear();
         self.diff_selections.clear();
@@ -1494,6 +1574,7 @@ impl App {
         self.file_tree_highlight_path = None;
         self.file_list_mode = FileListMode::Changed;
         self.collapsed_file_tree_paths.clear();
+        self.collapsed_thread_ids.clear();
         self.record_recent_repository(recent_path);
         self.persist_settings();
         self.commit_history_scroll
@@ -2607,9 +2688,10 @@ impl App {
                 self.diff_selections.clear();
                 // A staged draft names a pane and path from the previous
                 // workspace, which the reset above just invalidated.
-                self.cancel_comment_draft(window, cx);
-                self.selected_comment_id = None;
-                self.pending_comments_list_scroll.borrow_mut().take();
+                self.cancel_thread_draft(window, cx);
+                self.reply_draft_thread_id = None;
+                self.selected_thread_id = None;
+                self.pending_threads_list_scroll.borrow_mut().take();
                 self.stop_caret_blink();
                 self.diff_row_cache.borrow_mut().clear();
                 self.read_only_cell_cache.borrow_mut().clear();
@@ -2641,9 +2723,14 @@ impl App {
         self.pending_delete_review = None;
         self.workspace.clear();
         // A staged draft names a pane and path in the just-cleared workspace.
-        self.comment_draft = None;
-        self.selected_comment_id = None;
-        self.pending_comments_list_scroll.borrow_mut().take();
+        self.thread_draft = None;
+        self.reply_draft_thread_id = None;
+        self.selected_thread_id = None;
+        self.pending_threads_list_scroll.borrow_mut().take();
+        // Collapse state is transient and scoped to the open changeset (see
+        // "Collapsing threads" in docs/specs/review/threads.md): it never
+        // survives closing and reopening a changeset.
+        self.collapsed_thread_ids.clear();
         self.file_tree_highlight_path = None;
         self.file_tree_hovered = false;
         self.guide_scroll.set_offset(point(px(0.), px(0.)));
@@ -2659,6 +2746,11 @@ impl App {
         // thread id or error from the last changeset must not leak in.
         self.guide_thread = None;
         self.guide_error = None;
+        // Agent-thread session bindings are transient and changeset-scoped
+        // (the sessions were just killed by cancel_all above).
+        self.agent_thread_runs.clear();
+        self.agent_thread_sessions.clear();
+        self.agent_thread_errors.clear();
         self.stop_caret_blink();
         self.diff_row_cache.borrow_mut().clear();
         self.read_only_cell_cache.borrow_mut().clear();
@@ -2741,9 +2833,31 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         let crate::ai::AiSessionsEvent::ThreadUpdated(id) = *event;
-        if self.guide_thread != Some(id) {
+        if self.guide_thread == Some(id) {
+            self.on_guide_thread_updated(sessions, id, cx);
             return;
         }
+        // Otherwise this may be an agent thread's turn; find the review thread
+        // bound to this AI thread. Unknown ids (e.g. a run already cancelled
+        // and unbound) are ignored.
+        let Some(review_thread_id) = self
+            .agent_thread_runs
+            .iter()
+            .find_map(|(review_thread_id, ai_id)| (*ai_id == id).then(|| review_thread_id.clone()))
+        else {
+            return;
+        };
+        self.on_agent_thread_updated(&review_thread_id, sessions, id, cx);
+    }
+
+    /// The guide-generation branch of `on_ai_sessions_event`, unchanged in
+    /// behavior — extracted so agent-thread routing can sit beside it.
+    fn on_guide_thread_updated(
+        &mut self,
+        sessions: Entity<crate::ai::AiSessions>,
+        id: crate::ai::ThreadId,
+        cx: &mut Context<Self>,
+    ) {
         let (status, result) = {
             let sessions = sessions.read(cx);
             let Some(thread) = sessions.thread(id) else {
@@ -2775,6 +2889,74 @@ impl App {
             crate::ai::ThreadStatus::Running => {} // ticker re-renders via notify below
         }
         cx.notify();
+    }
+
+    /// Apply an agent thread's status transition: a completed turn appends the
+    /// AI reply and drops the in-flight run (the session binding survives so a
+    /// follow-up can resume it); a failure records an error for Retry; a
+    /// cancellation drops the bindings silently, leaving the thread's saved
+    /// messages untouched.
+    fn on_agent_thread_updated(
+        &mut self,
+        review_thread_id: &str,
+        sessions: Entity<crate::ai::AiSessions>,
+        id: crate::ai::ThreadId,
+        cx: &mut Context<Self>,
+    ) {
+        let (status, result) = {
+            let sessions = sessions.read(cx);
+            let Some(thread) = sessions.thread(id) else {
+                return;
+            };
+            (thread.status.clone(), thread.last_result.clone())
+        };
+        match status {
+            crate::ai::ThreadStatus::Idle => {
+                // The single terminal event for this turn: drop the in-flight
+                // run so we append exactly once (the session binding stays).
+                self.agent_thread_runs.remove(review_thread_id);
+                match result {
+                    Some(text) => self.append_agent_reply(review_thread_id, text, cx),
+                    None => {
+                        self.agent_thread_errors.insert(
+                            review_thread_id.to_string(),
+                            "The AI returned no result.".to_string(),
+                        );
+                    }
+                }
+            }
+            crate::ai::ThreadStatus::Failed(message) => {
+                self.agent_thread_runs.remove(review_thread_id);
+                self.agent_thread_errors
+                    .insert(review_thread_id.to_string(), message);
+            }
+            crate::ai::ThreadStatus::Cancelled => {
+                self.agent_thread_runs.remove(review_thread_id);
+                self.agent_thread_sessions.remove(review_thread_id);
+            }
+            crate::ai::ThreadStatus::Running => {} // ticker re-renders via notify below
+        }
+        cx.notify();
+    }
+
+    /// Append an AI-authored reply to an agent thread and persist it.
+    fn append_agent_reply(&mut self, review_thread_id: &str, text: String, cx: &mut Context<Self>) {
+        let Some(review_id) = self.current_review().map(|review| review.id.clone()) else {
+            return;
+        };
+        let tid = review_thread_id.to_string();
+        let message = crate::reviews::ThreadMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            author: crate::reviews::MessageAuthor::Agent,
+            body: text,
+            created_at: now_unix_seconds(),
+        };
+        let result = self.reviews.mutate(&review_id, |review| {
+            if let Some(thread) = review.threads.iter_mut().find(|thread| thread.id == tid) {
+                thread.messages.push(message);
+            }
+        });
+        self.after_review_mutation(result.map(|_| ()), None, cx);
     }
 
     /// Parse a completed guide turn's result and persist it on the open
@@ -3673,11 +3855,31 @@ impl App {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
     }
 
-    /// `Cmd+Shift+C`: stages a pending comment on the active selection:
-    /// freezes the anchor, reveals the sidebar on the Comments tab, and
+    /// `Cmd+Shift+C`: stages a pending thread on the active selection:
+    /// freezes the anchor, reveals the sidebar on the Threads tab, and
     /// focuses the composer. No-ops when there is no range selection or the
     /// open changeset can't carry a review (the pending changeset).
-    pub(crate) fn stage_comment_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn stage_thread_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stage_thread_draft_of_kind(crate::reviews::ReviewThreadKind::Note, window, cx);
+    }
+
+    /// `Ask AI`: stages a pending *agent* thread on the active selection.
+    /// Mirrors `stage_thread_draft` but marks the draft `Agent`, so saving it
+    /// starts an AI turn. Additionally gated on `settings.ai_enabled` — the
+    /// affordance is hidden with AI off, and this is its belt-and-braces guard.
+    pub(crate) fn stage_agent_thread_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.settings.ai_enabled {
+            return;
+        }
+        self.stage_thread_draft_of_kind(crate::reviews::ReviewThreadKind::Agent, window, cx);
+    }
+
+    fn stage_thread_draft_of_kind(
+        &mut self,
+        kind: crate::reviews::ReviewThreadKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.open_changeset_supports_guide() {
             return;
         }
@@ -3685,36 +3887,45 @@ impl App {
             return;
         };
         let Some(anchor) =
-            comment_anchors::anchor_from_selection(&content, selection.side, &selection)
+            thread_anchors::anchor_from_selection(&content, selection.side, &selection)
         else {
             return;
         };
-        let Some(resolved) = comment_anchors::resolve_anchor(&content, &anchor) else {
+        let Some(resolved) = thread_anchors::resolve_anchor(&content, &anchor) else {
             return;
         };
-        self.comment_draft = Some(CommentDraft {
+        self.thread_draft = Some(ThreadDraft {
             path: key,
             anchor,
             resolved,
+            kind,
         });
-        self.selected_comment_id = None;
+        self.selected_thread_id = None;
+        // Only one composer is ever open at a time.
+        self.reply_draft_thread_id = None;
         self.settings.changeset_panels.guide_open = true;
         self.persist_settings();
-        self.sidebar_tab = SidebarTab::Comments;
-        self.comment_input
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        window.focus(&gpui::Focusable::focus_handle(&self.comment_input, cx));
+        self.sidebar_tab = SidebarTab::Threads;
+        let placeholder = match kind {
+            crate::reviews::ReviewThreadKind::Agent => "Ask about this code…",
+            crate::reviews::ReviewThreadKind::Note => "Add a comment…",
+        };
+        self.thread_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.set_placeholder(placeholder, window, cx);
+        });
+        window.focus(&gpui::Focusable::focus_handle(&self.thread_input, cx));
         cx.notify();
     }
 
-    /// Saves the staged draft as a review comment (creating the review if
+    /// Saves the staged draft as a review thread (creating the review if
     /// none exists yet, exactly like guide generation does). Empty bodies
     /// are ignored; the composer stays open for the user to type or cancel.
-    pub(crate) fn save_comment_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = self.comment_draft.clone() else {
+    pub(crate) fn save_thread_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.thread_draft.clone() else {
             return;
         };
-        let body = self.comment_input.read(cx).value().trim().to_string();
+        let body = self.thread_input.read(cx).value().trim().to_string();
         if body.is_empty() {
             return;
         }
@@ -3722,87 +3933,473 @@ impl App {
         let Some(review_id) = self.current_review().map(|review| review.id.clone()) else {
             return;
         };
-        let comment = crate::reviews::ReviewComment {
+        let created_at = now_unix_seconds();
+        let thread = crate::reviews::ReviewThread {
             id: uuid::Uuid::new_v4().to_string(),
             path: draft.path,
             anchor: draft.anchor,
-            body,
-            created_at: now_unix_seconds(),
+            messages: vec![crate::reviews::ThreadMessage {
+                id: uuid::Uuid::new_v4().to_string(),
+                author: crate::reviews::MessageAuthor::Reviewer,
+                body,
+                created_at,
+            }],
+            created_at,
+            ..Default::default()
         };
-        let comment_id = comment.id.clone();
+        let thread_id = thread.id.clone();
         let result = self
             .reviews
-            .mutate(&review_id, |review| review.comments.push(comment));
+            .mutate(&review_id, |review| review.threads.push(thread));
         self.after_review_mutation(result.map(|_| ()), Some(window), cx);
-        self.comment_draft = None;
-        self.comment_input
+        self.thread_draft = None;
+        self.thread_input
             .update(cx, |state, cx| state.set_value("", window, cx));
-        self.select_comment(&comment_id, cx);
+        self.select_thread(&thread_id, cx);
     }
 
-    /// Discards the staged draft without saving.
-    pub(crate) fn cancel_comment_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.comment_draft.take().is_none() {
+    /// Save the staged draft, routed by its kind: an `Agent` draft starts an
+    /// AI turn, a `Note` draft saves a plain reviewer thread. Bound to the
+    /// composer's Cmd+Enter chord.
+    fn submit_thread_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.thread_draft.as_ref().map(|draft| draft.kind) {
+            Some(crate::reviews::ReviewThreadKind::Agent) => {
+                self.save_agent_thread_draft(window, cx)
+            }
+            _ => self.save_thread_draft(window, cx),
+        }
+    }
+
+    /// Saves the staged agent draft: persist the `Agent` thread with the
+    /// reviewer's question as its first message, select it, then kick off the
+    /// AI turn that answers it. An empty question is ignored (the composer
+    /// stays open), mirroring `save_thread_draft`.
+    pub(crate) fn save_agent_thread_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.thread_draft.clone() else {
+            return;
+        };
+        let question = self.thread_input.read(cx).value().trim().to_string();
+        if question.is_empty() {
             return;
         }
-        self.comment_input
+        self.ensure_open_changeset_review(Some(window), cx);
+        let Some(review_id) = self.current_review().map(|review| review.id.clone()) else {
+            return;
+        };
+        let created_at = now_unix_seconds();
+        let thread = crate::reviews::ReviewThread {
+            id: uuid::Uuid::new_v4().to_string(),
+            path: draft.path,
+            anchor: draft.anchor,
+            kind: crate::reviews::ReviewThreadKind::Agent,
+            messages: vec![crate::reviews::ThreadMessage {
+                id: uuid::Uuid::new_v4().to_string(),
+                author: crate::reviews::MessageAuthor::Reviewer,
+                body: question,
+                created_at,
+            }],
+            created_at,
+            ..Default::default()
+        };
+        let thread_id = thread.id.clone();
+        let result = self
+            .reviews
+            .mutate(&review_id, |review| review.threads.push(thread));
+        self.after_review_mutation(result.map(|_| ()), Some(window), cx);
+        self.thread_draft = None;
+        self.thread_input
             .update(cx, |state, cx| state.set_value("", window, cx));
-        cx.notify();
+        self.select_thread(&thread_id, cx);
+        self.start_agent_thread_turn(&thread_id, cx);
     }
 
-    /// Selects a saved comment: opens the file's diff (if it isn't already
-    /// the active tab) and scrolls to the anchor. Never scrolls the comments
-    /// list — a sidebar row click moves only the diff (see
-    /// `select_comment_from_diff` for the diff-click direction). A no-op for
-    /// an unknown id.
-    pub(crate) fn select_comment(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(comment) = self
-            .open_changeset_comments()
+    /// Start (or restart) the AI turn for an agent thread. Uses `ask_prompt`
+    /// for a thread that is still just its opening question, and the
+    /// transcript-seeded `ask_followup_prompt` once it carries a conversation
+    /// — the latter is the fresh-session path a follow-up falls back to when
+    /// no live session can be resumed. Records the run, or an error for the
+    /// Retry affordance when the session can't start.
+    fn start_agent_thread_turn(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let Some(thread) = self
+            .open_changeset_threads()
             .into_iter()
-            .find(|comment| comment.id == id)
+            .find(|thread| thread.id == thread_id)
         else {
             return;
         };
-        self.selected_comment_id = Some(id.to_string());
-        self.comment_draft = None;
-        self.open_file_preview(comment.path.clone(), cx);
-        self.scroll_diff_to_comment_anchor(&comment, cx);
+        let Some((anchor, repo_root)) = self.agent_anchor_for(&thread) else {
+            self.agent_thread_errors.insert(
+                thread_id.to_string(),
+                AGENT_START_FAILED_MESSAGE.to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        let prompt = if thread.messages.len() <= 1 {
+            let question = thread
+                .first_message()
+                .map(|message| message.body.clone())
+                .unwrap_or_default();
+            crate::ai::prompts::ask_prompt(&anchor, &thread.anchor.quoted_text, &question)
+        } else {
+            let transcript = agent_thread_transcript(&thread);
+            crate::ai::prompts::ask_followup_prompt(
+                &anchor,
+                &thread.anchor.quoted_text,
+                &transcript,
+            )
+        };
+        self.agent_thread_errors.remove(thread_id);
+        let started = self.ai_sessions.update(cx, |sessions, cx| {
+            sessions.start_thread(
+                repo_root,
+                crate::ai::ThreadKind::Ask,
+                Some(anchor),
+                prompt,
+                None,
+                cx,
+            )
+        });
+        match started {
+            Ok(id) => {
+                self.agent_thread_runs.insert(thread_id.to_string(), id);
+                self.agent_thread_sessions.insert(thread_id.to_string(), id);
+            }
+            Err(crate::ai::StartError::AtCapacity) => {
+                self.agent_thread_errors
+                    .insert(thread_id.to_string(), AGENT_AT_CAPACITY_MESSAGE.to_string());
+            }
+            Err(_) => {
+                self.agent_thread_errors.insert(
+                    thread_id.to_string(),
+                    AGENT_START_FAILED_MESSAGE.to_string(),
+                );
+            }
+        }
         cx.notify();
     }
 
-    /// `select_comment` for a click on anchored text in the diff: selecting
-    /// the comment additionally queues the comments list to bring its row
-    /// near the list's top (consumed by `render_comments_tab`). Only the
+    /// Build the AI anchor (file, side, line range, changeset sha) plus the
+    /// repo root a turn runs in, from a saved thread's anchor. `None` when no
+    /// changeset is open.
+    fn agent_anchor_for(
+        &self,
+        thread: &crate::reviews::ReviewThread,
+    ) -> Option<(crate::ai::Anchor, PathBuf)> {
+        let (_base, head_sha, repo_root) = self.open_changeset_range()?;
+        let side = match thread.anchor.side {
+            crate::reviews::ThreadSide::Old => crate::ai::DiffSide::Old,
+            crate::reviews::ThreadSide::New => crate::ai::DiffSide::New,
+        };
+        let anchor = crate::ai::Anchor {
+            file: PathBuf::from(&thread.path),
+            line_range: (thread.anchor.start_line as u32)..=(thread.anchor.end_line as u32),
+            side,
+            changeset_sha: head_sha,
+        };
+        Some((anchor, repo_root))
+    }
+
+    /// Send a follow-up in an agent thread. Appends the reviewer's message
+    /// immediately, then resumes the bound CLI session (`send_turn`) when one
+    /// is still alive and idle, or starts a fresh transcript-seeded session
+    /// otherwise. A no-op while a turn is already in flight.
+    pub(crate) fn send_agent_thread_reply(
+        &mut self,
+        thread_id: &str,
+        body: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent_thread_runs.contains_key(thread_id) {
+            return;
+        }
+        let Some(review_id) = self.current_review().map(|review| review.id.clone()) else {
+            return;
+        };
+        let tid = thread_id.to_string();
+        let message = crate::reviews::ThreadMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            author: crate::reviews::MessageAuthor::Reviewer,
+            body: body.clone(),
+            created_at: now_unix_seconds(),
+        };
+        let result = self.reviews.mutate(&review_id, |review| {
+            if let Some(thread) = review.threads.iter_mut().find(|thread| thread.id == tid) {
+                thread.messages.push(message);
+            }
+        });
+        self.after_review_mutation(result.map(|_| ()), Some(window), cx);
+        self.selected_thread_id = Some(tid.clone());
+        self.agent_thread_errors.remove(&tid);
+
+        if let Some(&id) = self.agent_thread_sessions.get(&tid) {
+            let resumable = self.ai_sessions.read(cx).thread(id).is_some_and(|thread| {
+                thread.has_run_once && thread.status == crate::ai::ThreadStatus::Idle
+            });
+            if resumable {
+                let sent = self
+                    .ai_sessions
+                    .update(cx, |sessions, cx| sessions.send_turn(id, body, cx));
+                match sent {
+                    Ok(()) => {
+                        self.agent_thread_runs.insert(tid, id);
+                        cx.notify();
+                        return;
+                    }
+                    Err(crate::ai::StartError::AtCapacity) => {
+                        self.agent_thread_errors
+                            .insert(tid, AGENT_AT_CAPACITY_MESSAGE.to_string());
+                        cx.notify();
+                        return;
+                    }
+                    // A dead session (unknown/busy) falls back to a fresh start.
+                    Err(_) => {}
+                }
+            }
+        }
+        self.start_agent_thread_turn(&tid, cx);
+    }
+
+    /// Cancel an agent thread's in-flight turn, leaving the thread with just
+    /// the messages already saved (no partial agent reply is appended). The
+    /// bindings are dropped eagerly so the ticker clears this frame.
+    pub(crate) fn cancel_agent_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        if let Some(&id) = self.agent_thread_runs.get(thread_id) {
+            self.ai_sessions
+                .update(cx, |sessions, cx| sessions.cancel(id, cx));
+        }
+        self.agent_thread_runs.remove(thread_id);
+        self.agent_thread_sessions.remove(thread_id);
+        cx.notify();
+    }
+
+    /// Retry a failed agent turn: clear the error and start the turn again
+    /// (re-seeded from the transcript when the thread already has a reply).
+    pub(crate) fn retry_agent_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        self.agent_thread_errors.remove(thread_id);
+        self.start_agent_thread_turn(thread_id, cx);
+    }
+
+    /// The in-flight AI thread's latest tool activity for an agent thread's
+    /// running ticker, or `None` when no turn is running for it.
+    fn agent_thread_run_activity(
+        &self,
+        thread_id: &str,
+        cx: &Context<Self>,
+    ) -> Option<Option<String>> {
+        let id = self.agent_thread_runs.get(thread_id)?;
+        let thread = self.ai_sessions.read(cx).thread(*id)?;
+        Some(thread.latest_activity.clone())
+    }
+
+    /// Discards the staged draft without saving.
+    pub(crate) fn cancel_thread_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.thread_draft.take().is_none() {
+            return;
+        }
+        self.thread_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// Opens the reply composer on `thread_id`, focuses `reply_input`, and
+    /// closes any other open composer first — a staged new-thread draft or
+    /// a reply already open on a different thread; only one composer is
+    /// ever open at a time. A no-op for an unknown id.
+    pub(crate) fn start_thread_reply(
+        &mut self,
+        thread_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .open_changeset_threads()
+            .iter()
+            .any(|thread| thread.id == thread_id)
+        {
+            return;
+        }
+        self.thread_draft = None;
+        self.reply_draft_thread_id = Some(thread_id.to_string());
+        // Opening a reply composer is a real expansion, not just a render-time
+        // mask: the thread id comes out of the collapsed set so that closing
+        // the composer later (save or cancel) does not snap it back to
+        // collapsed. See `thread_row_collapsed` for the render-time override
+        // that keeps this thread visible even if `set_all_threads_collapsed`
+        // runs while the composer is still open.
+        self.collapsed_thread_ids.remove(thread_id);
+        self.reply_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        window.focus(&gpui::Focusable::focus_handle(&self.reply_input, cx));
+        cx.notify();
+    }
+
+    /// Saves the open reply as a new message appended to its thread. An
+    /// empty (or whitespace-only) reply is ignored and the composer stays
+    /// open. The thread stays selected once the reply lands.
+    pub(crate) fn save_thread_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.reply_draft_thread_id.clone() else {
+            return;
+        };
+        let body = self.reply_input.read(cx).value().trim().to_string();
+        if body.is_empty() {
+            return;
+        }
+        // An agent thread's reply goes to the AI: append the message and run a
+        // turn. Blocked (composer stays open) while a turn is already in
+        // flight.
+        let is_agent = self
+            .open_changeset_threads()
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .is_some_and(|thread| thread.kind == crate::reviews::ReviewThreadKind::Agent);
+        if is_agent {
+            if self.agent_thread_runs.contains_key(&thread_id) {
+                return;
+            }
+            self.reply_draft_thread_id = None;
+            self.reply_input
+                .update(cx, |state, cx| state.set_value("", window, cx));
+            self.send_agent_thread_reply(&thread_id, body, window, cx);
+            return;
+        }
+        let Some(review_id) = self.current_review().map(|review| review.id.clone()) else {
+            return;
+        };
+        let message = crate::reviews::ThreadMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            author: crate::reviews::MessageAuthor::Reviewer,
+            body,
+            created_at: now_unix_seconds(),
+        };
+        let result = self.reviews.mutate(&review_id, |review| {
+            if let Some(thread) = review
+                .threads
+                .iter_mut()
+                .find(|thread| thread.id == thread_id)
+            {
+                thread.messages.push(message);
+            }
+        });
+        self.after_review_mutation(result.map(|_| ()), Some(window), cx);
+        self.reply_draft_thread_id = None;
+        self.reply_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.selected_thread_id = Some(thread_id);
+        cx.notify();
+    }
+
+    /// Discards the open reply without saving.
+    pub(crate) fn cancel_thread_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reply_draft_thread_id.take().is_none() {
+            return;
+        }
+        self.reply_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// Selects a saved thread: opens the file's diff (if it isn't already
+    /// the active tab) and scrolls to the anchor. Never scrolls the threads
+    /// list — a sidebar row click moves only the diff (see
+    /// `select_thread_from_diff` for the diff-click direction). A no-op for
+    /// an unknown id.
+    pub(crate) fn select_thread(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(thread) = self
+            .open_changeset_threads()
+            .into_iter()
+            .find(|thread| thread.id == id)
+        else {
+            return;
+        };
+        self.selected_thread_id = Some(id.to_string());
+        self.thread_draft = None;
+        self.open_file_preview(thread.path.clone(), cx);
+        self.scroll_diff_to_thread_anchor(&thread, cx);
+        cx.notify();
+    }
+
+    /// `select_thread` for a click on anchored text in the diff: selecting
+    /// the thread additionally queues the threads list to bring its row
+    /// near the list's top (consumed by `render_threads_tab`). Only the
     /// diff→list direction scrolls the list; a sidebar row click uses plain
-    /// `select_comment` and leaves the list where it is. A no-op for an
+    /// `select_thread` and leaves the list where it is. A no-op for an
     /// unknown id.
-    pub(crate) fn select_comment_from_diff(&mut self, id: &str, cx: &mut Context<Self>) {
-        self.select_comment(id, cx);
-        if self.selected_comment_id.as_deref() == Some(id) {
-            *self.pending_comments_list_scroll.borrow_mut() = Some(id.to_string());
+    pub(crate) fn select_thread_from_diff(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.select_thread(id, cx);
+        if self.selected_thread_id.as_deref() == Some(id) {
+            *self.pending_threads_list_scroll.borrow_mut() = Some(id.to_string());
+            // Navigation must never land on a hidden body: a diff-driven
+            // selection always brings its thread's row out of collapse.
+            self.collapsed_thread_ids.remove(id);
         }
     }
 
-    /// All saved comments on the open changeset's review, in saved order.
+    /// Toggles whether `thread_id`'s row shows its collapsed header only or
+    /// its full body. A no-op for an unknown id (mirrors
+    /// `toggle_file_tree_folder`, which likewise never validates the path).
+    pub(crate) fn toggle_thread_collapsed(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        if !self.collapsed_thread_ids.insert(thread_id.to_string()) {
+            self.collapsed_thread_ids.remove(thread_id);
+        }
+        cx.notify();
+    }
+
+    /// Drives every thread in the open changeset's review to `collapsed`.
+    /// Unlike the file tree's collapse model, threads carry no per-thread
+    /// default, so collapsing simply records every current thread id and
+    /// expanding clears the set outright. The thread with an open reply
+    /// composer is left out of the collapsed set: collapse-all must not
+    /// record a collapse that would only be masked away at render time by
+    /// `thread_row_collapsed`, since that mask would vanish the moment the
+    /// composer closes.
+    pub(crate) fn set_all_threads_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
+        if collapsed {
+            self.collapsed_thread_ids = self
+                .open_changeset_threads()
+                .into_iter()
+                .map(|thread| thread.id)
+                .filter(|id| self.reply_draft_thread_id.as_deref() != Some(id.as_str()))
+                .collect();
+        } else {
+            self.collapsed_thread_ids.clear();
+        }
+        cx.notify();
+    }
+
+    /// Whether `thread`'s row should render collapsed to its header. An open
+    /// reply draft always wins over a collapsed state — a collapsed thread
+    /// with an open reply draft auto-expands rather than hiding the
+    /// composer it just opened. This is a render-time backstop only (e.g.
+    /// for a reply opened before this collapse-all ran); the steady-state
+    /// invariant is maintained by `start_thread_reply` removing the id from
+    /// `collapsed_thread_ids` and `set_all_threads_collapsed` skipping it.
+    fn thread_row_collapsed(&self, thread: &crate::reviews::ReviewThread) -> bool {
+        self.collapsed_thread_ids.contains(&thread.id)
+            && self.reply_draft_thread_id.as_deref() != Some(thread.id.as_str())
+    }
+
+    /// All saved threads on the open changeset's review, in saved order.
     /// Empty when no review exists yet.
-    pub(crate) fn open_changeset_comments(&self) -> Vec<crate::reviews::ReviewComment> {
+    pub(crate) fn open_changeset_threads(&self) -> Vec<crate::reviews::ReviewThread> {
         self.current_review()
-            .map(|review| review.comments.clone())
+            .map(|review| review.threads.clone())
             .unwrap_or_default()
     }
 
-    /// Saved-comment count for the Comments tab badge. Drafts are excluded —
-    /// only persisted comments count.
-    pub(crate) fn comment_count(&self) -> usize {
+    /// Saved-thread count for the Threads tab badge. Drafts are excluded —
+    /// only persisted threads count.
+    pub(crate) fn thread_count(&self) -> usize {
         self.current_review()
-            .map(|review| review.comments.len())
+            .map(|review| review.threads.len())
             .unwrap_or(0)
     }
 
     /// The diff content for `path` in the open changeset, independent of any
     /// stored selection — the counterpart `active_diff_selection_context` uses
     /// for the active tab, generalized to an arbitrary (possibly inactive)
-    /// path so a comment's anchor can be resolved on the file it names.
+    /// path so a thread's anchor can be resolved on the file it names.
     fn diff_side_content_for_path(
         &self,
         path: &str,
@@ -3827,25 +4424,25 @@ impl App {
         }
     }
 
-    /// Scrolls the active pane's diff so `comment`'s anchor is visible.
-    /// Resolves the anchor fresh against the comment's own file (not the
+    /// Scrolls the active pane's diff so `thread`'s anchor is visible.
+    /// Resolves the anchor fresh against the thread's own file (not the
     /// active selection), so re-selecting an already-open file still lands on
     /// the right row. A no-op when the anchor no longer resolves, or when the
     /// file was opened this same frame and its scroll state isn't painted
-    /// yet — a later interaction (or reselecting the comment) restores the
+    /// yet — a later interaction (or reselecting the thread) restores the
     /// scroll; a deferred-scroll mechanism was judged unnecessary complexity
     /// for this slice.
-    fn scroll_diff_to_comment_anchor(
+    fn scroll_diff_to_thread_anchor(
         &mut self,
-        comment: &crate::reviews::ReviewComment,
+        thread: &crate::reviews::ReviewThread,
         cx: &mut Context<Self>,
     ) {
         let pane = self.workspace.active_pane();
-        let side = comment_anchors::diff_side(comment.anchor.side);
-        let Some(content) = self.diff_side_content_for_path(&comment.path, side) else {
+        let side = thread_anchors::diff_side(thread.anchor.side);
+        let Some(content) = self.diff_side_content_for_path(&thread.path, side) else {
             return;
         };
-        let Some(resolved) = comment_anchors::resolve_anchor(&content, &comment.anchor) else {
+        let Some(resolved) = thread_anchors::resolve_anchor(&content, &thread.anchor) else {
             return;
         };
         let scroll = self.pane_scroll(pane, cx);
@@ -4408,11 +5005,16 @@ impl App {
             })
     }
 
-    fn render_repo_open(&self, repo: &repo::OpenRepository, cx: &mut Context<Self>) -> AnyElement {
+    fn render_repo_open(
+        &self,
+        repo: &repo::OpenRepository,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match &self.review_screen {
             ReviewScreen::Graph => self.render_graph_screen(repo, cx).into_any_element(),
             ReviewScreen::Changeset { changeset, .. } => self
-                .render_changeset_screen(repo, changeset, cx)
+                .render_changeset_screen(repo, changeset, window, cx)
                 .into_any_element(),
         }
     }
@@ -6288,6 +6890,7 @@ impl App {
         &self,
         repo: &repo::OpenRepository,
         changeset: &repo::ChangeSet,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let body: AnyElement = match self.file_list_entries(repo, changeset) {
@@ -6308,7 +6911,7 @@ impl App {
                         .child(
                             resizable_panel()
                                 .size(px(self.changeset_guide_width()))
-                                .child(self.render_review_sidebar(changeset, cx)),
+                                .child(self.render_review_sidebar(changeset, window, cx)),
                         )
                         .into_any_element()
                 } else {
@@ -7074,30 +7677,31 @@ impl App {
             hscroll: scroll.diff.hscroll.clone(),
             anchors: Rc::new(self.anchor_decorations_for_path(path)),
             can_comment: self.open_changeset_supports_guide(),
+            can_ask_ai: self.settings.ai_enabled && self.open_changeset_supports_guide(),
         }
     }
 
-    /// The comment anchors to decorate `path`'s diff with: every saved comment
+    /// The thread anchors to decorate `path`'s diff with: every saved thread
     /// on this file resolved onto its side's current rows (unresolvable
     /// anchors are skipped), plus the staged draft when it targets this file.
-    /// `selected` marks the saved comment matching `selected_comment_id`; the
+    /// `selected` marks the saved thread matching `selected_thread_id`; the
     /// draft is always `pending`.
     fn anchor_decorations_for_path(&self, path: &str) -> Vec<diff_view::AnchorDecoration> {
         let mut anchors = Vec::new();
-        for comment in self.open_changeset_comments() {
-            if comment.path != path {
+        for thread in self.open_changeset_threads() {
+            if thread.path != path {
                 continue;
             }
-            let side = comment_anchors::diff_side(comment.anchor.side);
+            let side = thread_anchors::diff_side(thread.anchor.side);
             let Some(content) = self.diff_side_content_for_path(path, side) else {
                 continue;
             };
-            let Some(resolved) = comment_anchors::resolve_anchor(&content, &comment.anchor) else {
+            let Some(resolved) = thread_anchors::resolve_anchor(&content, &thread.anchor) else {
                 continue;
             };
-            let selected = self.selected_comment_id.as_deref() == Some(comment.id.as_str());
+            let selected = self.selected_thread_id.as_deref() == Some(thread.id.as_str());
             anchors.push(diff_view::AnchorDecoration {
-                comment_id: Some(comment.id.clone()),
+                thread_id: Some(thread.id.clone()),
                 side: resolved.side,
                 start: resolved.start,
                 end: resolved.end,
@@ -7105,10 +7709,10 @@ impl App {
                 pending: false,
             });
         }
-        if let Some(draft) = &self.comment_draft {
+        if let Some(draft) = &self.thread_draft {
             if draft.path == path {
                 anchors.push(diff_view::AnchorDecoration {
-                    comment_id: None,
+                    thread_id: None,
                     side: draft.resolved.side,
                     start: draft.resolved.start,
                     end: draft.resolved.end,
@@ -7929,10 +8533,10 @@ pub(crate) fn commit_history_selection_underlay_rects(
 }
 
 impl Render for App {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match &self.mode {
             Mode::NoRepo => self.render_no_repo(cx).into_any_element(),
-            Mode::RepoOpen { repo } => self.render_repo_open(repo, cx),
+            Mode::RepoOpen { repo } => self.render_repo_open(repo, window, cx),
         };
 
         div()
@@ -8154,6 +8758,65 @@ mod tests {
         assert!((width - 370.).abs() < 0.01, "expected ~370, got {width}");
     }
 
+    #[test]
+    fn agent_thread_transcript_reseed_prompt_carries_the_full_conversation() {
+        // The post-restart re-seed path (`start_agent_thread_turn`'s
+        // `thread.messages.len() > 1` branch) has no live session to resume
+        // and instead rebuilds the prompt from scratch via
+        // `agent_thread_transcript` + `ask_followup_prompt`. This asserts
+        // that composition directly: every prior message must survive into
+        // the final prompt, in order, with the newest reviewer message as
+        // the transcript's last entry.
+        let mut thread = test_thread("src/lib.rs", 1);
+        thread.messages = vec![
+            crate::reviews::ThreadMessage {
+                id: "m1".into(),
+                author: crate::reviews::MessageAuthor::Reviewer,
+                body: "why the question mark?".into(),
+                created_at: 1,
+            },
+            crate::reviews::ThreadMessage {
+                id: "m2".into(),
+                author: crate::reviews::MessageAuthor::Agent,
+                body: "it propagates errors.".into(),
+                created_at: 2,
+            },
+            crate::reviews::ThreadMessage {
+                id: "m3".into(),
+                author: crate::reviews::MessageAuthor::Reviewer,
+                body: "is that safe here?".into(),
+                created_at: 3,
+            },
+        ];
+
+        let transcript = super::agent_thread_transcript(&thread);
+        assert_eq!(
+            transcript,
+            "Reviewer: why the question mark?\nAI: it propagates errors.\nReviewer: is that safe here?"
+        );
+
+        let anchor = crate::ai::Anchor {
+            file: std::path::PathBuf::from("src/lib.rs"),
+            line_range: 1..=1,
+            side: crate::ai::DiffSide::New,
+            changeset_sha: "abc123".to_string(),
+        };
+        let prompt = crate::ai::prompts::ask_followup_prompt(&anchor, "quoted", &transcript);
+        let first_index = prompt
+            .find("why the question mark?")
+            .expect("the earliest reviewer message survives into the re-seed prompt");
+        let middle_index = prompt
+            .find("it propagates errors.")
+            .expect("the agent's reply survives into the re-seed prompt");
+        let last_index = prompt
+            .find("is that safe here?")
+            .expect("the newest reviewer message survives into the re-seed prompt");
+        assert!(
+            first_index < middle_index && middle_index < last_index,
+            "the transcript lands in the prompt in its original, oldest-first order"
+        );
+    }
+
     #[gpui::test]
     fn closing_the_changeset_cancels_ai_threads(cx: &mut TestAppContext) {
         let window = crate::app::test_support::add_app_window(cx);
@@ -8208,7 +8871,7 @@ mod tests {
     }
 
     /// Open a two-commit repo's changeset with `hello.txt`'s diff open as the
-    /// active pane's tab, so a range selection can be staged into a comment
+    /// active pane's tab, so a range selection can be staged into a thread
     /// draft. Returns the dir (kept alive), the changed file's path, the
     /// window, and the visual context — mirrors the shape of
     /// `guide_panel`'s (module-private) `open_changeset_with_guide_panel`.
@@ -8240,7 +8903,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn staging_saving_and_cancelling_a_comment_draft(cx: &mut TestAppContext) {
+    async fn staging_saving_and_cancelling_a_thread_draft(cx: &mut TestAppContext) {
         // Root-wrapped (see `open_two_commit_changeset_with_root`'s doc
         // comment): staging focuses the composer's `Input`, which reaches
         // for `gpui_component::Root` when it paints.
@@ -8261,11 +8924,8 @@ mod tests {
                         },
                         cx,
                     );
-                    app.stage_comment_draft(window, cx);
-                    let draft = app
-                        .comment_draft
-                        .as_ref()
-                        .expect("selection stages a draft");
+                    app.stage_thread_draft(window, cx);
+                    let draft = app.thread_draft.as_ref().expect("selection stages a draft");
                     assert_eq!(
                         draft.resolved.start,
                         crate::app::diff_selection::DiffPoint { row: 0, column: 0 },
@@ -8278,14 +8938,14 @@ mod tests {
                     );
                     assert_eq!(
                         app.sidebar_tab,
-                        SidebarTab::Comments,
-                        "staging activates the Comments tab"
+                        SidebarTab::Threads,
+                        "staging activates the Threads tab"
                     );
                     assert!(
                         app.settings.changeset_panels.guide_open,
                         "staging reveals the sidebar"
                     );
-                    assert_eq!(app.comment_count(), 0, "count stays at zero until saved");
+                    assert_eq!(app.thread_count(), 0, "count stays at zero until saved");
                 });
             })
             .unwrap();
@@ -8293,16 +8953,12 @@ mod tests {
         window
             .update(cx, |_root, window, cx| {
                 app_entity.update(cx, |app, cx| {
-                    app.save_comment_draft(window, cx);
+                    app.save_thread_draft(window, cx);
                     assert!(
-                        app.comment_draft.is_some(),
+                        app.thread_draft.is_some(),
                         "an empty body cannot be saved, so the composer stays open"
                     );
-                    assert_eq!(
-                        app.comment_count(),
-                        0,
-                        "nothing is saved with an empty body"
-                    );
+                    assert_eq!(app.thread_count(), 0, "nothing is saved with an empty body");
                 });
             })
             .unwrap();
@@ -8310,18 +8966,26 @@ mod tests {
         window
             .update(cx, |_root, window, cx| {
                 app_entity.update(cx, |app, cx| {
-                    app.comment_input.update(cx, |state, cx| {
+                    app.thread_input.update(cx, |state, cx| {
                         state.set_value("Should this read PRICES at report time?", window, cx)
                     });
-                    app.save_comment_draft(window, cx);
-                    assert!(app.comment_draft.is_none(), "saving clears the draft");
-                    assert_eq!(app.comment_count(), 1);
-                    let comments = app.open_changeset_comments();
-                    assert_eq!(comments[0].body, "Should this read PRICES at report time?");
-                    assert_eq!(comments[0].path, changed_path);
+                    app.save_thread_draft(window, cx);
+                    assert!(app.thread_draft.is_none(), "saving clears the draft");
+                    assert_eq!(app.thread_count(), 1);
+                    let threads = app.open_changeset_threads();
+                    assert_eq!(threads[0].messages.len(), 1);
                     assert_eq!(
-                        app.selected_comment_id.as_deref(),
-                        Some(comments[0].id.as_str())
+                        threads[0].messages[0].body,
+                        "Should this read PRICES at report time?"
+                    );
+                    assert_eq!(
+                        threads[0].messages[0].author,
+                        crate::reviews::MessageAuthor::Reviewer
+                    );
+                    assert_eq!(threads[0].path, changed_path);
+                    assert_eq!(
+                        app.selected_thread_id.as_deref(),
+                        Some(threads[0].id.as_str())
                     );
                 });
             })
@@ -8342,10 +9006,10 @@ mod tests {
                         },
                         cx,
                     );
-                    app.stage_comment_draft(window, cx);
-                    app.cancel_comment_draft(window, cx);
-                    assert!(app.comment_draft.is_none());
-                    assert_eq!(app.comment_count(), 1, "cancel discards without saving");
+                    app.stage_thread_draft(window, cx);
+                    app.cancel_thread_draft(window, cx);
+                    assert!(app.thread_draft.is_none());
+                    assert_eq!(app.thread_count(), 1, "cancel discards without saving");
                 });
             })
             .unwrap();
@@ -8368,16 +9032,16 @@ mod tests {
                     },
                     cx,
                 );
-                app.stage_comment_draft(window, cx);
-                assert!(app.comment_draft.is_none());
+                app.stage_thread_draft(window, cx);
+                assert!(app.thread_draft.is_none());
             })
             .unwrap();
     }
 
     #[gpui::test]
-    async fn selecting_a_saved_comment_reopens_its_file(cx: &mut TestAppContext) {
+    async fn selecting_a_saved_thread_reopens_its_file(cx: &mut TestAppContext) {
         let (_dir, changed_path, window, _visual) = open_two_commit_changeset(cx);
-        let comment_id = window
+        let thread_id = window
             .update(cx, |app, window, cx| {
                 let pane = app.workspace.active_pane();
                 app.set_diff_selection(
@@ -8391,19 +9055,19 @@ mod tests {
                     },
                     cx,
                 );
-                app.stage_comment_draft(window, cx);
-                app.comment_input
+                app.stage_thread_draft(window, cx);
+                app.thread_input
                     .update(cx, |state, cx| state.set_value("A comment.", window, cx));
-                app.save_comment_draft(window, cx);
-                app.open_changeset_comments()[0].id.clone()
+                app.save_thread_draft(window, cx);
+                app.open_changeset_threads()[0].id.clone()
             })
             .unwrap();
 
-        // Close the tab and clear the selection, so `select_comment` has to
+        // Close the tab and clear the selection, so `select_thread` has to
         // reopen the file rather than finding it already active.
         window
             .update(cx, |app, _window, cx| {
-                app.selected_comment_id = None;
+                app.selected_thread_id = None;
                 app.close_active_workspace_tab(cx);
             })
             .unwrap();
@@ -8411,10 +9075,10 @@ mod tests {
 
         window
             .update(cx, |app, _window, cx| {
-                app.select_comment(&comment_id, cx);
+                app.select_thread(&thread_id, cx);
                 assert_eq!(
-                    app.selected_comment_id.as_deref(),
-                    Some(comment_id.as_str()),
+                    app.selected_thread_id.as_deref(),
+                    Some(thread_id.as_str()),
                     "selecting a known id sets it"
                 );
                 let pane = app.workspace.active_pane();
@@ -8423,7 +9087,7 @@ mod tests {
                         .active_item(pane)
                         .map(|item| item.path().to_string()),
                     Some(changed_path.clone()),
-                    "selecting a comment reopens its file"
+                    "selecting a thread reopens its file"
                 );
             })
             .unwrap();
@@ -8431,28 +9095,25 @@ mod tests {
         // An unknown id is a no-op: the current selection is left untouched.
         window
             .update(cx, |app, _window, cx| {
-                app.select_comment("does-not-exist", cx);
-                assert_eq!(
-                    app.selected_comment_id.as_deref(),
-                    Some(comment_id.as_str())
-                );
+                app.select_thread("does-not-exist", cx);
+                assert_eq!(app.selected_thread_id.as_deref(), Some(thread_id.as_str()));
             })
             .unwrap();
     }
 
-    /// `select_comment` reopens the file (setting the pane's pending
-    /// first-change-block flag) and then scrolls to the comment's own
-    /// anchor. A comment on a late line must land on that anchor, not get
+    /// `select_thread` reopens the file (setting the pane's pending
+    /// first-change-block flag) and then scrolls to the thread's own
+    /// anchor. A thread on a late line must land on that anchor, not get
     /// stomped by the next render's first-change-block scroll.
     #[gpui::test]
-    async fn selecting_a_comment_lands_on_its_anchor_not_the_first_change_block(
+    async fn selecting_a_thread_lands_on_its_anchor_not_the_first_change_block(
         cx: &mut TestAppContext,
     ) {
         let (dir, oid_hex) = init_repo_with_long_diff();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
 
-        let comment_id = window
+        let thread_id = window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
                 app.select_single_commit(oid_hex, cx);
@@ -8464,23 +9125,23 @@ mod tests {
                     .expect("review created for the open changeset")
                     .id
                     .clone();
-                let comment = test_comment("long.txt", 80);
-                let comment_id = comment.id.clone();
+                let thread = test_thread("long.txt", 80);
+                let thread_id = thread.id.clone();
                 let result = app
                     .reviews
-                    .mutate(&review_id, |review| review.comments.push(comment));
+                    .mutate(&review_id, |review| review.threads.push(thread));
                 app.after_review_mutation(result.map(|_| ()), Some(window), cx);
-                comment_id
+                thread_id
             })
             .unwrap();
         cx.run_until_parked();
 
-        // Close the tab and clear the selection, so `select_comment` has to
+        // Close the tab and clear the selection, so `select_thread` has to
         // reopen the file rather than finding it already active — this is
         // what arms the pending-focus flag `open_file_preview` sets.
         window
             .update(cx, |app, _window, cx| {
-                app.selected_comment_id = None;
+                app.selected_thread_id = None;
                 app.close_active_workspace_tab(cx);
             })
             .unwrap();
@@ -8488,7 +9149,7 @@ mod tests {
 
         window
             .update(cx, |app, _window, cx| {
-                app.select_comment(&comment_id, cx);
+                app.select_thread(&thread_id, cx);
             })
             .unwrap();
         cx.run_until_parked();
@@ -8503,11 +9164,11 @@ mod tests {
         let expected = crate::app::diff_view::scroll_offset_for_block_top(79, 3);
         assert_eq!(
             offset.y, expected,
-            "selecting a comment should land on its anchor, not the first change block"
+            "selecting a thread should land on its anchor, not the first change block"
         );
     }
 
-    /// Wrap-mode twin of `selecting_a_comment_lands_on_its_anchor_not_the_first_change_block`:
+    /// Wrap-mode twin of `selecting_a_thread_lands_on_its_anchor_not_the_first_change_block`:
     /// `open_file_preview`'s `reset()` empties the wrap list (`wrap.reset(0)`),
     /// so seeding the anchor scroll against it without first syncing the
     /// list's item count to the diff's row count is silently discarded by the
@@ -8515,14 +9176,14 @@ mod tests {
     /// for the same fragility) — the diff lands at the top of the file instead
     /// of the anchor.
     #[gpui::test]
-    async fn selecting_a_comment_lands_on_its_anchor_in_wrap_mode(cx: &mut TestAppContext) {
+    async fn selecting_a_thread_lands_on_its_anchor_in_wrap_mode(cx: &mut TestAppContext) {
         use gpui::size;
 
         let (dir, oid_hex) = init_repo_with_long_diff();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
 
-        let comment_id = window
+        let thread_id = window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
                 app.select_single_commit(oid_hex, cx);
@@ -8535,13 +9196,13 @@ mod tests {
                     .expect("review created for the open changeset")
                     .id
                     .clone();
-                let comment = test_comment("long.txt", 80);
-                let comment_id = comment.id.clone();
+                let thread = test_thread("long.txt", 80);
+                let thread_id = thread.id.clone();
                 let result = app
                     .reviews
-                    .mutate(&review_id, |review| review.comments.push(comment));
+                    .mutate(&review_id, |review| review.threads.push(thread));
                 app.after_review_mutation(result.map(|_| ()), Some(window), cx);
-                comment_id
+                thread_id
             })
             .unwrap();
         cx.run_until_parked();
@@ -8550,13 +9211,13 @@ mod tests {
         visual.simulate_resize(size(px(700.), px(360.)));
         cx.run_until_parked();
 
-        // Close the tab and clear the selection, so `select_comment` has to
+        // Close the tab and clear the selection, so `select_thread` has to
         // reopen the file rather than finding it already active — this is
         // what arms the pending-focus flag and empties the wrap list via
         // `reset()`.
         window
             .update(cx, |app, _window, cx| {
-                app.selected_comment_id = None;
+                app.selected_thread_id = None;
                 app.close_active_workspace_tab(cx);
             })
             .unwrap();
@@ -8564,7 +9225,7 @@ mod tests {
 
         window
             .update(cx, |app, _window, cx| {
-                app.select_comment(&comment_id, cx);
+                app.select_thread(&thread_id, cx);
             })
             .unwrap();
         cx.run_until_parked();
@@ -8580,23 +9241,23 @@ mod tests {
         let expected = 79usize.saturating_sub(crate::app::diff_view::CHANGE_BLOCK_CONTEXT_ROWS);
         assert_eq!(
             top, expected,
-            "selecting a comment in wrap mode should land on its anchor, not the top of the file"
+            "selecting a thread in wrap mode should land on its anchor, not the top of the file"
         );
     }
 
-    /// A comment anchored near end-of-file would otherwise compute a scroll
+    /// A thread anchored near end-of-file would otherwise compute a scroll
     /// target past the diff's real scroll range (the raw block-top math adds
     /// context rows with no bound at the end); the target must clamp to the
     /// handle's painted max offset instead of overshooting past the last row.
     #[gpui::test]
-    async fn selecting_a_comment_near_eof_clamps_to_the_scroll_range(cx: &mut TestAppContext) {
+    async fn selecting_a_thread_near_eof_clamps_to_the_scroll_range(cx: &mut TestAppContext) {
         use gpui::size;
 
         let (dir, oid_hex) = init_repo_with_long_diff();
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
 
-        let comment_id = window
+        let thread_id = window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
                 app.select_single_commit(oid_hex, cx);
@@ -8611,13 +9272,13 @@ mod tests {
                 // Last line of the 160-line fixture: its raw anchor target
                 // (row 159, 3 rows of context) scrolls well past the real
                 // end of the content.
-                let comment = test_comment("long.txt", 160);
-                let comment_id = comment.id.clone();
+                let thread = test_thread("long.txt", 160);
+                let thread_id = thread.id.clone();
                 let result = app
                     .reviews
-                    .mutate(&review_id, |review| review.comments.push(comment));
+                    .mutate(&review_id, |review| review.threads.push(thread));
                 app.after_review_mutation(result.map(|_| ()), Some(window), cx);
-                comment_id
+                thread_id
             })
             .unwrap();
         cx.run_until_parked();
@@ -8635,7 +9296,7 @@ mod tests {
 
         window
             .update(cx, |app, _window, cx| {
-                app.selected_comment_id = None;
+                app.selected_thread_id = None;
                 app.close_active_workspace_tab(cx);
             })
             .unwrap();
@@ -8643,7 +9304,7 @@ mod tests {
 
         window
             .update(cx, |app, _window, cx| {
-                app.select_comment(&comment_id, cx);
+                app.select_thread(&thread_id, cx);
             })
             .unwrap();
         cx.run_until_parked();
@@ -8660,14 +9321,14 @@ mod tests {
 
     /// `FileDiffScroll::reset()` zeroes offsets but, before this fix, left the
     /// uniform-list handles' `last_item_size` in place — geometry from
-    /// whatever file last painted. A closed-file `select_comment` runs the
+    /// whatever file last painted. A closed-file `select_thread` runs the
     /// clamp in `set_diff_scroll_top` one frame before the new file paints, so
     /// a short file shown first (whose content fits without scrolling, giving
     /// a near-zero `max_offset`) must not leave that stale geometry in place
     /// to clamp a deep anchor in a subsequently opened long file down to
     /// (near) zero.
     #[gpui::test]
-    async fn selecting_a_comment_in_a_longer_file_is_not_clamped_to_a_previously_shown_shorter_file(
+    async fn selecting_a_thread_in_a_longer_file_is_not_clamped_to_a_previously_shown_shorter_file(
         cx: &mut TestAppContext,
     ) {
         use gpui::size;
@@ -8676,7 +9337,7 @@ mod tests {
         let path = dir.path().to_path_buf();
         let window = add_app_window(cx);
 
-        let comment_id = window
+        let thread_id = window
             .update(cx, |app, window, cx| {
                 app.open_repository_at(path, window, cx);
                 app.select_single_commit(oid_hex, cx);
@@ -8690,13 +9351,13 @@ mod tests {
                     .expect("review created for the open changeset")
                     .id
                     .clone();
-                let comment = test_comment("long.txt", 80);
-                let comment_id = comment.id.clone();
+                let thread = test_thread("long.txt", 80);
+                let thread_id = thread.id.clone();
                 let result = app
                     .reviews
-                    .mutate(&review_id, |review| review.comments.push(comment));
+                    .mutate(&review_id, |review| review.threads.push(thread));
                 app.after_review_mutation(result.map(|_| ()), Some(window), cx);
-                comment_id
+                thread_id
             })
             .unwrap();
         cx.run_until_parked();
@@ -8716,7 +9377,7 @@ mod tests {
 
         window
             .update(cx, |app, _window, cx| {
-                app.select_comment(&comment_id, cx);
+                app.select_thread(&thread_id, cx);
             })
             .unwrap();
         cx.run_until_parked();
@@ -8729,7 +9390,7 @@ mod tests {
         let expected = crate::app::diff_view::scroll_offset_for_block_top(79, 3);
         assert_eq!(
             offset.y, expected,
-            "selecting a comment in a longer file should reach its true anchor, \
+            "selecting a thread in a longer file should reach its true anchor, \
              not clamp against the previously shown shorter file's near-zero range"
         );
     }

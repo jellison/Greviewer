@@ -78,6 +78,30 @@ context, consulting the repository history as needed. {TARGETING}",
     )
 }
 
+/// Prompt for continuing an ask thread in a *fresh* CLI session — used after
+/// an app restart (or a failed turn) has dropped the original session, so the
+/// model has no memory of the conversation. `transcript` is the full prior
+/// exchange, oldest first, already formatted as `Reviewer:`/`AI:` lines; the
+/// final entry is the reviewer's newest message, which the model must
+/// answer.
+pub fn ask_followup_prompt(anchor: &Anchor, selected_text: &str, transcript: &str) -> String {
+    let side = match anchor.side {
+        DiffSide::Old => "old side (before the change)",
+        DiffSide::New => "new side (after the change)",
+    };
+    format!(
+        "In this git repository, a reviewer is looking at commit {sha}, file \
+`{file}`, lines {start}-{end} on the {side} of the diff. The selected text is:\n\n\
+```\n{selected_text}\n```\n\nContinue this conversation about that exact context. \
+The exchange so far (oldest first):\n\n{transcript}\n\nAnswer the reviewer's most \
+recent message, consulting the repository history as needed. {TARGETING}",
+        sha = anchor.changeset_sha,
+        file = anchor.file.display(),
+        start = anchor.line_range.start(),
+        end = anchor.line_range.end(),
+    )
+}
+
 pub fn review_prompt(base_sha: Option<&str>, head_sha: &str) -> String {
     let range = range_text(base_sha, head_sha);
     format!(
@@ -180,6 +204,19 @@ mod tests {
         assert!(prompt.contains("let x = y?;"));
         assert!(prompt.contains("why the question mark?"));
         assert!(prompt.contains("new side"));
+    }
+
+    #[test]
+    fn ask_followup_prompt_carries_context_and_transcript() {
+        let transcript = "Reviewer: why the question mark?\nAI: it propagates errors.\nReviewer: is that safe here?";
+        let prompt = ask_followup_prompt(&anchor(), "let x = y?;", transcript);
+        assert!(prompt.contains("src/graph/mod.rs"));
+        assert!(prompt.contains("40-52"));
+        assert!(prompt.contains("def456"));
+        assert!(prompt.contains("let x = y?;"));
+        assert!(prompt.contains("is that safe here?"));
+        assert!(prompt.contains("Continue this conversation"));
+        assert!(prompt.contains("not the working tree"));
     }
 
     #[test]

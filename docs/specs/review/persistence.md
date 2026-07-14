@@ -141,15 +141,15 @@ contains, and how it is presented — is specified in
 only for the fact that the guide travels with the review record, exactly like
 its name, dates, and status.
 
-## Carrying comments
+## Carrying threads
 
-A review may hold any number of comments, each anchored to a piece of a
-file's diff. A review that has never had a comment added to it simply carries
-none. Deleting a review removes every comment it carries along with the rest
-of it. The comment's own contract — what a comment is, how it is added, seen,
+A review may hold any number of threads, each anchored to a piece of a
+file's diff. A review that has never had a thread added to it simply carries
+none. Deleting a review removes every thread it carries along with the rest
+of it. The thread's own contract — what a thread is, how it is added, seen,
 and selected, and how its anchor is kept or lost across sessions — is
-specified in [Review Comments](comments.md); this document is the source of
-truth only for the fact that comments travel with the review record, exactly
+specified in [Review Threads](threads.md); this document is the source of
+truth only for the fact that threads travel with the review record, exactly
 like its name, dates, and status.
 
 ## What the user can rely on
